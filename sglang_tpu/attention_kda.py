@@ -122,6 +122,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         tokens = mixed_qkv.shape[0]
         n_v, d_k, d_v = layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
         lower_bound = layer.lower_bound
+        conv_weight = layer.conv_weights
+        if conv_weight.ndim == 2:
+            conv_weight = conv_weight.unsqueeze(1)
         out = self._op(
             mixed_qkv,
             # Raw beta [T, n_v] and forget gate [T, n_v * d_k]; the kernel
@@ -130,7 +133,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             a.reshape(tokens, n_v * d_k),
             cache.conv[0],
             cache.temporal,
-            layer.conv_weights.unsqueeze(1),
+            # The kernel's depthwise [dim, 1, K]; GLM-5.3-Flash binds that
+            # parameter itself (an unsqueeze view is re-materialized per call).
+            conv_weight,
             layer.bias,
             layer.A_log.reshape(n_v),
             # Per-channel under KDA; Mosaic rejects the flat [n_v * d_k] form.
@@ -151,11 +156,13 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
 
     def _run_scan(self, layer, mixed_qkv, a, b):
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv = cache.conv[0]
         return self._op(
             mixed_qkv,
             a,
             b,
-            cache.conv[0],
+            # The reference recurrence indexes [slots, K-1, dim].
+            conv.reshape(conv.shape[0], conv.shape[1], -1),
             cache.temporal,
             layer.conv_weights,
             layer.A_log,

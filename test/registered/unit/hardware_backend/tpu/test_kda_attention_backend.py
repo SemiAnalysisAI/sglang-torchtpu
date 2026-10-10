@@ -154,7 +154,9 @@ class TestKDAAttentionBackend(unittest.TestCase):
                 for actual, original in zip(
                     args[:5], (qkv, a, b, self.cache.conv[0], self.cache.temporal)
                 ):
-                    self.assertIs(actual, original)
+                    # The conv pool may be a rank-preserving view of the owned state.
+                    self.assertEqual(actual.data_ptr(), original.data_ptr())
+                    self.assertEqual(actual.numel(), original.numel())
                 self.assertEqual(
                     args[8].tolist(), self.backend._query_start_loc.tolist()
                 )

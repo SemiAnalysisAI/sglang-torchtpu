@@ -132,7 +132,7 @@ class TestTpuMambaPool(CustomTestCase):
             mamba_layer_ids=[0, 1],
             device="cpu",
         )
-        self.assertEqual(pool.mamba_cache.conv[0][0].shape, (4, 3, 192))
+        self.assertEqual(pool.mamba_cache.conv[0][0].shape, (4, 3, 1, 192))
         self.assertEqual(pool.mamba_cache.temporal[0].shape, (4, 4, 16, 16))
 
     def test_kernel_native_buffer_layout(self):

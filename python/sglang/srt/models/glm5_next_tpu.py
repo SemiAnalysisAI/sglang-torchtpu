@@ -634,7 +634,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         for layer in self.model.layers:
             attn = layer.self_attn
             if isinstance(attn, Glm5NextLinearAttention):
-                attn.attn.conv_weights = attn.qkv_conv1d.weight.squeeze(1)
+                # The depthwise [dim, 1, K] parameter itself, not a view.
+                attn.attn.conv_weights = attn.qkv_conv1d.weight
         if self.model.fused_mhc:
             self.model.prepare_fused_mhc()
 
