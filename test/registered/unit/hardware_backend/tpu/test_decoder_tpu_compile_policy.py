@@ -4367,5 +4367,36 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertEqual(finalized[1].shape, (BS,))
 
 
+class TestWarmupDpAttentionMetadataWidth(CustomTestCase):
+    """Warmup traces the per-rank token counts at the width serving replays."""
+
+    def _warmup_counts(self, **parallel):
+        policy = _make_policy(_model_runner())
+        forward_batch = SimpleNamespace()
+        with get_parallel().override(**parallel):
+            policy._set_dp_attention_metadata(
+                forward_batch, num_tokens=16, bs=4, mode=ForwardMode.EXTEND
+            )
+        return forward_batch
+
+    def test_target_width_is_the_dp_sync_width(self):
+        fb = self._warmup_counts(attn_dp_size=4, num_dp_ranks=4)
+        self.assertEqual(fb.global_num_tokens_cpu, [16] * 4)
+        self.assertEqual(tuple(fb.global_num_tokens_gpu.shape), (4,))
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [4] * 4)
+        self.assertEqual(tuple(fb.global_num_tokens_for_logprob_gpu.shape), (4,))
+
+    def test_attention_owning_draft_keeps_the_dp_sync_width(self):
+        # draft_tp_context narrows attn_dp_size to 1 for an EAGLE3 draft that
+        # owns attention, but the scheduler still publishes num_dp_ranks counts
+        # (ScheduleBatch.draft_global_num_tokens). Tracing a 1-wide tensor here
+        # made every DP>1 EAGLE3 prefill fail the direct_compile shape guard.
+        fb = self._warmup_counts(attn_dp_size=1, num_dp_ranks=4)
+        self.assertEqual(fb.global_num_tokens_cpu, [16] * 4)
+        self.assertEqual(fb.original_global_num_tokens_cpu, [16] * 4)
+        self.assertEqual(tuple(fb.global_num_tokens_gpu.shape), (4,))
+        self.assertEqual(tuple(fb.global_num_tokens_for_logprob_gpu.shape), (4,))
+
+
 if __name__ == "__main__":
     unittest.main()

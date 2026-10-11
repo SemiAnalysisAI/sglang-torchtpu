@@ -1437,10 +1437,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         from sglang.srt.layers.dp_attention import DpPaddingMode
 
-        # One entry per attention-DP rank (dp_size counts replicas now).
-        dp_size = get_parallel().attn_dp_size
+        # One entry per scheduler in the DP sync, which is what the scheduler
+        # publishes (``prepare_mlp_sync_batch_raw`` sizes the gather by
+        # ``num_dp_ranks``). Not ``attn_dp_size``: an attention-owning EAGLE3
+        # draft warms up inside ``draft_tp_context``, which narrows
+        # ``attn_dp_size`` to 1 while the scheduler still hands the draft the
+        # target-wide per-rank counts. ``num_dp_ranks`` is computed at publish
+        # and is not narrowed, so target and draft trace the width serving
+        # replays with.
+        num_dp_ranks = get_parallel().num_dp_ranks
         device = self.model_runner.device
-        global_num_tokens = [num_tokens] * dp_size
+        global_num_tokens = [num_tokens] * num_dp_ranks
         forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
         forward_batch.is_extend_in_batch = mode == ForwardMode.EXTEND
         forward_batch.global_num_tokens_cpu = list(global_num_tokens)
@@ -1448,9 +1455,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, device=device
         )
-        forward_batch.global_num_tokens_for_logprob_cpu = [bs] * dp_size
+        forward_batch.global_num_tokens_for_logprob_cpu = [bs] * num_dp_ranks
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            [bs] * dp_size, dtype=torch.int64, device=device
+            [bs] * num_dp_ranks, dtype=torch.int64, device=device
         )
 
     def _dummy_kv_slot(self) -> int:
