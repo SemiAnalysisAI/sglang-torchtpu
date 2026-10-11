@@ -406,6 +406,16 @@ class RaidenSenderMixin:
         if not accepted:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
+            return
+        logger.info(
+            "RaidenKVManager rank%d prefill registered read | room=%s "
+            "req_id=%s uuid=%d pages=%d",
+            self.attn_tp_rank,
+            room,
+            req_id,
+            uuid,
+            len(block_ids),
+        )
 
     def _discard_sender_read_locked(self, room: int, req_id: str) -> None:
         reads = self._send_reads.get(room)
