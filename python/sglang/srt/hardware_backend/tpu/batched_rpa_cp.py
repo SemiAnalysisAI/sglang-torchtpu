@@ -27,6 +27,340 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _CP_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_cp"
+_PCP_DEBUG_DUMP = bool(int(__import__("os").environ.get("SGLANG_PCP_DEBUG_DUMP", "0")))
+_PCP_DEBUG_CALLS: dict[int, int] = {}
+
+
+_GATHER_BUFFERS: dict = {}
+_AG_OP_NAME = "sglang_tpu_pallas::pcp_all_gather_rows"
+_AG_OP_CACHE: dict = {}
+# Row granularity of the exported all-gather: bounds the number of per-shape
+# exports (one per padded row count) and keeps the gathered chunks tile aligned.
+_AG_ROW_BUCKET = 16
+_PCP_GATHER_IMPL = __import__("os").environ.get("SGLANG_PCP_GATHER_IMPL", "jax")
+# Device order of the exported SPMD meshes: "native" (torch_tpu get_pallas_mesh
+# when available), "rank" (jax devices listed in torch-rank order) or "id".
+_PCP_MESH_ORDER = __import__("os").environ.get("SGLANG_PCP_MESH_ORDER", "native")
+
+
+_MESH_DEVICE_IDS: list | None = None
+
+
+def _rank_ordered_device_ids(world: int) -> list[int]:
+    """Physical TPU device id of every torch rank (index = rank).
+
+    The exported SPMD programs assign partition p to `mesh.devices.flat[p]`,
+    and the CP axis of the mesh must coincide with the attn_cp process groups
+    (built over torch ranks), so the mesh has to list devices in rank order.
+    """
+    global _MESH_DEVICE_IDS
+    if _MESH_DEVICE_IDS is not None and len(_MESH_DEVICE_IDS) >= world:
+        return _MESH_DEVICE_IDS[:world]
+    import torch.distributed as dist
+
+    ids = list(range(world))
+    if dist.is_initialized() and dist.get_world_size() >= world:
+        try:
+            from torch_tpu._internal.distributed import tpu_distributed
+
+            mine = int(tpu_distributed.global_device_id())
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, mine)
+            ids = [int(i) for i in gathered[:world]]
+        except Exception:  # noqa: BLE001 - fall back to identity mapping
+            pass
+    _MESH_DEVICE_IDS = ids
+    return ids
+
+
+def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
+    order = order or _PCP_MESH_ORDER
+    if order == "native":
+        try:
+            from torch_tpu._internal.pallas import get_pallas_mesh
+
+            return get_pallas_mesh(axis_names, mesh_shape)
+        except ImportError:
+            order = "rank"
+    # torch_tpu builds without get_pallas_mesh: build the mesh from the JAX
+    # view of the local TPU devices, ordered by torch rank (or by device id).
+    import math
+
+    import jax
+
+    world = math.prod(mesh_shape)
+    by_id = {int(d.id): d for d in jax.devices()}
+    ids = _rank_ordered_device_ids(world) if order == "rank" else list(range(world))
+    devices = np.array([by_id[i] for i in ids]).reshape(mesh_shape)
+    return jax.sharding.Mesh(devices, axis_names)
+
+
+def _call_custom_kernel_supports_device_assignment() -> bool:
+    try:
+        from torch_tpu._internal.pallas import pallas as pallas_impl
+
+        doc = getattr(pallas_impl.tpu_torch_pallas.call_custom_kernel, "__doc__", "") or ""
+        return "device_assignment" in doc
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _export_mesh_op(name, fn, mesh, input_partition_specs, output_partition_specs):
+    """Export an SPMD JAX op over `mesh` as a torch custom op.
+
+    Newer torch_tpu builds take the mesh's device assignment through
+    `call_custom_kernel(device_assignment=...)` (sglang's `cpu_export_jax_op`);
+    older ones only offer `torch_tpu._internal.pallas.jax_op(mesh=...)`.
+    """
+    if _call_custom_kernel_supports_device_assignment():
+        from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+
+        return cpu_export_jax_op(
+            name,
+            fn,
+            mesh=mesh,
+            input_partition_specs=input_partition_specs,
+            output_partition_specs=output_partition_specs,
+        )
+    from torch_tpu._internal.pallas import jax_op
+
+    return jax_op(name, fn, mesh=mesh, input_partition_specs=input_partition_specs)
+
+
+def build_cp_all_gather_op(cp_size: int, attn_tp_size: int, mesh_order: str | None = None):
+    """Export a `lax.all_gather` over the CP axis of the (pcp, model) mesh.
+
+    The eager torch collective (`all_gather_into_tensor` on the attn_cp group)
+    is not ordered against the Pallas/XLA programs the prefill path launches
+    around it, and in the PCP forward the remote ranks' rows intermittently
+    arrived as NaN/zero. An XLA all-gather inside the same program stream has no
+    such race. Rows are gathered along dim 0: rank r's block lands at
+    [r * rows, (r + 1) * rows). Mesh position (c, t) is torch rank
+    c * attn_tp_size + t, matching the attn_cp groups built in parallel_state.
+    """
+    mesh_order = mesh_order or _PCP_MESH_ORDER
+    key = (cp_size, attn_tp_size, mesh_order)
+    cached = _AG_OP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    mesh = _get_pallas_mesh(("pcp", "model"), (cp_size, attn_tp_size), order=mesh_order)
+    import jax.numpy as jnp
+
+    # Every rank passes its own [rows, cols] block as a "replicated" P() array
+    # (the torch_tpu runtime specializes the program on the local shapes). The
+    # gather is cp-1 collective-permutes along the CP axis, as in pp_wave:
+    # output slot s holds the block of CP rank (self - s) % cp (slot 0 = own
+    # block); the caller maps slots back to ranks. (A plain `all_gather` of the
+    # P() input is folded into copies of the local block, and `axis_index`
+    # lowers to partition-id, which the runtime's SPMD compile rejects.)
+    def _local(a: jax.Array) -> jax.Array:
+        blocks = [a]
+        for s in range(1, cp_size):
+            perm = [(i, (i + s) % cp_size) for i in range(cp_size)]
+            blocks.append(jax.lax.ppermute(a, "pcp", perm))
+        return jnp.stack(blocks, axis=0)
+
+    def _wrapped(x: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(),
+            check_vma=False,
+        )(x)
+
+    op = _export_mesh_op(
+        f"{_AG_OP_NAME}_cp{cp_size}_tp{attn_tp_size}_{mesh_order}",
+        _wrapped,
+        mesh,
+        (P(),),
+        (P(),),
+    )
+    _AG_OP_CACHE[key] = op
+    return op
+
+
+def cp_all_gather_padded(
+    x: torch.Tensor, local_len: int, max_len: int, cp_size: int, group=None, impl=None
+) -> torch.Tensor:
+    """All-gather `x[:local_len]` (zero-padded to `max_len` rows) across the CP
+    group. Returns `[cp_size, max_len, cols]`; entry r holds rank r's rows.
+
+    impl="jax" (default) runs the exported XLA all-gather; impl="torch" uses the
+    eager `all_gather_into_tensor` with persistent buffers.
+    """
+    impl = impl or _PCP_GATHER_IMPL
+    cols = x.shape[1]
+    if impl == "jax":
+        rows = -(-max_len // _AG_ROW_BUCKET) * _AG_ROW_BUCKET
+        src = x[:local_len]
+        if rows > local_len:
+            src = torch.nn.functional.pad(src, (0, 0, 0, rows - local_len))
+        src = src.contiguous()
+        parallel = get_parallel()
+        op = build_cp_all_gather_op(cp_size, parallel.attn_tp_size)
+        out = op(src).view(cp_size, rows, cols)
+        # slot s holds rank (cp_rank - s) % cp_size -> rank r is slot (cp_rank - r) % cp_size
+        cp_rank = parallel.attn_cp_rank
+        order = torch.tensor(
+            [(cp_rank - r) % cp_size for r in range(cp_size)], device=out.device
+        )
+        return out.index_select(0, order)[:, :max_len]
+
+    group = group or get_parallel().attn_cp_group
+    key = ("src", max_len, cols, x.dtype, x.device)
+    src = _GATHER_BUFFERS.get(key)
+    if src is None:
+        src = torch.zeros((max_len, cols), dtype=x.dtype, device=x.device)
+        _GATHER_BUFFERS[key] = src
+    src[:local_len].copy_(x[:local_len])
+    if max_len > local_len:
+        src[local_len:].zero_()
+    okey = ("dst", max_len * cp_size, cols, x.dtype, x.device)
+    dst = _GATHER_BUFFERS.get(okey)
+    if dst is None:
+        dst = torch.zeros((max_len * cp_size, cols), dtype=x.dtype, device=x.device)
+        _GATHER_BUFFERS[okey] = dst
+    torch.accelerator.synchronize()
+    group.all_gather_into_tensor(dst, src)
+    torch.accelerator.synchronize()
+    return dst.view(cp_size, max_len, cols)
+
+
+def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tensor:
+    """All-gather a rank-local 2-D row block into global zigzag token order.
+
+    Same semantics as `ZigzagCPStrategy.gather_kv_cache`, but the collective is
+    the exported XLA all-gather (see `build_cp_all_gather_op`).
+    """
+    meta = forward_batch.attn_cp_metadata
+    per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
+    cp_size = len(per_rank)
+    cp_rank = get_parallel().attn_cp_rank
+    max_len = max(per_rank)
+    local_len = per_rank[cp_rank]
+    assert x.dim() == 2 and x.shape[0] >= local_len
+
+    chunks = cp_all_gather_padded(x, local_len, max_len, cp_size, group=group)
+    gathered = torch.cat([chunks[r][: per_rank[r]] for r in range(cp_size)], dim=0)
+    parts = torch.split(gathered, meta.reverse_split_len, dim=0)
+    return torch.cat([parts[i] for i in meta.cp_reverse_index], dim=0)
+
+
+def _pcp_gather_experiments(k, v, forward_batch, cp_rank, cp_size, layer_id):
+    """Debug aid: try several all-gather formulations of the local K and report
+    NaN / all-zero rows in the remote ranks' part of the gathered tensor."""
+    import torch.nn.functional as F
+
+    meta = forward_batch.attn_cp_metadata
+    per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
+    max_len = max(per_rank)
+    local_len = per_rank[cp_rank]
+    group = get_parallel().attn_cp_group
+    T = k.shape[0]
+
+    def gather(x, zero_out=False, sync=False):
+        x = x[:local_len]
+        if max_len > x.shape[0]:
+            x = F.pad(x, [0, 0] * (x.ndim - 1) + [0, max_len - x.shape[0]])
+        x = x.contiguous()
+        if sync:
+            torch.accelerator.synchronize()
+        out = (torch.zeros if zero_out else torch.empty)(
+            (max_len * cp_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+        )
+        group.all_gather_into_tensor(out, x)
+        return out
+
+    def stats(name, g):
+        g = g.float().reshape(cp_size, max_len, -1)
+        res = []
+        for r in range(cp_size):
+            rows = g[r, : per_rank[r]]
+            nan = int(torch.isnan(rows).any(-1).sum())
+            zero = int((rows == 0).all(-1).sum())
+            res.append(f"r{r}:nan={nan}/{per_rank[r]},zero={zero}")
+        print(f"[PCP-GX r{cp_rank} L{layer_id}] {name:24s} " + " ".join(res), flush=True)
+
+    kd = k.shape[1] * k.shape[2]
+    k2 = k.reshape(T, kd)
+    stats("k3d_empty", gather(k))
+    stats("k3d_zeros", gather(k, zero_out=True))
+    stats("k2d_empty", gather(k2))
+    stats("k2d_zeros", gather(k2, zero_out=True))
+    stats("k2d_sync", gather(k2, sync=True))
+    stats("k2d_clone", gather(k2.clone()))
+    stats("k2d_f32", gather(k2.float()))
+    kv2 = torch.cat([k2, v.reshape(T, -1)], dim=-1)
+    stats("kv2d_empty", gather(kv2))
+    stats("kv2d_zeros", gather(kv2, zero_out=True))
+    stats("k2d_pad512", gather(F.pad(k2, (0, 512 - kd))))
+    # the generic all_gather API (concat along dim 0, uses the same collective)
+    g = group.all_gather(F.pad(k2[:local_len], (0, 0, 0, max_len - local_len)).contiguous(), dim=0)
+    stats("k2d_api", g)
+    g = cp_all_gather_rows(k2, forward_batch).float()
+    print(f"[PCP-GX r{cp_rank} L{layer_id}] {'k2d_safe(global)':24s} nan_rows={int(torch.isnan(g).any(-1).sum())}/{g.shape[0]} zero_rows={int((g == 0).all(-1).sum())}", flush=True)
+
+
+def _pcp_debug_dump(
+    layer, cp_rank, q, k, v, k_reordered, v_reordered, kv_cache, kv_lens,
+    page_indices, pcp_meta, distribution, update_kv, ctx_out, ctx_lse, cur_out,
+    cur_lse, sliding_window, sm_scale, cp_size, forward_batch,
+):
+    """Debug aid (SGLANG_PCP_DEBUG_DUMP=1): per-layer NaN statistics and a tensor
+    dump of the first forward's first layers for offline kernel replay."""
+    import os
+
+    layer_id = int(getattr(layer, "layer_id", -1))
+    call = _PCP_DEBUG_CALLS.get(layer_id, 0)
+    _PCP_DEBUG_CALLS[layer_id] = call + 1
+    if layer_id == 0 and call >= 1 and getattr(forward_batch, "attn_cp_metadata", None) is not None:
+        try:
+            _pcp_gather_experiments(k, v, forward_batch, cp_rank, cp_size, layer_id)
+        except Exception as e:  # debug only
+            print(f"[PCP-GX r{cp_rank}] experiments failed: {e!r}", flush=True)
+
+    def nan_rows(t):
+        if t is None:
+            return "-"
+        bad = torch.isnan(t.float()).flatten(1).any(1)
+        idx = torch.nonzero(bad).flatten().tolist()
+        return f"{len(idx)}:{idx[:12]}"
+
+    cu = pcp_meta.pcp_cu_q_lens.tolist()
+    print(
+        f"[PCP-DBG r{cp_rank} L{layer_id} call{call}] q={tuple(q.shape)} k_loc={tuple(k.shape)} "
+        f"k_glob={tuple(k_reordered.shape)} cu={cu[:9]} qpos={pcp_meta.q_positions.tolist()[:8]} "
+        f"kvlens={kv_lens.tolist()[:8]} kvnew={pcp_meta.kv_new_lens.tolist()[:8]} dist={distribution.tolist()} "
+        f"upd={update_kv.tolist()[:8]} sw={sliding_window} | nan q={nan_rows(q)} k={nan_rows(k)} v={nan_rows(v)} "
+        f"kglob={nan_rows(k_reordered)} vglob={nan_rows(v_reordered)} cur_out={nan_rows(cur_out)} cur_lse={nan_rows(cur_lse)} "
+        f"ctx_out={nan_rows(ctx_out)} ctx_lse={nan_rows(ctx_lse)}",
+        flush=True,
+    )
+    if call == 1 and layer_id <= 1:
+        path = f"/tmp/pcp_dump_r{cp_rank}_L{layer_id}.pt"
+        torch.save(
+            {
+                "q": q.cpu(), "k": k.cpu(), "v": v.cpu(), "k_glob": k_reordered.cpu(),
+                "v_glob": v_reordered.cpu(), "kv_lens": kv_lens.cpu(),
+                "page_indices": page_indices.cpu(), "cu_q_lens": pcp_meta.pcp_cu_q_lens.cpu(),
+                "distribution": distribution.cpu(), "q_positions": pcp_meta.q_positions.cpu(),
+                "kv_new_lens": pcp_meta.kv_new_lens.cpu(), "update_kv": update_kv.cpu(),
+                "cur_out": cur_out.cpu(), "cur_lse": cur_lse.cpu(),
+                "ctx_out": None if ctx_out is None else ctx_out.cpu(),
+                "ctx_lse": None if ctx_lse is None else ctx_lse.cpu(),
+                "sliding_window": sliding_window, "sm_scale": sm_scale, "cp_size": cp_size,
+                "cp_rank": cp_rank, "kv_cache_shape": tuple(kv_cache.shape),
+                "extend_seq_lens": getattr(forward_batch, "extend_seq_lens_cpu", None),
+                "extend_prefix_lens": getattr(forward_batch, "extend_prefix_lens_cpu", None),
+            },
+            path,
+        )
+        print(f"[PCP-DBG r{cp_rank}] dumped {path}", flush=True)
 _OP_CACHE: dict = {}
 _CP_RANK_TENSORS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
@@ -61,6 +395,143 @@ class PcpBatchedMetadata:
     pcp_cache_lens: torch.Tensor
     c_per_req: int = 1
 
+
+_RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring"
+
+
+def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
+    """Register the PCP cache-phase (ring attention) op over the CP x TP mesh.
+
+    The ring rotates KV blocks with mesh-addressed remote DMAs and reads its
+    rank from `lax.axis_index("pcp")`, so the kernel has to run inside a
+    `shard_map` over a ("pcp", "model") mesh that spans the whole TP group:
+    device `d` is CP rank `d // attn_tp_size`, matching the attn_cp groups
+    built in parallel_state. Every rank passes its own local tensors; they are
+    declared replicated (P()) so local and global shapes coincide, as in
+    `fused_moe_rs_op`.
+    """
+    key = (_RING_OP_NAME, cp_size, attn_tp_size)
+    cached = _OP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import functools
+
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import kv_layout
+    from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
+
+    mesh = _get_pallas_mesh(("pcp", "model"), (cp_size, attn_tp_size))
+    num_tensor_args = 12
+
+    def _local(
+        queries,
+        keys,
+        values,
+        kv_cache_fused,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        q_positions,
+        kv_new_lens,
+        cp_rank,
+        update_kv_cache,
+        *,
+        sm_scale,
+        sliding_window,
+        soft_cap,
+        k_scale,
+        v_scale,
+    ):
+        out, _, lse = wrapper.ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache_fused,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            use_causal_mask=True,
+            attention_scope=configs.AttentionScope.CACHE_ONLY,
+            cp_group_size=cp_size,
+            cp_rank=cp_rank,
+            pcp_ring_axis_name="pcp",
+            pcp_ring_mesh_axis_names=("pcp", "model"),
+            q_positions=q_positions,
+            kv_new_lens=kv_new_lens,
+            new_kv_page_indices=None,
+            update_kv_cache=update_kv_cache,
+            return_lse=True,
+            kv_layout=kv_layout(),
+        )
+        return out, lse
+
+    def _wrapped(
+        queries: jax.Array,
+        keys: jax.Array,
+        values: jax.Array,
+        kv_cache_fused: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        q_positions: jax.Array,
+        kv_new_lens: jax.Array,
+        cp_rank: jax.Array,
+        update_kv_cache: jax.Array,
+        sm_scale: float,
+        sliding_window: int | None,
+        soft_cap: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> tuple[jax.Array, jax.Array]:
+        fn = functools.partial(
+            _local,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return jax.shard_map(
+            fn,
+            mesh=mesh,
+            in_specs=(P(),) * num_tensor_args,
+            out_specs=(P(), P()),
+            check_vma=False,
+        )(
+            queries,
+            keys,
+            values,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            q_positions,
+            kv_new_lens,
+            cp_rank,
+            update_kv_cache,
+        )
+
+    op = _export_mesh_op(
+        f"{_RING_OP_NAME}_cp{cp_size}_tp{attn_tp_size}",
+        _wrapped,
+        mesh,
+        (P(),) * num_tensor_args + (None,) * 5,
+        (P(), P()),
+    )
+    _OP_CACHE[key] = op
+    return op
 
 def build_batched_rpa_cp_op():
     """Register the CP-aware custom op for batched RPA."""
@@ -507,7 +978,8 @@ def batched_rpa_pcp_forward(
     if pcp_meta.cache_pages > 0:
         # kv_lens == cached prefix and kv_new_lens == 0, so the kernel's global
         # cache length is exactly the prefix. No KV is written in this phase.
-        context_out, context_lse = cp_op(
+        ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
+        context_out, context_lse = ring_op(
             q_op,
             k_logical,
             v_logical,
@@ -519,17 +991,12 @@ def batched_rpa_pcp_forward(
             pcp_meta.q_positions,
             zeros_2x,
             cp_rank_tensor,
-            None,
             zeros_2x,
             float(layer.scaling),
             sliding_window,
-            layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
+            float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
             k_scale,
             v_scale,
-            1,  # CACHE_ONLY
-            cp_size,
-            "pcp",
-            True,
         )
 
     # 2. Current Phase (All-Gather current chunk tokens)
@@ -537,8 +1004,20 @@ def batched_rpa_pcp_forward(
         strategy is not None
         and getattr(forward_batch, "attn_cp_metadata", None) is not None
     ):
-        k_reordered = strategy.gather_kv_cache(k.contiguous(), forward_batch).contiguous()
-        v_reordered = strategy.gather_kv_cache(v.contiguous(), forward_batch).contiguous()
+        # Gather K and V as one flat [T, 2 * heads * head_dim] tensor. On TPU a
+        # [T, heads, head_dim] gather with small minor dims (e.g. (2, 64) bf16)
+        # came back with NaN rows in a tiled pattern; a lane-dense 2-D tensor
+        # (like the hidden-state gathers) is moved correctly.
+        num_local = k.shape[0]
+        kd = k.shape[1] * k.shape[2]
+        vd = v.shape[1] * v.shape[2]
+        kv_local = torch.cat(
+            [k.reshape(num_local, kd), v.reshape(num_local, vd)], dim=-1
+        ).contiguous()
+        kv_glob = cp_all_gather_rows(kv_local, forward_batch)
+        num_glob = kv_glob.shape[0]
+        k_reordered = kv_glob[:, :kd].reshape(num_glob, k.shape[1], k.shape[2]).contiguous()
+        v_reordered = kv_glob[:, kd:].reshape(num_glob, v.shape[1], v.shape[2]).contiguous()
     else:
         k_curr = get_parallel().attn_cp_group.all_gather(k, dim=0)
         v_curr = get_parallel().attn_cp_group.all_gather(v, dim=0)
@@ -587,6 +1066,13 @@ def batched_rpa_pcp_forward(
         True,
     )
 
+    if _PCP_DEBUG_DUMP:
+        _pcp_debug_dump(
+            layer, cp_rank, q_op, k, v, k_reordered, v_reordered, kv_cache,
+            curr_kv_lens, curr_page_indices, pcp_meta, curr_distribution,
+            curr_update_kv, context_out, context_lse, curr_out, curr_lse,
+            sliding_window, float(layer.scaling), cp_size, forward_batch,
+        )
 
     # 3. Softmax State Merge
     if context_out is not None and context_lse is not None:
@@ -737,8 +1223,10 @@ def batched_rpa_dcp_forward(
     )
     curr_lse_safe = torch.nan_to_num(curr_lse.to(torch.float32), nan=-float("inf"))
 
-    all_context_lse = cp_group.all_gather(context_lse_safe, dim=0)
-    all_context_lse_3d = all_context_lse.view(cp_size, -1, *context_lse.shape[1:])
+    # Gather one flat row per rank (see the PCP K/V gather for why narrow minor
+    # dims are avoided on TPU), then view back to [cp, tokens, heads].
+    all_context_lse = cp_group.all_gather(context_lse_safe.reshape(1, -1), dim=0)
+    all_context_lse_3d = all_context_lse.view(cp_size, *context_lse.shape)
 
     stacked_lses = torch.cat(
         [curr_lse_safe.unsqueeze(0), all_context_lse_3d], dim=0
