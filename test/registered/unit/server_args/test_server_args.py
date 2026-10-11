@@ -2918,6 +2918,62 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestTpuBatchLimitsUnderAttentionDp(CustomTestCase):
+    """The TPU compile-bucket cap is per attention-DP worker.
+
+    The 10/09 upstream sync made --dp-size count replicas and moved the
+    attention-DP width to --attn-dp-size; the coupling kept reading dp_size,
+    so a tp=16 attn_dp=2 server compiled bs=32 buckets for a 16-request worker
+    and its RPA page table overflowed scoped SMEM at 1M context.
+    """
+
+    def _resolved_cap(self, **overrides):
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            tp_size=16,
+            max_running_requests=32,
+            # The nightly recipes pass bucket lists, not an explicit cap; the
+            # field default (32) would otherwise pin the cap above the worker.
+            torch_compile_max_bs=None,
+            tpu_compile_bs=[1, 2, 4, 8, 16],
+            # Set, so the hook skips the headroom estimate that needs a model.
+            mem_fraction_static=0.6,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+            **overrides,
+        )
+        # The multimodal decode-graph expansion reads the model config; stub
+        # it so the hook never resolves "dummy" against the Hub.
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_multimodal=False,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "torch_compile_max_bs")
+
+    def test_attn_dp_size_spelling_caps_per_worker(self):
+        self.assertEqual(self._resolved_cap(attn_dp_size=2), 16)
+
+    def test_deprecated_dp_size_spelling_caps_per_worker(self):
+        self.assertEqual(self._resolved_cap(dp_size=2, enable_dp_attention=True), 16)
+
+    def test_replicas_without_dp_attention_keep_the_full_cap(self):
+        self.assertEqual(self._resolved_cap(dp_size=2), 32)
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
