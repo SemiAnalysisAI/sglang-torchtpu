@@ -75,7 +75,7 @@ def build_tpu_draft_extend_metadata(
       draft_prefix_lens: Pre-block sequence lengths, [bs] on device.
       seq_lens_cpu: Host mirror of draft_prefix_lens, [bs] on CPU.
       extend_seq_lens_buf: Optional [cap_bs] int32 device buffer with
-        cap_bs >= bs, filled in place instead of allocating every step.
+        cap_bs >= bs, already filled with ``width`` by its owner.
 
     Returns:
       The block's TpuDraftExtendMetadata.
@@ -92,8 +92,9 @@ def build_tpu_draft_extend_metadata(
         )
     extend_prefix_lens = draft_prefix_lens.to(torch.int32)
     if extend_seq_lens_buf is not None:
+        # The caller fills the buffer with `width` once; refilling it every
+        # round would launch an eager program per step.
         extend_seq_lens = extend_seq_lens_buf[:bs]
-        extend_seq_lens.fill_(width)
     else:
         extend_seq_lens = torch.full(
             (bs,), width, dtype=torch.int32, device=draft_prefix_lens.device

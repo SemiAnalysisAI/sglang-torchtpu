@@ -1149,9 +1149,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
-        self._draft_extend_seq_lens_buf = torch.empty(
-            (new_cap,), dtype=torch.int32, device=device
-        )
+        # Constant draft width; build_tpu_draft_extend_metadata reads it as is.
+        # Built on host and uploaded: a device-side fill of this tiny buffer
+        # halted the TPU SparseCore (tt_jit_fill_ UserFatal).
+        self._draft_extend_seq_lens_buf = torch.full(
+            (new_cap,), block_size, dtype=torch.int32
+        ).to(device)
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
@@ -2923,7 +2926,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu=batch.seq_lens_cpu,
                 extend_seq_lens_buf=self._draft_extend_seq_lens_buf,
             )
-            draft_seq_lens = tpu_extend.seq_lens
+            # The draft forward runs as TARGET_VERIFY, whose attention metadata
+            # adds the block width to seq_lens itself; keep the committed prefix.
             extend_split = {
                 "extend_prefix_lens": tpu_extend.extend_prefix_lens,
                 "extend_seq_lens": tpu_extend.extend_seq_lens,
