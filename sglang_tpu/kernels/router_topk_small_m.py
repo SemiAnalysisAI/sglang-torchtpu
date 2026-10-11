@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single-kernel sigmoid top-k router for one decode token.
+"""Single-kernel sigmoid top-k router for a few tokens (decode or a verify window).
 
 Replaces biased_grouped_topk_impl's XLA chain for one expert group (sigmoid,
 bias add, TopK, gather, renormalize, optional routed scaling; ~12 ops per MoE
-layer) with one Pallas call. Top-k is rank based: one [E, E] comparison block
+layer) with one Pallas call that walks the rows in a static loop. Top-k is rank based: one [E, E] comparison block
 gives every expert's rank, so the kernel needs a handful of reductions instead
 of k dependent arg-max rounds. Equal scores rank the lower index first, the
 order torch.topk / XLA TopK select in.
@@ -17,16 +17,27 @@ from jax.experimental import pallas as pl
 
 _RENORMALIZE_SUM_EPSILON = 1e-20
 _LANES = 128
+# Rows are unrolled; a speculative verify window is at most this many tokens.
+_MAX_TOKENS = 16
 
 
 def supports(tokens: int, num_experts: int, topk: int) -> bool:
-    return tokens == 1 and topk <= min(num_experts, _LANES)
+    return tokens <= _MAX_TOKENS and topk <= min(num_experts, _LANES)
 
 
 def _kernel(logits_ref, bias_ref, w_ref, ids_ref, *, topk, scale):
-    width = logits_ref.shape[1]
-    scores = jax.nn.sigmoid(logits_ref[...].astype(jnp.float32))
-    choice = scores + bias_ref[...].astype(jnp.float32)
+    for row in range(logits_ref.shape[0]):
+        w, ids = _route_row(
+            logits_ref[row : row + 1, :], bias_ref[...], topk=topk, scale=scale
+        )
+        w_ref[row : row + 1, :] = w
+        ids_ref[row : row + 1, :] = ids
+
+
+def _route_row(logits, bias, *, topk, scale):
+    width = logits.shape[1]
+    scores = jax.nn.sigmoid(logits.astype(jnp.float32))
+    choice = scores + bias.astype(jnp.float32)
 
     # Column copies of the [1, E] rows via a diagonal reduction (no transpose).
     rows = jax.lax.broadcasted_iota(jnp.int32, (width, width), 0)
@@ -54,14 +65,13 @@ def _kernel(logits_ref, bias_ref, w_ref, ids_ref, *, topk, scale):
     w = w / (jnp.sum(w, axis=-1, keepdims=True) + _RENORMALIZE_SUM_EPSILON)
     if scale != 1.0:
         w = w * scale
-    w_ref[...] = w[:, :topk]
-    ids_ref[...] = ids[:, :topk]
+    return w[:, :topk], ids[:, :topk]
 
 
 def router_topk_small_m(
     logits: jax.Array, bias: jax.Array, topk: int, scale: float
 ) -> tuple[jax.Array, jax.Array]:
-    """logits [1, E], bias [E] -> (weights f32 [1, k], ids i32 [1, k]).
+    """logits [M, E], bias [E] -> (weights f32 [M, k], ids i32 [M, k]).
 
     Blocks span the full (unpadded) expert dim, so the call adds no pad or
     slice ops around the kernel.

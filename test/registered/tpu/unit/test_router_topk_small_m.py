@@ -46,10 +46,12 @@ class TestRouterTopkSmallM(unittest.TestCase):
         router_topk.register_router_topk_op()
         op = router_topk._OP
         gen = torch.Generator().manual_seed(11)
+        # One decode token, and an 8-token speculative verify window.
         for trial in range(20):
+            tokens = 1 if trial % 2 == 0 else 8
             for apply_scale in (False, True):
-                with self.subTest(trial=trial, apply_scale=apply_scale):
-                    logits = (torch.randn(1, EXPERTS, generator=gen) * 2).to("tpu")
+                with self.subTest(trial=trial, tokens=tokens, apply_scale=apply_scale):
+                    logits = (torch.randn(tokens, EXPERTS, generator=gen) * 2).to("tpu")
                     bias = (torch.randn(EXPERTS, generator=gen) * 0.1).to("tpu")
                     try:
                         router_topk._OP = None
