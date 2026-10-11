@@ -879,6 +879,13 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_torch_compile(self) -> bool:
         return True
 
+    def maybe_enable_recompile_site_tracing(self) -> None:
+        from sglang_tpu.compilation.recompilation_checker import (
+            maybe_enable_site_tracing,
+        )
+
+        maybe_enable_site_tracing()
+
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")
 

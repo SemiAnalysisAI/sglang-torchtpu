@@ -125,6 +125,9 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
+    def maybe_enable_recompile_site_tracing(self) -> None:
+        """Start recording the source lines of serving-time compiles, if supported."""
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
