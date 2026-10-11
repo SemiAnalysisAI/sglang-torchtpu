@@ -8,7 +8,7 @@ ordinary attention. KDA uses the JAX recurrence in hardware_backend/tpu.
 """
 
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -437,6 +437,8 @@ class Glm5NextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.start_layer, self.end_layer = 0, config.num_hidden_layers
+        # Layers whose input residual stream DFlash conditions on.
+        self.layers_to_capture: frozenset[int] = frozenset()
         self.fused_mhc = envs.SGLANG_TPU_GLM_FLASH_FUSED_MHC.get()
         if envs.SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL.get():
             from sglang_tpu.fp8_linear import (
@@ -456,13 +458,19 @@ class Glm5NextModel(nn.Module):
             register_glm_mhc_ops()
 
     def forward(self, input_ids, forward_batch, input_embeds=None):
+        """Final hidden states, plus the captured aux states when DFlash asks."""
         x = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        aux = []
         if self.fused_mhc:
-            return self._forward_fused_mhc(x, forward_batch)
-        x = x.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
-        for layer in self.layers:
-            x = layer(x, forward_batch)
-        return self.norm(x.mean(-2))
+            hidden = self._forward_fused_mhc(x, forward_batch, aux)
+        else:
+            x = x.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
+            for i, layer in enumerate(self.layers):
+                if i in self.layers_to_capture:
+                    aux.append(x.mean(-2))
+                x = layer(x, forward_batch)
+            hidden = self.norm(x.mean(-2))
+        return (hidden, aux) if self.layers_to_capture else hidden
 
     def prepare_fused_mhc(self):
         """Pack each site's hc_base and hc_scale into the kernel's [1, VEC_WIDTH] row."""
@@ -487,9 +495,10 @@ class Glm5NextModel(nn.Module):
                     persistent=False,
                 )
 
-    def _forward_fused_mhc(self, x, forward_batch):
+    def _forward_fused_mhc(self, x, forward_batch, aux):
         """Same math as Glm5NextDecoderLayer.forward, with each hc_post fused
-        into the following hc_pre: streams are [T, hc * hidden]."""
+        into the following hc_pre: streams are [T, hc * hidden]. Appends the
+        stream-mean residual entering each captured layer to ``aux``."""
         from sglang_tpu.glm_mhc import glm_mhc_ops
 
         pre_op, seam_op, post_op = glm_mhc_ops()
@@ -529,6 +538,8 @@ class Glm5NextModel(nn.Module):
                     nxt.hc_attn_norm_weight,
                     *site,
                 )
+                if i + 1 in self.layers_to_capture:
+                    aux.append(res.view(-1, h, c.hidden_size).mean(-2))
             else:
                 res = post_op(out, res, post, comb, h)
         return self.norm(res.view(-1, h, c.hidden_size).mean(-2))
@@ -574,9 +585,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise ValueError(
                 "GLM-5.3-Flash TPU currently requires --disable-radix-cache"
             )
-        if args.speculative_algorithm or args.enable_dp_attention or args.pp_size != 1:
+        if args.speculative_algorithm not in (None, "DFLASH"):
             raise ValueError(
-                "GLM-5.3-Flash TPU currently supports TP/EP text serving without speculative decoding or DP/PP"
+                "GLM-5.3-Flash TPU supports only DFLASH speculative decoding"
+            )
+        if args.enable_dp_attention or args.pp_size != 1:
+            raise ValueError(
+                "GLM-5.3-Flash TPU currently supports TP/EP text serving without DP/PP"
             )
         if not c.mhc or c.qk_rope_head_dim != 0:
             raise ValueError("Expected the GLM-5.3-Flash mHC/NoPE checkpoint")
@@ -592,7 +607,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
         hidden = self.model(input_ids, forward_batch, input_embeds)
-        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+        aux = None
+        if self.model.layers_to_capture:
+            hidden, aux = hidden
+        return self.logits_processor(
+            input_ids, hidden, self.lm_head, forward_batch, aux
+        )
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        # Capturing before layer k + 1 gives the completed output of layer k.
+        self.model.layers_to_capture = frozenset(val + 1 for val in layer_ids)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
