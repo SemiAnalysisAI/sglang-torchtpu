@@ -109,9 +109,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
-        if self._use_scan and forward_batch.forward_mode.is_target_verify():
+        if self._use_scan and self._spec_window > 1:
             raise NotImplementedError(
-                "The reference KDA scan does not support speculative target verify"
+                "The reference KDA scan does not support speculative decoding"
             )
         super().init_forward_metadata(forward_batch)
 
