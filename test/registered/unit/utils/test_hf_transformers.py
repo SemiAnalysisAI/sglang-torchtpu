@@ -939,6 +939,27 @@ class TestGemma4AttentionOverrides(CustomTestCase):
         self.assertFalse(config.text_config.is_heterogeneous)
         self.assertEqual(config.text_config.head_dim, 256)
 
+    def test_pre_5_17_transformers_keeps_the_global_attribute_split(self):
+        # transformers < 5.17 (the TPU stack pins 5.8.1) has no heterogeneity
+        # spec: the full-attention shape still lives on `global_head_dim` /
+        # `num_global_key_value_heads`, and `is_heterogeneous` is undefined.
+        text_config = SimpleNamespace(
+            head_dim=128,
+            global_head_dim=256,
+            num_key_value_heads=2,
+            num_global_key_value_heads=4,
+        )
+        config = SimpleNamespace(text_config=text_config)
+
+        _apply_gemma4_attention_overrides(config)
+
+        self.assertEqual(text_config.head_dim, 256)
+        self.assertEqual(text_config.v_head_dim, 256)
+        self.assertEqual(text_config.num_key_value_heads, 4)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.swa_v_head_dim, 128)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
     def test_config_without_a_per_layer_spec_states_one_shape(self):
         config = self._make_config(per_layer_config=None)
         self.assertFalse(config.text_config.is_heterogeneous)

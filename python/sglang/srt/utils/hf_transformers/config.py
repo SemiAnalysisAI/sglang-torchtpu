@@ -111,7 +111,17 @@ def _apply_gemma4_attention_overrides(config):
     # values and full-attention overrides them; SGLang's base is full attention.
     text_config = config.text_config
 
-    if text_config.is_heterogeneous:
+    # transformers < 5.17 has no heterogeneity spec: it keeps the full-attention
+    # shape on `global_head_dim` / `num_global_key_value_heads` and never
+    # defines `is_heterogeneous` (the TPU stack pins transformers 5.8.1).
+    if not hasattr(text_config, "is_heterogeneous"):
+        full_head_dim = getattr(text_config, "global_head_dim", text_config.head_dim)
+        full_kv_heads = getattr(
+            text_config, "num_global_key_value_heads", text_config.num_key_value_heads
+        )
+        swa_head_dim = text_config.head_dim
+        swa_kv_heads = text_config.num_key_value_heads
+    elif text_config.is_heterogeneous:
         # transformers states that split as a `per_layer_config`, and
         # consumes `global_head_dim` / `num_global_key_value_heads` building it.
         shapes = _gemma4_attention_shapes(text_config)

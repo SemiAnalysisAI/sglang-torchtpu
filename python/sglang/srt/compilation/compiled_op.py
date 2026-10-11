@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -83,6 +84,7 @@ def compiled_op(
     def decorator(fn):
         compiled_fn = None
         use_direct = False
+        signature = inspect.signature(fn)
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -95,6 +97,12 @@ def compiled_op(
                 return fn(*args, **kwargs)
             from jax import tree_util
 
+            # The specialization key (and dynamo's guards) see the call's
+            # argument structure. Warmup recipes pass their inputs positionally
+            # while serving code names them, so bind both to the signature:
+            # one spelling, one specialization.
+            bound = signature.bind(*args, **kwargs)
+            args, kwargs = bound.args, bound.kwargs
             args, kwargs = tree_util.tree_map(_canonical_tensor, (args, kwargs))
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"

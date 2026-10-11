@@ -229,14 +229,19 @@ def handle_gpu_memory_settings(server_args: Any):
             reconcile_tpu_batch_limits,
         )
 
+        # Attention DP is declared by width (--attn-dp-size); the deprecated
+        # --dp-size N --enable-dp-attention spelling may not have resolved yet,
+        # and after it has, dp_size counts replicas (1), not attention groups.
+        resolved = resolved_view(server_args)
+        attn_dp_size = resolved.attn_dp_size
+        if attn_dp_size == 1 and resolved.enable_dp_attention:
+            attn_dp_size = resolved.dp_size
         torch_compile_max_bs, tpu_compile_bs, max_running_requests = (
             reconcile_tpu_batch_limits(
                 cfg.torch_compile_max_bs,
                 cfg.tpu_compile_bs,
                 cfg.max_running_requests,
-                attn_dp_size=(
-                    cfg.dp_size if resolved_view(server_args).enable_dp_attention else 1
-                ),
+                attn_dp_size=attn_dp_size,
             )
         )
         declare_resolution(
