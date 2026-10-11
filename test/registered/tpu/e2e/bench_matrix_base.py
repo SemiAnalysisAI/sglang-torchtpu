@@ -42,6 +42,7 @@ import subprocess
 import time
 import unittest
 import urllib.request
+from typing import Optional
 
 import requests
 
@@ -138,6 +139,20 @@ def _print_workload_digest(summary) -> None:
             f"output_throughput={metrics.get('output_throughput')}",
             flush=True,
         )
+
+
+def _dp_scheduler_count(server_info) -> Optional[int]:
+    """How many DP schedulers the served engine runs, read back off server_info.
+
+    Attention DP is declared by width now (attn_dp_size, with dp_size the
+    replica count); the deprecated --dp-size N --enable-dp-attention spelling
+    reports dp_size=N. The product covers both. None when the run recorded
+    neither field.
+    """
+    info = server_info or {}
+    if info.get("dp_size") is None and info.get("attn_dp_size") is None:
+        return None
+    return int(info.get("dp_size") or 1) * int(info.get("attn_dp_size") or 1)
 
 
 def _reachable_prefix_hit_rate(config, dp_size):
@@ -426,7 +441,7 @@ def build_bench_test(
                     # count would go stale the next time the parallelism
                     # moves -- silently, as an unreachable floor.
                     config = leg.get("config") or {}
-                    dp_size = (leg.get("server_info") or {}).get("dp_size")
+                    dp_size = _dp_scheduler_count(leg.get("server_info"))
                     self.assertIsNotNone(
                         dp_size,
                         f"{leg['tag']}: leg meta records no dp_size, so the "
@@ -556,7 +571,7 @@ def build_bench_test(
                     accept_lengths = (
                         derived.get("spec_accept_length_by_scheduler") or []
                     )
-                    dp_size = int(server_info.get("dp_size") or 0)
+                    dp_size = _dp_scheduler_count(server_info) or 0
                     self.assertGreater(
                         dp_size,
                         0,
@@ -632,7 +647,8 @@ def build_bench_test(
                             for field, expected in expected_fields.items()
                         )
                         and (features.get("spec_verify_calls") or 0.0) > 0.0
-                        and len(accept_lengths) == int(server_info.get("dp_size") or 0)
+                        and len(accept_lengths)
+                        == (_dp_scheduler_count(server_info) or 0)
                         and len(accept_lengths) > 0
                         and all(
                             float(accept_length)
