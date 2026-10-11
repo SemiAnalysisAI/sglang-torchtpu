@@ -518,6 +518,8 @@ class FutureMap:
         # returns int64 token ids that must land in the buffer's dtype).
         if values.dtype != buf.dtype:
             values = values.to(buf.dtype)
+        if values.shape[0] > indices.shape[0]:
+            values = values[: indices.shape[0]]
         if self._use_dynamic_index:
             buf.index_copy_(0, indices, values)
         else:
