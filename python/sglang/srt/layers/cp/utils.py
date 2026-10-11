@@ -233,10 +233,15 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
+    cp_size = get_parallel().attn_cp_size
     physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    if physical_tokens == 0 or physical_tokens % cp_size != 0:
+        return input_ids
+
     padded_input_ids = input_ids.new_zeros(physical_tokens)
-    padded_input_ids[: input_ids.shape[0]] = input_ids
-    return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
+    copy_len = min(input_ids.shape[0], physical_tokens)
+    padded_input_ids[:copy_len] = input_ids[:copy_len]
+    return padded_input_ids.view(-1, cp_size).T.flatten()
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
