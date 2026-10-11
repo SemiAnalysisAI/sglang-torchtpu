@@ -935,8 +935,11 @@ PERF_BASELINE_FILE_BY_PLATFORM = {
     "b200": "b200.json",
     "5090": "5090.json",
     "xpu_b60": "xpu_b60.json",
+    "tpu7x": "tpu7x.json",
 }
 PERF_BASELINE_PLATFORM_ALIASES = {
+    "tpu": "tpu7x",
+    "tpu7x": "tpu7x",
     "sm90": "h100",
     "hopper": "h100",
     "h100": "h100",
@@ -969,6 +972,8 @@ def get_perf_baseline_platform() -> str:
         return _normalize_perf_baseline_platform(override)
     if current_platform.is_xpu():
         return "xpu_b60"
+    if current_platform.is_tpu():
+        return "tpu7x"
     if current_platform.is_sm120():
         return "5090"
     if current_platform.is_blackwell():

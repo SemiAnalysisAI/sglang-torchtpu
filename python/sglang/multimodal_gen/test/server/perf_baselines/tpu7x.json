@@ -1,0 +1,65 @@
+{
+  "metadata": {
+    "model": "Diffusion Server",
+    "hardware": "CI TPU7x single chip (nightly-tpu-4-v7 pool)",
+    "description": "Seeded from the baseline the harness dumped on Nightly Test (TPU) run 38164884500 (branch wyzhang/exp/1011-nightly-test, 2026-10-11): one attempt, 4 denoising steps at 832x480x9 frames. The slice is shared and the recorded TPU tests gate correctness, not throughput, so the tolerances are wide; expected_load_ms streams 5B weights over the network and is guarded only by the e2e tolerance.",
+    "last_updated": "2026-10-11"
+  },
+  "tolerances": {
+    "long_term": {
+      "e2e": 0.5,
+      "denoise_stage": 0.5,
+      "non_denoise_stage": 0.9,
+      "denoise_step": 0.6,
+      "denoise_agg": 0.5,
+      "load_peak_vram": 0.05,
+      "runtime_peak_vram": 0.05
+    },
+    "pr_test": {
+      "e2e": 0.6,
+      "denoise_stage": 0.6,
+      "non_denoise_stage": 0.9,
+      "denoise_step": 0.7,
+      "denoise_agg": 0.6,
+      "load_peak_vram": 0.05,
+      "runtime_peak_vram": 0.05,
+      "load": 0.8
+    }
+  },
+  "improvement_reporting": {
+    "threshold": 0.2
+  },
+  "sampling": {
+    "step_fractions": [
+      0.0,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    ]
+  },
+  "scenarios": {
+    "wan2_2_ti2v_5b_t2v": {
+      "estimated_full_test_time_s": 207.4,
+      "stages_ms": {
+        "InputValidationStage": 0.03,
+        "TextEncodingStage": 16876.72,
+        "LatentPreparationStage": 9.64,
+        "TimestepPreparationStage": 2.05,
+        "DenoisingStage": 661.64,
+        "DecodingStage": 28.68
+      },
+      "denoise_step_ms": {
+        "0": 119.4,
+        "1": 130.8,
+        "2": 209.45,
+        "3": 200.37
+      },
+      "expected_e2e_ms": 23100.93,
+      "expected_load_ms": 145412.27,
+      "expected_avg_denoise_ms": 165.0,
+      "expected_median_denoise_ms": 165.58
+    }
+  }
+}
