@@ -245,17 +245,26 @@ def merge_attn_states(
         merged_out: [num_tokens, num_heads, head_dim]
         merged_lse: [num_tokens, num_heads]
     """
+    out_dtype = context_out.dtype
+    context_lse = context_lse.to(torch.float32)
+    curr_lse = curr_lse.to(torch.float32)
     max_lse = torch.maximum(context_lse, curr_lse)
-    exp_context = torch.exp(context_lse - max_lse)
-    exp_curr = torch.exp(curr_lse - max_lse)
+    # A phase that attended nothing reports -inf; keep the subtraction finite.
+    max_lse_safe = torch.where(torch.isinf(max_lse), torch.zeros_like(max_lse), max_lse)
+    exp_context = torch.exp(context_lse - max_lse_safe)
+    exp_curr = torch.exp(curr_lse - max_lse_safe)
     exp_sum = exp_context + exp_curr
+    exp_sum_safe = torch.where(exp_sum == 0.0, torch.ones_like(exp_sum), exp_sum)
 
-    w_context = (exp_context / exp_sum).unsqueeze(-1)
-    w_curr = (exp_curr / exp_sum).unsqueeze(-1)
+    w_context = (exp_context / exp_sum_safe).unsqueeze(-1)
+    w_curr = (exp_curr / exp_sum_safe).unsqueeze(-1)
 
-    merged_out = context_out * w_context + curr_out * w_curr
-    merged_lse = max_lse + torch.log(exp_sum)
-    return merged_out.to(context_out.dtype), merged_lse
+    merged_out = (
+        torch.nan_to_num(context_out.to(torch.float32), nan=0.0) * w_context
+        + torch.nan_to_num(curr_out.to(torch.float32), nan=0.0) * w_curr
+    )
+    merged_lse = max_lse_safe + torch.log(exp_sum_safe)
+    return merged_out.to(out_dtype), merged_lse
 
 
 def build_pcp_batched_metadata(
@@ -458,13 +467,9 @@ def batched_rpa_pcp_forward(
         c_heads = c_sizes
         c_tails = c_sizes
 
-    logical_tokens = min(q.shape[0], sum(c_heads) + sum(c_tails))
-    pad_size = max(0, q.shape[0] - logical_tokens)
-    q_logical = q[:logical_tokens] if pad_size > 0 else q
-    k_logical = k[:logical_tokens] if pad_size > 0 else k
-    v_logical = v[:logical_tokens] if pad_size > 0 else v
-
-    q_op = q_logical
+    q_op = q
+    k_logical = k
+    v_logical = v
 
     sliding_window = getattr(layer, "sliding_window_size", None)
     if sliding_window is not None and sliding_window <= 0:
@@ -478,25 +483,44 @@ def batched_rpa_pcp_forward(
     else:
         raw_pages = base_meta.page_indices
 
+    # Both phases see the same local Q layout: per request, a head chunk
+    # (virtual sequence 2*i) followed by a tail chunk (2*i + 1). All per-sequence
+    # metadata is therefore sized 2 * num_reqs, and every virtual sequence
+    # carries its request's page-striped page table (rank r owns pages
+    # p % cp_size == r in local slot p // cp_size, for cache and new KV alike).
+    pages_per_seq = raw_pages.shape[0] // num_reqs
+    pages_2d = raw_pages.view(num_reqs, pages_per_seq)
+    owned_pages = pages_2d[:, cp_rank::cp_size]
+    pad_len = pages_per_seq - owned_pages.shape[1]
+    if pad_len > 0:
+        striped_curr_pages = torch.nn.functional.pad(owned_pages, (0, pad_len), value=0)
+    else:
+        striped_curr_pages = owned_pages
+    curr_page_indices = striped_curr_pages.repeat_interleave(2, dim=0).reshape(-1)
+    curr_distribution = base_meta.distribution * 2
+    cache_lens_2x = pcp_meta.pcp_cache_lens.repeat_interleave(2)
+    zeros_2x = torch.zeros_like(cache_lens_2x, dtype=torch.int32)
+
     # 1. Cache Phase (Ring Attention over ICI)
     context_out = None
     context_lse = None
     if pcp_meta.cache_pages > 0:
-        cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
+        # kv_lens == cached prefix and kv_new_lens == 0, so the kernel's global
+        # cache length is exactly the prefix. No KV is written in this phase.
         context_out, context_lse = cp_op(
             q_op,
             k_logical,
             v_logical,
             kv_cache,
-            pcp_meta.pcp_cache_lens,
-            pcp_meta.striped_page_indices,
-            base_meta.cu_q_lens,
-            base_meta.distribution,
+            cache_lens_2x,
+            curr_page_indices,
+            pcp_meta.pcp_cu_q_lens,
+            curr_distribution,
             pcp_meta.q_positions,
-            pcp_meta.kv_new_lens,
+            zeros_2x,
             cp_rank_tensor,
-            raw_pages,
-            cache_update_kv,
+            None,
+            zeros_2x,
             float(layer.scaling),
             sliding_window,
             layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
@@ -529,19 +553,13 @@ def batched_rpa_pcp_forward(
         tail_v = v_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
         v_reordered = torch.cat([head_v, tail_v], dim=1).reshape(-1, v.shape[1], v.shape[2])
 
-    # For the 2-chunk zigzag schedule, each request consists of 2 virtual sequences
-    # (head chunk and tail chunk) on this rank.
-    curr_kv_lens = pcp_meta.pcp_cache_lens.repeat_interleave(2) + pcp_meta.kv_new_lens
-    pages_per_seq = raw_pages.shape[0] // num_reqs
-    pages_2d = raw_pages.view(num_reqs, pages_per_seq)
-    owned_pages = pages_2d[:, cp_rank::cp_size]
-    pad_len = pages_per_seq - owned_pages.shape[1]
-    if pad_len > 0:
-        striped_curr_pages = torch.nn.functional.pad(owned_pages, (0, pad_len), value=0)
-    else:
-        striped_curr_pages = owned_pages
-    curr_page_indices = striped_curr_pages.repeat_interleave(2, dim=0).reshape(-1)
-    curr_distribution = base_meta.distribution * 2
+    # Each virtual sequence's KV is the cached prefix plus the whole
+    # all-gathered new KV of its request; causality is enforced by q_positions.
+    curr_kv_lens = cache_lens_2x + pcp_meta.kv_new_lens
+
+    if k_reordered.shape[0] < q_op.shape[0]:
+        k_reordered = torch.nn.functional.pad(k_reordered, (0, 0, 0, 0, 0, q_op.shape[0] - k_reordered.shape[0]))
+        v_reordered = torch.nn.functional.pad(v_reordered, (0, 0, 0, 0, 0, q_op.shape[0] - v_reordered.shape[0]))
 
     curr_update_kv = pcp_meta.update_kv_cache.to(dtype=torch.int32, device=device)
     curr_out, curr_lse = cp_op(
@@ -584,8 +602,6 @@ def batched_rpa_pcp_forward(
         out = out * torch.sigmoid(lse - sinks.to(torch.float32))[..., None]
         out = out.to(q.dtype)
 
-    if pad_size > 0:
-        out = torch.cat([out, out.new_zeros(pad_size, *out.shape[1:])], dim=0)
     return out
 
 
@@ -658,14 +674,17 @@ def batched_rpa_dcp_forward(
     kv_new_lens = torch.ones_like(seq_lens, dtype=torch.int32)
 
     # 1. Cache Phase (CACHE_ONLY)
+    # The cached prefix is [0, seq_len - 1); the current token's slot is not
+    # written until the new-token phase, so it must not be in the cache scope.
     cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
     cache_kv_new_lens = torch.zeros_like(seq_lens, dtype=torch.int32)
+    cache_kv_lens = (seq_lens - kv_new_lens).to(torch.int32)
     context_out, context_lse = cp_op(
         q,
         k,
         v,
         kv_cache,
-        base_meta.kv_lens,
+        cache_kv_lens,
         striped_page_indices,
         base_meta.cu_q_lens,
         base_meta.distribution,

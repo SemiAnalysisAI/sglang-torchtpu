@@ -371,6 +371,24 @@ class BaseBlockSizeCalculator:
         # Sum up all buffer memory usage (scales are co-located inside bkv_bytes).
         buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
 
+        if serve_cfgs.return_lse:
+            # LSE output block: [num_kv_heads, bq_sz * lse_rows_per_token, lanes].
+            if serve_cfgs.is_packed_lse:
+                lse_rows_per_token = 1
+            else:
+                lse_rows_per_token = utils.align_to(
+                    self.aligned_num_q_heads // model_cfgs.num_kv_heads,
+                    self.tpu_info.num_sublanes,
+                )
+            lse_bytes = (
+                model_cfgs.num_kv_heads
+                * bq_sz
+                * lse_rows_per_token
+                * self.tpu_info.num_lanes
+                * self.out_bytes
+            )
+            buffer_bytes += lse_bytes * configs.NUM_OUTPUT_SLOTS
+
         # Step 2: Calculate worst case memory usage during computation.
         loaded_bq_size = bq_sz * model_cfgs.num_q_heads * self.aligned_head_dim
         loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * self.aligned_head_dim

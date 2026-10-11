@@ -175,9 +175,17 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
             cp_size = get_parallel().attn_cp_size
             cp_rank = get_parallel().attn_cp_rank
-            prefix_lens = getattr(forward_batch, "prefix_lens", None)
+            # ForwardBatch carries the cached prefix per request as
+            # `extend_prefix_lens` (there is no `prefix_lens` attribute). The
+            # PCP cache phase, the kernel's global cache length and the
+            # new-token writeback offset all derive from it.
+            prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
             if prefix_lens is None:
                 prefix_lens = torch.zeros_like(forward_batch.seq_lens)
+            else:
+                prefix_lens = prefix_lens.to(
+                    device=forward_batch.seq_lens.device, dtype=torch.int32
+                )[: forward_batch.seq_lens.shape[0]]
             num_local_tokens = None
             if getattr(forward_batch, "attn_cp_metadata", None) is not None:
                 per_rank = forward_batch.attn_cp_metadata.per_rank_actual_token

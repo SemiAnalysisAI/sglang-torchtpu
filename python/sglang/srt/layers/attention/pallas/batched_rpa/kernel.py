@@ -270,6 +270,11 @@ class ComputeMetadata:
     causal_offset: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
+    # CP CACHE_ONLY with a sliding window: the KV block is a page stripe of
+    # `stripe_rank` starting at local index `stripe_k_id`, and the window has
+    # to be measured in global token coordinates.
+    stripe_rank: list[jax.Array] | None = None
+    stripe_k_id: list[jax.Array] | None = None
 
 
 # The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
@@ -376,6 +381,14 @@ def fetch_compute_metadata(
         [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
     )
 
+    striped = (
+        cfgs.serve.cp_group_size is not None
+        and cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY
+        and cfgs.model.sliding_window is not None
+    )
+    stripe_rank_list = [] if striped else None
+    stripe_k_id_list = [] if striped else None
+
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
@@ -398,11 +411,16 @@ def fetch_compute_metadata(
             local_k_start_list.append(kv_cache_len_val - k_id)
         if local_k_end_list is not None:
             local_k_end_list.append(kv_cache_len_val - k_id)
+        if striped:
+            stripe_rank_list.append(cp_rank)
+            stripe_k_id_list.append(k_id)
 
     return ComputeMetadata(
         causal_offset=causal_offset_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
+        stripe_rank=stripe_rank_list,
+        stripe_k_id=stripe_k_id_list,
     )
 
 
@@ -439,6 +457,10 @@ def ring_fetch_compute_metadata(
         [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
     )
 
+    striped = cfgs.model.sliding_window is not None
+    stripe_rank_list = [] if striped else None
+    stripe_k_id_list = [] if striped else None
+
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
@@ -461,11 +483,16 @@ def ring_fetch_compute_metadata(
         if local_k_end_list is not None:
             scope_end = cfgs.local_kv_cache_len(global_kv_cache_len, src_rank)
             local_k_end_list.append(scope_end - k_id)
+        if striped:
+            stripe_rank_list.append(src_rank)
+            stripe_k_id_list.append(k_id)
 
     return ComputeMetadata(
         causal_offset=causal_offset_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
+        stripe_rank=stripe_rank_list,
+        stripe_k_id=stripe_k_id_list,
     )
 
 
@@ -512,9 +539,21 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        diff = q_kv_diff
+        if step_meta.stripe_rank is not None:
+            # The block is a page stripe: local index l of stripe `s` holds global
+            # token l + (l // page) * (P - 1) * page + s * page. Fold that delta
+            # into the Q-KV distance so the window is measured in global tokens.
+            cp_size = cfgs.serve.cp_group_size
+            local_idx = step_meta.stripe_k_id[b_idx] + kv_iota
+            delta = (
+                (local_idx >> cfgs.serve.page_size_log2) * ((cp_size - 1) * cfgs.serve.page_size)
+                + step_meta.stripe_rank[b_idx] * cfgs.serve.page_size
+            )
+            diff = q_kv_diff - delta
+        mask_b = diff >= offset
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+            mask_b = jnp.logical_and(mask_b, diff < sliding_window + offset)
 
         if step_meta.local_k_start is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
@@ -577,18 +616,47 @@ class RingAttention:
             for name in names
         )
 
-    def initial_handshake(self):
-        """Tell the predecessor every slot is free. Call before the pipeline."""
+    def _sends_at(self, schedule_ref, step, total_steps):
+        """Whether the schedule sends at `step` (every rank runs the same one).
+
+        Out-of-range steps never send, so callers can probe `step - 1` and
+        `step + 1` without bounds checks.
+        """
+        in_range = jnp.logical_and(step >= 0, step < total_steps)
+        s = jnp.clip(step, 0, schedule_ref.k_idx.shape[0] - 1)
+        is_valid = schedule_ref.s_idx[s, 0] != -1
+        hop = lax.rem(schedule_ref.k_idx[s, 0], self.size)
+        return jnp.logical_and(in_range, jnp.logical_and(is_valid, hop < self.size - 1))
+
+    def _grant(self):
         pl.semaphore_signal(
             self.sems.sync_sem,
-            configs.NUM_INPUT_SLOTS,
+            1,
             device_id=self.prev_id,
             device_id_type=pl.DeviceIdType.MESH,
         )
 
+    def initial_handshake(self, schedule_ref, total_steps):
+        """Grant the predecessor the slots that are free before the pipeline.
+
+        The predecessor's send at its step `s` lands in our slot `(s + 1) %
+        n_buffer`, which we last used at our step `s - 2`. Slots for `s = 0`
+        and `s = 1` have no earlier use, so they are free from the start; every
+        later slot is granted by `before_prefetch` once it is vacated. Call once
+        per pipeline invocation (schedule chunk).
+        """
+
+        @pl.when(self._sends_at(schedule_ref, 0, total_steps))
+        def _grant_s0():
+            self._grant()
+
+        @pl.when(self._sends_at(schedule_ref, 1, total_steps))
+        def _grant_s1():
+            self._grant()
+
     def drain_credits(self):
-        """Consume the successor's initial grants. Call after the pipeline."""
-        pl.semaphore_wait(self.sems.sync_sem, configs.NUM_INPUT_SLOTS)
+        """Grants and spends balance exactly; nothing to drain."""
+        return
 
     def _remote_copy(self, src_slot, dst_slot):
         return pltpu.make_async_remote_copy(
@@ -599,6 +667,31 @@ class RingAttention:
             device_id=self.next_id,
             device_id_type=pl.DeviceIdType.MESH,
         )
+
+    def before_prefetch(self, step, schedule_ref, total_steps):
+        """Vacate the previous step's slot. Call before this step's prefetch.
+
+        Slot `(step - 1) % n_buffer` is reused twice: by this step's local
+        prefetch (two steps ahead, i.e. for step + 2) and by the predecessor's
+        send at its step + 1. Both must wait until our own send out of that
+        slot, started at step - 1, has completed; the predecessor is then
+        granted the credit it spends on that send.
+        """
+        n_buffer = configs.NUM_INPUT_SLOTS
+        prev_step = step - 1
+        prev_slot = lax.rem(jnp.maximum(prev_step, 0), n_buffer)
+
+        @pl.when(self._sends_at(schedule_ref, prev_step, total_steps))
+        def _wait_prev_send():
+            self._remote_copy(prev_slot, prev_slot).wait_send()
+
+        grant = jnp.logical_and(
+            step >= 1, self._sends_at(schedule_ref, step + 1, total_steps)
+        )
+
+        @pl.when(grant)
+        def _release_prev_slot():
+            self._grant()
 
     def receive_and_forward(self, step, schedule_ref, total_steps):
         """Take this step's rotated block, then pass it on."""
@@ -627,49 +720,28 @@ class RingAttention:
 
         @pl.when(sends)
         def _start_send():
-            # Spend a credit before writing into the receiver's buffer.
+            # Spend a credit: the receiver has vacated the destination slot.
             pl.semaphore_wait(self.sems.sync_sem, 1)
             send_op.start()
 
-        self._pending_send = (sends, receives, send_op, slot)
+        self._pending_send = (sends, send_op)
 
     def finish(self, step: int | jax.Array, schedule_ref, total_steps):
-        """Close out the step's hop: drain pipelined sends, release credit."""
+        """Close out the step's hop.
+
+        Sends are normally awaited by the next step's `before_prefetch`; the
+        last step of a pipeline invocation drains its own.
+        """
         assert self._pending_send is not None
-        sends, receives, send_op, slot = self._pending_send
+        sends, send_op = self._pending_send
         self._pending_send = None
 
-        # Overlapped send draining: wait for the send from (step - 1),
-        # which has already had a full step of compute to complete in the background.
-        n_buffer = configs.NUM_INPUT_SLOTS
-        prev_step = step - 1
-        prev_sends = jnp.logical_and(
-            prev_step >= 0,
-            lax.rem(schedule_ref.k_idx[jnp.maximum(prev_step, 0), 0], self.size)
-            < self.size - 1,
-        )
-        prev_slot = lax.rem(jnp.maximum(prev_step, 0), n_buffer)
-
-        @pl.when(prev_sends)
-        def _wait_prev_send():
-            self._remote_copy(prev_slot, prev_slot).wait_send()
-
-        # If this is the last step in the pipeline, also drain the current step's send:
         is_last_step = step == total_steps - 1
         drain_last = jnp.logical_and(is_last_step, sends)
 
         @pl.when(drain_last)
         def _wait_last_send():
             send_op.wait_send()
-
-        @pl.when(receives)
-        def _release_slot():
-            pl.semaphore_signal(
-                self.sems.sync_sem,
-                1,
-                device_id=self.prev_id,
-                device_id_type=pl.DeviceIdType.MESH,
-            )
 
 
 def rpa_body(
@@ -754,6 +826,11 @@ def rpa_body(
                 )
 
         start_kv_writeback()
+
+    # The prefetch issued here lands two steps ahead, in the slot used by
+    # step - 1. Under the ring that slot may still be sending; vacate it first.
+    if ring is not None:
+        ring.before_prefetch(step, schedule_ref, total_steps)
 
     start_next_fetch()
 
@@ -1194,7 +1271,6 @@ def rpa_kernel(
                 ring = RingAttention(
                     cfgs, ring_sems, kv_window_ref=final_allocs[1].window_ref
                 )
-                ring.initial_handshake()
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -1315,6 +1391,11 @@ def rpa_kernel(
                         total_steps=total_steps,
                     )
 
+                if ring is not None:
+                    # Credits are per pipeline invocation: grant the slots that
+                    # are free before step 0, balanced by the sends inside.
+                    ring.initial_handshake(schedule_ref, total_steps)
+
                 pipeline.run_manual_triple_buffer(
                     total_steps,
                     compute_fn,
@@ -1333,9 +1414,6 @@ def rpa_kernel(
                 size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
                 execute_schedule_chunk(start, size)
-
-            if ring is not None:
-                ring.drain_credits()
 
         _run()
 

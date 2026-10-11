@@ -180,8 +180,16 @@ class ServingConfigs:
 
     @property
     def is_packed_lse(self) -> bool:
-        """One LSE row per token (heads along lanes) instead of one per head."""
-        return self.pcp_ring_axis_name is not None
+        """One LSE row per token (heads along lanes) instead of one per head.
+
+        Disabled: the LSE writeback (`BatchingLSERef.copy_out`) DMAs at HBM
+        row `q_src * lse_rows_per_token` and requires that to be sublane
+        aligned. With one row per token a sequence whose Q starts at an
+        unaligned token offset (every PCP tail chunk) corrupts its LSE; with
+        `lse_rows_per_token` a multiple of the sublane count it is always
+        aligned.
+        """
+        return False
 
 
 class RpaCase(enum.StrEnum):

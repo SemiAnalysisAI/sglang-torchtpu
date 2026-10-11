@@ -173,8 +173,19 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
-            start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
+            sw_start_idx = jnp.maximum(
+                0, q_position + q_idx * cfgs.bq_sz - sliding_window + 1
+            )
+            if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY:
+                # `sw_start_idx` is a global token; find the first local index on
+                # this rank's page stripe that is >= it.
+                cp_group_size = cfgs.serve.cp_group_size
+                page = cfgs.serve.page_size
+                super_page = cp_group_size * page
+                in_super = sw_start_idx % super_page
+                local_in_page = jnp.clip(in_super - self.schedule_rank * page, 0, page)
+                sw_start_idx = (sw_start_idx // super_page) * page + local_in_page
+            start_k_idx = sw_start_idx // cfgs.bkv_sz
 
         end_k_idx_causal = (
             q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
