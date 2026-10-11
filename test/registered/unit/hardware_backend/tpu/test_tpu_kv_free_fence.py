@@ -17,10 +17,6 @@ from unittest.mock import Mock
 import torch
 
 import sglang
-from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-    TpuPagedTokenToKVPoolAllocator,
-)
-from sglang.srt.hardware_backend.tpu.kv_free_fence import install_kv_free_fence
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_decode,
@@ -43,6 +39,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.allocator_tpu import (
+    TpuPagedTokenToKVPoolAllocator,
+)
+from sglang_tpu.kv_free_fence import install_kv_free_fence
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
@@ -133,7 +133,8 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy)
 
         tree_cache = SimpleNamespace(
-            token_to_kv_pool_allocator=self.allocator, is_chunk_cache=lambda: True
+            token_to_kv_pool_allocator=self.allocator,
+            supports_prefix_sharing=lambda: False,
         )
         alloc_token_slots(tree_cache, num_tokens=PAGE)
         alloc_paged_token_slots_extend(
@@ -227,6 +228,38 @@ class TestKVFreeFence(CustomTestCase):
         self.allocator.free(busy[PAGE:])
         self.fence.on_forward_done(nxt)
         self.assertEqual(self.allocator.held_pages.num_pages, 0)
+
+    def test_after_in_flight_runs_once_the_forwards_formed_so_far_finish(self):
+        """A DMA read registered while forward N runs must not run before N
+        finishes, and reads registered later never overtake earlier ones."""
+        self._setup()
+        ran = []
+        first = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("a"))
+        second = self._launch()
+        self.fence.after_in_flight(lambda: ran.append("b"))
+        self.assertEqual(ran, [])
+        self.fence.on_forward_done(first)
+        self.assertEqual(ran, ["a"])
+        self.fence.on_forward_done(second)
+        self.assertEqual(ran, ["a", "b"])
+        self.fence.after_in_flight(lambda: ran.append("c"))
+        self.assertEqual(ran, ["a", "b", "c"])
+
+    def test_after_in_flight_waits_for_a_formed_batch_not_yet_launched(self):
+        """With overlap off for a batch, the previous result is processed after
+        the batch forms; a read registered then must wait for that batch."""
+        self._setup()
+        ran = []
+        previous = self._launch()
+        self.fence.on_batch_formed()
+        self.fence.after_in_flight(lambda: ran.append("read"))
+        self.fence.on_forward_done(previous)
+        self.assertEqual(ran, [])
+        current = SimpleNamespace(copy_done=None)
+        self.fence.on_forward_launched(current)
+        self.fence.on_forward_done(current)
+        self.assertEqual(ran, ["read"])
 
     def test_install_covers_swa_sub_pools_and_rejects_other_allocators(self):
         full, swa = (
@@ -345,7 +378,11 @@ class TestOverlapLoopWiring(CustomTestCase):
             running_batch=None,
             last_batch=None,
             kv_free_fence=_install(allocator, synchronize_device=lambda: None),
+            # Upstream's loop skips batch creation while input is deferred.
+            _deferred_input_requests=[],
         )
+        # ... and waits for the oldest result when continuous polling is on.
+        scheduler._is_continuous_input_polling_enabled.return_value = False
         scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
             lambda batch, **kwargs: batch
         )
@@ -427,6 +464,9 @@ class TestRadixEvictionUnderFence(CustomTestCase):
                 page_size=PAGE,
                 eviction_policy="lru",
                 tree_components=(ComponentType.FULL,),
+                # The fence's release stamps live in the Python core, which a TPU
+                # allocator always resolves to; this CPU one would pick Rust.
+                tree_core_backend="python",
             )
         )
 
@@ -567,7 +607,7 @@ class TestTpuImportOrder(CustomTestCase):
             sglang.srt.utils.is_tpu = lambda: True
             import sglang.srt.mem_cache.allocator.swa
             import sys
-            assert "sglang.srt.hardware_backend.tpu.kv_free_fence" in sys.modules
+            assert "sglang_tpu.kv_free_fence" in sys.modules
             """)
         completed = subprocess.run(
             [sys.executable, "-c", script],

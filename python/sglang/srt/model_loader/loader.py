@@ -83,6 +83,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
@@ -330,7 +331,9 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    return model_class(**kwargs)
+    model = model_class(**kwargs)
+    check_stage_producers(model)
+    return model
 
 
 def post_load_weights(model: nn.Module) -> None:
@@ -443,7 +446,7 @@ class DefaultModelLoader(BaseModelLoader):
         def init_new(cls, model_config: ModelConfig, model):
             local_expert_range = None
             if _is_tpu:
-                from sglang.srt.hardware_backend.tpu.ep_local_expert_reader import (
+                from sglang_tpu.ep_local_expert_reader import (
                     tpu_local_routed_expert_range,
                 )
 

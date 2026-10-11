@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
@@ -370,7 +371,7 @@ def _kv_shard_rotation_bases(
     The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
 
     - Read through ``req.last_node`` at alloc time, never a value cached on
-      the request: ``cache_unfinished_req`` can rebind a chunked request onto
+      the request: a ``checkpoint`` can rebind a chunked request onto
       another chain's canonical locs between chunks, changing the base. The
       read goes through ``tree_cache.rotation_base_of`` because the node
       handle is tree-specific (a NodeId on the unified tree).
@@ -419,8 +420,8 @@ def alloc_req_slots(
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
+        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x without prefix sharing.
+        if tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
                 if req_to_token_pool.enable_mamba_extra_buffer_lazy
@@ -451,7 +452,9 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    if (
+        _is_hip or _is_cuda or current_platform.dcp_shards_every_kv_pool()
+    ) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -726,7 +729,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         if _r2t.device.type == "cpu":
             # Host-resident pool: gather last_loc on host (alloc_decode runs
             # its formula on host).
-            last_loc = _r2t[batch.req_pool_indices.cpu(), seq_lens - 1]
+            last_loc = _r2t[batch.req_pool_indices_cpu, seq_lens - 1]
         else:
             last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
         seq_lens_next = seq_lens + token_per_req
