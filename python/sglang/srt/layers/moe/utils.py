@@ -502,38 +502,29 @@ def initialize_moe_config():
     )
 
 
+# A dense model never runs initialize_moe_config, so these leaves stay None
+# and the getters answer the default. They must not write it back: the first
+# read can happen inside a compiled forward (layer_boundary's deferred-sum
+# decision), and a flag-group write is a graph break, fatal under TPU
+# fullgraph compilation.
 def get_moe_a2a_backend() -> MoeA2ABackend:
-    moe = get_flags().moe
-    if moe.a2a_backend is None:
-        moe.a2a_backend = MoeA2ABackend.NONE
-    return moe.a2a_backend
+    a2a_backend = get_flags().moe.a2a_backend
+    return MoeA2ABackend.NONE if a2a_backend is None else a2a_backend
 
 
 def get_moe_runner_backend() -> MoeRunnerBackendLike:
-    moe = get_flags().moe
-    if moe.runner_backend is None:
-        moe.runner_backend = MoeRunnerBackend.AUTO
-    return moe.runner_backend
+    runner_backend = get_flags().moe.runner_backend
+    return MoeRunnerBackend.AUTO if runner_backend is None else runner_backend
 
 
 def get_speculative_moe_runner_backend() -> MoeRunnerBackendLike:
-    moe = get_flags().moe
-    if moe.speculative_runner_backend is None:
-        logger.warning(
-            "SPECULATIVE_MOE_RUNNER_BACKEND is not initialized, using auto backend"
-        )
-        moe.speculative_runner_backend = MoeRunnerBackend.AUTO
-    return moe.speculative_runner_backend
+    runner_backend = get_flags().moe.speculative_runner_backend
+    return MoeRunnerBackend.AUTO if runner_backend is None else runner_backend
 
 
 def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
-    moe = get_flags().moe
-    if moe.speculative_a2a_backend is None:
-        logger.warning(
-            "SPECULATIVE_MOE_A2A_BACKEND is not initialized, using none backend"
-        )
-        moe.speculative_a2a_backend = MoeA2ABackend.NONE
-    return moe.speculative_a2a_backend
+    a2a_backend = get_flags().moe.speculative_a2a_backend
+    return MoeA2ABackend.NONE if a2a_backend is None else a2a_backend
 
 
 def is_shared_experts_fusion_disabled() -> bool:

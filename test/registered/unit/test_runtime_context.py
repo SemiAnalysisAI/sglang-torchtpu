@@ -1094,6 +1094,39 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertEqual(get_moe_runner_backend().name, "AUTO")
         self.assertFalse(is_tbo_enabled())
 
+    def test_lazy_defaults_trace_under_torch_compile(self):
+        # Regression: a dense model never materializes flags.moe, and the
+        # layer-boundary exit decision reads the a2a backend inside the
+        # compiled forward. Writing the default back there is a flag-group
+        # write, which dynamo cannot trace; fullgraph=True keeps it fatal.
+        import torch
+
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+            get_speculative_moe_a2a_backend,
+            get_speculative_moe_runner_backend,
+        )
+
+        reset_context()
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            if get_moe_a2a_backend().is_none():
+                x = x + 1
+            if get_speculative_moe_a2a_backend().is_none():
+                x = x + 2
+            if get_moe_runner_backend().name == "AUTO":
+                x = x + 4
+            if get_speculative_moe_runner_backend().name == "AUTO":
+                x = x + 8
+            return x
+
+        self.assertEqual(probe(torch.zeros(())).item(), 15)
+        # The defaults are answered, not written back.
+        self.assertIsNone(get_flags().moe.a2a_backend)
+        self.assertIsNone(get_flags().moe.runner_backend)
+
     def test_initialize_materializes_group(self):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
 
