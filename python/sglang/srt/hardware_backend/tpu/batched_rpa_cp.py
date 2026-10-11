@@ -38,8 +38,9 @@ _AG_OP_CACHE: dict = {}
 # exports (one per padded row count) and keeps the gathered chunks tile aligned.
 _AG_ROW_BUCKET = 16
 _PCP_GATHER_IMPL = __import__("os").environ.get("SGLANG_PCP_GATHER_IMPL", "jax")
-# Device order of the exported SPMD meshes: "native" (torch_tpu get_pallas_mesh
-# when available), "rank" (jax devices listed in torch-rank order) or "id".
+# Device order of the exported SPMD meshes: "native" (torch_tpu's
+# get_pallas_mesh; falls back to "rank" when the build lacks it) or "rank"
+# (jax devices listed in torch-rank order).
 _PCP_MESH_ORDER = __import__("os").environ.get("SGLANG_PCP_MESH_ORDER", "native")
 
 
@@ -83,14 +84,14 @@ def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
         except ImportError:
             order = "rank"
     # torch_tpu builds without get_pallas_mesh: build the mesh from the JAX
-    # view of the local TPU devices, ordered by torch rank (or by device id).
+    # view of the local TPU devices, ordered by torch rank.
     import math
 
     import jax
 
     world = math.prod(mesh_shape)
     by_id = {int(d.id): d for d in jax.devices()}
-    ids = _rank_ordered_device_ids(world) if order == "rank" else list(range(world))
+    ids = _rank_ordered_device_ids(world)
     devices = np.array([by_id[i] for i in ids]).reshape(mesh_shape)
     return jax.sharding.Mesh(devices, axis_names)
 
@@ -190,8 +191,10 @@ def cp_all_gather_padded(
     """All-gather `x[:local_len]` (zero-padded to `max_len` rows) across the CP
     group. Returns `[cp_size, max_len, cols]`; entry r holds rank r's rows.
 
-    impl="jax" (default) runs the exported XLA all-gather; impl="torch" uses the
-    eager `all_gather_into_tensor` with persistent buffers.
+    impl="jax" (default) runs the exported XLA all-gather. impl="torch"
+    (SGLANG_PCP_GATHER_IMPL=torch) uses the eager `all_gather_into_tensor`,
+    which on torch_tpu returned wrong rows for the remote ranks whenever the
+    per-rank shard lengths differ (uneven zigzag chunks); kept for A/B only.
     """
     impl = impl or _PCP_GATHER_IMPL
     cols = x.shape[1]
@@ -251,78 +254,16 @@ def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tens
     return torch.cat([parts[i] for i in meta.cp_reverse_index], dim=0)
 
 
-def _pcp_gather_experiments(k, v, forward_batch, cp_rank, cp_size, layer_id):
-    """Debug aid: try several all-gather formulations of the local K and report
-    NaN / all-zero rows in the remote ranks' part of the gathered tensor."""
-    import torch.nn.functional as F
-
-    meta = forward_batch.attn_cp_metadata
-    per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
-    max_len = max(per_rank)
-    local_len = per_rank[cp_rank]
-    group = get_parallel().attn_cp_group
-    T = k.shape[0]
-
-    def gather(x, zero_out=False, sync=False):
-        x = x[:local_len]
-        if max_len > x.shape[0]:
-            x = F.pad(x, [0, 0] * (x.ndim - 1) + [0, max_len - x.shape[0]])
-        x = x.contiguous()
-        if sync:
-            torch.accelerator.synchronize()
-        out = (torch.zeros if zero_out else torch.empty)(
-            (max_len * cp_size, *x.shape[1:]), dtype=x.dtype, device=x.device
-        )
-        group.all_gather_into_tensor(out, x)
-        return out
-
-    def stats(name, g):
-        g = g.float().reshape(cp_size, max_len, -1)
-        res = []
-        for r in range(cp_size):
-            rows = g[r, : per_rank[r]]
-            nan = int(torch.isnan(rows).any(-1).sum())
-            zero = int((rows == 0).all(-1).sum())
-            res.append(f"r{r}:nan={nan}/{per_rank[r]},zero={zero}")
-        print(f"[PCP-GX r{cp_rank} L{layer_id}] {name:24s} " + " ".join(res), flush=True)
-
-    kd = k.shape[1] * k.shape[2]
-    k2 = k.reshape(T, kd)
-    stats("k3d_empty", gather(k))
-    stats("k3d_zeros", gather(k, zero_out=True))
-    stats("k2d_empty", gather(k2))
-    stats("k2d_zeros", gather(k2, zero_out=True))
-    stats("k2d_sync", gather(k2, sync=True))
-    stats("k2d_clone", gather(k2.clone()))
-    stats("k2d_f32", gather(k2.float()))
-    kv2 = torch.cat([k2, v.reshape(T, -1)], dim=-1)
-    stats("kv2d_empty", gather(kv2))
-    stats("kv2d_zeros", gather(kv2, zero_out=True))
-    stats("k2d_pad512", gather(F.pad(k2, (0, 512 - kd))))
-    # the generic all_gather API (concat along dim 0, uses the same collective)
-    g = group.all_gather(F.pad(k2[:local_len], (0, 0, 0, max_len - local_len)).contiguous(), dim=0)
-    stats("k2d_api", g)
-    g = cp_all_gather_rows(k2, forward_batch).float()
-    print(f"[PCP-GX r{cp_rank} L{layer_id}] {'k2d_safe(global)':24s} nan_rows={int(torch.isnan(g).any(-1).sum())}/{g.shape[0]} zero_rows={int((g == 0).all(-1).sum())}", flush=True)
-
-
 def _pcp_debug_dump(
     layer, cp_rank, q, k, v, k_reordered, v_reordered, kv_cache, kv_lens,
     page_indices, pcp_meta, distribution, update_kv, ctx_out, ctx_lse, cur_out,
     cur_lse, sliding_window, sm_scale, cp_size, forward_batch,
 ):
-    """Debug aid (SGLANG_PCP_DEBUG_DUMP=1): per-layer NaN statistics and a tensor
-    dump of the first forward's first layers for offline kernel replay."""
-    import os
-
+    """Debug aid (SGLANG_PCP_DEBUG_DUMP=1): per-layer NaN statistics of the
+    PCP attention inputs/outputs."""
     layer_id = int(getattr(layer, "layer_id", -1))
     call = _PCP_DEBUG_CALLS.get(layer_id, 0)
     _PCP_DEBUG_CALLS[layer_id] = call + 1
-    if layer_id == 0 and call >= 1 and getattr(forward_batch, "attn_cp_metadata", None) is not None:
-        try:
-            _pcp_gather_experiments(k, v, forward_batch, cp_rank, cp_size, layer_id)
-        except Exception as e:  # debug only
-            print(f"[PCP-GX r{cp_rank}] experiments failed: {e!r}", flush=True)
 
     def nan_rows(t):
         if t is None:
@@ -341,26 +282,8 @@ def _pcp_debug_dump(
         f"ctx_out={nan_rows(ctx_out)} ctx_lse={nan_rows(ctx_lse)}",
         flush=True,
     )
-    if call == 1 and layer_id <= 1:
-        path = f"/tmp/pcp_dump_r{cp_rank}_L{layer_id}.pt"
-        torch.save(
-            {
-                "q": q.cpu(), "k": k.cpu(), "v": v.cpu(), "k_glob": k_reordered.cpu(),
-                "v_glob": v_reordered.cpu(), "kv_lens": kv_lens.cpu(),
-                "page_indices": page_indices.cpu(), "cu_q_lens": pcp_meta.pcp_cu_q_lens.cpu(),
-                "distribution": distribution.cpu(), "q_positions": pcp_meta.q_positions.cpu(),
-                "kv_new_lens": pcp_meta.kv_new_lens.cpu(), "update_kv": update_kv.cpu(),
-                "cur_out": cur_out.cpu(), "cur_lse": cur_lse.cpu(),
-                "ctx_out": None if ctx_out is None else ctx_out.cpu(),
-                "ctx_lse": None if ctx_lse is None else ctx_lse.cpu(),
-                "sliding_window": sliding_window, "sm_scale": sm_scale, "cp_size": cp_size,
-                "cp_rank": cp_rank, "kv_cache_shape": tuple(kv_cache.shape),
-                "extend_seq_lens": getattr(forward_batch, "extend_seq_lens_cpu", None),
-                "extend_prefix_lens": getattr(forward_batch, "extend_prefix_lens_cpu", None),
-            },
-            path,
-        )
-        print(f"[PCP-DBG r{cp_rank}] dumped {path}", flush=True)
+
+
 _OP_CACHE: dict = {}
 _CP_RANK_TENSORS: dict[tuple[torch.device, int], torch.Tensor] = {}
 

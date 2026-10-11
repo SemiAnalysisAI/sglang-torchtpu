@@ -559,14 +559,31 @@ class RingBlockSizeCalculator(BaseBlockSizeCalculator):
     def capped_vmem_limit_bytes(self) -> float:
         # PCP ring attention creates high register pressure during compilation,
         # requiring VMEM headroom for register spill slots. We cap at 65% of
-        # the VMEM limit to ensure safe compilation.
-        return self.vmem_limit_bytes * 0.65
+        # the VMEM limit to ensure safe compilation. The spill slots are not
+        # modelled by `calculate_vmem_usage` and grow with the q heads per
+        # device (GPT-OSS at 32 heads needed 74-88 MiB for bq512/bkv1024 where
+        # the estimate was 41 MiB), so shrink the budget past 16 heads.
+        frac = 0.65
+        heads = self.aligned_num_q_heads
+        while heads > 16:
+            frac /= 2
+            heads //= 2
+        return self.vmem_limit_bytes * frac
 
     @property
     def max_bkv_sz(self) -> int:
         # Capping bkv_sz at 1024 matches the maximum TPU attention tile size
         # and prevents compiler register spills while maximizing compute per step.
-        return min(super().max_bkv_sz, 1024)
+        # The ring kernel's spill slots grow with the number of q heads per
+        # device: with 32 heads (GPT-OSS at attn_tp=2) bkv=1024 needed ~74 MiB
+        # against a 64 MiB VMEM limit, so halve the cap for every doubling of
+        # heads beyond 16.
+        cap = 1024
+        heads = self.aligned_num_q_heads
+        while heads > 16 and cap > self.mxu_column_size:
+            cap //= 2
+            heads //= 2
+        return min(super().max_bkv_sz, cap)
 
     def fits(self, batch_size: int, bq_sz: int, bkv_sz: int) -> bool:
         bq_c_sz = self.compute_tile_size(batch_size, bq_sz, bkv_sz)

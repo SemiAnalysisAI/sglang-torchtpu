@@ -469,6 +469,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         max_len = max(per_rank_token)
         local_len = per_rank_token[self.cp_rank]
         assert x.shape[0] >= local_len
+        if x.device.type == "tpu":
+            return self._all_gather_reorganized_tpu(x, per_rank_token, max_len, local_len)
         x = x[:local_len]
         pad_size = max_len - x.shape[0]
         if pad_size > 0:
@@ -498,3 +500,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             ],
             dim=0,
         )
+
+    def _all_gather_reorganized_tpu(self, x, per_rank_token, max_len, local_len):
+        """TPU: gather through the exported XLA collective (see
+        `batched_rpa_cp.build_cp_all_gather_op`). The eager torch collective
+        returned wrong rows for the remote ranks whenever the per-rank shard
+        lengths differ (uneven zigzag chunks)."""
+        from sglang.srt.hardware_backend.tpu.batched_rpa_cp import cp_all_gather_padded
+
+        minor = tuple(x.shape[1:])
+        x2 = x.reshape(x.shape[0], -1)
+        chunks = cp_all_gather_padded(x2, local_len, max_len, self.cp_size)
+        return torch.cat(
+            [chunks[r][:n] for r, n in enumerate(per_rank_token)], dim=0
+        ).reshape(-1, *minor)
