@@ -109,9 +109,9 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
-        if forward_batch.forward_mode.is_target_verify():
+        if self._use_scan and forward_batch.forward_mode.is_target_verify():
             raise NotImplementedError(
-                "TpuKDAAttnBackend does not support speculative target verify"
+                "The reference KDA scan does not support speculative target verify"
             )
         super().init_forward_metadata(forward_batch)
 
@@ -151,11 +151,14 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             layer.conv_weights.shape[-1],
             True,
             None if lower_bound is None else float(lower_bound),
-            # Pure decode has no PER_SEQ rows and extend no BATCHED rows, so each
-            # runs one kernel pass.
+            # Pure decode / verify has no PER_SEQ rows and extend no BATCHED
+            # rows, so each runs one kernel pass.
             batched_only=self._is_decode,
             prefill_only=not self._is_decode,
             packed_weights=layer.kda_packed_weights,
+            read_offsets=self._read_offsets,
+            num_spec_tokens=self._num_spec_tokens,
+            spec_window=self._spec_window,
         )
         return out.view(tokens, n_v, d_v)
 
