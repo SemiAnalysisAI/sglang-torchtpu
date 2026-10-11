@@ -418,6 +418,151 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
+# The attention backend TPU decode context parallelism runs on.
+_DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
+
+# The chunk handle_gpu_memory_settings declares later for an unset
+# --chunked-prefill-size on TPU, whose device memory capacity it does not know.
+_UNSET_CHUNKED_PREFILL_SIZE = 4096
+
+
+def _validate_decode_context_parallel(server_args) -> None:
+    """Refuse the server-arg combinations TPU decode context parallelism does
+    not implement.
+
+    DCP shards each request's KV by absolute token position across a slice of
+    the TP group and merges the per-rank partial attention by log-sum-exp. It
+    runs on the batched RPA backend with a host-resident ``req_to_token`` and a
+    KV cache no other component reads -- every other attention backend,
+    parallelism mode and KV consumer is refused.
+    """
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.environ import envs
+
+    cfg = resolving_view(server_args)
+    dcp_size = cfg.dcp_size
+    if dcp_size <= 1:
+        return
+
+    if cfg.attention_backend != _DCP_ATTENTION_BACKEND:
+        raise ValueError(
+            "--decode-context-parallel-size > 1 on TPU requires "
+            f"--attention-backend {_DCP_ATTENTION_BACKEND}, got "
+            f"{cfg.attention_backend!r}."
+        )
+    if cfg.tp_size % dcp_size != 0:
+        raise ValueError(
+            f"--tensor-parallel-size ({cfg.tp_size}) must be divisible by "
+            f"--decode-context-parallel-size ({dcp_size})."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--pipeline-parallel-size > 1 is not supported with "
+            f"--decode-context-parallel-size > 1 on TPU (got pp_size={cfg.pp_size})."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--speculative-algorithm is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.speculative_algorithm!r})."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-mixed-chunk is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
+            "plain decode and extend batches only."
+        )
+    if cfg.enable_dp_attention:
+        raise ValueError(
+            "--enable-dp-attention is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--attention-context-parallel-size > 1 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"attn_cp_size={cfg.attn_cp_size})."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "--enable-prefill-cp is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--disaggregation-mode is not supported with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.disaggregation_mode!r})."
+        )
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-hierarchical-cache is not supported with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.dcp_comm_backend != "ag_rs":
+        raise ValueError(
+            "--dcp-comm-backend must be 'ag_rs' with "
+            "--decode-context-parallel-size > 1 on TPU: the merge gathers the "
+            "LSEs and sums the outputs with zero-padded all-reduces, got "
+            f"{cfg.dcp_comm_backend!r}."
+        )
+    if cfg.dcp_replicate_q_proj:
+        raise ValueError(
+            "--dcp-replicate-q-proj is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: it only applies to the "
+            "a2a/fi_a2a exchange on MLA attention."
+        )
+    if not cfg.enable_torch_compile:
+        raise ValueError(
+            "--enable-torch-compile is required with "
+            "--decode-context-parallel-size > 1 on TPU."
+        )
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "--tpu-compile-tracer must be 'dynamo' with "
+            "--decode-context-parallel-size > 1 on TPU (got "
+            f"{cfg.tpu_compile_tracer!r})."
+        )
+    if not envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get():
+        raise ValueError(
+            "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP attention "
+            "metadata is built from a host-resident req_to_token."
+        )
+    if _uses_seq_along_lane_kv():
+        raise ValueError(
+            "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
+            "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
+            "targets the token-major fused KV cache."
+        )
+    if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError(
+            "--decode-context-parallel-size > 1 on TPU supports only a bf16 KV "
+            "cache (--kv-cache-dtype bfloat16), got --kv-cache-dtype "
+            f"{cfg.kv_cache_dtype}."
+        )
+    chunk = cfg.chunked_prefill_size
+    if chunk is None:
+        chunk = _UNSET_CHUNKED_PREFILL_SIZE
+    if 0 < chunk < cfg.page_size * dcp_size:
+        raise ValueError(
+            f"--chunked-prefill-size ({chunk}) must be at least --page-size x "
+            f"--decode-context-parallel-size ({cfg.page_size} x {dcp_size} = "
+            f"{cfg.page_size * dcp_size}) on TPU: the DCP allocator hands out "
+            "pages of that many tokens and the scheduler cuts prefill chunks at "
+            "page boundaries, so a smaller chunk is never scheduled."
+        )
+    # TODO(yinlin09): lift once DCP4/DCP8 pass the e2e gate on the pinned stack;
+    # DCP8 served on torch_tpu 0.1.1.dev20260914 with libtpu 0.0.47.
+    if dcp_size > 2:
+        raise ValueError(
+            "--decode-context-parallel-size must be 1 or 2 on TPU, got "
+            f"{dcp_size}: with more ranks the forward stalls in warmup with the "
+            "SparseCore gather offloads off and returns wrong first tokens with "
+            "them on."
+        )
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -466,6 +611,7 @@ class TpuSRTPlatform(SRTPlatform):
         _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang_tpu.env_override import (
+            apply_decode_cp_sparse_core_override,
             apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
@@ -474,6 +620,7 @@ class TpuSRTPlatform(SRTPlatform):
             max_total_tokens=cfg.max_total_tokens,
             num_hidden_layers=_resolve_num_hidden_layers(cfg),
         )
+        apply_decode_cp_sparse_core_override(dcp_size=cfg.dcp_size)
 
         if cfg.dtype is None or cfg.dtype == "auto":
             declare_resolution(
@@ -483,6 +630,22 @@ class TpuSRTPlatform(SRTPlatform):
         _validate_prefill_context_parallel(server_args)
         apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
 
+        # Decode context parallelism runs on one backend only, so an unset
+        # backend resolves to it instead of the platform default.
+        if cfg.attention_backend is None and cfg.dcp_size > 1:
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                attention_backend=_DCP_ATTENTION_BACKEND,
+            )
+        # Decode context parallelism supports only a bf16 KV cache, so an unset
+        # KV dtype resolves to it instead of the RPA backends' fp8 default.
+        if cfg.dcp_size > 1 and cfg.kv_cache_dtype == "auto":
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                kv_cache_dtype="bfloat16",
+            )
         if cfg.attention_backend is None:
             declare_resolution(
                 server_args,
@@ -584,6 +747,8 @@ class TpuSRTPlatform(SRTPlatform):
                 )
 
         _apply_page_size_default(server_args)
+        # After the page-size default: the DCP chunk check reads the page size.
+        _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
 
     # ------------------------------------------------------------------
@@ -732,6 +897,14 @@ class TpuSRTPlatform(SRTPlatform):
 
     def support_piecewise_cuda_graph(self) -> bool:
         return False
+
+    def supports_decode_context_parallel(self) -> bool:
+        return True
+
+    def dcp_shards_every_kv_pool(self) -> bool:
+        # The batched RPA DCP path addresses every pool through the widened
+        # location space and replicates K/V heads within a DCP group.
+        return True
 
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
