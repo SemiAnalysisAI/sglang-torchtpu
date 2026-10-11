@@ -565,6 +565,7 @@ def _producer_pipeline(mgr):
     pipe.sent = {}
     pipe.failed = set()
     pipe.poll = lambda: (set(), set(), set())
+    pipe._init_overlap_state()
     return pipe
 
 
