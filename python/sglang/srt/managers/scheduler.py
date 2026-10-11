@@ -114,7 +114,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import initialize_dense_moe_flags, initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
@@ -987,6 +987,8 @@ class Scheduler(
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config()
+        else:
+            initialize_dense_moe_flags()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config()

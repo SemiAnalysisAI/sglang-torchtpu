@@ -502,11 +502,23 @@ def initialize_moe_config():
     )
 
 
-# A dense model never runs initialize_moe_config, so these leaves stay None
-# and the getters answer the default. They must not write it back: the first
-# read can happen inside a compiled forward (layer_boundary's deferred-sum
-# decision), and a flag-group write is a graph break, fatal under TPU
-# fullgraph compilation.
+def initialize_dense_moe_flags():
+    """Materialize the backend leaves for a model without MoE layers.
+
+    The layer-boundary exit decision reads the a2a backend inside the compiled
+    forward. Dynamo traces a flag leaf (it has a source) but not an enum the
+    getter conjures for a None leaf, and a flag write mid-trace is a graph
+    break; so the leaves are written here, before any forward compiles.
+    """
+    moe = get_flags().moe
+    moe.a2a_backend = MoeA2ABackend.NONE
+    moe.runner_backend = MoeRunnerBackend.AUTO
+    moe.speculative_a2a_backend = MoeA2ABackend.NONE
+    moe.speculative_runner_backend = MoeRunnerBackend.AUTO
+
+
+# Before either initializer runs (benchmarks, unit tests) the leaves are None
+# and the getters answer the default without writing it back.
 def get_moe_a2a_backend() -> MoeA2ABackend:
     a2a_backend = get_flags().moe.a2a_backend
     return MoeA2ABackend.NONE if a2a_backend is None else a2a_backend

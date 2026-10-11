@@ -1127,6 +1127,24 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertIsNone(get_flags().moe.a2a_backend)
         self.assertIsNone(get_flags().moe.runner_backend)
 
+    def test_dense_model_materializes_backend_leaves(self):
+        # Regression: a dense model's leaves stayed None and the compiled
+        # forward's first a2a read produced an enum dynamo could not call
+        # methods on (sourceless); the scheduler now seeds them like MoE.
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            initialize_dense_moe_flags,
+        )
+
+        reset_context()
+        initialize_dense_moe_flags()
+        moe = get_flags().moe
+        self.assertTrue(moe.a2a_backend.is_none())
+        self.assertEqual(moe.runner_backend.name, "AUTO")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+        self.assertEqual(moe.speculative_runner_backend.name, "AUTO")
+        self.assertIs(get_moe_a2a_backend(), moe.a2a_backend)
+
     def test_initialize_materializes_group(self):
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_tbo_enabled
 
