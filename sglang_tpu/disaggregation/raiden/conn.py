@@ -1012,6 +1012,7 @@ class RaidenKVManager(
                     del announced[key]
             if self._prefill is not None:
                 for table in (
+                    self._prefill.handshake_at,
                     self._prefill.held_chunks,
                     self._prefill.send_total,
                     self._prefill.decode_pages,
@@ -1039,6 +1040,7 @@ class RaidenKVManager(
                     table.discard(room)
             if self._decode is not None:
                 for table in (
+                    self._decode.handshake_at,
                     self._decode.chunk_queue,
                     self._decode.remote_total,
                     self._decode.announced_spans,
