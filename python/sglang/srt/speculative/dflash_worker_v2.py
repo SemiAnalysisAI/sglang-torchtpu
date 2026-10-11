@@ -101,6 +101,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
 from sglang_tpu.dflash_utils_tpu import (
     DeviceVerifyBlockSelector,
+    assemble_dflash_verify_ids_tpu,
     build_tpu_draft_extend_metadata,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
@@ -539,6 +540,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        # Device copy for build_dflash_block_tpu, uploaded from host once.
+        self._mask_token_tensor = torch.tensor(
+            [int(self._mask_token_id)], dtype=torch.int64
+        ).to(self.device)
         target_model = self._target_worker.model_runner.model
         self._noise_embed_scale = (
             float(target_model.get_dflash_noise_embedding_scale())
@@ -2843,6 +2848,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                     block_size=block_size,
                     device=device,
                 )
+        elif _is_tpu and verify_cache_candidates is not None:
+            # One dispatch builds every block tensor in the shape it is read in,
+            # so no reshaped view reaches a later launch (each would cost
+            # torch_tpu an as_strided program).
+            (
+                padded_block_ids,
+                padded_block_ids_flat,
+                padded_positions,
+                padded_cache_loc_2d,
+                padded_cache_loc,
+            ) = self._verify_block_selector.build_block(
+                candidates=verify_cache_candidates,
+                committed_lens=draft_input.tpu_committed_lens,
+                prefix_lens=prefix_lens,
+                bonus_tokens=draft_input.bonus_tokens,
+                mask_token=self._mask_token_tensor,
+                bs=bs,
+            )
+            block_ids = padded_block_ids[:bs]
+            verify_out_cache_loc_2d = padded_cache_loc_2d[:bs]
         else:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
@@ -2862,17 +2887,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=device,
             )
 
-        if _is_tpu:
-            # Feed the bucket-padded buffer so the compiled artifact stays on a
-            # static shape, then trim the ghost rows back off.
-            input_embeds = self.embed_draft_block_ids(
-                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
-            )[: bs * block_size]
+        fused_block = _is_tpu and verify_cache_candidates is not None
+        if fused_block:
+            input_embeds = self.embed_draft_block_ids(block_ids=padded_block_ids)[
+                : bs * block_size
+            ]
+            draft_input_ids = padded_block_ids_flat[: bs * block_size]
+            positions = padded_positions[: bs * block_size]
+            verify_out_cache_loc = padded_cache_loc[: bs * block_size]
         else:
-            input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
-
-        positions = positions_2d.reshape(-1)
-        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+            if _is_tpu:
+                # Feed the bucket-padded buffer so the compiled artifact stays on
+                # a static shape, then trim the ghost rows back off.
+                input_embeds = self.embed_draft_block_ids(
+                    block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
+                )[: bs * block_size]
+            else:
+                input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
+            draft_input_ids = block_ids.flatten()
+            positions = positions_2d.reshape(-1)
+            verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -2952,7 +2986,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc_is_physical=True,
             batch_size=bs,
-            input_ids=block_ids.flatten(),
+            input_ids=draft_input_ids,
             req_pool_indices=batch.req_pool_indices,
             req_pool_indices_cpu=req_pool_indices_cpu,
             seq_lens=draft_seq_lens,
@@ -2989,10 +3023,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        assemble_next = None
         if _is_tpu:
             draft_next = draft_logits_output.next_draft_tokens
             if draft_next is None:
                 raise RuntimeError("DFLASH draft model returned no next_draft_tokens.")
+            # The draft graph's own [bs, block - 1] output; the compiled
+            # assembler is warmed per bucket, so only an unpadded batch uses it.
+            if fused_block and bs == self._maybe_pad_draft_bs(bs):
+                assemble_next = draft_next
         elif (
             self._is_domino
             and self._draft_sampler is not None
@@ -3111,9 +3150,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        verify_input_ids = None
+        if assemble_next is not None:
+            draft_tokens, verify_input_ids = assemble_dflash_verify_ids_tpu(
+                padded_block_ids, assemble_next
+            )
+        else:
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3124,7 +3169,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
+        if verify_input_ids is None:
+            verify_input_ids = draft_tokens.reshape(-1)
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=positions,
@@ -3320,8 +3366,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-        target_hidden = hidden.reshape(-1, hidden.shape[-1])
+        if hidden.dim() == 2 and hidden.shape[0] == bs * int(self.block_size):
+            # Already token-major; a view/reshape round trip would hand the
+            # appender a view, which torch_tpu materializes in an extra program.
+            target_hidden = hidden
+        else:
+            hidden = hidden.view(bs, int(self.block_size), -1)
+            target_hidden = hidden.reshape(-1, hidden.shape[-1])
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).

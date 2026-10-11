@@ -20,9 +20,11 @@ from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.spec_op_warmup import (
+    make_dflash_block_args,
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
     make_dflash_verify_cache_locs_args,
+    make_dflash_verify_ids_args,
 )
 from sglang_tpu.top_k import (
     TpuVocabShard,
@@ -41,8 +43,6 @@ class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
     draft forward carries the split explicitly; it is built on TPU only.
 
     Attributes:
-      seq_lens: Post-block sequence lengths, [bs] on device, dtype of the
-        draft_prefix_lens the builder was handed.
       extend_prefix_lens: Pre-block sequence lengths, [bs] int32 on device.
       extend_seq_lens: Rows added per request, [bs] int32 on device, every
         entry equal to width.
@@ -51,7 +51,6 @@ class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
       extend_num_tokens: Total rows in the block, bs * width.
     """
 
-    seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[list[int]] = None
@@ -100,7 +99,6 @@ def build_tpu_draft_extend_metadata(
             (bs,), width, dtype=torch.int32, device=draft_prefix_lens.device
         )
     return TpuDraftExtendMetadata(
-        seq_lens=draft_prefix_lens + width,
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
         extend_prefix_lens_cpu=seq_lens_cpu.tolist(),
@@ -373,6 +371,68 @@ def select_dflash_verify_cache_locs_tpu(
     return _select_verify_cache_locs(candidates, seq_lens, committed_lens, block_size)
 
 
+@compiled_op(warmup=make_dflash_block_args)
+def build_dflash_block_tpu(
+    candidates: torch.Tensor,
+    seq_lens: torch.Tensor,
+    committed_lens: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    mask_token: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Build every per-block tensor of a draft step in one dispatch.
+
+    Each result is a fresh tensor in the shape its consumer reads: torch_tpu
+    materializes reshaped views (and buffers written through them) in an extra
+    program per launch, so the flat forms are copies, not views.
+
+    Args:
+      candidates: Slot ids for [base, base + 2 * block_size), [bs, 2 * block_size].
+      seq_lens: Device prefix lengths, [bs].
+      committed_lens: Device mirror of the host base, [bs].
+      bonus_tokens: Each request's verified anchor token, [bs].
+      mask_token: The draft mask token id, [1].
+      block_size: Verify block width.
+
+    Returns:
+      (block_ids [bs, block_size], block_ids flat, positions flat,
+      cache_loc [bs, block_size], cache_loc flat).
+    """
+    cache_loc = _select_verify_cache_locs(
+        candidates, seq_lens, committed_lens, block_size
+    )
+    cols = torch.arange(block_size, device=candidates.device, dtype=torch.int64)
+    block_ids = torch.where(
+        cols[None, :] == 0, bonus_tokens.to(torch.int64)[:, None], mask_token
+    )
+    positions = seq_lens.to(torch.int64)[:, None] + cols[None, :]
+    return (
+        block_ids,
+        block_ids.reshape(-1).clone(),
+        positions.reshape(-1).clone(),
+        cache_loc,
+        cache_loc.reshape(-1).clone(),
+    )
+
+
+@compiled_op(warmup=make_dflash_verify_ids_args)
+def assemble_dflash_verify_ids_tpu(
+    block_ids: torch.Tensor,
+    draft_next: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Verify input: each block's anchor followed by its drafted tokens.
+
+    Args:
+      block_ids: Draft block ids, [bs, block_size]; column 0 is the anchor.
+      draft_next: Drafted tokens, [bs, block_size - 1].
+
+    Returns:
+      (tokens [bs, block_size], tokens flat), both fresh tensors.
+    """
+    tokens = torch.cat([block_ids[:, :1], draft_next.to(block_ids.dtype)], dim=1)
+    return tokens, tokens.reshape(-1).clone()
+
+
 class DeviceVerifyBlockSelector:
     """Bucket-padded driver for select_dflash_verify_cache_locs_tpu.
 
@@ -402,6 +462,7 @@ class DeviceVerifyBlockSelector:
         self._candidates: Optional[torch.Tensor] = None
         self._committed_lens: Optional[torch.Tensor] = None
         self._prefix_lens: Optional[torch.Tensor] = None
+        self._bonus_tokens: Optional[torch.Tensor] = None
 
     def select(
         self,
@@ -435,6 +496,40 @@ class DeviceVerifyBlockSelector:
             padded_candidates, padded_prefix, padded_committed, self.block_size
         )[:bs]
 
+    def build_block(
+        self,
+        *,
+        candidates: torch.Tensor,
+        committed_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        mask_token: torch.Tensor,
+        bs: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run build_dflash_block_tpu on the bucket-padded rows.
+
+        Returns its outputs at the padded bucket size; rows past bs are garbage
+        the caller trims off.
+        """
+        pad_bs = self._pad_bs(bs)
+        self._ensure_capacity(pad_bs)
+        padded_candidates = self._candidates[:pad_bs]
+        padded_committed = self._committed_lens[:pad_bs]
+        padded_prefix = self._prefix_lens[:pad_bs]
+        padded_bonus = self._bonus_tokens[:pad_bs]
+        padded_candidates[:bs].copy_(candidates)
+        padded_committed[:bs].copy_(committed_lens)
+        padded_prefix[:bs].copy_(prefix_lens)
+        padded_bonus[:bs].copy_(bonus_tokens)
+        return build_dflash_block_tpu(
+            padded_candidates,
+            padded_prefix,
+            padded_committed,
+            padded_bonus,
+            mask_token,
+            self.block_size,
+        )
+
     def _ensure_capacity(self, pad_bs: int) -> None:
         """Grow the staging buffers to hold pad_bs rows.
 
@@ -453,6 +548,9 @@ class DeviceVerifyBlockSelector:
             (pad_bs,), dtype=torch.int64, device=self._device
         )
         self._prefix_lens = torch.empty(
+            (pad_bs,), dtype=torch.int64, device=self._device
+        )
+        self._bonus_tokens = torch.empty(
             (pad_bs,), dtype=torch.int64, device=self._device
         )
 

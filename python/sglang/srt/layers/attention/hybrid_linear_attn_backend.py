@@ -109,6 +109,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+        # TPU launches an eager program per arange; query_start_loc depends only
+        # on (tokens, stride), so reuse one read-only tensor per shape.
+        self._cache_query_start_loc = torch.device(self.device).type == "tpu"
+        self._query_start_loc_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
@@ -120,6 +124,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
             )
         return self._mamba_chunk_size
+
+    def _uniform_query_start_loc(self, num_tokens: int, stride: int) -> torch.Tensor:
+        """[0, stride, ..., num_tokens] int32: rows of `stride` tokens each."""
+        key = (num_tokens, stride)
+        cached = self._query_start_loc_cache.get(key)
+        if cached is not None:
+            return cached
+        loc = torch.arange(
+            0, num_tokens + 1, step=stride, dtype=torch.int32, device=self.device
+        )
+        if self._cache_query_start_loc:
+            self._query_start_loc_cache[key] = loc
+        return loc
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -190,9 +207,7 @@ class MambaAttnBackendBase(AttentionBackend):
         replayssm_write_pos = None
         replayssm_force_flush = None
         if forward_batch.forward_mode.is_decode_or_idle():
-            query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
-            )
+            query_start_loc = self._uniform_query_start_loc(bs, 1)
             # The ring cursor is a per-slot decode counter shared by all GDN layers;
             # manage it once here (snapshot, hand to layers, advance mod L), not per-layer.
             # Gate on the linear_replayssm FLAG, not on cursor-tensor presence: the
@@ -265,12 +280,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
                 else:
-                    query_start_loc = torch.arange(
-                        0,
-                        forward_batch.input_ids.shape[0] + 1,
-                        step=forward_batch.spec_info.draft_token_num,
-                        dtype=torch.int32,
-                        device=forward_batch.input_ids.device,
+                    query_start_loc = self._uniform_query_start_loc(
+                        forward_batch.input_ids.shape[0],
+                        forward_batch.spec_info.draft_token_num,
                     )
 
                 if self.topk > 1:
