@@ -104,6 +104,16 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
+    def get_zigzag_cp_strategy_cls(self) -> type:
+        """Return the zigzag prefill context-parallel strategy class."""
+        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+
+        return ZigzagCPStrategy
+
+    def runs_eager_extend_cp(self) -> bool:
+        """Whether the eager runner shards a context-parallel extend itself."""
+        return True
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
