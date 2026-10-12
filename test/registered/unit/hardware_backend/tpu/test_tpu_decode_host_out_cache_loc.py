@@ -2,7 +2,7 @@
 
 import importlib.util
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,6 +13,7 @@ from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator import swa
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.allocator_tpu import (
@@ -128,6 +129,10 @@ class TestAllocForDecodeHostResidentPool(CustomTestCase):
             patcher = patch.object(target, name, value, create=True)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # On a TPU host, _alloc_page_size reads the parallel config for DCP.
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(get_parallel().override(dcp_enabled=False))
         with envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.override(True):
             self.pool = ReqToTokenPool(
                 size=9, max_context_len=16, device="tpu", enable_memory_saver=False
