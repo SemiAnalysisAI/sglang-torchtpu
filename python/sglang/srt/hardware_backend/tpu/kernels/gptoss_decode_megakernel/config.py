@@ -66,6 +66,7 @@ class DecodeConfig:
     w_slots: int = 3  # expert weight ring depth (w_slots - 1 items in flight)
     vmem_mib: int = 60
     ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
+    w_dtype: str = "bf16"  # expert weights: "bf16" or "mxfp4" (fp4 e2m1 codes + scale per 32 K)
 
     # ------------------------------------------------------------------ derived
     @property
@@ -92,9 +93,24 @@ class DecodeConfig:
     def EL(self) -> int:  # experts per rank
         return self.E if self.moe_mode == "tp" else self.E // self.R
 
+    def moe_cols(self, r: int) -> tuple[int, int]:
+        """Rank r's slice [start, stop) of the expert intermediate dim.
+
+        "tp" + bf16: even I/R split. "tp" + mxfp4: whole 32-wide scale blocks per rank
+        (90 blocks over 8 ranks -> 12,12,11,...), so no block straddles two ranks.
+        """
+        if self.moe_mode == "ep":
+            return 0, self.I
+        if self.w_dtype != "mxfp4":
+            return r * (self.I // self.R), (r + 1) * (self.I // self.R)
+        nb = self.I // 32
+        base, extra = divmod(nb, self.R)
+        start = r * base + min(r, extra)
+        return 32 * start, 32 * (start + base + (r < extra))
+
     @property
-    def IL_RAW(self) -> int:
-        return self.I // self.R if self.moe_mode == "tp" else self.I
+    def IL_RAW(self) -> int:  # largest per-rank intermediate slice
+        return max(b - a for a, b in (self.moe_cols(r) for r in range(self.R)))
 
     @property
     def IL(self) -> int:
@@ -121,6 +137,14 @@ class DecodeConfig:
         return self.B * max(cdiv(self.max_pages, self.npb), 1) + self.B
 
     @property
+    def SR13(self) -> int:  # MXFP4 scale rows of a w13 chunk (Hp/32, padded to the bf16 tile)
+        return rup(self.Hp // 32, 16)
+
+    @property
+    def SR2(self) -> int:  # MXFP4 scale rows of a w2 chunk
+        return rup(self.tne // 32, 16)
+
+    @property
     def VW(self) -> int:
         return max(self.Hp, self.QKVWL, 128)
 
@@ -141,6 +165,9 @@ class DecodeConfig:
         assert self.I % self.R == 0 and self.moe_mode in ("tp", "ep")
         assert self.kv_dtype in ("bf16", "fp8") and self.ar_dtype in ("bf16", "f32")
         assert self.tne % 128 == 0 and self.w_slots >= 2
+        assert self.w_dtype in ("bf16", "mxfp4")
+        if self.w_dtype == "mxfp4":
+            assert self.I % 32 == 0 and self.Hp % 128 == 0
         assert self.page % 8 == 0 and self.kv_bufs >= 2
         assert self.npb_swa >= self.NWP, "sliding layers: one work item per sequence"
 

@@ -42,6 +42,8 @@ def _setup(c, seed=0):
     rng = np.random.default_rng(seed)
     keys = jax.random.split(jax.random.PRNGKey(seed), c.L + 3)
     layers = [REF.random_layer(c, k) for k in keys[:c.L]]
+    if c.w_dtype == "mxfp4":  # the reference sees exactly the representable weights
+        layers = [REF.mxfp4_roundtrip(c, w) for w in layers]
     x = jax.random.normal(keys[c.L], (c.B, c.H), jnp.float32).astype(jnp.bfloat16)
     pos = _positions(c)
     T = c.max_pages * c.page
@@ -74,7 +76,8 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
                                        d["v_hist"], d["layers"])
         out, kv_s, kv_f = _run(c, d, xla_ar=False)
         rel = _rel(out, ref)
-        print(f"{c.moe_mode} kv={c.kv_dtype} L={c.L} B={c.B}: megakernel vs reference rel {rel:.2e}")
+        print(f"{c.moe_mode} w={c.w_dtype} kv={c.kv_dtype} L={c.L} B={c.B}: "
+              f"megakernel vs reference rel {rel:.2e}")
         self.assertLess(rel, 2e-2)
         self._check_pools(c, d, kv_s, kv_f, kn_ref, vn_ref)
         if also_fallback:
@@ -125,6 +128,13 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
         # several full-layer items per sequence, prefetch crossing sequence boundaries
         self._check(C.tiny(B=4, max_pages=8, npb=2, kv_bufs=4, nb_swa=40, nb_full=40,
                            kv_dtype="fp8"))
+
+    def test_mxfp4_tp_moe(self):
+        # block-aligned TP split of I: 12 scale blocks over 8 ranks (2,2,2,2,1,1,1,1)
+        self._check(C.tiny(B=4, w_dtype="mxfp4"), also_fallback=True)
+
+    def test_mxfp4_ep_moe_fp8_kv(self):
+        self._check(C.tiny(B=4, w_dtype="mxfp4", moe_mode="ep", kv_dtype="fp8"))
 
     def test_b16_npb1(self):
         self._check(dataclasses.replace(C.tiny(B=16, npb=1), nb_swa=72, nb_full=72))

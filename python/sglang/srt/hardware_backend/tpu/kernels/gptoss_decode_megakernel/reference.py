@@ -188,8 +188,7 @@ def moe_partials(c: DecodeConfig, x2, ids, wts, w: LayerWeights):
     parts = []
     for r in range(R):
         if c.moe_mode == "tp":
-            il = I // R
-            cols = np.arange(r * il, (r + 1) * il)
+            cols = np.arange(*c.moe_cols(r))
             experts, rows, b2flag = range(E), cols, 1.0 if r == 0 else 0.0
         else:
             el = E // R
@@ -206,6 +205,46 @@ def moe_partials(c: DecodeConfig, x2, ids, wts, w: LayerWeights):
             acc = acc + wfull[:, e:e + 1] * y
         parts.append(acc)
     return parts
+
+
+# ----------------------------------------------------------------------------- MXFP4
+FP4_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)  # e2m1 codes 0..7
+
+
+def mxfp4_quantize(w):
+    """w [..., K, N] -> (codes uint8 [..., Kp, N] (e2m1, sign bit 8), scale f32 [..., Kp/32, N]).
+
+    OCP MX: one power-of-two scale per 32 consecutive K elements, 2^(floor(log2 amax) - 2);
+    K is zero-padded to a multiple of 32. Idempotent on already-representable weights.
+    """
+    w = np.asarray(jnp.asarray(w).astype(F32))
+    K = w.shape[-2]
+    Kp = -(-K // 32) * 32
+    pad = [(0, 0)] * (w.ndim - 2) + [(0, Kp - K), (0, 0)]
+    w = np.pad(w, pad)
+    blk = w.reshape(w.shape[:-2] + (Kp // 32, 32, w.shape[-1]))
+    amax = np.max(np.abs(blk), axis=-2)
+    e = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-38))) - 2, -126)
+    scale = np.exp2(np.clip(e, -126, 127)).astype(np.float32)
+    x = np.clip(blk / scale[..., None, :], -6.0, 6.0)
+    mag = np.abs(x)
+    code = np.argmin(np.abs(mag[..., None] - FP4_VALUES), axis=-1).astype(np.uint8)
+    code = code | np.where((x < 0) & (code > 0), 8, 0).astype(np.uint8)
+    return code.reshape(w.shape), scale
+
+
+def mxfp4_dequantize(code, scale, K=None):
+    v = FP4_VALUES[code & 7] * np.where(code & 8, -1.0, 1.0).astype(np.float32)
+    v = v * np.repeat(scale, 32, axis=-2)
+    return v if K is None else v[..., :K, :]
+
+
+def mxfp4_roundtrip(c: DecodeConfig, w: LayerWeights) -> LayerWeights:
+    """Expert weights snapped to MXFP4-representable values (blocks along each K dim)."""
+    w13 = mxfp4_dequantize(*mxfp4_quantize(w.w13), K=c.H)
+    w2 = mxfp4_dequantize(*mxfp4_quantize(w.w2), K=c.I)
+    return dataclasses.replace(w, w13=jnp.asarray(w13).astype(BF16),
+                               w2=jnp.asarray(w2).astype(BF16))
 
 
 def route(c: DecodeConfig, x2, w: LayerWeights):

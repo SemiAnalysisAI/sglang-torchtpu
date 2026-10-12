@@ -66,6 +66,12 @@ COLLECTIVE_ID = 0
 AW_NAMES = ("wqkv", "wo", "wr", "vec", "sinks")
 EW_NAMES = ("w13", "b13", "w2", "b2")
 W_NAMES = AW_NAMES + EW_NAMES
+EW_NAMES_FP4 = ("w13q", "w13s", "b13", "w2q", "w2s", "b2")
+F4 = jnp.float4_e2m1fn
+
+
+def w_names(c: DecodeConfig) -> tuple[str, ...]:
+    return AW_NAMES + (EW_NAMES_FP4 if c.w_dtype == "mxfp4" else EW_NAMES)
 # rows of the per-layer `vec` [8, VW] f32 operand
 V_LN1, V_LN2, V_BO, V_BQKV, V_BR = range(5)
 
@@ -77,17 +83,58 @@ def packed_specs(c: DecodeConfig) -> dict[str, jax.ShapeDtypeStruct]:
     """Global shapes of the packed per-rank weights (leading axis R, sharded over "tp")."""
     R, L, Hp, EL, NJ, T = c.R, c.L, c.Hp, c.EL, c.NJ, c.tne
     s = jax.ShapeDtypeStruct
-    return {
+    out = {
         "wqkv": s((R, L, Hp, c.QKVWL), BF16),
         "wo": s((R, L, c.QWL, Hp), BF16),
         "wr": s((R, L, Hp, 128), BF16),
         "vec": s((R, L, 8, c.VW), F32),
         "sinks": s((R, L, c.NQL, 128), F32),
-        "w13": s((R, L, EL, NJ, Hp, 2 * T), BF16),
-        "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
-        "w2": s((R, L, EL, NJ, T, Hp), BF16),
-        "b2": s((R, L, EL, 1, Hp), F32),
     }
+    if c.w_dtype == "mxfp4":
+        # 8 e2m1 codes per uint32 along K (row k of a group of 8 at bits 4k, the
+        # `pltpu.bitcast` packing); bf16 power-of-two scale per 32 K rows and column
+        out.update({
+            "w13q": s((R, L, EL, NJ, Hp // 8, 2 * T), jnp.uint32),
+            # scale rows padded to the bf16 sublane tile: unpadded rows made XLA relayout-
+            # copy the scale arrays every step (seen in the AOT HLO)
+            "w13s": s((R, L, EL, NJ, c.SR13, 2 * T), BF16),
+            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+            "w2q": s((R, L, EL, NJ, T // 8, Hp), jnp.uint32),
+            "w2s": s((R, L, EL, NJ, c.SR2, Hp), BF16),
+            "b2": s((R, L, EL, 1, Hp), F32),
+        })
+    else:
+        out.update({
+            "w13": s((R, L, EL, NJ, Hp, 2 * T), BF16),
+            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+            "w2": s((R, L, EL, NJ, T, Hp), BF16),
+            "b2": s((R, L, EL, 1, Hp), F32),
+        })
+    return {k: out[k] for k in w_names(c)}
+
+
+def mxfp4_pack(w, scale_rows=None):
+    """[..., K, N] MXFP4-representable weights -> (uint32 codes [..., K/8, N], bf16 scales
+    [..., scale_rows, N] (rows past K/32 are padding)). K must be a multiple of 32."""
+    from .reference import mxfp4_quantize
+    code, scale = mxfp4_quantize(w)
+    code = code.astype(np.uint32)
+    words = np.zeros(code.shape[:-2] + (code.shape[-2] // 8, code.shape[-1]), np.uint32)
+    for k in range(8):
+        words |= code[..., k::8, :] << np.uint32(4 * k)
+    if scale_rows is not None:
+        pad = [(0, 0)] * (scale.ndim - 2) + [(0, scale_rows - scale.shape[-2]), (0, 0)]
+        scale = np.pad(scale, pad, constant_values=1.0)
+    return jnp.asarray(words), jnp.asarray(scale).astype(BF16)
+
+
+def mxfp4_unpack_xla(words, scale):
+    """XLA-side inverse of `mxfp4_pack` (same semantics as `pltpu.bitcast` u32 -> fp4)."""
+    f = lax.bitcast_convert_type(words, F4)  # [..., K/8, N, 8], element k = bits 4k
+    f = jnp.swapaxes(f, -1, -2)
+    f = f.reshape(f.shape[:-3] + (f.shape[-3] * 8, f.shape[-1])).astype(F32)
+    scale = scale[..., :f.shape[-2] // 32, :]
+    return f * jnp.repeat(scale.astype(F32), 32, axis=-2)
 
 
 def pool_specs(c: DecodeConfig) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
@@ -136,7 +183,7 @@ def pack_weights(c: DecodeConfig, layers: list[LayerWeights]) -> dict[str, jax.A
             sk = w.sinks[r * NQL:(r + 1) * NQL].astype(F32)
             per["sinks"].append(jnp.broadcast_to(sk[:, None], (NQL, 128)))
             if c.moe_mode == "tp":
-                ex, cols = np.arange(E), np.arange(r * ILR, (r + 1) * ILR)
+                ex, cols = np.arange(E), np.arange(*c.moe_cols(r))
             else:
                 ex, cols = np.arange(r * EL, (r + 1) * EL), np.arange(I)
             g = pad_to(w.w13[ex][:, :, cols], (EL, Hp, IL)).reshape(EL, Hp, NJ, T)
@@ -150,7 +197,11 @@ def pack_weights(c: DecodeConfig, layers: list[LayerWeights]) -> dict[str, jax.A
             per["b2"].append(pad_to(w.b2[ex].astype(F32), (EL, Hp))[:, None])
         for k_ in W_NAMES:
             out[k_].append(jnp.stack(per[k_]))
-    return {k_: jnp.stack(v_) for k_, v_ in out.items()}
+    out = {k_: jnp.stack(v_) for k_, v_ in out.items()}
+    if c.w_dtype == "mxfp4":
+        out["w13q"], out["w13s"] = mxfp4_pack(out.pop("w13"), c.SR13)
+        out["w2q"], out["w2s"] = mxfp4_pack(out.pop("w2"), c.SR2)
+    return {k_: out[k_] for k_ in w_names(c)}
 
 
 def build_pools(c: DecodeConfig, k_hist, v_hist, pos, pt_swa, pt_full, base=None):
@@ -226,12 +277,24 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
             "acts": pltpu.SMEM((8, 128), I32),
             "ite": pltpu.SMEM((c.EL + 1,), I32),
             "macc": V((BR, Hp), F32),
-            "w13r": V((NS, Hp, 2 * T), BF16),
-            "w2r": V((NS, T, Hp), BF16),
             "b13r": V((NS, 1, 2 * T), F32),
             "b2r": V((NS, 1, Hp), F32),
-            "sem_e": pltpu.SemaphoreType.DMA((NS, 4)),
+            "sem_e": pltpu.SemaphoreType.DMA((NS, 6)),
         })
+        if c.w_dtype == "mxfp4":
+            s.update({
+                "w13qr": V((NS, Hp // 8, 2 * T), jnp.uint32),
+                "w13sr": V((NS, c.SR13, 2 * T), BF16),
+                "w2qr": V((NS, T // 8, Hp), jnp.uint32),
+                "w2sr": V((NS, c.SR2, Hp), BF16),
+                "w13r": V((1, Hp, 2 * T), BF16),  # dequantized chunk (one, reused)
+                "w2r": V((1, T, Hp), BF16),
+            })
+        else:
+            s.update({
+                "w13r": V((NS, Hp, 2 * T), BF16),
+                "w2r": V((NS, T, Hp), BF16),
+            })
     if comm:
         s.update({
             "send": V((2, BR, Hp), ardt),
@@ -289,12 +352,13 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     s_names = list(scratch)
     aw_need = {"mega": AW_NAMES, "attn": ("wqkv", "wo", "vec", "sinks"), "moe": ("wr", "vec")}[mode]
     aw_dst = {"wqkv": "awqkv", "wo": "awo", "wr": "awr", "vec": "awvec", "sinks": "awsink"}
-    n_in = 7 + len(W_NAMES) + 2
+    WN = w_names(c)
+    n_in = 7 + len(WN) + 2
 
     def kernel(*refs):
         rank_s, pos_s, ptw_s, ptf_s, x_ref, cos_ref, sin_ref = refs[:7]
-        Wr = dict(zip(W_NAMES, refs[7:7 + len(W_NAMES)]))
-        kv_swa, kv_full = refs[7 + len(W_NAMES):n_in]
+        Wr = dict(zip(WN, refs[7:7 + len(WN)]))
+        kv_swa, kv_full = refs[7 + len(WN):n_in]
         n_out = 1 if mode == "moe" else 2
         outs = refs[n_in:n_in + n_out]
         S = dict(zip(s_names, refs[n_in + n_out:]))
@@ -596,10 +660,13 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 e = S["ite"][i // NJ]
                 j = i % NJ
                 sem = S["sem_e"]
-                return (cp(Wr["w13"].at[l, e, j], S["w13r"].at[slot], sem.at[slot, 0]),
-                        cp(Wr["w2"].at[l, e, j], S["w2r"].at[slot], sem.at[slot, 1]),
-                        cp(Wr["b13"].at[l, e, j], S["b13r"].at[slot], sem.at[slot, 2]),
-                        cp(Wr["b2"].at[l, e], S["b2r"].at[slot], sem.at[slot, 3]))
+                ds = [cp(Wr["b13"].at[l, e, j], S["b13r"].at[slot], sem.at[slot, 0]),
+                      cp(Wr["b2"].at[l, e], S["b2r"].at[slot], sem.at[slot, 1])]
+                names = (("w13q", "w13s", "w2q", "w2s") if c.w_dtype == "mxfp4"
+                         else ("w13", "w2"))
+                for i, n in enumerate(names):
+                    ds.append(cp(Wr[n].at[l, e, j], S[n + "r"].at[slot], sem.at[slot, 2 + i]))
+                return ds
 
             for k in range(NS - 1):
                 @pl.when(k < NI)
@@ -622,12 +689,18 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
                 e = S["ite"][i // NJ]
                 j = i % NJ
-                h = jnp.dot(S["xn"][...], S["w13r"][slot], preferred_element_type=F32)
+                if c.w_dtype == "mxfp4":
+                    dequant(S["w13qr"], S["w13sr"], slot, S["w13r"], Hp)
+                    dequant(S["w2qr"], S["w2sr"], slot, S["w2r"], T)
+                    wslot = 0
+                else:
+                    wslot = slot
+                h = jnp.dot(S["xn"][...], S["w13r"][wslot], preferred_element_type=F32)
                 h = h + S["b13r"][slot]
                 g = jnp.minimum(h[:, :T], c.limit)
                 u = jnp.clip(h[:, T:], -c.limit, c.limit)
                 a = ((u + 1.0) * (g * jax.nn.sigmoid(c.alpha * g))).astype(BF16)
-                y = jnp.dot(a, S["w2r"][slot], preferred_element_type=F32)
+                y = jnp.dot(a, S["w2r"][wslot], preferred_element_type=F32)
                 y = y + jnp.where(j == 0, b2flag, 0.0) * S["b2r"][slot]
                 wcol = jnp.sum(jnp.where(lane == base + e, S["wf"][...], 0.0), axis=1,
                                keepdims=True)
@@ -636,6 +709,20 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
             lax.fori_loop(0, NI, item, 0)
             return S["macc"][...]
+
+        # ---------------------------------------------------------- MXFP4 dequant
+        def dequant(q_ref, s_ref, slot, out_ref, K):
+            """uint32 codes [K/8, N] + bf16 scales [K/32, N] of ring slot -> bf16 [K, N].
+
+            Static 128-row chunks (16 code rows, 4 scale rows) keep live values small; the
+            e2m1 -> bf16 unpack is `pltpu.bitcast` + convert, as in gmm_v2's fp4 path.
+            """
+            for ch in range(K // 128):
+                w = pltpu.bitcast(q_ref[slot, ch * 16:(ch + 1) * 16, :], F4).astype(BF16)
+                for g in range(4):
+                    r0 = ch * 128 + g * 32
+                    sc = s_ref[slot, ch * 4 + g:ch * 4 + g + 1, :]
+                    out_ref[0, r0:r0 + 32, :] = w[g * 32:(g + 1) * 32] * sc
 
         # ---------------------------------------------------------- composition
         if mode == "mega":
@@ -703,7 +790,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 4 + [vmem] * 3 + [hbm] * (len(W_NAMES) + 2)
+    in_specs = [smem] * 4 + [vmem] * 3 + [hbm] * (len(WN) + 2)
     nkn = L if mode == "mega" else 1
     kn_shape = jax.ShapeDtypeStruct((nkn, BR, 1, c.kv_packing, 128), kvdt)
     if mode == "mega":
@@ -825,7 +912,7 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
         pt_s, pt_f, newpg = page_args(c, pos, pt_s.astype(I32), pt_f.astype(I32))
         cos, sin = rope_tables(c, pos)
         xp = jnp.pad(x, ((0, c.BR - c.B), (0, c.Hp - c.H))).astype(BF16)
-        wl = [W[k] for k in W_NAMES]
+        wl = [W[k] for k in w_names(c)]
         if not xla_ar:
             out, kvn = mega(rank, pos, pt_s, pt_f, xp, cos, sin, *wl, kv_s, kv_f)
         else:
@@ -845,7 +932,7 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
             kv_s, kv_f = sc(newpg, pos, kvn, kv_s, kv_f)
         return out[:c.B, :c.H], kv_s[None], kv_f[None]
 
-    w_spec = {k: P("tp") for k in W_NAMES}
+    w_spec = {k: P("tp") for k in w_names(c)}
     smap = jax.shard_map(
         per_rank, mesh=mesh,
         in_specs=(P("tp"), P(), P(), P(), P(), w_spec, P("tp"), P("tp")),

@@ -39,11 +39,13 @@ def main():
     ap.add_argument("--kv", default="fp8", choices=["bf16", "fp8"])
     ap.add_argument("--moe", default="tp", choices=["tp", "ep"])
     ap.add_argument("--tne", type=int, default=384)
-    ap.add_argument("--npb", type=int, default=2)
+    ap.add_argument("--npb", type=int, default=8)
     ap.add_argument("--nb", type=int, default=4096, help="pages per pool (per rank, per layer)")
     ap.add_argument("--max-pages", type=int, default=128)
     ap.add_argument("--vmem-mib", type=int, default=60)
     ap.add_argument("--xla-ar", action="store_true", help="compile the XLA-collective fallback")
+    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights")
+    ap.add_argument("--kv-bufs", type=int, default=3)
     ap.add_argument("--no-scatter", action="store_true", help="leave out the KV scatter call")
     ap.add_argument("--topology", default="tpu7x:2x2x1")
     args = ap.parse_args()
@@ -60,8 +62,10 @@ def main():
     for B in args.batch:
         c = config.full(B, L=args.layers, kv_dtype=args.kv, moe_mode=args.moe, tne=args.tne,
                         npb=args.npb, nb_full=args.nb, nb_swa=args.nb,
-                        max_pages=args.max_pages, vmem_mib=args.vmem_mib)
+                        max_pages=args.max_pages, vmem_mib=args.vmem_mib, kv_bufs=args.kv_bufs,
+                        w_dtype="mxfp4" if args.mxfp4 else "bf16")
         rec = dict(mode="aot_" + args.topology, B=B, L=c.L, kv=c.kv_dtype, moe=c.moe_mode,
+                   w=c.w_dtype, max_pages=c.max_pages,
                    tne=c.tne, npb=c.npb, Hp=c.Hp, IL=c.IL, xla_ar=args.xla_ar,
                    scatter=not args.no_scatter)
         vm = MK.vmem_bytes(c, "mega")

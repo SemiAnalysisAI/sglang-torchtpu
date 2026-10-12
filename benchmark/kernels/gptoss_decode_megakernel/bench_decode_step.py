@@ -84,7 +84,19 @@ def xla_step_fn(c, mesh, MK, REF):
             ok = (loc >= 0) & (loc < c.EL)
             loc = jnp.clip(loc, 0, c.EL - 1)
             # packed (chunk-tiled) layouts used directly, so XLA does not relayout weights
-            w13, w2 = W["w13"][l], W["w2"][l]  # [EL, NJ, Hp, 2*tne], [EL, NJ, tne, Hp]
+            if c.w_dtype == "mxfp4":  # dequantize in XLA (only the gathered experts if small B)
+                def deq(n, idx=None):
+                    q, sc = W[n + "q"][l], W[n + "s"][l]
+                    if idx is not None:
+                        q, sc = q[idx], sc[idx]
+                    return MK.mxfp4_unpack_xla(q, sc).astype(BF16)
+                small = B * c.TOPK < c.EL
+                w13 = deq("w13", loc if small else None)
+                w2 = deq("w2", loc if small else None)
+            else:
+                w13, w2 = W["w13"][l], W["w2"][l]  # [EL, NJ, Hp, 2*tne], [EL, NJ, tne, Hp]
+                if B * c.TOPK < c.EL:
+                    w13, w2 = w13[loc], w2[loc]
             b13, b2 = W["b13"][l][:, :, 0], W["b2"][l][:, 0]  # [EL, NJ, 2*tne], [EL, Hp]
             flag = 1.0 if c.moe_mode == "ep" else (rank == 0).astype(F32)
             T_ = c.tne
@@ -95,9 +107,9 @@ def xla_step_fn(c, mesh, MK, REF):
                 return ((u + 1.0) * (g * jax.nn.sigmoid(c.alpha * g))).astype(BF16)
 
             if B * c.TOPK < c.EL:  # gather the routed experts' weights
-                h = jnp.einsum("bh,bkjhn->bkjn", xn, w13[loc], preferred_element_type=F32)
+                h = jnp.einsum("bh,bkjhn->bkjn", xn, w13, preferred_element_type=F32)
                 a = act(h + b13[loc])
-                y = jnp.einsum("bkjt,bkjth->bkh", a, w2[loc], preferred_element_type=F32)
+                y = jnp.einsum("bkjt,bkjth->bkh", a, w2, preferred_element_type=F32)
                 y = y + flag * b2[loc]
                 part = jnp.sum(jnp.where(ok, wts, 0.0)[..., None] * y, 1)
             else:  # dense over all local experts (most are active at this batch)
@@ -123,7 +135,7 @@ def xla_step_fn(c, mesh, MK, REF):
                 kv_f = kv_f.at[l // 2, page, tok, 0].set(slot)
         return res.astype(BF16)[:, :c.H], kv_s[None], kv_f[None]
 
-    w_spec = {k: P("tp") for k in MK.W_NAMES}
+    w_spec = {k: P("tp") for k in MK.w_names(c)}
     smap = jax.shard_map(per_rank, mesh=mesh,
                          in_specs=(P("tp"), P(), P(), P(), P(), w_spec, P("tp"), P("tp")),
                          out_specs=(P(), P("tp"), P("tp")), check_vma=False)
@@ -149,6 +161,7 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--vmem-mib", type=int, default=60)
+    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights (stock format)")
     ap.add_argument("--cpu-smoke", action="store_true",
                     help="tiny dims + Pallas interpret mode on 8 virtual CPU devices (script check)")
     args = ap.parse_args()
@@ -197,13 +210,21 @@ def main():
         extra = {} if args.cpu_smoke else dict(L=args.layers, tne=args.tne,
                                                vmem_mib=args.vmem_mib)
         c = mk_cfg(B, kv_dtype=args.kv, moe_mode=args.moe, npb=args.npb, nb_full=nb,
+                   w_dtype="mxfp4" if args.mxfp4 else "bf16",
                    nb_swa=nb_swa, max_pages=max_pages, kv_bufs=args.kv_bufs, **extra)
         if W is None:  # weights do not depend on B
             keys = jax.random.split(jax.random.PRNGKey(0), 16)
             W = {}
             for i, (k, s) in enumerate(MK.packed_specs(c).items()):
-                scale = {"vec": 0.0, "sinks": 1.0}.get(k, 0.02)
-                W[k] = rand(s, keys[i], scale)
+                if s.dtype == jnp.uint32:  # any nibble is a valid e2m1 code
+                    W[k] = jax.jit(lambda kk, s=s: jax.random.bits(kk, s.shape, jnp.uint32),
+                                   out_shardings=shd)(keys[i])
+                elif k in ("w13s", "w2s"):  # fp4 magnitudes <= 6 -> |w| <= 0.05
+                    W[k] = jax.jit(lambda s=s: jnp.full(s.shape, 2.0**-7, s.dtype),
+                                   out_shardings=shd)()
+                else:
+                    scale = {"vec": 0.0, "sinks": 1.0}.get(k, 0.02)
+                    W[k] = rand(s, keys[i], scale)
             # ln1 / ln2 = 1 so activations stay O(1)
             W["vec"] = W["vec"].at[:, :, 0:2, :].set(1.0)
         pools = new_pools(c)
@@ -216,6 +237,7 @@ def main():
         pt_s = jax.device_put(jnp.asarray(ptw.astype(np.int32)), rep)
         for mode in args.modes:
             rec = dict(mode=mode, B=B, L=c.L, ctx=args.ctx, kv=c.kv_dtype, moe=c.moe_mode,
+                       w=c.w_dtype,
                        tne=c.tne, npb=c.npb, kv_bufs=c.kv_bufs)
             try:
                 if mode == "xla":

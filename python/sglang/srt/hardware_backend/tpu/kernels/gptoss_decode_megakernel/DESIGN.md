@@ -49,15 +49,15 @@ token `[B, H]`; output is the last layer's residual stream `[B, H]`.
 | KV layout | Exactly sglang's fused TPU pool per layer: `[pages, 64, 1, packing, 128]` (K slot 0, V slot 1, fp8 slots 2–3 padding, head_dim zero-padded to 128). Read as uint32 words + shifts, like RPA v3 `load_bkv`. bf16 and fp8_e4m3 are both supported. | **Gap:** layers are stacked `[L/2, …]` per pool type (SWA pool / full pool, each with its own page table, as in SWAKVPool). Stock keeps one tensor per layer. |
 | New K/V write | Separate non-collective scatter kernel | XLA TPU does not place outputs of a `collective_id` pallas_call into live-out buffers. Aliasing the pool inside the megakernel would copy the whole pool every step (see vllm `_frozen/qwen35/pool_io.py`). AOT HLO shows no pool-sized copy. |
 | Weight streaming | Attention + router weights (`wqkv, wo, wr, vec, sinks`) use a 2-slot buffer. Layer l+1's set is prefetched at the start of layer l. Expert chunks `(w13 [Hp, 2·tne], w2 [tne, Hp], b13, b2)` stream through a `w_slots`-deep ring (default 3, so 2 chunks in flight). | Expert chunks depend on routing, so the expert ring cannot start before layer l's router. Across the layer boundary the stream continues only with the next layer's attention weights. |
-| Weight dtype | bf16 everywhere | See MXFP4 below |
+| Weight dtype | Attention/router bf16. Experts bf16 or `w_dtype="mxfp4"`: e2m1 codes, 8 per uint32 along K (`pltpu.bitcast` packing), plus a bf16 power-of-two scale per 32 K rows × column (rows padded to 16). | MXFP4 chunk = 1.94 MB vs 6.78 MB bf16 (3.5× fewer bytes). It is dequantized in VMEM (bitcast → bf16 → × scale, in static 128-row chunks) into a bf16 buffer, then hits the MXU, like gmm_v2's `dequantize_in_vmem`. In TP mode the I split is block-aligned: 90 blocks → 12,12,11,…, padded to 384. |
 
 ## VMEM (analytic, tile-padded; real dims, fp8 KV, TP MoE, tne=384, npb=2)
 
 | B | scratch + resident operands | biggest items |
 |---|---|---|
-| 1, 2, 4, 8, 16 | 38.8 MiB | w13 ring 12.9, wqkv×2 8.6, w2 ring 6.5, wo×2 5.8, wr×2 1.4, AR recv 1.4 |
-| 32 | 41.6 MiB | AR recv 2.9 |
-| 64 | 47.4 MiB | AR recv 5.8 |
+| 1, 2, 4, 8, 16 | 39.4 MiB (MXFP4 experts: 32.0) | w13 ring 12.9, wqkv×2 8.6, w2 ring 6.5, wo×2 5.8, wr×2 1.4, AR recv 1.4 |
+| 32 | 42.3 MiB (MXFP4: 34.9) | AR recv 2.9 |
+| 64 | 48.0 MiB (MXFP4: 40.6) | AR recv 5.8 |
 
 `vmem_limit_bytes` = 60 MiB. AOT compiles succeeded under that limit for all buckets.
 Mosaic does not report its own peak, so the table is our estimate (`megakernel.vmem_bytes`).
@@ -69,16 +69,18 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 |---|---|---|
 | Megakernel vs pure-JAX TP reference (`reference.step`) | interpret, 8 CPU devices, tiny dims (H=240→256, real 64q/8kv/D=64 heads, E=16, top-4, I=384, page 64, 4 pages/seq, positions incl. 0, 63, 130, 255) | rel err 3–5e-3 for bf16/fp8 KV, TP/EP MoE, L=2/4, B=1/4/16 |
 | In-kernel all-reduce vs `psum` | megakernel vs `xla_ar=True` fallback, same inputs | bit-identical outputs and pools |
+| MXFP4 experts | Weights snapped to MXFP4 in the reference, packed codes + scales in the kernel, TP (block-aligned split) and EP | rel err 3.9–4.0e-3. Megakernel vs fallback bit-identical. |
 | In-place KV | pools pre-filled with finite garbage everywhere the step must not read. After the step, exactly the new-token slots changed and they hold the reference K/V | pass |
-| Compile for TPU | AOT `tpu7x:2x2x1` (jax 0.10.2 + libtpu 0.0.47 on a CPU-only Linux host), real dims, L=36, B ∈ {1,2,4,8,16,32,64}: fp8 TP, bf16 TP, fp8 EP megakernels and the fp8 TP XLA-AR fallback | 28/28 compile (megakernel 1.4–3.8 s, fallback 15–18 s). HLO copies are only small operand moves (no pool copy). Raw output: `benchmark/kernels/gptoss_decode_megakernel/aot_tpu7x_2x2x1_results.jsonl` |
+| Compile for TPU | AOT `tpu7x:2x2x1` (jax 0.10.2 + libtpu 0.0.47 on a CPU-only Linux host), real dims, L=36, B ∈ {1,2,4,8,16,32,64}: fp8 TP, bf16 TP, fp8 EP megakernels and the fp8 TP XLA-AR fallback | all compile (bf16/MXFP4 experts, fp8/bf16 KV, TP/EP, max_pages 65/128/513 i.e. up to 32K context, XLA-AR fallback; megakernel 1.4–6 s). HLO copies are only small operand moves (no pool copy). Raw output: `benchmark/kernels/gptoss_decode_megakernel/aot_tpu7x_2x2x1_results.jsonl` |
 | Not validated | Anything on hardware: ICI remote-DMA timing/races, barrier semaphore behaviour, the uint32 *ref* bitcast of KV pages (interpret mode cannot bitcast refs, so it uses an equivalent value-level `pltpu.bitcast`; the ref path is AOT-only), real VMEM peak, performance | — |
 
 ## Known gaps / next steps
 
-- **MXFP4 experts.** Stock streams MXFP4 (uint8 codes `[K/2, N]` + e8m0 scales per 32 along
-  K). This v0 streams bf16, which is about 4× the expert bytes, so at B ≥ 8 it reads far more
-  HBM than stock. To support MXFP4: DMA packed codes + scales per chunk, dequantize to bf16
-  in VMEM (or use the v7x fp4 MXU path), and re-tile `pack_weights`.
+- **MXFP4 experts.** Implemented (`w_dtype="mxfp4"`); not measured on TPU. The VPU
+  dequant of every streamed chunk (~3.4M weights per expert chunk) might cost as much as the
+  DMA bytes it saves. The fallback is the stock-style "per-32-K-group product then scale",
+  or native fp4 MXU if Mosaic exposes it. Integration must convert the stock checkpoint
+  layout (uint8 `[E, K/2, N]` + f32 scales `[E, K/32, 1, N]`) to this layout offline.
 - **AR cost.** The one-shot AR moves 7× payload per rank, with no RS/AG and no small-B
   folding. It is not topology-aware: 2 TCs per chip, 2x2 chips.
 - **Expert prefetch across layers.** Only the attention weights cross the layer boundary.
