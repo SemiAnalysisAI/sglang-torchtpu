@@ -435,6 +435,7 @@ def _simulate_balanced_routing_kernel(
     layer_offset,
     token_shard_rank,
     num_token_shards,
+    token_offset,
     stride_im,
     stride_ik,
     stride_wm,
@@ -462,7 +463,7 @@ def _simulate_balanced_routing_kernel(
     ``token_shard_rank`` and ``num_token_shards`` ensure scattered DP ranks generate
     different expert assignments for their local tokens when DP > 1."""
     t = tl.program_id(0)
-    global_t = t * num_token_shards + token_shard_rank
+    global_t = (t + token_offset) * num_token_shards + token_shard_rank
     j = tl.arange(0, BLOCK_K)
     mask = j < K
     if RANDOM:
@@ -492,6 +493,7 @@ def _simulate_balanced_routing(
     layer_id: Optional[int] = None,
     token_shard_rank: int = 0,
     num_token_shards: int = 1,
+    token_offset: int = 0,
     seed: Optional[int] = None,
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
@@ -505,6 +507,7 @@ def _simulate_balanced_routing(
     ``token_shard_rank`` and ``num_token_shards`` describe scattered DP input.
     Their defaults describe a gathered token buffer (effective DP=1). ``seed``
     is exposed for deterministic tests; production calls use a per-launch seed.
+    ``token_offset`` locates a contiguous TP shard within its DP token buffer.
     """
     global _simulate_uniform_seed
     num_tokens, k = topk_ids.shape
@@ -526,6 +529,7 @@ def _simulate_balanced_routing(
         0 if layer_id is None else layer_id,
         token_shard_rank,
         num_token_shards,
+        token_offset,
         topk_ids.stride(0),
         topk_ids.stride(1),
         topk_weights.stride(0),
@@ -546,8 +550,9 @@ def _simulate_tpu_perfect_balanced_routing(
     layer_id: Optional[int] = None,
     token_shard_rank: int = 0,
     num_token_shards: int = 1,
+    token_offset: int = 0,
 ) -> None:
-    """Portable rank-first benchmark routing for TPU."""
+    """Rank-first routing; ``token_offset`` precedes any DP interleaving."""
     num_tokens, k = topk_ids.shape
     if num_tokens == 0 or k == 0:
         return
@@ -558,9 +563,8 @@ def _simulate_tpu_perfect_balanced_routing(
     assignment_stride = k if num_routed_topk is None else num_routed_topk
     global_tokens = (
         torch.arange(num_tokens, device=topk_ids.device, dtype=topk_ids.dtype)
-        * num_token_shards
-        + token_shard_rank
-    )
+        + token_offset
+    ) * num_token_shards + token_shard_rank
     slots = torch.arange(k, device=topk_ids.device, dtype=topk_ids.dtype)
     deal = (
         global_tokens.unsqueeze(1) * assignment_stride
@@ -2907,6 +2911,19 @@ def select_experts(
             # its routing must remain identical across those replicas.
             token_shard_rank, num_token_shards = 0, 1
 
+        token_offset = 0
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+                get_fused_moe_sequence_parallel_plan,
+            )
+
+            if get_fused_moe_sequence_parallel_plan().gather_topk:
+                # TP all-gather concatenates contiguous, compile-padded shards.
+                # Apply their offset before the existing DP interleaving.
+                token_offset = (
+                    get_parallel().attn_tp_group.rank_in_group * topk_ids.shape[0]
+                )
+
         if simulate_tpu_perfect_balanced_experts:
             _simulate_tpu_perfect_balanced_routing(
                 topk_ids,
@@ -2917,6 +2934,7 @@ def select_experts(
                 layer_id=layer_id,
                 token_shard_rank=token_shard_rank,
                 num_token_shards=num_token_shards,
+                token_offset=token_offset,
             )
         else:
             _simulate_balanced_routing(
@@ -2927,6 +2945,7 @@ def select_experts(
                 layer_id=layer_id,
                 token_shard_rank=token_shard_rank,
                 num_token_shards=num_token_shards,
+                token_offset=token_offset,
             )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
