@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import AbstractContextManager, contextmanager
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Any, Optional, Type
 
 import torch
 
@@ -1172,6 +1172,7 @@ class TpuSRTPlatform(SRTPlatform):
         """Freeze torch.compile so serving-time recompiles raise."""
         from sglang.srt.runtime_context import get_exec, get_spec
         from sglang_tpu.compilation.recompilation_checker import (
+            arm_recompilation_checker,
             maybe_enable_site_tracing,
         )
 
@@ -1179,6 +1180,7 @@ class TpuSRTPlatform(SRTPlatform):
         maybe_enable_site_tracing()
         if not get_exec().graph.enable_torch_compile:
             return
+        arm_recompilation_checker(reset_counters=False, overwrite_baseline=False)
         if (
             get_spec().speculative_algorithm is not None
             and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
@@ -1201,6 +1203,15 @@ class TpuSRTPlatform(SRTPlatform):
             getattr(torch, "tpu", None), "_get_cache_misses", None
         )
         return None if get_cache_misses is None else int(get_cache_misses())
+
+    def get_recompilation_counters(self) -> dict[str, Any]:
+        from sglang_tpu.compilation.recompilation_checker import (
+            get_recompilation_counters,
+        )
+
+        return get_recompilation_counters(
+            flush=not envs.SGLANG_TPU_CHECK_RECOMPILATION.get()
+        )
 
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel

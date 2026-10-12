@@ -1023,16 +1023,19 @@ class CompiledForwardShim:
         # Read at entry: the padded shapes are what the graph compiled for.
         pad_q = int(forward_batch.input_ids.shape[0])
         pad_b = int(forward_batch.seq_lens.shape[0])
-        try:
-            return self._forward(
-                fn, input_ids, positions, forward_batch, *args, **kwargs
-            )
-        finally:
-            checker.check(
+        return self._forward(
+            fn,
+            input_ids,
+            positions,
+            forward_batch,
+            *args,
+            _recompilation_check=lambda: checker.check(
                 context_fn=lambda: self._describe_forward(
                     forward_batch, pad_q=pad_q, pad_b=pad_b
                 )
-            )
+            ),
+            **kwargs,
+        )
 
     def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
         # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).
@@ -1049,6 +1052,7 @@ class CompiledForwardShim:
         positions: torch.Tensor | None,
         forward_batch: Any,
         *args: Any,
+        _recompilation_check: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
@@ -1167,7 +1171,11 @@ class CompiledForwardShim:
                     args = _fit_pp_proxy_in_args(
                         args=args, input_ids=input_ids, forward_batch=forward_batch
                     )
-            out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            try:
+                out = fn(input_ids, positions, forward_batch, *args, **kwargs)
+            finally:
+                if _recompilation_check is not None:
+                    _recompilation_check()
             if isinstance(out, PendingCall):
                 finalize_fields = {key: getattr(forward_batch, key) for key in saved}
                 finalize_fields["is_prefill_only"] = forward_batch.is_prefill_only

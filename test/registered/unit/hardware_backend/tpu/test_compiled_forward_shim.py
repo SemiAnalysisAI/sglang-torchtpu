@@ -728,6 +728,35 @@ class TestCompiledForwardShim(CustomTestCase):
         context_fn = checker.check.call_args.kwargs["context_fn"]
         self.assertEqual(context_fn(), "M EXTEND real=q952,b1 pad=q1024,b64")
 
+    def test_recompilation_check_runs_before_output_unpadding(self):
+        """checker.check must run immediately after fn(...) before finalize_forward_batch."""
+        order: list[str] = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            order.append("fn")
+            return LogitsProcessorOutput(next_token_logits=torch.zeros(4, 10))
+
+        policy = DecoderTpuCompilePolicy()
+        orig_finalize = policy.finalize_forward_batch
+
+        def finalize(out, fb):
+            order.append("finalize")
+            return orig_finalize(out, fb)
+
+        policy.finalize_forward_batch = finalize
+        shim = CompiledForwardShim(compiled, policy=policy)
+        checker = MagicMock()
+        checker.check.side_effect = lambda **kw: order.append("check")
+        shim.set_recompilation_checker(checker, model_label="M")
+        fb = self._forward_batch(
+            input_ids=torch.zeros(8, dtype=torch.int32),
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+        )
+        shim(None, None, fb)
+        self.assertEqual(order, ["fn", "check", "finalize"])
+
     def test_slices_logits_and_hidden_states(self):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
@@ -744,6 +773,25 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertEqual(out.hidden_states.shape, (4, 5))
         self.assertTrue(torch.equal(out.next_token_logits, padded_logits[:2]))
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
+
+        # When real_b == pad_b and real_q == pad_q, trim_next_token_outputs
+        # must not materialize a no-op slice view.
+        exact_logits = torch.zeros(4, 10)
+        exact_hidden = torch.zeros(8, 5)
+        shim_exact = CompiledForwardShim(
+            MagicMock(
+                return_value=LogitsProcessorOutput(
+                    next_token_logits=exact_logits,
+                    hidden_states=exact_hidden,
+                )
+            ),
+            policy=DecoderTpuCompilePolicy(),
+        )
+        out_exact = shim_exact(
+            None, None, self._forward_batch(_tpu_real_q=8, _tpu_real_b=4)
+        )
+        self.assertIs(out_exact.next_token_logits, exact_logits)
+        self.assertIs(out_exact.hidden_states, exact_hidden)
 
     def test_defers_output_unpadding_for_chained_forwards(self):
         padded = LogitsProcessorOutput(
