@@ -18,6 +18,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -425,7 +426,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
         )
@@ -568,19 +568,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
                 linear_attn_backend = AscendKDAAttnBackend(runner)
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
-            elif is_tpu():
-                from sglang_tpu.attention_kda_pallas import (
-                    TpuKDAAttnBackend,
-                )
-
-                logger.info(
-                    "Using TPU KDA linear-attention backend for Kimi linear models."
-                )
-                linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
-                linear_attn_backend = KDAAttnBackend(runner)
+                linear_attn_backend = current_platform.get_kda_attn_backend_cls()(
+                    runner
+                )
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            linear_attn_backend = current_platform.get_kda_attn_backend_cls()(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

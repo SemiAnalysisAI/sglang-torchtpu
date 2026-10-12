@@ -864,6 +864,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
+    def get_kda_attn_backend_cls(self) -> type:
+        from sglang_tpu.attention_kda_pallas import TpuKDAAttnBackend
+
+        return TpuKDAAttnBackend
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.

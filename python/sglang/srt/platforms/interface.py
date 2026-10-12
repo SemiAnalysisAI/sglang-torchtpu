@@ -92,6 +92,12 @@ class SRTPlatform(DeviceMixin):
 
         return MambaPool
 
+    def get_kda_attn_backend_cls(self) -> type:
+        """Return the KDA (Kimi delta attention) linear-attention backend class."""
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+        return KDAAttnBackend
+
     def get_mla_kv_pool_cls(self) -> type:
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError
