@@ -216,7 +216,7 @@ def is_deepseek_dsa(config) -> bool:
 def dsa_context_fits_index_topk(config, context_length: Optional[int]) -> bool:
     index_topk = _hf_attr(config, "index_topk")
     return (
-        _hf_arch(config) == "GlmMoeDsaForCausalLM"
+        _hf_arch(config) in ("GlmMoeDsaForCausalLM", "Glm5NextForConditionalGeneration")
         and index_topk is not None
         and context_length is not None
         and context_length <= index_topk
@@ -1205,6 +1205,13 @@ class ModelConfig:
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        # the TPU GLM-5.3-Flash model expands MLA to per-head K/V (sglang_tpu/models/glm5_next.py)
+        tpu_dense_glm5_next = getattr(self.hf_config, "tpu_dense_dsa", False) and (
+            self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        )
+        if tpu_dense_glm5_next:
+            self.head_dim = self.hf_text_config.qk_nope_head_dim
+            self.hf_text_config.head_dim = self.head_dim
         if self.head_dim is None:
             if is_pure_ssm:
                 self.head_dim = 0
@@ -1229,8 +1236,10 @@ class ModelConfig:
         if self.swa_v_head_dim is None:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
+        if tpu_dense_glm5_next:
+            self.attention_arch = AttentionArch.MHA
         # FIXME: temporary special judge for MLA architecture
-        if (
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures

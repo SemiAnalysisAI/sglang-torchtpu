@@ -1037,6 +1037,9 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        from sglang_tpu.models import register_tpu_models
+
+        register_tpu_models()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:
