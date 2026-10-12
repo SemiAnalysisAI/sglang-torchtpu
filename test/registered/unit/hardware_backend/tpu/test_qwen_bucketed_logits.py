@@ -1,13 +1,13 @@
 """Finite TPU logits shapes and preservation of logical request outputs."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang_tpu.compilation import decoder_compile_policy as m
-from sglang_tpu.compilation.bucketer import Bucketer
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -17,13 +17,18 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation import decoder_compile_policy as m
+from sglang_tpu.compilation.bucketer import Bucketer
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
 def runtime():
-    with get_context().override_server_args(enable_torch_compile=True):
+    with (
+        get_context().override_server_args(enable_torch_compile=True),
+        envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(True),
+    ):
         yield
 
 
@@ -200,3 +205,7 @@ def test_prompt_logprob_pruning_uses_only_real_hidden_rows(lengths, starts):
     expected = processor._get_pruned_states(hidden[:5], None, None, metadata)
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[3], expected[3])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

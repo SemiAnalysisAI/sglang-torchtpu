@@ -308,9 +308,8 @@ def alloc_paged_token_slots_extend(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if (
-        _is_tpu
-        and batch is not None
-        and getattr(batch, "tpu_input_device", None) == "cpu"
+        batch is not None
+        and batch.batch_input_device == "cpu"
         and torch.device(batch.device).type != "cpu"
     ):
         extra_alloc_kwargs["output_device"] = "cpu"
@@ -493,9 +492,7 @@ def alloc_for_extend(
     extend_lens_cpu = torch.tensor(
         batch.extend_lens, dtype=torch.int64, pin_memory=pin_memory
     )
-    input_device = batch.device
-    if _is_tpu:
-        input_device = getattr(batch, "tpu_input_device", None) or batch.device
+    input_device = batch.batch_input_device or batch.device
     prefix_lens_device = prefix_lens_cpu.to(input_device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(input_device, non_blocking=True)
 
@@ -682,9 +679,8 @@ def alloc_paged_token_slots_decode(
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
     if (
-        _is_tpu
-        and batch is not None
-        and getattr(batch, "tpu_input_device", None) == "cpu"
+        batch is not None
+        and batch.batch_input_device == "cpu"
         and torch.device(batch.device).type != "cpu"
     ):
         extra_alloc_kwargs["output_device"] = "cpu"

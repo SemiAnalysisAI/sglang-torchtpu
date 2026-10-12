@@ -314,11 +314,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         output_device: Optional[str] = None,
     ):
         assert self.page_size > 1
-        # TPU can retain allocation metadata on the host until model padding.
-        # Other backends and callers retain the existing device-output contract.
+        # A host-staging platform keeps slots on the host until model padding.
+        # Other callers keep the device-output contract.
         output_kwargs = {}
         if output_device is not None:
-            assert _is_tpu
             output_kwargs["output_device"] = output_device
 
         num_new_pages = get_num_new_pages(
@@ -470,7 +469,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.page_size > 1
         output_kwargs = {}
         if output_device is not None:
-            assert _is_tpu
             output_kwargs["output_device"] = output_device
         full_alloc_kwargs = dict(output_kwargs)
         if out_indices_cpu is not None:

@@ -1,6 +1,7 @@
 """Explicit host-input placement; meta checks device boundaries without a TPU."""
 
-from contextlib import ExitStack, contextmanager
+import sys
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,12 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
-from sglang_tpu.compilation.bucketer import Bucketer
-from sglang_tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
-from sglang_tpu.tpu_platform import TpuSRTPlatform
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -25,6 +21,12 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -33,12 +35,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def backend(tpu):
     with ExitStack() as stack:
         for module in (
-            "managers.schedule_batch",
             "managers.overlap_utils",
             "mem_cache.allocation",
             "model_executor.forward_batch_info",
         ):
             stack.enter_context(patch(f"sglang.srt.{module}._is_tpu", tpu))
+        stack.enter_context(
+            patch(
+                "sglang.srt.managers.schedule_batch.current_platform",
+                TpuSRTPlatform() if tpu else SRTPlatform(),
+            )
+        )
         yield
 
 
@@ -49,6 +56,7 @@ def config():
             enable_torch_compile=True, mamba_radix_cache_strategy="no_buffer"
         ),
         get_parallel().override(moe_ep_size=1),
+        envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(True),
         backend(True),
     ):
         yield
@@ -74,13 +82,13 @@ def make_batch(mode, lengths, prefixes, mm=None, input_device="cpu"):
             for i in range(bs)
         ],
         device="meta",
-        tpu_input_device=input_device,
+        batch_input_device=input_device,
         forward_mode=mode,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         input_ids=torch.arange(n),
         seq_lens=torch.tensor([p + n for p, n in zip(prefixes, lengths)]),
         seq_lens_cpu=torch.tensor([p + n for p, n in zip(prefixes, lengths)]),
-        tpu_orig_seq_lens_cpu=torch.tensor(
+        orig_seq_lens_host=torch.tensor(
             [p + n for p, n in zip(prefixes, lengths)], dtype=torch.int32
         ),
         orig_seq_lens=torch.tensor(
@@ -104,6 +112,7 @@ def make_batch(mode, lengths, prefixes, mm=None, input_device="cpu"):
     )
     runner = SimpleNamespace(
         device="meta",
+        is_draft_worker=False,
         kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         model_config=SimpleNamespace(
@@ -238,9 +247,15 @@ def test_allocator_output_device_is_opt_in(staged):
 
 def test_platform_default_and_tpu_fallbacks():
     batch, _ = make_batch(ForwardMode.EXTEND, [2], [0])
-    assert not hasattr(SRTPlatform(), "get_batch_input_device")
+    assert SRTPlatform().get_batch_input_device(batch) is None
     platform = TpuSRTPlatform()
     assert platform.get_batch_input_device(batch) == "cpu"
+    # The D2H host-pad flag alone must not enable host staging.
+    with (
+        envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+        envs.SGLANG_TPU_HOST_PADDING.override(True),
+    ):
+        assert platform.get_batch_input_device(batch) is None
     for name, value in (
         ("spec_algorithm", SpeculativeAlgorithm.EAGLE3),
         ("dllm_config", object()),
@@ -265,8 +280,8 @@ def test_merge_fallback_never_reads_device_metadata_back_to_host():
     device, _ = make_batch(ForwardMode.DECODE, [3], [0], input_device=None)
     for name in ("input_ids", "seq_lens", "orig_seq_lens", "out_cache_loc"):
         setattr(device, name, getattr(device, name).to("meta"))
-    host._align_tpu_input_devices(device)
-    assert host.tpu_input_device == device.tpu_input_device == "meta"
+    host._align_input_devices(device)
+    assert host.batch_input_device == device.batch_input_device == "meta"
     for name in ("input_ids", "seq_lens", "orig_seq_lens", "out_cache_loc"):
         assert getattr(host, name).device.type == "meta"
 
@@ -290,7 +305,7 @@ def test_relay_keeps_decode_and_mixed_tokens_on_device():
         3,
         0,
     ]
-    assert batch.tpu_mixed_input_tokens.device.type == "meta"
+    assert batch.mixed_input_tokens.device.type == "meta"
     batch.input_ids = None
     resolve_forward_inputs(batch, future)
     assert batch.input_ids.device.type == "meta"
@@ -312,15 +327,15 @@ def test_filter_keeps_host_metadata_and_device_relay_keys_in_request_order():
     assert original.tolist() == [3, 4, 5]
     assert batch.input_ids.tolist() == [2, 0]
     assert batch.req_pool_indices_cpu.tolist() == [2, 0]
-    assert batch.tpu_orig_seq_lens_cpu.tolist() == [5, 3]
+    assert batch.orig_seq_lens_host.tolist() == [5, 3]
     assert batch.req_pool_indices.device.type == "meta"
     assert calls[0][1].device.type == "meta"
 
 
 def test_seeded_sampler_gets_local_device_positions():
-    from sglang_tpu.sampler import TpuSampler
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.sampler import Sampler
+    from sglang_tpu.sampler import TpuSampler
 
     sampler = TpuSampler.__new__(TpuSampler)
     output = LogitsProcessorOutput(next_token_logits=torch.empty(2, 16, device="meta"))
@@ -348,13 +363,12 @@ def test_seeded_sampler_gets_local_device_positions():
     assert positions.tolist() == [3, 4]
 
 
-@pytest.mark.parametrize("tpu", [False, True])
 @pytest.mark.parametrize(
     "device,input_device,expected",
     [("cpu", "cpu", {}), ("meta", None, {}), ("meta", "cpu", {"output_device": "cpu"})],
 )
 def test_shared_allocation_only_passes_output_device_for_staged_accelerator(
-    tpu, device, input_device, expected
+    device, input_device, expected
 ):
     from unittest.mock import MagicMock
 
@@ -362,14 +376,14 @@ def test_shared_allocation_only_passes_output_device_for_staged_accelerator(
 
     pool = SimpleNamespace(
         page_size=4,
+        forward_write_target=nullcontext,
         alloc_extend=MagicMock(return_value=torch.arange(2)),
         alloc_decode=MagicMock(return_value=torch.arange(2)),
     )
     tree = SimpleNamespace(token_to_kv_pool_allocator=pool)
-    batch = SimpleNamespace(device=device, tpu_input_device=input_device)
+    batch = SimpleNamespace(device=device, batch_input_device=input_device)
     lengths = torch.tensor([1, 1])
     with (
-        backend(tpu),
         patch.object(allocation, "evict_from_tree_cache"),
         patch.object(allocation, "page_interleave_shard_size", return_value=1),
     ):
@@ -386,13 +400,12 @@ def test_shared_allocation_only_passes_output_device_for_staged_accelerator(
         allocation.alloc_paged_token_slots_decode(
             tree, lengths, lengths, lengths - 2, batch=batch
         )
-    assert pool.alloc_extend.call_args.kwargs == (expected if tpu else {})
-    assert pool.alloc_decode.call_args.kwargs == (expected if tpu else {})
+    assert pool.alloc_extend.call_args.kwargs == expected
+    assert pool.alloc_decode.call_args.kwargs == expected
 
 
-@pytest.mark.parametrize("tpu", [False, True])
 @pytest.mark.parametrize("dynamic_index", [False, True])
-def test_future_map_store_materializes_host_values_only_on_tpu(tpu, dynamic_index):
+def test_future_map_store_materializes_host_values_on_relay_device(dynamic_index):
     from sglang.srt.managers.overlap_utils import FutureMap
 
     relay = FutureMap.__new__(FutureMap)
@@ -409,37 +422,17 @@ def test_future_map_store_materializes_host_values_only_on_tpu(tpu, dynamic_inde
             seen.append(args[-1])
         return original(self, *args)
 
-    with backend(tpu), patch.object(torch.Tensor, operation, observe):
+    with patch.object(torch.Tensor, operation, observe):
         relay._store(buffer, indices, source)
     assert len(seen) == 1
-    assert seen[0].device == (buffer.device if tpu else source.device)
+    assert seen[0].device == buffer.device
     assert seen[0].dtype == buffer.dtype
     assert source.tolist() == [3, 7]
     assert source.dtype == torch.int64
 
 
-def test_non_tpu_ignores_host_staging_metadata():
-    # A CPU placement tag must not opt another backend into TPU behavior.
-    batch, runner = make_batch(ForwardMode.EXTEND, [3, 2], [0, 0])
-    batch.prefill_input_ids_cpu = batch.input_ids
-    with (
-        backend(False),
-        patch(
-            "sglang.srt.model_executor.forward_batch_info.compute_position",
-            return_value=(torch.empty(5, device="meta"), torch.empty(2, device="meta")),
-        ),
-    ):
-        resolve_forward_inputs(batch, SimpleNamespace())
-        fb = build(batch, runner)
-    assert batch.input_ids.device.type == "meta"
-    assert fb.req_pool_indices is batch.req_pool_indices
-    assert fb.extend_seq_lens.device.type == "meta"
-    assert fb.extend_prefix_lens.device.type == "meta"
-    assert fb.mrope_positions.device.type == "meta"
-
-
 def test_non_tpu_cpu_forward_preserves_request_indices_identity():
-    batch, runner = make_batch(ForwardMode.EXTEND, [3], [0])
+    batch, runner = make_batch(ForwardMode.EXTEND, [3], [0], input_device=None)
     runner.device = batch.device = "cpu"
     batch.req_pool_indices = torch.tensor([2])
     batch.req_pool_indices_cpu = torch.tensor([2])
@@ -526,11 +519,14 @@ def test_pd_prebuilt_initializes_placement_for_first_decode(tpu):
     req.multimodal_inputs = None
     with (
         patch.object(prebuilt, "_is_tpu", tpu),
-        patch("sglang.srt.platforms.current_platform", TpuSRTPlatform()),
+        patch(
+            "sglang.srt.platforms.current_platform",
+            TpuSRTPlatform() if tpu else SRTPlatform(),
+        ),
         patch.object(prebuilt.SamplingBatchInfo, "from_schedule_batch"),
     ):
         batch.prepare_for_prebuilt()
-    assert batch.tpu_input_device == ("cpu" if tpu else None)
+    assert batch.batch_input_device == ("cpu" if tpu else None)
     for name in ("seq_lens", "orig_seq_lens"):
         assert getattr(batch, name).device.type == ("cpu" if tpu else "meta")
     assert batch.seq_lens_cpu.tolist() == [3]
@@ -546,7 +542,7 @@ def test_mixed_prompt_is_bucketed_before_injecting_device_tail(prompt_length):
     relay = SimpleNamespace(output_tokens_buf=torch.arange(16) + 100)
     resolve_forward_inputs(batch, relay)
     assert batch.input_ids.tolist() == list(range(prompt_length)) + [0, 0]
-    assert batch.tpu_mixed_input_tokens.tolist() == [103, 109]
+    assert batch.mixed_input_tokens.tolist() == [103, 109]
     fb = build(batch, runner)
     prepare(fb, runner)
     assert fb.input_ids.tolist()[: prompt_length + 2] == list(range(prompt_length)) + [
@@ -556,30 +552,30 @@ def test_mixed_prompt_is_bucketed_before_injecting_device_tail(prompt_length):
     assert fb.input_ids.tolist()[prompt_length + 2 :] == [0] * (
         fb.input_ids.numel() - prompt_length - 2
     )
-    assert fb.tpu_mixed_input_tokens is None
+    assert fb.mixed_input_tokens is None
 
 
 def test_decode_placement_recovers_without_reading_device_lengths():
     batch, _ = make_batch(ForwardMode.DECODE, [8, 12], [0, 0], input_device="meta")
     batch.seq_lens = torch.empty(2, dtype=torch.int64, device="meta")
     batch.orig_seq_lens = torch.empty(2, dtype=torch.int32, device="meta")
-    batch.tpu_orig_seq_lens_cpu = torch.tensor([18, 22], dtype=torch.int32)
+    batch.orig_seq_lens_host = torch.tensor([18, 22], dtype=torch.int32)
     # This TPU-only method is absent from the CPU platform used by the test.
     with patch(
         "sglang.srt.managers.schedule_batch.current_platform.get_batch_input_device",
         return_value="cpu",
         create=True,
     ):
-        batch._refresh_tpu_input_device()
-    assert batch.tpu_input_device == "cpu"
+        batch._refresh_input_device()
+    assert batch.batch_input_device == "cpu"
     assert batch.seq_lens.tolist() == [8, 12]
     assert batch.orig_seq_lens.tolist() == [18, 22]
 
 
 def test_decode_advances_original_length_mirror_after_recovery():
     batch, _ = make_batch(ForwardMode.DECODE, [8, 12], [0, 0])
-    batch.tpu_orig_seq_lens_cpu = torch.tensor([18, 22], dtype=torch.int32)
-    batch.orig_seq_lens = batch.tpu_orig_seq_lens_cpu
+    batch.orig_seq_lens_host = torch.tensor([18, 22], dtype=torch.int32)
+    batch.orig_seq_lens = batch.orig_seq_lens_host
     batch.sampling_info = SimpleNamespace(
         penalizer_orchestrator=SimpleNamespace(is_required=False)
     )
@@ -601,7 +597,7 @@ def test_decode_advances_original_length_mirror_after_recovery():
         batch.prepare_for_decode()
     assert batch.seq_lens.tolist() == [9, 13]
     assert batch.orig_seq_lens.tolist() == [19, 23]
-    assert batch.tpu_orig_seq_lens_cpu.tolist() == [19, 23]
+    assert batch.orig_seq_lens_host.tolist() == [19, 23]
 
 
 def test_decode_allocator_uses_host_request_indices_without_device_read():
@@ -624,3 +620,7 @@ def test_decode_allocator_uses_host_request_indices_without_device_read():
         result = allocation.alloc_for_decode(batch, 1)
     assert result.tolist() == [24, 30]
     assert alloc.call_args.kwargs["last_loc"].tolist() == [23, 29]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

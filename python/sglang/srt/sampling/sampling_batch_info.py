@@ -14,9 +14,12 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.host_sampling_params import (
+    HostSamplingParams,
+    SamplingParamTensors,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils import is_tpu
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -25,7 +28,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-_is_tpu = is_tpu()
 
 
 def _rows_to_device_indices(
@@ -109,6 +111,9 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Host mirror of the sampling params when the batch inputs are host-staged.
+    host_sampling_params: Optional[HostSamplingParams] = None
+
     # Host-side specialization hint. ``None`` means the batch contains mixed
     # top-k values. Keeping this on the host lets accelerator-specific samplers
     # select a static top-k kernel without synchronizing ``top_ks`` from the
@@ -125,7 +130,7 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        host_params = _is_tpu and getattr(batch, "tpu_input_device", None) == "cpu"
+        host_params = batch.batch_input_device == "cpu"
         parameter_device = "cpu" if host_params else device
         _pin = is_pin_memory_available(device)
         # Match the [B, 1] device allocation produced by merging/filtering.
@@ -297,11 +302,7 @@ class SamplingBatchInfo:
             sampling_mask_top_ks=sampling_mask_top_ks,
         )
         if host_params:
-            from sglang_tpu.sampling_params import (
-                initialize_sampling_params,
-            )
-
-            initialize_sampling_params(ret)
+            ret._publish_host_sampling_params(ret._sampling_param_tensors())
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
 
@@ -442,22 +443,43 @@ class SamplingBatchInfo:
 
         return observer_state
 
+    def _sampling_param_tensors(self) -> SamplingParamTensors:
+        return {
+            "temperatures": self.temperatures,
+            "top_ps": self.top_ps,
+            "top_ks": self.top_ks,
+            "min_ps": self.min_ps,
+            "sampling_seed": self.sampling_seed,
+        }
+
+    def _publish_host_sampling_params(self, host: SamplingParamTensors) -> None:
+        mirror = HostSamplingParams.publish(host, self.device)
+        values = mirror.device_values()
+        self.temperatures = values["temperatures"]
+        self.top_ps = values["top_ps"]
+        self.top_ks = values["top_ks"]
+        self.min_ps = values["min_ps"]
+        self.sampling_seed = values["sampling_seed"]
+        self.host_sampling_params = mirror
+
+    def _current_host_sampling_params(self) -> Optional[HostSamplingParams]:
+        mirror = self.host_sampling_params
+        if mirror is None or not mirror.matches(self._sampling_param_tensors()):
+            return None
+        return mirror
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
-        params_filtered = False
-        if _is_tpu:
-            from sglang_tpu.sampling_params import (
-                filter_sampling_params,
-            )
-
-            params_filtered = filter_sampling_params(self, keep_indices)
+        mirror = self._current_host_sampling_params()
+        if mirror is not None:
+            self._publish_host_sampling_params(mirror.filtered(keep_indices))
         for item in (
             []
-            if params_filtered
+            if mirror is not None
             else [
                 "temperatures",
                 "top_ps",
@@ -589,13 +611,11 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        params_merged = False
-        if _is_tpu:
-            from sglang_tpu.sampling_params import (
-                merge_sampling_params,
-            )
-
-            params_merged = merge_sampling_params(self, other)
+        left = self._current_host_sampling_params()
+        right = other._current_host_sampling_params()
+        params_merged = left is not None and right is not None
+        if params_merged:
+            self._publish_host_sampling_params(left.merged(right))
         for item in (
             []
             if params_merged
@@ -658,7 +678,9 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        return dataclasses.replace(
+            self, penalizer_orchestrator=None, host_sampling_params=None
+        )
 
 
 def merge_bias_tensor(

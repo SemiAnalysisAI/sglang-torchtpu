@@ -962,7 +962,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     # on_done_with_host_buffer callback until H2D completes.
                     value.to(self.model_runner.device, non_blocking=True),
                 )
-        mixed_tokens = getattr(forward_batch, "tpu_mixed_input_tokens", None)
+        mixed_tokens = getattr(forward_batch, "mixed_input_tokens", None)
         if mixed_tokens is not None:
             # Tensor offsets keep the prompt length as data, not an XLA shape.
             tail_start = real_q - mixed_tokens.numel()
@@ -970,7 +970,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 forward_batch.input_ids.device, non_blocking=True
             )
             forward_batch.input_ids.index_copy_(0, indices, mixed_tokens)
-            forward_batch.tpu_mixed_input_tokens = None
+            forward_batch.mixed_input_tokens = None
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
         spec_info = forward_batch.spec_info
@@ -1715,6 +1715,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         return super().install()
 
     def _has_eager_outer_logits(self) -> bool:
+        # Bucketed VL hidden rows ship with host staging, behind the same flag.
+        if not envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get():
+            return False
         runner = getattr(self, "model_runner", None)
         if runner is None:
             return False

@@ -1,22 +1,22 @@
 """Host metadata ownership and coverage of eager serving shapes."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from sglang_tpu import sampling_params as host_params
-from sglang_tpu.compilation.bucketer import Bucketer
-from sglang_tpu.compilation.decoder_compile_policy import (
-    DecoderTpuCompilePolicy,
-)
-from sglang_tpu.serving_op_precompile import precompile_serving_ops
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling import sampling_batch_info as sampling
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.compilation.bucketer import Bucketer
+from sglang_tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.serving_op_precompile import precompile_serving_ops
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -27,7 +27,7 @@ def config():
         yield
 
 
-def make_info(temps, *, tpu=True, device="meta", staged=True):
+def make_info(temps, *, device="meta", staged=True):
     reqs = []
     for i, temp in enumerate(temps):
         params = SamplingParams(temperature=temp, top_k=i + 1, sampling_seed=i + 23)
@@ -40,32 +40,26 @@ def make_info(temps, *, tpu=True, device="meta", staged=True):
             )
         )
     batch = SimpleNamespace(
-        reqs=reqs, device=device, tpu_input_device="cpu" if staged else None
+        reqs=reqs, device=device, batch_input_device="cpu" if staged else None
     )
-    with (
-        patch.object(sampling, "_is_tpu", tpu),
-        patch.object(
-            sampling.penaltylib,
-            "BatchedPenalizerOrchestrator",
-            return_value=MagicMock(is_required=False),
-        ),
+    with patch.object(
+        sampling.penaltylib,
+        "BatchedPenalizerOrchestrator",
+        return_value=MagicMock(is_required=False),
     ):
         return sampling.SamplingBatchInfo.from_schedule_batch(batch, 32)
 
 
 @pytest.mark.parametrize("seeded", [False, True])
 def test_public_parameters_stay_on_device_and_filter_merge_preserve_order(seeded):
-    with (
-        get_context().override_server_args(enable_deterministic_inference=seeded),
-        patch.object(sampling, "_is_tpu", True),
-    ):
+    with get_context().override_server_args(enable_deterministic_inference=seeded):
         info = make_info([0.2, 0.6, 0.8])
         before = info.copy_for_forward()
-        before_host = info._tpu_sampling_params[0]
+        before_host = info.host_sampling_params.host
         info.filter_batch([2, 0], torch.empty(2, dtype=torch.int64, device="meta"))
         other = make_info([0.4])
         info.merge_batch(other)
-        host = info._tpu_sampling_params[0]
+        host = info.host_sampling_params.host
         torch.testing.assert_close(
             host["temperatures"].flatten(), torch.tensor([0.8, 0.2, 0.4])
         )
@@ -83,13 +77,12 @@ def test_public_parameters_stay_on_device_and_filter_merge_preserve_order(seeded
         torch.testing.assert_close(
             before_host["temperatures"].flatten(), torch.tensor([0.2, 0.6, 0.8])
         )
-        assert not hasattr(before, "_tpu_sampling_params")
+        assert before.host_sampling_params is None
 
 
-@pytest.mark.parametrize("tpu,staged", [(False, True), (True, False)])
-def test_default_and_ineligible_parameters_keep_base_path(tpu, staged):
-    info = make_info([0.2, 0.8], tpu=tpu, staged=staged)
-    assert not hasattr(info, "_tpu_sampling_params")
+def test_unstaged_batch_keeps_base_path():
+    info = make_info([0.2, 0.8], staged=False)
+    assert info.host_sampling_params is None
     assert info.temperatures.device.type == "meta"
 
 
@@ -100,10 +93,9 @@ def test_mutated_parameters_cannot_use_stale_host_mirror(inplace):
         info.temperatures.add_(1)
     else:
         info.temperatures = torch.tensor([[3.0], [4.0]])
-    assert not host_params.filter_sampling_params(info, [1])
+    assert info._current_host_sampling_params() is None
     expected = info.temperatures[1:].clone()
-    with patch.object(sampling, "_is_tpu", True):
-        info.filter_batch([1], torch.tensor([1]))
+    info.filter_batch([1], torch.tensor([1]))
     torch.testing.assert_close(info.temperatures, expected)
 
 
@@ -193,3 +185,7 @@ def test_mixed_tail_warmup_covers_token_buckets_and_tail_widths():
         )
     assert set(seen) == {(tokens, bs) for tokens in [8, 16] for bs in [1, 2, 3, 4]}
     assert live.tolist() == [99] * 9
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

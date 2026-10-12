@@ -101,11 +101,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     if batch.prefill_input_ids_cpu is not None:
         if _is_tpu and any(batch.multimodal_inputs or ()):
             batch.mm_input_ids_cpu = batch.prefill_input_ids_cpu
-        # Eligible TPU prompts wait for backend bucket padding, including mixed
-        # prompts whose device-produced decode tail is injected after upload.
-        input_device = batch.device
-        if _is_tpu:
-            input_device = getattr(batch, "tpu_input_device", None) or batch.device
+        # Host-staged prompts wait for backend bucket padding; a mixed batch's
+        # device-produced decode tail is written after upload.
+        input_device = batch.batch_input_device or batch.device
         prefill_gpu = batch.prefill_input_ids_cpu.to(input_device, non_blocking=True)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
@@ -117,13 +115,13 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                     future_map.output_tokens_buf,
                     batch.mix_running_indices,
                 )
-            if _is_tpu and input_device == "cpu":
+            if batch.batch_input_device == "cpu":
                 # Arbitrary prompt lengths are padded on the host. Keep relay
                 # tokens on device and write them at runtime offsets afterward.
                 batch.input_ids = torch.cat(
                     [prefill_gpu, prefill_gpu.new_zeros(decode_gpu.numel())]
                 )
-                batch.tpu_mixed_input_tokens = decode_gpu
+                batch.mixed_input_tokens = decode_gpu
             else:
                 batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
@@ -530,8 +528,8 @@ class FutureMap:
         static across steps (offset is a runtime tensor value, not a shape).
         Ported from fork PR #78; elsewhere keep the cheaper setitem.
         """
-        # TPU host-staged metadata must reach the relay device before storing.
-        if _is_tpu and values.device != buf.device:
+        # Host-staged metadata must reach the relay device before storing.
+        if values.device != buf.device:
             values = values.to(device=buf.device, dtype=buf.dtype, non_blocking=True)
         elif values.dtype != buf.dtype:
             values = values.to(buf.dtype)

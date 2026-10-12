@@ -7,16 +7,16 @@ import time
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.model_executor.forward_batch_info import (
+    compute_local_num_token_non_padded,
+)
+from sglang.srt.runtime_context import get_disagg, get_flags
 from sglang_tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    compute_local_num_token_non_padded,
-)
-from sglang.srt.runtime_context import get_disagg, get_flags
 
 logger = logging.getLogger(__name__)
 

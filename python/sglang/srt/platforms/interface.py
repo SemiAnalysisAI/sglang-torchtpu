@@ -19,7 +19,11 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.compilation.support_torch_compile import CompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -113,6 +117,29 @@ class SRTPlatform(DeviceMixin):
     def runs_eager_extend_cp(self) -> bool:
         """Whether the eager runner shards a context-parallel extend itself."""
         return True
+
+    def get_batch_input_device(self, batch: ScheduleBatch) -> Optional[str]:
+        """Device that host-born batch inputs stay on until the forward pads them.
+
+        None keeps the batch on its own device and skips host mirrors.
+        """
+        return None
+
+    def get_vl_decoder_compile_policy_cls(self) -> Optional[type[CompilePolicy]]:
+        """Compile policy for VL language backbones; None leaves them unannotated."""
+        return None
+
+    def precompile_serving_ops(
+        self,
+        *,
+        compile_policy: Optional[CompilePolicy],
+        future_map: FutureMap,
+        spec_algorithm: SpeculativeAlgorithm,
+        max_running_requests: int,
+        vocab_size: int,
+        enable_mixed_chunk: bool,
+    ) -> None:
+        """Warm scheduler-side eager ops that run outside the compiled forward."""
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.

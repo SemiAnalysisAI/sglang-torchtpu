@@ -82,8 +82,8 @@ _TOKEN_FIELD_DIM = {"mrope_positions": -1}
 #   2. Fallback: when that would require changing shared sglang code, let
 #      the tensor reach the TPU as usual and add the extra TPU-to-host copy
 #      here for padding. Do this only for tensors that are not too large.
-# Every field below uses the fallback today, because shared code copies them
-# to the TPU before this step.
+# SGLANG_TPU_HOST_PADDING uses the fallback. SGLANG_TPU_HOST_PADDING_NO_D2H
+# takes option 1 for eligible batches (TpuSRTPlatform.get_batch_input_device).
 _HOST_PAD_TOKEN_FIELDS = frozenset(
     ("input_ids", "positions", "out_cache_loc", "mrope_positions")
 )

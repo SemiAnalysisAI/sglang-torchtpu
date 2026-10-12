@@ -178,7 +178,7 @@ class TestHostPadFieldSelection(CustomTestCase):
 
     def _policy(self):
         return DecoderTpuCompilePolicy(
-            model_runner=SimpleNamespace(),
+            model_runner=SimpleNamespace(device="cpu"),
             t_bucketer=Bucketer(name="Token", buckets=[8]),
             b_bucketer=Bucketer(name="Bs", buckets=[1, 4]),
         )

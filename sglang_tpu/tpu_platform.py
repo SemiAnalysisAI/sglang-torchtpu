@@ -19,8 +19,12 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
+    from sglang.srt.compilation.support_torch_compile import CompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = get_logger(__name__)
 
@@ -935,14 +939,17 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
-    def get_batch_input_device(self, batch) -> str:
+    def get_batch_input_device(self, batch: ScheduleBatch) -> Optional[str]:
         """Place eligible TPU inputs on CPU until decoder padding/materialization."""
-        from sglang_tpu.allocator_tpu import (
-            TpuPagedTokenToKVPoolAllocator,
-        )
+        # Opt-in: off returns None, so batches keep the device-only contract.
+        if not envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get():
+            return None
         from sglang.srt.layers.cp.utils import get_cp_strategy
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
         from sglang.srt.runtime_context import get_exec, get_flags
+        from sglang_tpu.allocator_tpu import (
+            TpuPagedTokenToKVPoolAllocator,
+        )
 
         allocator = batch.token_to_kv_pool_allocator
         host_allocator = type(allocator) is TpuPagedTokenToKVPoolAllocator or (
@@ -975,6 +982,36 @@ class TpuSRTPlatform(SRTPlatform):
         ):
             return "cpu"
         return batch.device
+
+    def get_vl_decoder_compile_policy_cls(self) -> Optional[type[CompilePolicy]]:
+        from sglang_tpu.compilation.decoder_compile_policy import (
+            Qwen3VLDecoderTpuCompilePolicy,
+        )
+
+        return Qwen3VLDecoderTpuCompilePolicy
+
+    def precompile_serving_ops(
+        self,
+        *,
+        compile_policy: Optional[CompilePolicy],
+        future_map: FutureMap,
+        spec_algorithm: SpeculativeAlgorithm,
+        max_running_requests: int,
+        vocab_size: int,
+        enable_mixed_chunk: bool,
+    ) -> None:
+        if not envs.SGLANG_TPU_HOST_PADDING_NO_D2H.get():
+            return
+        from sglang_tpu.serving_op_precompile import precompile_serving_ops
+
+        precompile_serving_ops(
+            compile_policy=compile_policy,
+            future_map=future_map,
+            spec_algorithm=spec_algorithm,
+            max_running_requests=max_running_requests,
+            vocab_size=vocab_size,
+            enable_mixed_chunk=enable_mixed_chunk,
+        )
 
     def supports_torch_compile(self) -> bool:
         return True

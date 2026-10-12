@@ -22,6 +22,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -33,8 +34,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -172,18 +173,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         return hidden_states, aux_hidden_states
 
 
-if is_tpu():
-    from sglang.srt.compilation.support_torch_compile import support_torch_compile
-    from sglang_tpu.compilation.decoder_compile_policy import (
-        Qwen3VLDecoderTpuCompilePolicy,
-    )
-
-    # This backbone is a sibling of the annotated dense Qwen3LLMModel. Without
-    # its own policy, vision precompile suppresses the fallback for the decoder.
-    support_torch_compile(
-        Qwen3MoeLLMModel,
-        policy=Qwen3VLDecoderTpuCompilePolicy,
-    )
+# Sibling of the annotated dense Qwen3LLMModel. Without its own policy, vision
+# precompile suppresses the fallback for the decoder.
+_vl_decoder_policy = current_platform.get_vl_decoder_compile_policy_cls()
+if _vl_decoder_policy is not None:
+    support_torch_compile(Qwen3MoeLLMModel, policy=_vl_decoder_policy)
 
 
 def load_fused_expert_weights(

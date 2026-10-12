@@ -544,8 +544,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
-    # TPU mixed tails stay on device until bucketed input_ids have been uploaded.
-    tpu_mixed_input_tokens: Optional[torch.Tensor] = None
+    # Device-produced mixed decode tail, written after bucketed input_ids upload.
+    mixed_input_tokens: Optional[torch.Tensor] = None
 
     # The write loc before `rebind_write_loc` replaced it with physical
     # ids; a backend re-derives from it into its capture-stable buffer.
@@ -1013,9 +1013,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
-        input_device = model_runner.device
-        if _is_tpu:
-            input_device = getattr(batch, "tpu_input_device", None) or input_device
+        input_device = batch.batch_input_device or model_runner.device
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1023,7 +1021,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_ids=batch.input_ids,
             req_pool_indices=(
                 batch.req_pool_indices_cpu
-                if _is_tpu and input_device == "cpu"
+                if batch.batch_input_device == "cpu"
                 else batch.req_pool_indices
             ),
             seq_lens=batch.seq_lens,
@@ -1037,9 +1035,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,
-            tpu_mixed_input_tokens=(
-                getattr(batch, "tpu_mixed_input_tokens", None) if _is_tpu else None
-            ),
+            mixed_input_tokens=batch.mixed_input_tokens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
@@ -1533,9 +1529,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_decode(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
-        input_device = model_runner.device
-        if _is_tpu:
-            input_device = getattr(batch, "tpu_input_device", None) or input_device
+        input_device = batch.batch_input_device or model_runner.device
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
@@ -1604,9 +1598,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_extend(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
-        input_device = model_runner.device
-        if _is_tpu:
-            input_device = getattr(batch, "tpu_input_device", None) or input_device
+        input_device = batch.batch_input_device or model_runner.device
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
