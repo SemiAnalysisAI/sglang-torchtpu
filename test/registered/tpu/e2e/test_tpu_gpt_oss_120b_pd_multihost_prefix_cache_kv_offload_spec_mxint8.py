@@ -2153,9 +2153,7 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
     def test_device_pool_engages_the_precompile_deadlock_guard(self) -> None:
         from unittest import mock
 
-        from sglang.srt.hardware_backend.tpu.env_override import (
-            apply_small_kv_pool_vmem_prefetch_override,
-        )
+        from sglang_tpu.env_override import apply_small_kv_pool_vmem_prefetch_override
 
         # GPT-OSS-120B has 36 hidden layers. The guard must fire at this pool.
         with mock.patch.dict(os.environ, {"LIBTPU_INIT_ARGS": "--existing=1"}):
