@@ -54,9 +54,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
-    mla_ragged_paged_attention,
-)
 from sglang.test.kernels.tpu_mla_rpa_v2 import (
     MASK_VALUE,
     NUM_Q_HEADS,
@@ -66,6 +63,9 @@ from sglang.test.kernels.tpu_mla_rpa_v2 import (
     ref_attention,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+    mla_ragged_paged_attention,
+)
 
 _NUM_KV_PAGES_PER_BLOCK = (3, 1, 1)
 _NUM_QUERIES_PER_BLOCK = (1, 1, 16)
