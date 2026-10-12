@@ -591,16 +591,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                     cp_logits_installed = True
 
         if self._cp_strategy is not None and not is_draft_worker:
-            if not cp_logits_installed:
+            pp_group = self.model_runner.pp_group
+            if not cp_logits_installed and pp_group.is_last_rank:
                 raise NotImplementedError(
                     "Prefill context parallelism on TPU reduces the last-token rows "
                     "inside the compiled logits step, but "
                     f"{type(self.model_runner.model).__name__} runs its logits "
                     "processor outside the compiled forward."
                 )
-            compile_fn = wrap_cp_embedding_forward(
-                compile_fn, self.model_runner.model.get_input_embeddings()
-            )
+            if pp_group.is_first_rank:
+                compile_fn = wrap_cp_embedding_forward(
+                    compile_fn, self.model_runner.model.get_input_embeddings()
+                )
         if self.tracer == "direct":
             compiled, warmup_async = self._direct_compile(compile_fn)
         else:
