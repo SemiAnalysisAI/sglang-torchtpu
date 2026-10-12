@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -83,6 +84,7 @@ def compiled_op(
     def decorator(fn):
         compiled_fn = None
         use_direct = False
+        signature = inspect.signature(fn)
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -95,11 +97,16 @@ def compiled_op(
                 return fn(*args, **kwargs)
             from jax import tree_util
 
-            args, kwargs = tree_util.tree_map(_canonical_tensor, (args, kwargs))
+            # Bind to fn's signature: positional warmups and keyword callers share a key.
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            args, kwargs = tree_util.tree_map(
+                _canonical_tensor, (bound.args, bound.kwargs)
+            )
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
-                    from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                    from sglang_tpu.compilation.direct_compile import (
                         direct_compile,
                     )
 
@@ -134,8 +141,8 @@ def compiled_op(
 
 def warmup_compiled_op(op: Callable, *args, **kwargs) -> None:
     """Submit output-free warmup to the current queue, or finish immediately."""
-    from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
-    from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+    from sglang_tpu.compilation.pending_call import PendingCall
+    from sglang_tpu.compilation.warmup_queue import (
         current_warmup_queue,
     )
 

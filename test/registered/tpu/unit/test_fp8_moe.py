@@ -7,16 +7,16 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-import sglang.srt.hardware_backend.tpu.fp8_moe as tpu_fp8_moe
-import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op_module
 import sglang.srt.layers.quantization.fp8 as fp8_mod
-from sglang.srt.layers.moe.pallas.fused_moe_op import (
-    _build_fused_moe_op,
-    fused_moe_call,
-)
+import sglang_tpu.fp8_moe as tpu_fp8_moe
+import sglang_tpu.moe.pallas.fused_moe_op as fused_moe_op_module
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.moe.pallas.fused_moe_op import (
+    _build_fused_moe_op,
+    fused_moe_call,
+)
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
@@ -200,12 +200,10 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(captured["activation"], "silu")
         self.assertEqual(captured["global_num_experts"], 0)
         self.assertEqual(captured["expert_group_offset"], 0)
+        # Padded slots (-1) reach the kernel, which drops them.
+        torch.testing.assert_close(captured["topk_weights"], topk_weights)
         torch.testing.assert_close(
-            captured["topk_weights"],
-            torch.tensor([[0.75, 0.0], [1.0, 0.5]], dtype=torch.bfloat16),
-        )
-        torch.testing.assert_close(
-            captured["topk_ids"], torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+            captured["topk_ids"], torch.tensor([[0, -1], [1, 0]], dtype=torch.int32)
         )
 
     def test_fp8_moe_forwards_ep_metadata_multi_rank(self):

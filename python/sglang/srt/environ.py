@@ -201,6 +201,10 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class EnvFloatWithAlias(_DeprecatedEnvFallback, EnvFloat):
+    pass
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -740,6 +744,13 @@ class Envs:
     # Raiden: a decode starts a room's next read as soon as the prefill
     # announces it; 0 starts reads only on the next scheduler poll.
     SGLANG_RAIDEN_LISTENER_START_READ = EnvBool(True)
+    # Raiden: deadline of each KV chunk transfer, not of the whole request; the
+    # closing read counts as a chunk, and a non-chunked transfer is one chunk.
+    # Counted from registration on the prefill and from start_read on the
+    # decode. Set the same on both.
+    SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S = EnvFloatWithAlias(
+        60.0, deprecated_name="SGLANG_RAIDEN_TIMEOUT_S"
+    )
     SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
     )
@@ -1897,6 +1908,8 @@ class Envs:
     # per-length XLA compilations. This adds a blocking TPU-to-CPU-to-TPU copy.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
+    SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill
@@ -1957,7 +1970,9 @@ class Envs:
     # paths instead of gather. When set to 0, this is disabled. When set
     # to a positive integer, this is the threshold for tokens per rank below
     # which the dense matmul path is taken. Suggset to start with 1024 or 2048
-    # and tune from there.
+    # and tune from there. Below it, batches of up to 2048 routed rows also
+    # take the sort-free dense rank route, and one-token batches the
+    # route-meta kernel.
     SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).

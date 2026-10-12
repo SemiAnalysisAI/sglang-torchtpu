@@ -1344,8 +1344,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         w1_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         moe_runner_config = self.moe_runner_config
         if moe_runner_config.apply_router_weight_on_input:
@@ -1368,16 +1368,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # expert_group_offset + num_local_experts). gmm_v2 only touches the rows
         # of expert groups inside that window, so non-local experts cost nothing
         # and no remapping to local IDs is needed. Under EP1 the offset is 0 and
-        # the window spans every expert, so the window check is a no-op.
+        # the window spans every expert, so the window check is a no-op. The
+        # kernel drops IDs outside the global range (TopK's -1 padded tokens).
         global_num_experts = layer.num_local_experts * get_parallel().moe_ep_size
         expert_group_offset = layer.num_local_experts * get_parallel().moe_ep_rank
-        # gmm_v2 indexes its weights by expert ID, so IDs outside the global
-        # range would read out of bounds. Clamp them and zero their routing
-        # weight, so the expert-0 slot they land on contributes nothing.
-        # Defensive: no router on this path emits out-of-range IDs today.
-        valid = (topk_ids >= 0) & (topk_ids < global_num_experts)
-        topk_ids = torch.where(valid, topk_ids, 0)
-        kernel_topk_weights = kernel_topk_weights * valid.to(x.dtype)
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in
@@ -1404,9 +1398,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
         )
         if no_combine:
-            # The kernel masks non-local groups, but invalid IDs mapped to
-            # expert 0 appear local on rank 0. Preserve zero-weight slot masking
-            # before the caller applies per-expert normalization and weights.
+            # The EP kernel masks by ownership only; zero-weight slots stay zero
+            # for the caller's per-expert normalization, as without EP.
             output = torch.where(kernel_topk_weights.unsqueeze(-1) != 0, output, 0)
         return StandardCombineInput(hidden_states=output)
 

@@ -12,7 +12,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -44,8 +44,8 @@ _is_tpu = is_tpu()
 _PP_PD_CONSENSUS_TAG = 0x5050
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.tpu.pp_scheduler import PPDecodeTransferStatus
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang_tpu.pp_scheduler import PPDecodeTransferStatus
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -222,7 +222,7 @@ class SchedulerPPMixin:
     # otherwise over the host channel. Each helper dispatches once; the wait
     # on the output copy event is the same on both.
     def _pp_init_wave(self: Scheduler):
-        from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+        from sglang_tpu.pp_scheduler import (
             build_scheduler_pp_wave,
         )
 
@@ -1185,7 +1185,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=self._pp_tensor_dict_shard_group(),
                     async_send=async_send,
                 )
             )
@@ -1242,12 +1242,16 @@ class SchedulerPPMixin:
                     (tensor_dict, recv_event)
                 )
 
+    def _pp_tensor_dict_shard_group(self: Scheduler) -> Optional[GroupCoordinator]:
+        # None sends whole dicts: TPU dicts go over host gloo, no device all-gather.
+        return None if self._pp_wave is not None else self.attn_tp_group
+
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
-                all_gather_group=(self.attn_tp_group),
+                all_gather_group=self._pp_tensor_dict_shard_group(),
             )
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
@@ -1259,7 +1263,7 @@ class SchedulerPPMixin:
         # there and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=self._pp_tensor_dict_shard_group(),
             keep_on_host=self._pp_wave is not None,
         )
 
@@ -1884,7 +1888,7 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        all_gather_group = self.attn_tp_group
+        all_gather_group = self._pp_tensor_dict_shard_group()
 
         # ---- Prepare send dict ----
         # On NPU, always send something (full output or a lightweight skip
@@ -2106,7 +2110,7 @@ class SchedulerPPMixin:
         if self._pp_wave is not None:
             # Over the wave every stage polls its own receivers and the status
             # carries the failures seen by any stage.
-            from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+            from sglang_tpu.pp_scheduler import (
                 decode_transfer_status,
             )
 
@@ -2183,7 +2187,7 @@ class SchedulerPPMixin:
         if release_rids is not None:
             terminal_rids = release_rids
             if self._pp_wave is not None:
-                from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+                from sglang_tpu.pp_scheduler import (
                     abort_failed_receivers,
                 )
 
