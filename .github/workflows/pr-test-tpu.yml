@@ -93,15 +93,19 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
-            # Kernel-vs-reference suite: kernels, their tests, and the image
-            # toolchain (a jax/libtpu bump changes kernels without a source diff).
+            # Kernel-vs-reference suite: kernels, the load-time prep the MoE cases
+            # run, their references and tests, and the image toolchain (a
+            # jax/libtpu bump changes kernels without a source diff).
             kernel:
-              - 'python/sglang/srt/layers/attention/pallas/**'
-              - 'python/sglang/srt/layers/moe/pallas/**'
-              - 'python/sglang/srt/hardware_backend/tpu/kernels/**'
-              - 'python/sglang/test/tpu/moe_reference.py'
-              - 'python/sglang/test/kernels/tpu_mla_rpa_v2.py'
-              - 'test/registered/tpu/kernel/**'
+              - 'sglang_tpu/attention/pallas/**'
+              - 'sglang_tpu/moe/pallas/**'
+              - 'sglang_tpu/kernels/**'
+              - 'sglang_tpu/fp8_moe.py'
+              - 'sglang_tpu/fp4_moe.py'
+              - 'sglang_tpu/w4a16_moe.py'
+              - 'python/sglang/srt/layers/quantization/mxfp4_tpu_util.py'
+              - 'sglang_tpu/testing/**'
+              - 'test/registered/tpu/kernels/**'
               - 'python/pyproject_tpu.toml'
               - 'docker/tpu.Dockerfile'
               - 'docker/tpu-base.Dockerfile'

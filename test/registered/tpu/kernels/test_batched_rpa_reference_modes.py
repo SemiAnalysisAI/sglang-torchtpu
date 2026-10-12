@@ -88,10 +88,10 @@ class TestBatchedRpaReferenceModes(unittest.TestCase):
         import jax
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.batched_rpa.wrapper import (
+        from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
             ragged_paged_attention,
         )
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ref_ragged_paged_attention,
         )
 
@@ -167,7 +167,7 @@ class TestBatchedRpaReferenceModes(unittest.TestCase):
     def test_fp8_extend_then_mixed(self):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
 
         num_seqs = len(EXTEND_STEP)
         total_pages = num_seqs * PAGES_PER_SEQ + SPARE_PAGES

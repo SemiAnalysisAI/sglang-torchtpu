@@ -98,7 +98,7 @@ def _build_case(
     import jax
     import jax.numpy as jnp
 
-    from sglang.srt.layers.attention.pallas.util import get_dtype_packing
+    from sglang_tpu.attention.pallas.util import get_dtype_packing
 
     is_fp8 = kv_dtype != jnp.bfloat16
     k_scale, v_scale = (K_SCALE, V_SCALE) if is_fp8 else (None, None)
@@ -197,7 +197,7 @@ def _sinks(num_q_heads, seed=0):
 def _reference(case, *, sinks=None, sliding_window=None, soft_cap=None):
     import jax.numpy as jnp
 
-    from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+    from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
         ref_ragged_paged_attention,
     )
 
@@ -233,7 +233,7 @@ class TestRpaV3ReferenceModes(unittest.TestCase):
     ):
         import jax.numpy as jnp
 
-        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             ragged_paged_attention,
         )
 

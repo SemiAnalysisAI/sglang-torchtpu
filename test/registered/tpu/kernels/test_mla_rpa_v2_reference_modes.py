@@ -78,10 +78,10 @@ class TestMlaRpaV2ReferenceModes(unittest.TestCase):
         import jax.numpy as jnp
         import numpy as np
 
-        from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+        from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
             mla_ragged_paged_attention,
         )
-        from sglang.test.kernels.tpu_mla_rpa_v2 import (
+        from sglang_tpu.testing.mla_rpa_v2 import (
             MASK_VALUE,
             NUM_Q_HEADS,
             SM_SCALE,

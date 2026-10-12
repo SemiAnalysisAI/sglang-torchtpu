@@ -18,7 +18,7 @@ What each case checks
    slots, byte-for-byte, with no collateral damage to prefix tokens, to other
    sequences' pages, or to unallocated pages. The one documented exception is
    the sub-word tail past ``kv_len``; see ``assert_cache_write`` in
-   ``sglang.test.kernels.tpu_mla_rpa_v2``.
+   ``sglang_tpu.testing.mla_rpa_v2``.
 
 Metadata mirrors what ``TpuPallasRpaV3AttnBackend._build_metadata`` feeds the
 kernel in production: real (unaligned) ``kv_lens``, a *rectangular*
@@ -54,17 +54,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sglang.test.kernels.tpu_mla_rpa_v2 import (
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
+    mla_ragged_paged_attention,
+)
+from sglang_tpu.testing.mla_rpa_v2 import (
     MASK_VALUE,
     NUM_Q_HEADS,
     SM_SCALE,
     assert_cache_write,
     build_case,
     ref_attention,
-)
-from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
-    mla_ragged_paged_attention,
 )
 
 _NUM_KV_PAGES_PER_BLOCK = (3, 1, 1)

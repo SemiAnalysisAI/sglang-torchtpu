@@ -4,7 +4,7 @@ Small shapes fit in one tile under ``calculate_tiling``, so the per-tile scale
 window (``rhs_scale_index_map``) and the gate/up pairing of a fused activation
 are only exercised at production sizes. Each case pins a ``TileSizes`` that
 splits the dimension under test into several tiles and compares against
-``sglang.test.tpu.moe_reference.gmm_reference`` on the dequantized weights.
+``sglang_tpu.testing.moe_reference.gmm_reference`` on the dequantized weights.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -25,7 +25,7 @@ try:
     import jax
     import jax.numpy as jnp
 
-    from sglang.test.tpu import moe_reference as ref
+    from sglang_tpu.testing import moe_reference as ref
 
     _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 except Exception:  # pragma: no cover - non-TPU host
@@ -61,7 +61,7 @@ class TestGmmV2ReferenceModes(CustomTestCase):
 
     def test_fp8_block_scales_across_k_tiles(self):
         """W8A8 block-128 scales with K split into 4 tiles of 2 scale blocks."""
-        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
         K, N = 1024, 512
         rng = np.random.default_rng(0)
@@ -92,7 +92,7 @@ class TestGmmV2ReferenceModes(CustomTestCase):
     def test_mxfp4_vmem_dequant_across_k_tiles(self):
         """Packed MXFP4 (per-32 e8m0 scales, dequantized in VMEM) with K split
         into 4 tiles of 8 scale groups."""
-        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
         K, N = 1024, 256
         rng = np.random.default_rng(2)
@@ -123,7 +123,7 @@ class TestGmmV2ReferenceModes(CustomTestCase):
     def test_swigluoai_bias_across_n_tiles(self):
         """Fused swigluoai with gate/up biases, each half split into 3 N tiles:
         tile i of the gate must pair with tile i of the up half and its bias."""
-        from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
         K, N = 256, 384
         rng = np.random.default_rng(4)

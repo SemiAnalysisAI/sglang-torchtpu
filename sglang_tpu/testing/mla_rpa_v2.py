@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 
-from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
     align_to,
     get_dtype_packing,
     get_kv_cache_shape,

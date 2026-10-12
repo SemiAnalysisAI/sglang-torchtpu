@@ -3,7 +3,7 @@
 Each case builds weights the way the checkpoint stores them, runs them through
 the production load-time prep where one exists, and feeds the result to
 ``_fused_moe_jax`` with the SparseCore gather on (``fused_moe_call``'s default).
-The reference (``sglang.test.tpu.moe_reference``) dequantizes the checkpoint
+The reference (``sglang_tpu.testing.moe_reference``) dequantizes the checkpoint
 encoding independently, so prep, unpack order, scale indexing, bias, and
 activation drift all land here. Weights are exact in both (vmem-fp8 alone
 rounds them to fp8 by design); the tolerances cover output and activation
@@ -31,7 +31,7 @@ try:
     import jax
     import jax.numpy as jnp
 
-    from sglang.test.tpu import moe_reference as ref
+    from sglang_tpu.testing import moe_reference as ref
 
     _HAS_TPU = any(d.platform == "tpu" for d in jax.devices())
 except Exception:  # pragma: no cover - non-TPU host
@@ -83,7 +83,7 @@ def _run(
     w2_bias=None,
     **kwargs,
 ):
-    from sglang.srt.layers.moe.pallas.fused_moe_op import _fused_moe_jax
+    from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
     out = _fused_moe_jax(
         hidden_states=hidden,
@@ -166,7 +166,7 @@ def _int4_checkpoint(num_experts, hidden, inter, seed):
 
 def _prep_int4(ckpt):
     """Run prepare_tpu_w4a16_moe_weights on a stub layer; return its jnp tensors."""
-    from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+    from sglang_tpu.w4a16_moe import (
         prepare_tpu_w4a16_moe_weights,
     )
 
@@ -363,7 +363,7 @@ class TestFusedMoEReferenceModes(CustomTestCase):
         """Block-128 FP8 checkpoint scales in the default per-column layout
         (fused GMM1) and the compact 128-slot layout (unfused GMM1)."""
         from sglang.srt.environ import envs
-        from sglang.srt.hardware_backend.tpu.fp8_moe import (
+        from sglang_tpu.fp8_moe import (
             _to_tpu_fp8_moe_block_scale_layout,
         )
 
@@ -422,7 +422,7 @@ class TestFusedMoEReferenceModes(CustomTestCase):
     def test_nvfp4_block512_with_split_global_scales(self):
         """NVFP4 through prepare_tpu_nvfp4_moe_weights: separate gate/up global
         scales folded into the block-512 scales, packed W4A8 GMMs."""
-        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+        from sglang_tpu.fp4_moe import (
             prepare_tpu_nvfp4_moe_weights,
         )
 
