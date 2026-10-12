@@ -22,7 +22,7 @@ flowchart LR
   L["load_weights (stock)"] -->|same checkpoint stream| T["WeightTap: per-rank MK weights (host) -> device buffers"]
   F["GptOssModel.forward"] -->|"DECODE, no spec, bucket <= 64"| E["embed_tokens (stock)"]
   E --> S["gptoss_decode_mk_step (1 torch op = XLA glue + megakernel, 36 layers)"]
-  S --> W["36 x gptoss_decode_mk_kv_write (in place, one per layer pool)"]
+  S --> W["gptoss_decode_mk_kv_write_layers (1 call, 36 pools in place)"]
   W --> N["final norm, logits, sampling (stock)"]
   F -->|"everything else"| K["stock layer stack (RPA v3 + gmm_v2)"]
 ```
@@ -57,7 +57,7 @@ flowchart LR
 | Weight source | Tap the checkpoint stream in `load_weights` | Stock TP8/EP8 shards *whole experts*. TP-split MoE needs an I/8 slice of all 128, which only the checkpoint stream (seen whole by every rank) has. Building from loaded params would need a cross-rank all-to-all, and TPU dequantizes stock experts to bf16 anyway. |
 | Weight memory | Separate copy, ~8.7 GiB/rank (`weights.per_rank_bytes`: TP 8.66, EP 8.62 GiB) | See HBM budget below. Sharing would need the stock MoE to run from the same bytes (proposal below). |
 | KV pools | Kernel takes 18 SWA + 18 full **per-layer** pool operands (`split_pools=True`) | Stacking the per-layer tensors would copy the pools every step. torch_tpu needs each pool to be its own base tensor for RPA's donation. Inside the kernel, a static `pl.when` per page-DMA start picks the layer pair's ref; waits only need shapes. |
-| KV write | 36 tiny non-collective Pallas calls, one donated + aliased pool each (the `kv_row_write` pattern) | XLA does not alias outputs of a `collective_id` `pallas_call` into live-out buffers (DESIGN.md). One call with 36 aliased pools would need a `Tensor[]` mutation in the custom-op schema, so it was avoided for v1. Cost estimate ~0.05–0.1 ms/step (unmeasured). |
+| KV write | ONE non-collective Pallas call writes all 36 layers' new K/V; each pool is donated and aliased to its own output, so the torch op mutates 36 pools in place (`SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE=per_layer` gives 36 single-pool calls instead). No `has_side_effects`. | XLA does not alias outputs of a `collective_id` `pallas_call` into live-out buffers (DESIGN.md), so the write is separate from the megakernel. torch_tpu compiles the forward as one SPMD program, and the partitioner rejects unsharded side-effecting custom calls (job j-3f74154c: "Side-effect HLO must have sharding"). Like RPA v3 and `kv_row_write`, the call is kept alive by its aliased outputs. The torch schema marks each pool `Tensor(a!)` through a generated explicit signature. |
 | Page tables | Kernel `max_pages = pages_per_seq` of the RPA table (no context cap, no host-side branch) | Keeps the decision static per compiled graph (`fail_on_recompile` safe). SMEM estimate ~650 KiB at B=64, 131k context (risk below). |
 | RoPE | Gather the stock `cos_sin_cache` at `pos` (bf16, YaRN incl. `truncate`) | `reference.yarn_tables` always truncates the correction range. The GPT-OSS config uses `truncate: false`, so the kernel reference's tables would differ from stock. |
 | When MK runs | `ForwardMode.DECODE`, `spec_info is None`, no `input_embeds`/PP proxy/aux capture, `bs <= 64`, 1 token per request | All are static per compiled graph (mode, shapes), so there is one MK decode graph per batch bucket. EXTEND/MIXED/IDLE/verify/draft run the stock stack. |
@@ -102,7 +102,7 @@ devices, Pallas interpret mode:
    - torch_tpu custom-op mechanics: a `cpu_export_jax_op` with 53 operands under `shard_map`
      with `P()` per-rank blocks, the remote-DMA kernel inside the compiled decode graph next
      to stock collectives (same `collective_id` 0), and the donation of 36 pools by the
-     write op.
+     single write op (no pool copies is expected but unverified; check HBM and HLO).
    - Compile time per bucket, VMEM/SMEM at real dims with `split_pools`. The AOT results in
      DESIGN.md are for stacked pools and `max_pages <= 513`. The serving config uses
      `max_pages = pages_per_seq ≈ 2050` (128k context). That is ~650 KiB SMEM at B=64; it may
@@ -123,7 +123,7 @@ devices, Pallas interpret mode:
    - Golden outputs and GSM8K in the job are the check.
 4. **Performance gaps (v1)**:
    - Padding rows of a bucket are routed like real rows. Stock gmm also computes them.
-   - There are 36 extra small kernel launches for the KV writes.
+   - The KV writes are one extra small kernel launch per step.
    - The MK weights are a second copy.
    - The kernel's long-context × large-batch attention defect (T21 log) applies unchanged.
    - Load time (measured on a Mac CPU, 4 threads): the MXFP4 repack is ~0.1 s/layer.

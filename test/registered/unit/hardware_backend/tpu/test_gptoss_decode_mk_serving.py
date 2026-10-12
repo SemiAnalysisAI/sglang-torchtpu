@@ -413,6 +413,45 @@ class TestDecodeMapping(unittest.TestCase):
             want[int(pg[b]), int(off[b])] = np.asarray(kvn[b].astype(jnp.float32))
         np.testing.assert_array_equal(np.asarray(out.astype(jnp.float32)), want)
 
+    def test_kv_write_layers_matches_per_layer(self):
+        L, B, page, pk = 4, 3, 64, 4
+        rng = np.random.default_rng(2)
+        c = A.trace_config(
+            _cfg(B=1, L=L),
+            B=B,
+            pps=4,
+            kv_dtype=jnp.float8_e4m3fn,
+            nb_swa=5,
+            nb_full=7,
+            page=page,
+        )
+        pools = [
+            jnp.asarray(
+                rng.normal(size=((5 if i < L // 2 else 7), page, 1, pk, 128)),
+                jnp.float8_e4m3fn,
+            )
+            for i in range(L)
+        ]
+        kvn = jnp.asarray(rng.normal(size=(L, 16, 1, pk, 128)), jnp.float8_e4m3fn)
+        newpg = jnp.asarray([1, 4, 0, 6, 2, 0], jnp.int32)  # SWA pages | full pages
+        off = jnp.asarray([5, 63, 0], jnp.int32)
+        got = jax.jit(
+            lambda n, o, k, *p: A.kv_write_layers(n, o, k, *p, interpret=True)
+        )(newpg, off, kvn, *pools)
+        want = A.kv_write_all(c, newpg, off, kvn, pools, interpret=True)
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(
+                np.asarray(g.astype(jnp.float32)), np.asarray(w.astype(jnp.float32))
+            )
+        # an unsharded side-effecting custom call breaks torch_tpu's SPMD compile
+        for f, args in (
+            (A.kv_write_layers, (newpg, off, kvn, *pools)),
+            (A.kv_write, (newpg[:B], off, kvn[0], pools[0])),
+        ):
+            hlo = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+            self.assertIn("tpu_custom_call", hlo)
+            self.assertNotIn("has_side_effect = true", hlo)
+
 
 def _rel(a, b):
     a = np.asarray(jnp.asarray(a).astype(jnp.float32))
@@ -485,7 +524,10 @@ class TestEndToEndTinyStep(unittest.TestCase):
             out, kvn, newpg, off = A.per_rank_step(
                 c, rank[0], x, kvl, pi, spi, cs, w, pl_, interpret=True
             )
-            new_pools = A.kv_write_all(c, newpg, off, kvn, pl_, interpret=True)
+            if moe_mode == "tp":  # serving default: all layers in one call
+                new_pools = A.kv_write_layers(newpg, off, kvn, *pl_, interpret=True)
+            else:
+                new_pools = A.kv_write_all(c, newpg, off, kvn, pl_, interpret=True)
             return (out, *[p[None] for p in new_pools])
 
         f = jax.jit(
@@ -627,6 +669,13 @@ class TestRuntimeGating(unittest.TestCase):
                 os.environ.pop(RT.ENV_ENABLE, None)
             else:
                 os.environ[RT.ENV_ENABLE] = old
+
+    def test_kv_write_layers_op_schema(self):
+        names = ["newpg", "off", "kvn"] + [f"kv_{i}" for i in range(36)]
+        f = self.RT._mutating_op_fn(names, lambda *a: None)
+        schema = torch.library.infer_schema(f, mutates_args=tuple(names[3:]))
+        self.assertIn("Tensor newpg, Tensor off, Tensor kvn, Tensor(a3!) kv_0", schema)
+        self.assertIn("Tensor(a38!) kv_35) -> ()", schema)
 
     def test_generated_op_signature(self):
         import inspect

@@ -162,17 +162,21 @@ def per_rank_step(
 
 
 # ----------------------------------------------------------------------------- KV write
+#
+# No `has_side_effects`: torch_tpu compiles the forward as one SPMD program, and the XLA
+# SPMD partitioner requires a sharding on side-effecting custom calls (RET_CHECK
+# "Side-effect HLO must have sharding", job j-3f74154c). Like the stock in-place kernels
+# (RPA v3's cache update, kv_row_write) the call is kept alive by its aliased output,
+# which the torch op exposes as a mutation of the pool.
 
 
-def _kv_write_kernel(pg_s, off_s, kvn, pool_in, pool, sem):
-    """Write row b of ``kvn [BR, 1, packing, 128]`` into ``pool[pg[b], off[b]]`` for b < B:
-    start every DMA, then wait for all (one HBM->HBM DMA of one token per row)."""
-    del pool_in
-    B = pg_s.shape[0]
+def _write_rows(B, kvn_rows, pool, pg_of, off_s, sem):
+    """Start one HBM->HBM DMA per live row b < B (row b of ``kvn_rows`` -> ``pool[pg_of(b),
+    off[b]]``), then wait for all of them."""
 
     def cp(b):
         return pltpu.make_async_copy(
-            kvn.at[pl.ds(b, 1)], pool.at[pg_s[b], pl.ds(off_s[b], 1)], sem.at[0]
+            kvn_rows(b), pool.at[pg_of(b), pl.ds(off_s[b], 1)], sem.at[0]
         )
 
     def start(b, carry):
@@ -185,6 +189,18 @@ def _kv_write_kernel(pg_s, off_s, kvn, pool_in, pool, sem):
 
     lax.fori_loop(0, B, start, 0)
     lax.fori_loop(0, B, wait, 0)
+
+
+def _kv_write_kernel(pg_s, off_s, kvn, pool_in, pool, sem):
+    del pool_in
+    _write_rows(
+        off_s.shape[0],
+        lambda b: kvn.at[pl.ds(b, 1)],
+        pool,
+        lambda b: pg_s[b],
+        off_s,
+        sem,
+    )
 
 
 def kv_write(pg, off, kvn, pool, *, interpret: bool = False):
@@ -202,19 +218,54 @@ def kv_write(pg, off, kvn, pool, *, interpret: bool = False):
         out_specs=hbm,
         scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
         input_output_aliases={3: 0},
-        compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="gptoss_decode_mk_kv_write",
     )(pg.astype(I32), off.astype(I32), kvn, pool)
 
 
+def kv_write_layers(newpg, off, kvn, *pools, interpret: bool = False):
+    """All layers' new K/V in ONE call: ``pools`` in ``pool_layer_order`` (L/2 SWA, then L/2
+    full), each aliased to its own output, so every pool is updated in place.
+
+    newpg [2B] i32 (SWA pages, then full pages); off [B] i32; kvn [L, BR, 1, packing, 128].
+    Returns the L updated pools (aliases of the inputs).
+    """
+    L = len(pools)
+    order = pool_layer_order(L)
+    B = off.shape[0]
+
+    def kernel(pg_s, off_s, kvn_ref, *refs):
+        outs, sem = refs[L : 2 * L], refs[2 * L]
+        for i, layer in enumerate(order):  # static: one DMA batch per pool
+            base = 0 if layer % 2 == 0 else B  # sliding (even) layers use the SWA pages
+            _write_rows(
+                B,
+                lambda b, layer=layer: kvn_ref.at[layer, pl.ds(b, 1)],
+                outs[i],
+                lambda b, base=base: pg_s[base + b],
+                off_s,
+                sem,
+            )
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        kernel,
+        out_shape=tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in pools),
+        in_specs=[smem, smem, hbm] + [hbm] * L,
+        out_specs=tuple([hbm] * L),
+        scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
+        input_output_aliases={3 + i: i for i in range(L)},
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="gptoss_decode_mk_kv_write_layers",
+    )(newpg.astype(I32), off.astype(I32), kvn, *pools)
+
+
 def kv_write_all(c: DecodeConfig, newpg, off, kvn, pools, *, interpret: bool = False):
-    """Reference composition of the per-layer writes (tests; the serving path issues one
-    torch op per layer so each pool tensor is mutated in place)."""
+    """Reference composition of the per-layer writes (tests)."""
     B = c.B
     out = []
-    for i, p in enumerate(pools):
-        layer = 2 * i if i < c.L // 2 else 2 * (i - c.L // 2) + 1
+    for p, layer in zip(pools, pool_layer_order(c.L)):
         pg = newpg[:B] if c.sliding[layer] else newpg[B:]
         out.append(kv_write(pg, off, kvn[layer], p, interpret=interpret))
     return out

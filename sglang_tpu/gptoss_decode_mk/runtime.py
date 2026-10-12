@@ -40,6 +40,10 @@ STEP_OP_NAME = "sglang_tpu_pallas::gptoss_decode_mk_step"
 KV_WRITE_OP_NAME = "sglang_tpu::gptoss_decode_mk_kv_write"
 _STEP_OPS: dict = {}
 _KV_WRITE_OP = None
+_KV_WRITE_LAYERS_OPS: dict = {}
+# "layers" (default): one Pallas call writes all layers' K/V (L aliased pools);
+# "per_layer": one call per layer pool
+ENV_KV_WRITE = "SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE"
 
 
 def enabled_by_env() -> bool:
@@ -291,6 +295,55 @@ def get_kv_write_op():
     return _KV_WRITE_OP
 
 
+def _mutating_op_fn(names: list[str], body):
+    """A function ``(name0: Tensor, ...) -> None`` calling ``body(*args)``: torch's custom-op
+    schema inference needs explicit parameters to mark each pool as mutated."""
+    params = ", ".join(f"{n}: torch.Tensor" for n in names)
+    src = f"def gptoss_decode_mk_kv_write_layers({params}) -> None:\n    _body({', '.join(names)})\n"
+    ns: dict[str, Any] = {"torch": torch, "_body": body}
+    code = compile(src, "<gptoss_decode_mk_kv_write_layers>", "exec", dont_inherit=True)
+    exec(code, ns)  # noqa: S102 - static, generated from a fixed name list
+    return ns["gptoss_decode_mk_kv_write_layers"]
+
+
+def get_kv_write_layers_op(L: int):
+    """Torch op ``kv_write_layers(newpg [2B], off [B], kvn [L, BR, 1, packing, 128],
+    kv_0, ..., kv_{L-1})`` mutating all L pools in place with ONE Pallas call (each pool
+    donated and aliased to its own output, as RPA v3 does for its single pool)."""
+    if L in _KV_WRITE_LAYERS_OPS:
+        return _KV_WRITE_LAYERS_OPS[L]
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.gptoss_decode_mk import adapter as A
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    def _kv_write_layers(newpg, off, kvn, *pools):
+        return A.kv_write_layers(newpg, off, kvn, *pools)
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _kv_write_layers,
+        name=f"jax_gptoss_decode_mk_kv_write_layers_{L}",
+        donate_argnums=tuple(range(3, 3 + L)),
+        input_output_aliases={3 + i: i for i in range(L)},
+        warn_deprecated=False,
+    )
+    names = ["newpg", "off", "kvn"] + [f"kv_{i}" for i in range(L)]
+
+    def body(*args):
+        with tpu_info_for_cpu_export():
+            jax_kernel(*args)
+
+    op = torch.library.custom_op(
+        f"{KV_WRITE_OP_NAME}_layers_{L}",
+        _mutating_op_fn(names, body),
+        mutates_args=tuple(names[3:]),
+        device_types=["tpu"],
+    )
+    op.register_fake(_mutating_op_fn(names, lambda *a: None))
+    _KV_WRITE_LAYERS_OPS[L] = op
+    return op
+
+
 # ----------------------------------------------------------------------------- module
 
 
@@ -313,14 +366,18 @@ class GptOssDecodeMK(nn.Module):
         )
         # register the ops eagerly, outside any torch.compile trace
         self._step_op = get_step_op(c, tp_size)
-        self._kv_write_op = get_kv_write_op()
+        self.kv_write_mode = os.environ.get(ENV_KV_WRITE, "layers").strip().lower()
+        if self.kv_write_mode == "per_layer":
+            self._kv_write_op = get_kv_write_op()
+        else:
+            self.kv_write_mode = "layers"
+            self._kv_write_op = get_kv_write_layers_op(c.L)
         from sglang.srt.model_executor.forward_context import get_attn_backend
         from sglang_tpu.gptoss_decode_mk.adapter import pool_layer_order
 
         self._get_attn_backend = get_attn_backend
-        self.layer_ids = pool_layer_order(
-            c.L
-        )  # pool operand order: SWA, then full layers
+        # pool operand order: SWA, then full layers
+        self.layer_ids = pool_layer_order(c.L)
 
     @staticmethod
     def applies(
@@ -399,9 +456,14 @@ class GptOssDecodeMK(nn.Module):
             *pools,
         )
         B = x.shape[0]
-        pg_swa, pg_full = newpg[:B], newpg[B:]
-        for i, l in enumerate(self.layer_ids):
-            self._kv_write_op(pg_swa if l % 2 == 0 else pg_full, off, kvn[l], pools[i])
+        if self.kv_write_mode == "layers":
+            self._kv_write_op(newpg, off, kvn, *pools)
+        else:
+            pg_swa, pg_full = newpg[:B], newpg[B:]
+            for i, l in enumerate(self.layer_ids):
+                self._kv_write_op(
+                    pg_swa if l % 2 == 0 else pg_full, off, kvn[l], pools[i]
+                )
         # the stock stack's residual stream is not used on this path
         forward_batch.residual_stream = None
         return model.norm(hidden)
