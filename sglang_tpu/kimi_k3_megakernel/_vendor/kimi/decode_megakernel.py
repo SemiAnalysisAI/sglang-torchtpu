@@ -3664,6 +3664,12 @@ def stack(
     tokens_per_pair = batch_size // 4 if attention_token_scatter else 0
     cache_handoff_head_count = max(3, 8 // math.gcd(mla_cache_batch_tile_size, 8))
     hidden_size = prefix.shape[-1]
+    # SGLANG-PATCH: the state arrays may hold more rows than the batch tile;
+    # the step reads and writes only rows [0, batch_size) (or [0, sequences)).
+    if any(state.shape[0] < batch_size for state in states[:2]) or any(
+        state.shape[0] < sequences for state in states[2:]
+    ):
+        raise ValueError("State arrays must hold at least the batch rows")
     persist_kda_state = batch_size <= 4
     overlap_kda_state_reads = batch_size in (6, 8)
     overlap_kda_state_writes = batch_size in (6, 8)
@@ -3757,7 +3763,8 @@ def stack(
         def kda_state_source(ref, state_index):
             if select_state_row:
                 return ref.at[pl.ds(selected_state_row, 1), state_index]
-            return ref.at[:, state_index]
+            # SGLANG-PATCH: rows [0, batch_size) of the R-row state arrays.
+            return ref.at[pl.ds(0, batch_size), state_index]
 
         def kda_state_destination(vmem):
             return vmem.at[pl.ds(0, 1)] if select_state_row else vmem
@@ -4098,15 +4105,18 @@ def stack(
                     copy.wait()
 
                 def execute(history_vmem, state_vmem, state_semaphores, state_reads=()):
+                    # SGLANG-PATCH: write back only rows [0, batch_size).
                     state_writes = (
                         tpu.make_async_copy(
                             history_vmem,
-                            convolution_output_ref.at[:, state_index],
+                            convolution_output_ref.at[
+                                pl.ds(0, batch_size), state_index
+                            ],
                             state_semaphores.at[0],
                         ),
                         tpu.make_async_copy(
                             state_vmem,
-                            recurrent_output_ref.at[:, state_index],
+                            recurrent_output_ref.at[pl.ds(0, batch_size), state_index],
                             state_semaphores.at[1],
                         ),
                     )
@@ -4262,17 +4272,18 @@ def stack(
                             key_value_norm_vmem,
                             pool_semaphores,
                         ),
-                        key_cache_ref=key_ref.at[:, state_index],
-                        value_cache_ref=value_ref.at[:, state_index],
+                        # SGLANG-PATCH: rows [0, sequences) of the R-row caches.
+                        key_cache_ref=key_ref.at[pl.ds(0, sequences), state_index],
+                        value_cache_ref=value_ref.at[pl.ds(0, sequences), state_index],
                         workspace=MultiHeadLatentAttentionWorkspace(*workspace[4:]),
                         communication_workspace=communication_workspace,
                         updated_key_cache_ref=(
-                            key_output_ref.at[:, state_index]
+                            key_output_ref.at[pl.ds(0, sequences), state_index]
                             if mla_cache_write_in_attend
                             else None
                         ),
                         updated_value_cache_ref=(
-                            value_output_ref.at[:, state_index]
+                            value_output_ref.at[pl.ds(0, sequences), state_index]
                             if mla_cache_write_in_attend
                             else None
                         ),
@@ -4629,15 +4640,20 @@ def stack(
                     @pl.when((layer_index % 4 != 3) & (layer_index != 92))
                     def drain_state_writes():
                         state_index = layer_index - layer_index // 4
+                        # SGLANG-PATCH: must match the write starts' rows.
                         state_writes = (
                             tpu.make_async_copy(
                                 convolution_history_vmem,
-                                convolution_output_ref.at[:, state_index],
+                                convolution_output_ref.at[
+                                    pl.ds(0, batch_size), state_index
+                                ],
                                 auxiliary_semaphores.at[0],
                             ),
                             tpu.make_async_copy(
                                 recurrent_state_vmem,
-                                recurrent_output_ref.at[:, state_index],
+                                recurrent_output_ref.at[
+                                    pl.ds(0, batch_size), state_index
+                                ],
                                 auxiliary_semaphores.at[1],
                             ),
                         )
@@ -5309,9 +5325,10 @@ def make_decode(
         states = jax.tree.map(lambda x: x[0], states)
         if token.shape != (batch_size,) or position.shape != (batch_size,):
             raise ValueError("Token and position arrays must match the batch size")
-        if any(state.shape[0] != batch_size for state in states[:2]):
+        # SGLANG-PATCH: state arrays may hold more rows than the batch tile.
+        if any(state.shape[0] < batch_size for state in states[:2]):
             raise ValueError("KDA states must have a leading batch dimension")
-        if any(state.shape[0] != sequences for state in states[2:]):
+        if any(state.shape[0] < sequences for state in states[2:]):
             raise ValueError("MLA caches must have a leading sequence dimension")
         result = decode_local(
             weights,

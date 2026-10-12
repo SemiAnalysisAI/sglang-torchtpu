@@ -89,6 +89,20 @@ measured at ~1k context; at 8k context its vector-unit decode attention adds an 
      at EP 8.**
    - libtpu 0.0.47 has `xla_tpu_debug_sflag_wait_timeout_ms` /
      `xla_tpu_debug_sflag_wait_shalt_on_detection` for diagnosing a hung communicating kernel.
+6. Premise check (adversarial, CPU), four of eight answers in, all "true with conditions":
+   - **MLA handoff:** expanded K/V = SGLang's cached latent row `@ m_kb[layer]` (no extra
+     norm); key = `[E[h, 0:128] | latent[512:576] | 0^64]`, value = `E[h, 128:256]`. Needs a
+     bf16 KV cache (no fp8), DCP 1, conversion of exactly the committed length, and the
+     request diverted before the overlap scheduler puts it in an SGLang decode batch.
+   - **KDA handoff:** bit-exact; conv = MambaPool conv row reshaped to `[3,3,3,128]` and cast
+     f32→bf16 (lossless), recurrent copied as is; layer map `l = i + i // 3`.
+   - **EP8 load:** `--tp-size 32 --ep-size 8` needs no code change (pallas_tpu MoE backend,
+     no DP attention / EPLB); never run before.
+   - **Rows subset:** 10 ref sites + a guard, not 3 (see §5). Missing the persist-mode drain
+     waits passes every CPU check and would only fail on TPU. With the full patch, the
+     Mosaic module for R = 8 rows at B in {1, 2, 4} equals the native B-row module after
+     renaming the state memref types; R = B is byte-identical to upstream.
+   Still pending: expert-byte equivalence, scheduler seams, memory, in-place donation.
 
 ## 4. Design
 
@@ -134,7 +148,8 @@ donation through the bridge) was running when this snapshot was taken.
 
 | Path | What |
 |---|---|
-| `sglang_tpu/kimi_k3_megakernel/_vendor/` | Upstream `collectives32.py`, `pool_alias.py`, `kimi/__init__.py`, `kimi/decode_megakernel.py`, `kimi/load.py`, Apache-2.0 headers; only change so far: package-relative imports (`SGLANG-PATCH`) |
+| `sglang_tpu/kimi_k3_megakernel/_vendor/` | Upstream `collectives32.py`, `pool_alias.py`, `kimi/__init__.py`, `kimi/decode_megakernel.py`, `kimi/load.py`, Apache-2.0 headers. `SGLANG-PATCH` changes: package-relative imports; rows-subset (the step reads/writes rows `[0, B)` of `R >= B`-row states: KDA state reads, write starts and drain waits, MLA cache refs, `make_decode` checks relaxed to `<`, plus a guard in `stack()`). Exported once on CPU at B = 1, R = 8 (one Mosaic module); the module-equality test is not written yet |
+| `sglang_tpu/kimi_k3_megakernel/program.py` | The step as one flat jax function for the torch bridge: shard_map over `decode_local`, states `[R, ...]` per rank donated and aliased to outputs 1–4, logits all-gathered to `[B, vocab]`; `decode_options` (upstream recipes), `state_shapes`, `layer_counts`. **Written, never run** |
 | `sglang_tpu/kimi_k3_megakernel/slots.py` | Dense row table: request → megakernel row, compaction moves on release, `row_bucket()` |
 | `sglang_tpu/kimi_k3_megakernel/weights.py` | Dense-family loader from the checkpoint (per rank, base tensors), exact f32→E8M0 scale conversion, SGLang→megakernel expert family mapping (**blocked on the stacking problem above**) |
 | `test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_slots.py` | Slot table tests incl. a 5,000-step churn simulation |
@@ -201,8 +216,16 @@ hang-diagnostic flags.
 ## 9. Next steps
 
 1. Finish the premise check and fix the design where it fails (expert stacking first).
-2. Vendored kernel patches: rows `[0, B)` of `max_rows`-row state tensors; in-kernel
-   uint8→uint32 expert ref bitcast; live-row mask so padded rows stream no experts.
+2. Vendored kernel patches: rows `[0, B)` of `max_rows`-row state tensors (**applied**;
+   add the CPU test: export R = 8 vs R = B for B in {1, 2, 4}, compare Mosaic text after
+   renaming `memref<8x(69|24)x` to `memref<Bx..>`, and assert no `.at[:, state_index]`
+   remains); in-kernel uint8→uint32 expert ref bitcast; live-row mask so padded rows stream
+   no experts.
+2b. Torch op for `program.py`: register with the bridge plus a custom op that marks the four
+   states mutated (GDN pattern: `donate_argnums` + `input_output_aliases`, fake returns
+   logits only); confirm on CPU the export carries `tf.aliasing_output` on the states.
+   Open choice: mesh in torch-rank order (shares SGLang's EP8 experts as is) differs from
+   upstream's physical order inside a host; measure on TPU.
 3. Handoff op (SGLang latent + MambaPool → megakernel row), verified on CPU against the
    vendored reference math.
 4. Model-side integration: decode-mode routing for buckets ≤ 8 in `kimi_k3.py`, slot
