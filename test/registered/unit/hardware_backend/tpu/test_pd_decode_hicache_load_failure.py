@@ -91,34 +91,37 @@ def _ack(anchor, failed):
     return SimpleNamespace(node_ids=[anchor], finish_event=_event(failed))
 
 
-def _dr(event=None, status=HiCacheRestoreResult.READY, index=0):
-    dr = SimpleNamespace(
-        hicache_restored_node=object(),
-        hicache_load_consumer_index=index,
-        hicache_restore_status=status,
+def _dr(index, status=HiCacheRestoreResult.READY):
+    return SimpleNamespace(
+        hicache_load_consumer_index=index, hicache_restore_status=status
     )
-    if event is not None:
-        dr._tpu_load_back_event = event
-    return dr
 
 
 class TestFailRestores(CustomTestCase):
     def test_restore_of_a_failed_load_is_failed_not_ready(self):
         failed, ok = _event(True), _event(False)
         failed.failed, ok.failed = True, False
-        queue = SimpleNamespace(tree_cache=_Cache([]))
-        dr_failed, dr_ok = _dr(failed), _dr(ok)
-        lf._fail_restores_of_failed_loads(queue, [dr_failed, dr_ok])
+        cache = _Cache([])
+        cache.cache_controller.layer_done_counter.events[:] = [failed, ok]
+        dr_failed, dr_ok = _dr(0), _dr(1)
+        lf._fail_restores_of_failed_loads(
+            SimpleNamespace(tree_cache=cache), [dr_failed, dr_ok]
+        )
         self.assertEqual(dr_failed.hicache_restore_status, HiCacheRestoreResult.FAILED)
         self.assertEqual(dr_ok.hicache_restore_status, HiCacheRestoreResult.READY)
 
-    def test_binds_the_event_its_load_was_issued_with(self):
+    def test_leaves_restores_without_a_load_and_pending_ones(self):
+        failed = _event(True)
+        failed.failed = True
         cache = _Cache([])
-        event = _event(False)
-        cache.cache_controller.layer_done_counter.events[1] = event
-        dr = _dr(status=HiCacheRestoreResult.PENDING, index=1)
-        lf._fail_restores_of_failed_loads(SimpleNamespace(tree_cache=cache), [dr])
-        self.assertIs(dr._tpu_load_back_event, event)
+        cache.cache_controller.layer_done_counter.events[:] = [failed, None]
+        no_load = _dr(-1)
+        pending = _dr(0, status=HiCacheRestoreResult.PENDING)
+        lf._fail_restores_of_failed_loads(
+            SimpleNamespace(tree_cache=cache), [no_load, pending]
+        )
+        self.assertEqual(no_load.hicache_restore_status, HiCacheRestoreResult.READY)
+        self.assertEqual(pending.hicache_restore_status, HiCacheRestoreResult.PENDING)
 
 
 class TestReleaseFailedLoads(CustomTestCase):
