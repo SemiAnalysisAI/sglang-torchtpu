@@ -13,17 +13,57 @@ Prints {"include": [{"id", "size", "label"}, ...]}; writes the per-shard file
 list to $GITHUB_STEP_SUMMARY when set.
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import json
 import math
 import os
+from typing import Protocol, Sequence, TypedDict
 
 from ci_register_loader import ci_register as _ci_register
 
 
-def suite_tests(suite, tests_dir="test/registered", *, nightly=False, test_file=""):
-    """Enabled TPU tests of a suite, filtered the way run_suite.py filters them."""
+class RegisteredTest(Protocol):
+    """Fields read here from a ci_register.CIRegistry (loaded without sglang)."""
+
+    filename: str
+    est_time: float
+
+
+class ShardRow(TypedDict):
+    """One GitHub matrix leg.
+
+    Attributes:
+      id: 0-based shard index, passed as partition_id.
+      size: Total shard count, passed as partition_size.
+      label: Human-readable "<id + 1>-of-<size>", used in job and JobSet names.
+    """
+
+    id: int
+    size: int
+    label: str
+
+
+def suite_tests(
+    suite: str,
+    tests_dir: str = "test/registered",
+    *,
+    nightly: bool = False,
+    test_file: str = "",
+) -> list[RegisteredTest]:
+    """Collects the enabled TPU tests of a suite, filtered like run_suite.py.
+
+    Args:
+      suite: Registered suite name, e.g. stage-a-test-tpu-unit.
+      tests_dir: Root scanned recursively for registered test files.
+      nightly: Select the suite's nightly registrations instead of per-commit.
+      test_file: If set, keep only this file.
+
+    Returns:
+      The matching registrations, in discovery order.
+    """
     files = [
         path
         for path in glob.glob(os.path.join(tests_dir, "**", "*.py"), recursive=True)
@@ -47,12 +87,39 @@ def suite_tests(suite, tests_dir="test/registered", *, nightly=False, test_file=
     return tests
 
 
-def partition_count(tests, target_seconds, max_partitions):
+def partition_count(
+    tests: Sequence[RegisteredTest], *, target_seconds: float, max_partitions: int
+) -> int:
+    """Returns the shard count: total est_time / target_seconds, in [1, max]."""
     total = sum(test.est_time for test in tests)
     return max(1, min(max_partitions, math.ceil(total / target_seconds)))
 
 
-def main():
+def matrix_rows(size: int) -> list[ShardRow]:
+    """Builds the GitHub matrix include list for size shards."""
+    return [
+        ShardRow(id=rank, size=size, label=f"{rank + 1}-of-{size}")
+        for rank in range(size)
+    ]
+
+
+def _write_summary(
+    path: str, *, suite: str, shards: Sequence[Sequence[RegisteredTest]]
+) -> None:
+    """Appends each shard's file list to the step summary as collapsible blocks."""
+    size = len(shards)
+    with open(path, "a") as f:
+        f.write(f"## {suite}: {size} shard(s)\n\n")
+        for rank, shard in enumerate(shards):
+            est = sum(test.est_time for test in shard)
+            f.write(f"<details><summary>{rank + 1}/{size} ")
+            f.write(f"({len(shard)} files, est {est:.0f}s)</summary>\n\n")
+            for test in sorted(shard, key=lambda t: t.filename):
+                f.write(f"- `{test.filename}`\n")
+            f.write("\n</details>\n\n")
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", required=True)
     ap.add_argument("--nightly", action="store_true")
@@ -68,31 +135,18 @@ def main():
     tests = suite_tests(a.suite, a.tests_dir, nightly=a.nightly)
     if not tests:
         ap.error(f"suite {a.suite!r} has no enabled TPU tests")
-    size = partition_count(tests, a.target_seconds, a.max_partitions)
-    shards = [_ci_register.auto_partition(tests, rank, size) for rank in range(size)]
+    size = partition_count(
+        tests, target_seconds=a.target_seconds, max_partitions=a.max_partitions
+    )
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
-        with open(summary, "a") as f:
-            f.write(f"## {a.suite}: {size} shard(s)\n\n")
-            for rank, shard in enumerate(shards):
-                est = sum(test.est_time for test in shard)
-                f.write(f"<details><summary>{rank + 1}/{size} ")
-                f.write(f"({len(shard)} files, est {est:.0f}s)</summary>\n\n")
-                for test in sorted(shard, key=lambda t: t.filename):
-                    f.write(f"- `{test.filename}`\n")
-                f.write("\n</details>\n\n")
+        shards = [
+            _ci_register.auto_partition(tests, rank, size) for rank in range(size)
+        ]
+        _write_summary(summary, suite=a.suite, shards=shards)
 
-    print(
-        json.dumps(
-            {
-                "include": [
-                    {"id": rank, "size": size, "label": f"{rank + 1}-of-{size}"}
-                    for rank in range(size)
-                ]
-            }
-        )
-    )
+    print(json.dumps({"include": matrix_rows(size)}))
 
 
 if __name__ == "__main__":

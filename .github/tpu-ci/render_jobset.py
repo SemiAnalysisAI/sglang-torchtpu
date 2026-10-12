@@ -30,6 +30,8 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
        render_jobset.py --suite <name> --print-wait-seconds
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re
@@ -95,14 +97,27 @@ def single_test_name(files):
 
 
 def suite_wait_seconds(
-    suite,
-    tests_dir="test/registered",
+    suite: str,
+    tests_dir: str = "test/registered",
     *,
-    nightly=False,
-    test_file="",
-    partition_id=None,
-    partition_size=None,
-):
+    nightly: bool = False,
+    test_file: str = "",
+    partition_id: int | None = None,
+    partition_size: int | None = None,
+) -> int:
+    """Returns the poll budget (s) for a suite or one of its shards.
+
+    Args:
+      suite: Registered suite name.
+      tests_dir: Root scanned recursively for registered test files.
+      nightly: Budget the suite's nightly registrations.
+      test_file: If set, budget only this file.
+      partition_id: Shard index; required when partition_size is set.
+      partition_size: Shard count, or None for the whole suite.
+
+    Returns:
+      max(sum(est_time) * _WAIT_MARGIN, _WAIT_FLOOR_SECONDS).
+    """
     tests = suite_tests(suite, tests_dir, nightly=nightly, test_file=test_file)
     if partition_size is not None:
         tests = _ci_register.auto_partition(tests, partition_id, partition_size)

@@ -1,5 +1,7 @@
 """Check shard planning for the sharded TPU unit suite."""
 
+from __future__ import annotations
+
 import json
 import shutil
 import subprocess
@@ -14,7 +16,7 @@ REGISTRY_PATH = Path("python/sglang/test/ci/ci_register.py")
 
 
 class TestPlanPartitions(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -28,12 +30,14 @@ class TestPlanPartitions(unittest.TestCase):
         self.tests = self.root / "test/registered"
         self.tests.mkdir(parents=True)
 
-    def register(self, name, est_time, suite="unit", extra=""):
+    def register(
+        self, name: str, est_time: int, suite: str = "unit", extra: str = ""
+    ) -> None:
         (self.tests / name).write_text(
             f'register_tpu_ci(est_time={est_time}, suite="{suite}"{extra})\n'
         )
 
-    def run_python(self, script, *args):
+    def run_python(self, script: Path, *args: str) -> str:
         result = subprocess.run(
             [sys.executable, "-E", "-S", "-B", str(script), *args],
             cwd=self.root,
@@ -43,13 +47,13 @@ class TestPlanPartitions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def plan(self, *args):
+    def plan(self, *args: str) -> list[dict[str, int | str]]:
         out = self.run_python(
             self.scripts / "plan_partitions.py", "--suite", "unit", *args
         )
         return json.loads(out)["include"]
 
-    def test_size_scales_with_est_time_and_is_capped(self):
+    def test_size_scales_with_est_time_and_is_capped(self) -> None:
         for i in range(10):
             self.register(f"test_{i}.py", 600)
         self.register("test_other_suite.py", 99999, suite="other")
@@ -68,7 +72,7 @@ class TestPlanPartitions(unittest.TestCase):
             ],
         )
 
-    def test_shards_cover_suite_once_and_are_stable(self):
+    def test_shards_cover_suite_once_and_are_stable(self) -> None:
         for i, est in enumerate([900, 400, 400, 120, 120, 120, 60, 10, 10]):
             self.register(f"test_{i}.py", est)
         probe = self.scripts / "probe.py"
@@ -95,7 +99,7 @@ class TestPlanPartitions(unittest.TestCase):
         )
         self.run_python(probe)
 
-    def test_empty_suite_fails(self):
+    def test_empty_suite_fails(self) -> None:
         result = subprocess.run(
             [
                 sys.executable,
