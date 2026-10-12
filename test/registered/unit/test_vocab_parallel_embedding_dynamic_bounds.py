@@ -12,6 +12,16 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ModuleNotFoundError:
+    # CI reads registration from the AST; retain standalone CPU/meta execution.
+    def register_cpu_ci(**kwargs):
+        pass
+
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+try:
     import torch
 except ModuleNotFoundError:
     torch = None
