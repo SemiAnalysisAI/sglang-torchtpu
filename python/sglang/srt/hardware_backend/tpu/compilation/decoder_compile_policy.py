@@ -1295,7 +1295,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
     ) -> None:
         """Set CP metadata on dummy batch so precompile traces the CP extend graph."""
-        from sglang.srt.layers.cp.utils import prepare_cp_forward
+        from sglang.srt.layers.cp.utils import get_cp_strategy, prepare_cp_forward
+
+        strategy = get_cp_strategy()
+        if strategy is None:
+            return
+
+        min_tokens = getattr(strategy, "cp_size", 1) * 2
+        if num_tokens < min_tokens:
+            return
+
+        device = self.model_runner.device
+        lens = [num_tokens] + [0] * (bs - 1)
+        forward_batch.extend_seq_lens_cpu = list(lens)
+        forward_batch.seq_lens_cpu = torch.tensor(lens, dtype=torch.int64)
+        forward_batch.extend_seq_lens = torch.tensor(
+            lens, dtype=torch.int32, device=device
+        )
+        forward_batch.seq_lens = torch.tensor(
+            lens, dtype=torch.int64, device=device
+        )
+        forward_batch.orig_seq_lens = forward_batch.seq_lens
 
         forward_batch.attn_cp_metadata = None
         prepare_cp_forward(forward_batch)
