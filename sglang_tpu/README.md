@@ -17,6 +17,19 @@ pip install --no-deps -e .        # this plugin (dist "sglang-tpu")
 `--no-deps` keeps pip from re-resolving the fork's dependency tree; the editable
 fork already satisfies the plugin's `sglang` requirement.
 
+## Vision attention
+
+`VisionTpuAttention` defaults to `flash`. Set
+`SGLANG_TPU_VISION_ATTENTION_BACKEND=splash` before constructing the encoder to
+select JAX Splash attention. Each encoder retains the choice made at construction.
+
+Splash uses runtime segment IDs for packed/sparse attention and padding, so
+changing their values within the same sequence bucket does not require a new
+graph. Its static `FullMask` does not skip masked Q/K tiles. Explicit attention
+masks retain the existing SDPA fallback. Splash scales queries in their input
+dtype before the dot product, so BF16 rounding differs from Flash's FP32
+logits scaling.
+
 ## Two platform identities, one code base
 
 | Mode | Select with | Platform class | `is_out_of_tree()` | Status |

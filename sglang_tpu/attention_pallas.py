@@ -18,6 +18,7 @@ this module is adapted from (https://github.com/google-pytorch/torchtpu-vllm/tre
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import jax
@@ -28,6 +29,8 @@ from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel impo
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.utils import print_info_once
+from sglang_tpu.envs import envs
 from sglang_tpu.kernels.flash_attention import (
     SegmentIds,
     flash_attention,
@@ -463,9 +466,26 @@ class TpuPallasAttnBackend(AttentionBackend):
 
 
 # ---------------------------------------------------------------------------
-# Vision encoder: non-causal flash attention with segment_ids
+# Vision encoder: non-causal attention with segment_ids
 # ---------------------------------------------------------------------------
 _VISION_FLASH_OPS: dict[float, object] = {}
+_VISION_SPLASH_OPS: dict[float, object] = {}
+
+
+def _get_vision_attention_op(sm_scale: float):
+    """Select the vision kernel once, when the attention module is constructed."""
+    backend = envs.SGLANG_TPU_VISION_ATTENTION_BACKEND.get()
+    if backend == "flash":
+        op = _get_vision_flash_op(sm_scale)
+    elif backend == "splash":
+        op = _get_vision_splash_op(sm_scale)
+    else:
+        raise ValueError(
+            "SGLANG_TPU_VISION_ATTENTION_BACKEND must be 'flash' or 'splash', "
+            f"got {backend!r}"
+        )
+    print_info_once(f"TPU vision attention backend: {backend}")
+    return op
 
 
 def _get_vision_flash_op(sm_scale: float):
@@ -504,4 +524,67 @@ def _get_vision_flash_op(sm_scale: float):
 
     op.register_fake(_fake_vision_flash)
     _VISION_FLASH_OPS[key] = op
+    return op
+
+
+def _get_vision_splash_op(sm_scale: float):
+    """Non-causal Splash attention with runtime, per-example segment IDs.
+
+    Segment IDs cover both packed/sparse attention and sequence padding. They
+    remain tensor operands, so changing a mask within a sequence bucket does
+    not require another compilation. The static full mask does not skip tiles.
+    """
+    key = float(sm_scale)
+    op = _VISION_SPLASH_OPS.get(key)
+    if op is not None:
+        return op
+
+    import jax.numpy as jnp
+    from jax.experimental.pallas.ops.tpu import splash_attention
+    from torch_tpu._internal import pallas
+
+    def _jax_vision_splash(q, k, v, seg_ids):
+        # VisionTpuAttention pads sequences to multiples of 128. Heads are
+        # already local to each TP rank; vmap supplies the batch dimension.
+        mask = splash_attention.MultiHeadMask(
+            (splash_attention.FullMask((q.shape[2], k.shape[2])),) * q.shape[1]
+        )
+        kernel = splash_attention.make_splash_mha(
+            mask,
+            # TPU7x vision measurements favor 1024x1024 over Splash's 128x128
+            # defaults. Other padded lengths use a power-of-two divisor so
+            # both sequence axes remain exact multiples of their tile size.
+            block_sizes=splash_attention.BlockSizes(
+                block_q=math.gcd(q.shape[2], 1024),
+                block_kv=math.gcd(k.shape[2], 1024),
+            ),
+            head_shards=1,
+            q_seq_shards=1,
+        )
+        # Splash has no logits-scale argument. Match torch_tpu.splash_sdpa's
+        # input scaling; BF16 rounding differs from scaling FP32 QK logits.
+        q = q * jnp.asarray(sm_scale, dtype=q.dtype)
+        return jax.vmap(kernel)(
+            q,
+            k,
+            v,
+            segment_ids=splash_attention.SegmentIds(q=seg_ids, kv=seg_ids),
+        )
+
+    # jax_op requires real types even with postponed Python annotations.
+    _jax_vision_splash.__annotations__ = {
+        "q": jax.Array,
+        "k": jax.Array,
+        "v": jax.Array,
+        "seg_ids": jax.Array,
+        "return": jax.Array,
+    }
+    op_name = f"sglang_tpu::vision_splash_s{key!r}".replace(".", "_").replace("-", "m")
+    op = pallas.jax_op(op_name, _jax_vision_splash)
+
+    def _fake_vision_splash(q, k, v, seg_ids):
+        return torch.empty_like(q)
+
+    op.register_fake(_fake_vision_splash)
+    _VISION_SPLASH_OPS[key] = op
     return op

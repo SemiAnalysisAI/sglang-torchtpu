@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvStr
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -17,6 +17,9 @@ EnvField._allow_set_name = True
 
 
 class TpuEnvs:
+    # Opt-in vision attention kernel; snapshotted when constructing the encoder.
+    SGLANG_TPU_VISION_ATTENTION_BACKEND = EnvStr("flash")
+
     # Host heap (see host_heap_trim.py)
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.

@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.compilation import direct_compile
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.graph_runner import vit_tpu_compile_runner as vit_runner
 from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
@@ -472,12 +473,60 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         self.assertEqual(segment_ids.tolist(), [[0, 0, 0], [0, 0, 1]])
 
+    def test_shared_tpu_attention_selects_backend_at_construction(self):
+        setting = tpu_envs.SGLANG_TPU_VISION_ATTENTION_BACKEND
+        q = torch.zeros(128, 2, 96)
+        for backend in (None, "flash", "splash"):
+            flash_op = MagicMock(side_effect=lambda q, k, v, ids: q)
+            splash_op = MagicMock(side_effect=lambda q, k, v, ids: q)
+            with (
+                self.subTest(backend=backend),
+                _unset(setting) if backend is None else setting.override(backend),
+                patch("sglang.srt.layers.attention.vision._is_tpu", True),
+                patch(
+                    "sglang_tpu.attention_pallas._get_vision_flash_op",
+                    return_value=flash_op,
+                ) as flash_factory,
+                patch(
+                    "sglang_tpu.attention_pallas._get_vision_splash_op",
+                    return_value=splash_op,
+                ) as splash_factory,
+            ):
+                attention = VisionTpuAttention(
+                    head_dim=96, num_heads=2, num_kv_heads=2, softmax_scale=0.25
+                )
+                # Changing the flag must not replace an already compiled
+                # encoder's selected operation.
+                with setting.override("flash" if backend == "splash" else "splash"):
+                    attention(q, q, q, bsz=1)
+
+                selected_factory, other_factory = (
+                    (splash_factory, flash_factory)
+                    if backend == "splash"
+                    else (flash_factory, splash_factory)
+                )
+                selected_factory.assert_called_once_with(0.25)
+                selected_factory.return_value.assert_called_once()
+                other_factory.assert_not_called()
+
+    def test_shared_tpu_attention_rejects_unknown_backend(self):
+        with (
+            tpu_envs.SGLANG_TPU_VISION_ATTENTION_BACKEND.override("invalid"),
+            patch("sglang.srt.layers.attention.vision._is_tpu", True),
+            patch("sglang_tpu.attention_pallas._get_vision_flash_op") as flash,
+            patch("sglang_tpu.attention_pallas._get_vision_splash_op") as splash,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be 'flash' or 'splash'"):
+                VisionTpuAttention(head_dim=96, num_heads=2, num_kv_heads=2)
+            flash.assert_not_called()
+            splash.assert_not_called()
+
     def test_shared_tpu_attention_supports_batched_flattened_callers(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
         with (
             patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang.srt.layers.attention.vision._get_vision_attention_op",
                 return_value=flash_op,
             ),
         ):
@@ -501,7 +550,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         with (
             patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang.srt.layers.attention.vision._get_vision_attention_op",
                 return_value=MagicMock(),
             ),
         ):
@@ -540,7 +589,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         with (
             patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang.srt.layers.attention.vision._get_vision_attention_op",
                 return_value=flash_op,
             ),
         ):
@@ -565,7 +614,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         with (
             patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang.srt.layers.attention.vision._get_vision_attention_op",
                 return_value=flash_op,
             ),
         ):

@@ -52,7 +52,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_tpu:
-    from sglang_tpu.attention_pallas import _get_vision_flash_op
+    from sglang_tpu.attention_pallas import _get_vision_attention_op
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -1106,7 +1106,7 @@ class VisionTpuAttention(nn.Module):
         self.scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
-        self._flash_op = _get_vision_flash_op(float(self.scale))
+        self._flash_op = _get_vision_attention_op(float(self.scale))
         self._sdpa_fallback = VisionSdpaAttention(
             head_dim=head_dim,
             num_heads=num_heads,
