@@ -3,6 +3,8 @@
 # Copyright 2025 Google LLC
 """TPU FP8 dense linear helpers."""
 
+from typing import NamedTuple
+
 import torch
 
 
@@ -88,6 +90,77 @@ def apply_tpu_fp8_linear(
     if bias is not None:
         out = out + bias
     return out
+
+
+class StaticFp8Weight(NamedTuple):
+    """An fp8 [K, N] weight whose input activation has a fixed scale.
+
+    Calling it applies the GEMV, so a model holds one attribute and needs no
+    import of this module at the call site.
+    """
+
+    weight: torch.Tensor  # float8_e4m3fn [K, N]
+    out_scale: torch.Tensor  # f32 [N]: per-channel weight scale * input scale
+    inv_x_scale: float
+    one: torch.Tensor  # f32 [1], the unit scale torch._scaled_mm requires
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return apply_tpu_static_fp8_linear(x, self)
+
+
+def quantize_rmsnorm_fed_weight(
+    weight_kn: torch.Tensor, norm_weight: torch.Tensor
+) -> StaticFp8Weight:
+    """Quantize a [K, N] weight whose input is an RMSNorm output.
+
+    y = x / rms(x) * g gives |y_i| <= sqrt(K) * |g_i| for every input, so a
+    per-tensor input scale of sqrt(K) * max|g| / fp8_max cannot overflow and
+    needs no per-step amax. The weight takes a per-output-channel scale.
+
+    Every returned tensor is a fresh contiguous base tensor: torch_tpu
+    re-materializes a view passed into a compiled graph with an eager
+    as_strided launch on every call.
+    """
+    if weight_kn.shape[0] != norm_weight.shape[0]:
+        raise ValueError(
+            f"weight K={weight_kn.shape[0]} does not match the RMSNorm width "
+            f"{norm_weight.shape[0]}"
+        )
+    if weight_kn.shape[1] % 16 != 0:
+        raise ValueError(
+            f"torch_tpu torch._scaled_mm needs N % 16 == 0, got N={weight_kn.shape[1]}"
+        )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    w_scale = weight_kn.abs().amax(dim=0).float().clamp(min=1e-12) / fp8_max
+    w_fp8 = (weight_kn.float() / w_scale).to(torch.float8_e4m3fn).contiguous()
+    g_max = max(norm_weight.detach().abs().max().float().item(), 1e-12)
+    # 1% margin for the bf16 rounding of the RMSNorm output.
+    x_scale = 1.01 * weight_kn.shape[0] ** 0.5 * g_max / fp8_max
+    return StaticFp8Weight(
+        weight=w_fp8,
+        out_scale=(w_scale * x_scale).clone(),
+        inv_x_scale=1.0 / x_scale,
+        one=torch.ones(1, dtype=torch.float32, device=weight_kn.device),
+    )
+
+
+def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Tensor:
+    """x [M, K] @ w with the static input scale; returns x.dtype [M, N]."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x.float())
+    # The clamp is free in the quantize fusion and guards the cast, which
+    # does not saturate (an over-range value would become NaN).
+    x_q = (x_2d * w.inv_x_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    out = torch._scaled_mm(
+        x_q, w.weight, scale_a=w.one, scale_b=w.one, out_dtype=torch.float32
+    )
+    # Scale while still f32 and narrow before the cast: XLA folds scale,
+    # narrow and cast into one fusion. Narrowing a bf16 [16, N] instead adds a
+    # relayout of the tiled rows.
+    out = out * w.out_scale
+    if pad:
+        out = torch.narrow(out, 0, 0, x.shape[0])
+    return out.to(x.dtype)
 
 
 def tpu_w8a8_block_fp8_linear(
