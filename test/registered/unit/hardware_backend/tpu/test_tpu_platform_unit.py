@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import torch
 import torch.compiler.config as compiler_config
 
 from sglang.srt.environ import envs
@@ -131,6 +132,19 @@ class TestTpuPlatformInitialization(CustomTestCase):
 
 
 class TestTpuCompileCache(CustomTestCase):
+    def test_reports_tier1_cache_misses(self):
+        with patch.object(
+            torch,
+            "tpu",
+            SimpleNamespace(_get_cache_misses=lambda: 37),
+            create=True,
+        ):
+            self.assertEqual(TpuSRTPlatform().get_compilation_cache_misses(), 37)
+
+    def test_omits_cache_misses_when_runtime_has_no_counter(self):
+        with patch.object(torch, "tpu", SimpleNamespace(), create=True):
+            self.assertIsNone(TpuSRTPlatform().get_compilation_cache_misses())
+
     def test_pallas_source_change_updates_compile_cache_key(self):
         import sglang_tpu.compile_cache as compile_cache
 
