@@ -247,14 +247,18 @@ def mxfp4_roundtrip(c: DecodeConfig, w: LayerWeights) -> LayerWeights:
                                w2=jnp.asarray(w2).astype(BF16))
 
 
-def route(c: DecodeConfig, x2, w: LayerWeights):
+def route(c: DecodeConfig, x2, w: LayerWeights, margins=None):
     logits = mm(x2, w.wr) + w.br.astype(F32)
     vals, ids = jax.lax.top_k(logits, c.TOPK)
+    if margins is not None:  # gap between the k-th and (k+1)-th logit: tiny = near-tie
+        nxt = jax.lax.top_k(logits, c.TOPK + 1)[0][:, -1]
+        margins.append(vals[:, -1] - nxt)
     ex = jnp.exp(vals - vals[:, :1])
     return ids.astype(jnp.int32), ex / jnp.sum(ex, -1, keepdims=True)
 
 
-def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding: bool):
+def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding: bool,
+          margins=None):
     """res [B, H] bf16; kh/vh [B, T, NKV, D] in the KV dtype. Returns res, (k_new, v_new)."""
     B = res.shape[0]
     NQ, NKV, D, R = c.NQ, c.NKV, c.D, c.R
@@ -272,21 +276,23 @@ def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding:
     parts = [mm(o[:, r * ql:(r + 1) * ql], w.wo[r * ql:(r + 1) * ql]) for r in range(R)]
     res = (res.astype(F32) + tp_sum(c, parts) + w.bo.astype(F32)).astype(BF16)
     x2 = rmsnorm(res, w.ln2, c.eps)
-    ids, wts = route(c, x2, w)
+    ids, wts = route(c, x2, w, margins)
     res = (res.astype(F32) + tp_sum(c, moe_partials(c, x2, ids, wts, w))).astype(BF16)
     return res, (kq, vq)
 
 
-def step(c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights]):
+def step(c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights], margins=None):
     """x [B, H] bf16 (embedded token); pos [B]; k_hist/v_hist [L, B, T, NKV, D] (KV dtype).
 
     Returns hidden [B, H] bf16 before the final norm, and per-layer new K/V [L, B, NKV, D].
+    `margins`: optional list that receives each layer's top-k routing margin [B].
     """
     cos, sin = yarn_tables(c, pos)
     res = x
     kn, vn = [], []
     for li, w in enumerate(weights):
-        res, (k, v) = layer(c, res, cos, sin, pos, k_hist[li], v_hist[li], w, c.sliding[li])
+        res, (k, v) = layer(c, res, cos, sin, pos, k_hist[li], v_hist[li], w, c.sliding[li],
+                            margins)
         kn.append(k)
         vn.append(v)
     return res, jnp.stack(kn), jnp.stack(vn)

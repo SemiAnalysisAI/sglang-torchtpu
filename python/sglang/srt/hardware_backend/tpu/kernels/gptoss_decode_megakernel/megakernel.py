@@ -67,11 +67,12 @@ AW_NAMES = ("wqkv", "wo", "wr", "vec", "sinks")
 EW_NAMES = ("w13", "b13", "w2", "b2")
 W_NAMES = AW_NAMES + EW_NAMES
 EW_NAMES_FP4 = ("w13q", "w13s", "b13", "w2q", "w2s", "b2")
+EW_NAMES_FP8 = ("w13", "c13", "b13", "w2", "c2", "b2")
 F4 = jnp.float4_e2m1fn
 
 
 def w_names(c: DecodeConfig) -> tuple[str, ...]:
-    return AW_NAMES + (EW_NAMES_FP4 if c.w_dtype == "mxfp4" else EW_NAMES)
+    return AW_NAMES + {"mxfp4": EW_NAMES_FP4, "fp8": EW_NAMES_FP8}.get(c.w_dtype, EW_NAMES)
 # rows of the per-layer `vec` [8, VW] f32 operand
 V_LN1, V_LN2, V_BO, V_BQKV, V_BR = range(5)
 
@@ -103,6 +104,16 @@ def packed_specs(c: DecodeConfig) -> dict[str, jax.ShapeDtypeStruct]:
             "w2s": s((R, L, EL, NJ, c.SR2, Hp), BF16),
             "b2": s((R, L, EL, 1, Hp), F32),
         })
+    elif c.w_dtype == "fp8":
+        # e4m3 weights; column c of a chunk is w8[:, c] * c13[c] (power of two)
+        out.update({
+            "w13": s((R, L, EL, NJ, Hp, 2 * T), jnp.float8_e4m3fn),
+            "c13": s((R, L, EL, NJ, 1, 2 * T), F32),
+            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+            "w2": s((R, L, EL, NJ, T, Hp), jnp.float8_e4m3fn),
+            "c2": s((R, L, EL, NJ, 1, Hp), F32),
+            "b2": s((R, L, EL, 1, Hp), F32),
+        })
     else:
         out.update({
             "w13": s((R, L, EL, NJ, Hp, 2 * T), BF16),
@@ -126,6 +137,22 @@ def mxfp4_pack(w, scale_rows=None):
         pad = [(0, 0)] * (scale.ndim - 2) + [(0, scale_rows - scale.shape[-2]), (0, 0)]
         scale = np.pad(scale, pad, constant_values=1.0)
     return jnp.asarray(words), jnp.asarray(scale).astype(BF16)
+
+
+def fp8_pack(w):
+    """[..., K, N] MXFP4-representable weights -> (e4m3 [..., K, N], f32 [..., 1, N]) with
+    w == w8 * colscale exactly when a column's 32-blocks span <= 13 octaves (practically
+    always: e4m3 spans 2^-9..448, e2m1 values 0.5..6). Inexact elements are counted."""
+    w = np.asarray(jnp.asarray(w).astype(F32))
+    colmax = np.max(np.abs(w), axis=-2, keepdims=True)
+    g = np.where(colmax > 0, np.floor(np.log2(np.maximum(colmax, 1e-38))) - 7, 0)
+    f = np.exp2(g).astype(np.float32)
+    w8 = jnp.asarray(w / f).astype(jnp.float8_e4m3fn)
+    bad = int(np.sum(np.asarray(w8.astype(F32)) * f != w))
+    if bad:
+        import warnings
+        warnings.warn(f"fp8_pack: {bad} expert weights not exactly representable")
+    return w8, jnp.asarray(f)
 
 
 def mxfp4_unpack_xla(words, scale):
@@ -201,6 +228,9 @@ def pack_weights(c: DecodeConfig, layers: list[LayerWeights]) -> dict[str, jax.A
     if c.w_dtype == "mxfp4":
         out["w13q"], out["w13s"] = mxfp4_pack(out.pop("w13"), c.SR13)
         out["w2q"], out["w2s"] = mxfp4_pack(out.pop("w2"), c.SR2)
+    elif c.w_dtype == "fp8":
+        out["w13"], out["c13"] = fp8_pack(out["w13"])
+        out["w2"], out["c2"] = fp8_pack(out["w2"])
     return {k_: out[k_] for k_ in w_names(c)}
 
 
@@ -291,6 +321,13 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
                 "w13r": V((1, Hp, 2 * T), BF16),  # dequantized chunk (one, reused)
                 "w2r": V((1, T, Hp), BF16),
             })
+        elif c.w_dtype == "fp8":
+            s.update({
+                "w13r": V((NS, Hp, 2 * T), jnp.float8_e4m3fn),
+                "w2r": V((NS, T, Hp), jnp.float8_e4m3fn),
+                "c13r": V((NS, 1, 2 * T), F32),
+                "c2r": V((NS, 1, Hp), F32),
+            })
         else:
             s.update({
                 "w13r": V((NS, Hp, 2 * T), BF16),
@@ -337,8 +374,10 @@ def vmem_bytes(c: DecodeConfig, mode: str = "mega") -> dict[str, int]:
 def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, interpret=False):
     """Return a per-rank callable (to be used under shard_map over axis "tp").
 
-    mode="mega": f(rank, pos, pt_win [B*NWP], pt_full [B*MP], x, cos, sin, *W, kv_swa, kv_full)
-                 -> (out [BR, Hp] bf16, kvnew [L, BR, 1, packing, 128] (K slot 0, V slot 1))
+    mode="mega": f(rank, pos, pt_win [B*NWP], pt_full [B*MP], newpg [2B], x, cos, sin, *W,
+                   kv_swa, kv_full)
+                 -> (out [BR, Hp] bf16, kvnew [L, BR, 1, packing, 128] (K slot 0, V slot 1)
+                     [, kv_swa, kv_full if kv_write == "kernel" (aliased, written in place)])
     mode="attn": same operands with x := res [BR, Hp] f32 -> (partial f32, kvnew[1])
     mode="moe":  same operands with x := res [BR, Hp] f32 -> partial f32
     """
@@ -359,13 +398,14 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     aw_need = {"mega": AW_NAMES, "attn": ("wqkv", "wo", "vec", "sinks"), "moe": ("wr", "vec")}[mode]
     aw_dst = {"wqkv": "awqkv", "wo": "awo", "wr": "awr", "vec": "awvec", "sinks": "awsink"}
     WN = w_names(c)
-    n_in = 7 + len(WN) + 2
+    KW = mode == "mega" and c.kv_write == "kernel"  # in-kernel new-K/V write (aliased pools)
+    n_in = 8 + len(WN) + 2
 
     def kernel(*refs):
-        rank_s, pos_s, ptw_s, ptf_s, x_ref, cos_ref, sin_ref = refs[:7]
-        Wr = dict(zip(WN, refs[7:7 + len(WN)]))
-        kv_swa, kv_full = refs[7 + len(WN):n_in]
-        n_out = 1 if mode == "moe" else 2
+        rank_s, pos_s, ptw_s, ptf_s, newpg_s, x_ref, cos_ref, sin_ref = refs[:8]
+        Wr = dict(zip(WN, refs[8:8 + len(WN)]))
+        kv_swa, kv_full = refs[8 + len(WN):n_in]
+        n_out = 1 if mode == "moe" else (4 if KW else 2)
         outs = refs[n_in:n_in + n_out]
         S = dict(zip(s_names, refs[n_in + n_out:]))
         rank = rank_s[0]
@@ -396,7 +436,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 return k.astype(BF16), v.astype(BF16)
             k = pltpu.bitcast((w & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
             v = pltpu.bitcast(((w >> 8) & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
-            return k.astype(BF16), v.astype(BF16)
+            # e4m3 K/V go straight into the MXU against bf16 q / p (native on v7x; ~25%
+            # fewer ops per KV block than converting to bf16 first, static LLO count)
+            return k, v
 
         # On TPU the packed words are read/written through a uint32 view of the VMEM ref, as
         # RPA v3 does (validated by AOT compile only). The TPU interpreter cannot bitcast refs,
@@ -488,7 +530,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             return finish
 
         # ---------------------------------------------------------- A: QKV + RoPE
-        def phase_a(l, s, kn_idx):
+        def phase_a(l, s, kn_idx, pi=None):
             res = S["res"][...]
             var = jnp.sum(res * res, axis=-1, keepdims=True) * (1.0 / H)
             xn = (res * lax.rsqrt(var + c.eps) * vrow(s, V_LN1, Hp)).astype(BF16)
@@ -518,7 +560,31 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             store_words(S["kvn"], kv_encode(kq, vq))
             d = cp(S["kvn"], outs[1].at[kn_idx], S["sem_m"].at[0])
             d.start()
-            return (d,)
+            if not KW:
+                return (d,)
+            # write each live sequence's packed new-token slot into its page, in place
+            pool_out = outs[2] if s == 0 else outs[3]
+
+            def tok_cp(b):
+                return cp(S["kvn"].at[pl.ds(b, 1)],
+                          pool_out.at[pi, newpg_s[s * B + b], pl.ds(pos_s[b] % PAGE, 1)],
+                          S["sem_m"].at[1])
+
+            def start(b, _):
+                tok_cp(b).start()
+                return 0
+
+            lax.fori_loop(0, B, start, 0)
+
+            class _WaitAll:
+                @staticmethod
+                def wait():
+                    def w(b, _):
+                        tok_cp(0).wait()
+                        return 0
+                    lax.fori_loop(0, B, w, 0)
+
+            return (d, _WaitAll)
 
         # ---------------------------------------------------------- B: paged attention
         def attn_helpers(pi, sliding):
@@ -700,8 +766,8 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 sem = S["sem_e"]
                 ds = [cp(Wr["b13"].at[l, e, j], S["b13r"].at[slot], sem.at[slot, 0]),
                       cp(Wr["b2"].at[l, e], S["b2r"].at[slot], sem.at[slot, 1])]
-                names = (("w13q", "w13s", "w2q", "w2s") if c.w_dtype == "mxfp4"
-                         else ("w13", "w2"))
+                names = {"mxfp4": ("w13q", "w13s", "w2q", "w2s"),
+                         "fp8": ("w13", "c13", "w2", "c2")}.get(c.w_dtype, ("w13", "w2"))
                 for i, n in enumerate(names):
                     ds.append(cp(Wr[n].at[l, e, j], S[n + "r"].at[slot], sem.at[slot, 2 + i]))
                 return ds
@@ -734,11 +800,15 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 else:
                     wslot = slot
                 h = jnp.dot(S["xn"][...], S["w13r"][wslot], preferred_element_type=F32)
+                if c.w_dtype == "fp8":  # bf16 x e4m3 runs natively on the v7x MXU
+                    h = h * S["c13r"][slot]
                 h = h + S["b13r"][slot]
                 g = jnp.minimum(h[:, :T], c.limit)
                 u = jnp.clip(h[:, T:], -c.limit, c.limit)
                 a = ((u + 1.0) * (g * jax.nn.sigmoid(c.alpha * g))).astype(BF16)
                 y = jnp.dot(a, S["w2r"][wslot], preferred_element_type=F32)
+                if c.w_dtype == "fp8":
+                    y = y * S["c2r"][slot]
                 y = y + jnp.where(j == 0, b2flag, 0.0) * S["b2r"][slot]
                 wcol = jnp.sum(jnp.where(lane == base + e, S["wf"][...], 0.0), axis=1,
                                keepdims=True)
@@ -764,7 +834,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
         # ---------------------------------------------------------- composition
         if mode == "mega":
-            if comm:  # peers' slots start at zero (matters only for the "ar" ablation)
+            if comm and not exchange:  # "ar" ablation: peers' slots must hold finite data
                 S["recv"][...] = jnp.zeros(S["recv"].shape, S["recv"].dtype)
                 S["send"][...] = jnp.zeros(S["send"].shape, S["send"].dtype)
                 if c.AR_FOLD:
@@ -797,7 +867,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                             d.start()
 
                     if "attn" not in AB:
-                        kn_descs = phase_a(l, s, l)
+                        kn_descs = phase_a(l, s, l, p)
                         if "attn_kv" not in AB:
                             phase_b_run(s, p, sliding=(s == 0))
                         for d in kn_descs:
@@ -859,12 +929,19 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 4 + [vmem] * 3 + [hbm] * (len(WN) + 2)
+    in_specs = [smem] * 5 + [vmem] * 3 + [hbm] * (len(WN) + 2)
     nkn = L if mode == "mega" else 1
     kn_shape = jax.ShapeDtypeStruct((nkn, BR, 1, c.kv_packing, 128), kvdt)
+    aliases = {}
     if mode == "mega":
         out_shape = (jax.ShapeDtypeStruct((BR, Hp), BF16), kn_shape)
         out_specs = (vmem, hbm)
+        if KW:
+            sw, fu = pool_specs(c)
+            out_shape += (jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
+                          jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype))
+            out_specs += (hbm, hbm)
+            aliases = {n_in - 2: 2, n_in - 1: 3}
     elif mode == "attn":
         out_shape = (jax.ShapeDtypeStruct((BR, Hp), F32), kn_shape)
         out_specs = (vmem, hbm)
@@ -877,6 +954,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         in_specs=in_specs,
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
+        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             collective_id=COLLECTIVE_ID if exchange else None,
             vmem_limit_bytes=c.vmem_mib * 1024 * 1024,
@@ -970,7 +1048,8 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
     mega = None if xla_ar else build(c, "mega", interpret=interpret)
     attn = [build(c, "attn", l, interpret=interpret) for l in range(c.L)] if xla_ar else None
     moe = [build(c, "moe", l, interpret=interpret) for l in range(c.L)] if xla_ar else None
-    sc = build_kv_scatter(c, interpret=interpret) if scatter else None
+    in_kernel_kv = (not xla_ar) and c.kv_write == "kernel"
+    sc = build_kv_scatter(c, interpret=interpret) if scatter and not in_kernel_kv else None
     ardt = ar_jdtype(c)
 
     def per_rank(rank, x, pos, pt_s, pt_f, W, kv_s, kv_f):
@@ -983,16 +1062,20 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
         xp = jnp.pad(x, ((0, c.BR - c.B), (0, c.Hp - c.H))).astype(BF16)
         wl = [W[k] for k in w_names(c)]
         if not xla_ar:
-            out, kvn = mega(rank, pos, pt_s, pt_f, xp, cos, sin, *wl, kv_s, kv_f)
+            res_ = mega(rank, pos, pt_s, pt_f, newpg, xp, cos, sin, *wl, kv_s, kv_f)
+            out, kvn = res_[0], res_[1]
+            if in_kernel_kv:
+                kv_s, kv_f = res_[2], res_[3]
         else:
             res = xp.astype(F32)
             kvns = []
             for l in range(c.L):
-                part, kvn_l = attn[l](rank, pos, pt_s, pt_f, res, cos, sin, *wl, kv_s, kv_f)
+                part, kvn_l = attn[l](rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s,
+                                      kv_f)
                 tot = lax.psum(part.astype(ardt).astype(F32), "tp")
                 bo = W["vec"][l, V_BO:V_BO + 1, :c.Hp]
                 res = (res + tot + bo).astype(BF16).astype(F32)
-                part = moe[l](rank, pos, pt_s, pt_f, res, cos, sin, *wl, kv_s, kv_f)
+                part = moe[l](rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s, kv_f)
                 tot = lax.psum(part.astype(ardt).astype(F32), "tp")
                 res = (res + tot).astype(BF16).astype(F32)
                 kvns.append(kvn_l)

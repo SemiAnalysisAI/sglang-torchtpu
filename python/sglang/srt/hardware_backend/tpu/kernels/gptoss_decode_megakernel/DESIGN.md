@@ -47,18 +47,18 @@ token `[B, H]`; output is the last layer's residual stream `[B, H]`.
 | All-reduce | One-shot push over remote DMA. Each rank DMAs its partial into its own slot of all 7 peers' receive buffers, waits for the 7 arrivals, then sums the 8 slots in rank order in f32. There are two slots (attention / MoE) and no per-AR barrier (one barrier at kernel start). Sends are waited lazily, just before the slot is reused one layer later. `ar_start` / `finish` are split. Between them the megakernel lists layer l+1's attention items and starts their first KV page DMAs, which overlaps the MoE AR. For B ≤ 4 (`ar_fold`) only the live rows travel, as `[B·23, 128]` f32 (B=1: 12 KB per peer instead of 94 KB). | Ported from vllm-torchtpu `kernels/megakernel/comm.py` (non-RSAG path). Rank-order f32 sum keeps the residual stream, and so routing, identical on all ranks. RS→local→AG would need 2 latency rounds per AR (RMSNorm and QKV need the full hidden), so one-shot is latency-optimal for these payloads. |
 | XLA fallback | `make_step(..., xla_ar=True)` builds per-layer `attn` / `moe` kernels from **the same phase bodies** with `lax.psum` in between (2L+1 calls) | Used to check the in-kernel AR: the outputs are bit-identical in interpret mode |
 | KV layout | Exactly sglang's fused TPU pool per layer: `[pages, 64, 1, packing, 128]` (K slot 0, V slot 1, fp8 slots 2–3 padding, head_dim zero-padded to 128). Read as uint32 words + shifts, like RPA v3 `load_bkv`. bf16 and fp8_e4m3 are both supported. | **Gap:** layers are stacked `[L/2, …]` per pool type (SWA pool / full pool, each with its own page table, as in SWAKVPool). Stock keeps one tensor per layer. |
-| New K/V write | Separate non-collective scatter kernel | XLA TPU does not place outputs of a `collective_id` pallas_call into live-out buffers. Aliasing the pool inside the megakernel would copy the whole pool every step (see vllm `_frozen/qwen35/pool_io.py`). AOT HLO shows no pool-sized copy. |
+| New K/V write | Separate non-collective scatter kernel (`kv_write="scatter"`). `kv_write="kernel"` (megakernel writes into aliased pools) is implemented and tested, but AOT shows XLA adding pool-sized copies (4.6 GB temp), so **do not use it** | XLA TPU does not place outputs of a `collective_id` pallas_call into live-out buffers. Aliasing the pool inside the megakernel would copy the whole pool every step (see vllm `_frozen/qwen35/pool_io.py`). AOT HLO shows no pool-sized copy. |
 | Weight streaming | Attention + router weights (`wqkv, wo, wr, vec, sinks`) use a 2-slot buffer. Layer l+1's set is prefetched at the start of layer l. Expert chunks `(w13 [Hp, 2·tne], w2 [tne, Hp], b13, b2)` stream through a `w_slots`-deep ring (default 3, so 2 chunks in flight). | Expert chunks depend on routing, so the expert ring cannot start before layer l's router. Across the layer boundary the stream continues only with the next layer's attention weights. |
-| Weight dtype | Attention/router bf16. Experts bf16 or `w_dtype="mxfp4"`: e2m1 codes, 8 per uint32 along K (`pltpu.bitcast` packing), plus a bf16 power-of-two scale per 32 K rows × column (rows padded to 16). | MXFP4 chunk = 1.94 MB vs 6.78 MB bf16 (3.5× fewer bytes). It is dequantized in VMEM (bitcast → bf16 → × scale, in static 128-row chunks) into a bf16 buffer, then hits the MXU, like gmm_v2's `dequantize_in_vmem`. In TP mode the I split is block-aligned: 90 blocks → 12,12,11,…, padded to 384. |
+| Weight dtype | Attention/router bf16. Experts `w_dtype="fp8"` (recommended), bf16, or `"mxfp4"`. **fp8** is MXFP4 converted offline to e4m3 times a power-of-two per output column. The conversion is exact when a column's 32-blocks span ≤13 octaves, which holds in practice; the packer counts any inexact elements. The chunk then runs bf16 × e4m3 natively on the v7x MXU: 3.39 MB per expert chunk, and Mosaic emits ~0.6K vector ops vs ~6.4K for bf16 weights and ~11K for in-VMEM MXFP4 dequant (static LLO op counts, `scratch/probe_mm.py`). **mxfp4**: e2m1 codes, 8 per uint32 along K (`pltpu.bitcast` packing), plus a bf16 power-of-two scale per 32 K rows × column (rows padded to 16). | MXFP4 chunk = 1.94 MB vs 6.78 MB bf16 (3.5× fewer bytes). It is dequantized in VMEM (bitcast → bf16 → × scale, in static 128-row chunks) into a bf16 buffer, then hits the MXU, like gmm_v2's `dequantize_in_vmem`. In TP mode the I split is block-aligned: 90 blocks → 12,12,11,…, padded to 384. |
 
 ## VMEM (analytic, tile-padded; real dims, fp8 KV, TP MoE, tne=384, npb=2)
 
 | B | scratch + resident operands | biggest items |
 |---|---|---|
-| 1, 2, 4 | 38.2 MiB (MXFP4 experts: 30.8; folded AR buffers) |
+| 1, 2, 4 | 38.2 MiB (MXFP4 experts: 30.8, fp8 experts: 28.8; folded AR buffers) |
 | 8, 16 | 39.4 MiB (MXFP4: 32.0) | w13 ring 12.9, wqkv×2 8.6, w2 ring 6.5, wo×2 5.8, wr×2 1.4, AR recv 1.4 |
 | 32 | 42.3 MiB (MXFP4: 34.9) | AR recv 2.9 |
-| 64 | 48.0 MiB (MXFP4: 40.6) | AR recv 5.8 |
+| 64 | 48.0 MiB (MXFP4: 40.6, fp8: 38.7) | AR recv 5.8 |
 
 `vmem_limit_bytes` = 60 MiB. AOT compiles succeeded under that limit for all buckets.
 Mosaic does not report its own peak, so the table is our estimate (`megakernel.vmem_bytes`).
@@ -71,6 +71,8 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 | Megakernel vs pure-JAX TP reference (`reference.step`) | interpret, 8 CPU devices, tiny dims (H=240→256, real 64q/8kv/D=64 heads, E=16, top-4, I=384, page 64, 4 pages/seq, positions incl. 0, 63, 130, 255) | rel err 3–5e-3 for bf16/fp8 KV, TP/EP MoE, L=2/4, B=1/4/16 |
 | In-kernel all-reduce vs `psum` | megakernel vs `xla_ar=True` fallback, same inputs | bit-identical outputs and pools |
 | MXFP4 experts | Weights snapped to MXFP4 in the reference, packed codes + scales in the kernel, TP (block-aligned split) and EP | rel err 3.9–4.0e-3. Megakernel vs fallback bit-identical. |
+| fp8 experts (MXFP4 → e4m3 × column power of two) | TP (with fallback) and EP at B=16 | rel err 3.9–4.3e-3; outputs identical to MXFP4 (the conversion is exact). Near-tie routing rows (top-k margin < 3e-3, at most B/4) are excluded from the comparison: summation-order noise can legitimately flip them. |
+| In-kernel KV write | `kv_write="kernel"`, aliased pools | correct in interpret mode, but AOT shows XLA copying the pools, so not used |
 | In-place KV | pools pre-filled with finite garbage everywhere the step must not read. After the step, exactly the new-token slots changed and they hold the reference K/V | pass |
 | Compile for TPU | AOT `tpu7x:2x2x1` (jax 0.10.2 + libtpu 0.0.47 on a CPU-only Linux host), real dims, L=36, B ∈ {1,2,4,8,16,32,64}: fp8 TP, bf16 TP, fp8 EP megakernels and the fp8 TP XLA-AR fallback | all compile (bf16/MXFP4 experts, fp8/bf16 KV, TP/EP, max_pages 65/128/513 i.e. up to 32K context, XLA-AR fallback; megakernel 1.4–6 s). HLO copies are only small operand moves (no pool copy). Raw output: `benchmark/kernels/gptoss_decode_megakernel/aot_tpu7x_2x2x1_results.jsonl` |
 | Not validated | Anything on hardware: ICI remote-DMA timing/races, barrier semaphore behaviour, the uint32 *ref* bitcast of KV pages (interpret mode cannot bitcast refs, so it uses an equivalent value-level `pltpu.bitcast`; the ref path is AOT-only), real VMEM peak, performance | — |
@@ -90,6 +92,10 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 - **Expert prefetch across layers.** Only the attention weights cross the layer boundary.
   Option: start the next layer's first chunk speculatively (e.g. from the previous step's
   routing).
+- **Attention per KV block.** Static LLO counts for a 1024-token block are ~2K ops (~1.5K
+  now that fp8 K/V feed the MXU directly), i.e. ~1.5–2 ops per token. The 8-row q pushes
+  both K and V through the MXU as weights. At long context and large B this is
+  compute-bound, not HBM-bound.
 - **Attention.** v0 (one DMA wait per 2-page block, depth-1 prefetch per sequence) scaled
   badly with context on TPU: B32 went from 13.7 to 26.0 ms between ctx 1k and 4k. v1 adds
   the flat item stream, 512-token items and cross-sequence prefetch. It is not yet measured
@@ -115,6 +121,26 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 - `benchmark/kernels/gptoss_decode_megakernel/aot_compile.py`: tpu7x AOT check (needs libtpu, no TPU).
 - `benchmark/kernels/gptoss_decode_megakernel/bench_decode_step.py`: TPU microbenchmark (`mk` / `fallback` / `xla`).
   `--cpu-smoke` runs the script at tiny dims in interpret mode.
+
+## Fixed per-step cost (where B1 time goes)
+
+TPU ablations at B1 (MXFP4) put a 0.65 ms floor under `--ablate attn moe`. Static analysis
+of the compiled step shows:
+
+- **XLA glue:** ~10 tiny fusions (rope tables, window page table, new-token pages, pad,
+  slice). Each is µs-scale.
+- **Weight prefetch:** the per-layer attention/router weights are 8.3 MB, ~2.4 µs at HBM
+  speed, so ~85 µs/step. With both blocks ablated nothing hides it; normally it overlaps.
+- **Per call:** the kernel-start barrier, VMEM zero-init of the KV buffers, and the KV
+  scatter call (36·B row DMAs). The scatter is cheap at B1 and grows to ~2.3K DMAs at B64.
+- **Host dispatch:** the bench's original timing blocked on every step, so it included host
+  dispatch latency for a multi-device call with ~20 operands. The bench now also reports
+  `ms_pipelined` (back-to-back dispatch, one block) and `ms_device` (K steps inside one jit
+  via `fori_loop`). The gap between `ms_median` and `ms_device` is host/launch overhead,
+  which an sglang integration removes by keeping the step on device.
+
+To split per-call from per-layer cost, run `--ablate attn moe` at `--layers 2` and
+`--layers 36`.
 
 ## Timing ablations
 
