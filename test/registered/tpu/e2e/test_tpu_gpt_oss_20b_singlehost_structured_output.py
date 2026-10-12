@@ -56,6 +56,12 @@ WEATHER_TOOL = {
         },
     },
 }
+# Without strict the grammar only guarantees a JSON object ({} included), as in
+# OpenAI's semantics; a forced call must be strict for its arguments to hold.
+WEATHER_TOOL_STRICT = {
+    "type": "function",
+    "function": {**WEATHER_TOOL["function"], "strict": True},
+}
 
 
 def _chat(base_url: str, **body) -> dict:
@@ -144,11 +150,13 @@ def mixed_grammar_runner(base_url: str) -> dict:
 
 
 def tool_call_runner(base_url: str) -> dict:
-    def call(case: str, prompt: str, tool_choice: str) -> tuple[str, str | None]:
+    def call(
+        case: str, prompt: str, tool_choice: str, tool: dict
+    ) -> tuple[str, str | None]:
         choice = _chat(
             base_url,
             messages=[{"role": "user", "content": prompt}],
-            tools=[WEATHER_TOOL],
+            tools=[tool],
             tool_choice=tool_choice,
             max_tokens=2048,
             reasoning_effort="low",
@@ -172,9 +180,14 @@ def tool_call_runner(base_url: str) -> dict:
     return _verdict(
         [
             # The model chooses the tool; the parser must extract it.
-            call("auto", "What is the weather in Paris, in celsius?", "auto"),
+            call(
+                "auto",
+                "What is the weather in Paris, in celsius?",
+                "auto",
+                WEATHER_TOOL,
+            ),
             # Nothing asks for weather: only the grammar can force the call.
-            call("required", "Say hello.", "required"),
+            call("required", "Say hello.", "required", WEATHER_TOOL_STRICT),
         ]
     )
 
