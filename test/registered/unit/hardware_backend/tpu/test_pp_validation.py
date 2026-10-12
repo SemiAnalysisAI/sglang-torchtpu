@@ -35,6 +35,7 @@ def _args(**overrides):
         pp_size=1,
         dp_size=1,
         dcp_size=1,
+        ep_size=1,
         enable_dp_attention=False,
         attn_dp_size=1,
         enable_dp_lm_head=False,
@@ -144,11 +145,22 @@ class TestPipelineParallelValidation(CustomTestCase):
         prepare_tpu_env = _apply(_args(tp_size=8))
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
 
-    def test_rejects_tensor_parallel_stages(self):
-        with self.assertRaisesRegex(
-            NotImplementedError, r"--attn-cp-size equal to --tp-size"
+    def test_accepts_tensor_parallel_pair_stages(self):
+        prepare_tpu_env = _apply(_args(pp_size=8, tp_size=2, enable_torch_compile=True))
+        prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+
+    def test_rejects_tensor_parallel_stages_other_than_a_plain_pair(self):
+        """Only two-device stages of plain tensor parallelism were validated."""
+        for overrides in (
+            dict(tp_size=4),
+            dict(tp_size=2, dp_size=2, enable_dp_attention=True),
+            dict(tp_size=2, ep_size=2),
         ):
-            _apply(_args(pp_size=2, tp_size=2))
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(
+                    NotImplementedError, r"tensor-parallel pair"
+                ):
+                    _apply(_args(pp_size=2, enable_torch_compile=True, **overrides))
 
     def test_rejects_stages_wider_than_their_context_parallel_group(self):
         with self.assertRaisesRegex(
@@ -202,7 +214,9 @@ class TestPipelineParallelValidation(CustomTestCase):
     def test_rejection_happens_before_the_slice_env_is_prepared(self):
         with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_tpu_env:
             with self.assertRaises(NotImplementedError):
-                TpuSRTPlatform().apply_server_args_defaults(_args(pp_size=2, tp_size=2))
+                TpuSRTPlatform().apply_server_args_defaults(
+                    _cp_stage_args(tp_size=4, attn_cp_size=2)
+                )
         prepare_tpu_env.assert_not_called()
 
     def test_single_stage_keeps_every_flag(self):
