@@ -1,0 +1,144 @@
+# GPT-OSS decode megakernel in sglang serving (T21 Phase 2, v1)
+
+Status: **CPU-validated integration, never run on a TPU.** The kernel itself is described in
+`DESIGN.md`. The integration lives outside this directory, in `sglang_tpu/gptoss_decode_mk/`,
+plus two small hooks in `python/sglang/srt/models/gpt_oss.py`. The only kernel changes are
+the opt-in `DecodeConfig.split_pools` operand mode and an fp8 clamp of the new K/V.
+
+## Enabling
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SGLANG_TPU_GPTOSS_DECODE_MK` | `0` | `1` turns the integration on |
+| `SGLANG_TPU_GPTOSS_DECODE_MK_MOE` | `tp` | `tp`: each rank holds an I/8 slice of every expert. `ep`: 16 whole experts per rank |
+
+The rest of the server configuration is unchanged; it targets the CI recipe (`bench_matrix`
+gpt_oss_120b × 1host_pc).
+
+## What runs where
+
+```mermaid
+flowchart LR
+  L["load_weights (stock)"] -->|same checkpoint stream| T["WeightTap: per-rank MK weights (host) -> device buffers"]
+  F["GptOssModel.forward"] -->|"DECODE, no spec, bucket <= 64"| E["embed_tokens (stock)"]
+  E --> S["gptoss_decode_mk_step (1 torch op = XLA glue + megakernel, 36 layers)"]
+  S --> W["36 x gptoss_decode_mk_kv_write (in place, one per layer pool)"]
+  W --> N["final norm, logits, sampling (stock)"]
+  F -->|"everything else"| K["stock layer stack (RPA v3 + gmm_v2)"]
+```
+
+- **Load time** (`runtime.WeightTap`, `weights.MkWeightBuilder`): `GptOssForCausalLM.load_weights`
+  wraps its checkpoint iterator. Each tensor is copied into this rank's kernel layout before
+  it is passed on to the stock loader:
+  - MXFP4 experts are pure byte reshuffles. Bytes are read as little-endian uint32 words,
+    giving 8 K codes per word with code k at bits 4k. e8m0 scales become exact bf16 powers of two.
+  - w13 rows are de-interleaved (gate/up).
+  - In TP mode the I dim is split on whole 32-row scale blocks.
+  - A bf16 checkpoint (HF dequantized `gate_up_proj` / `down_proj`) is requantized with the
+    kernel reference's rule. This is lossless for weights that came from the MXFP4 release.
+  - The host copies are uploaded once as non-persistent buffers of a `GptOssDecodeMK`
+    submodule (`model.model._tpu_decode_mk`). Stock weights are kept for prefill/extend.
+- **Decode** (`runtime.GptOssDecodeMK.run`, `adapter.per_rank_step`):
+  - Inputs are the RPA v3 backend's own metadata (`kv_lens`, the rectangular `page_indices`,
+    `swa_page_indices`), the stock rotary `cos_sin_cache`, and the 36 per-layer fused pools
+    `[pages, 64, 1, packing, 128]`.
+  - The mapping is documented in `adapter.py`'s module docstring:
+    - `pos = kv_lens - 1`
+    - `pt_full / pt_swa = page tables [B, pages_per_seq]`
+    - window pages are taken from `pt_swa`
+    - the new token is written at `pt[pos // 64]` offset `pos % 64`, where stock RPA writes
+      it (`= out_cache_loc` and `full_to_swa[out_cache_loc]` under the paged allocator).
+  - Bucket-padding rows (`kv_lens == 0`) attend nothing and write the reserved page 0.
+
+## Design choices (simplest viable; each changes scope)
+
+| Topic | Choice | Why / alternative |
+|---|---|---|
+| Weight source | Tap the checkpoint stream in `load_weights` | Stock TP8/EP8 shards *whole experts*. TP-split MoE needs an I/8 slice of all 128, which only the checkpoint stream (seen whole by every rank) has. Building from loaded params would need a cross-rank all-to-all, and TPU dequantizes stock experts to bf16 anyway. |
+| Weight memory | Separate copy, ~8.7 GiB/rank (`weights.per_rank_bytes`: TP 8.66, EP 8.62 GiB) | See HBM budget below. Sharing would need the stock MoE to run from the same bytes (proposal below). |
+| KV pools | Kernel takes 18 SWA + 18 full **per-layer** pool operands (`split_pools=True`) | Stacking the per-layer tensors would copy the pools every step. torch_tpu needs each pool to be its own base tensor for RPA's donation. Inside the kernel, a static `pl.when` per page-DMA start picks the layer pair's ref; waits only need shapes. |
+| KV write | 36 tiny non-collective Pallas calls, one donated + aliased pool each (the `kv_row_write` pattern) | XLA does not alias outputs of a `collective_id` `pallas_call` into live-out buffers (DESIGN.md). One call with 36 aliased pools would need a `Tensor[]` mutation in the custom-op schema, so it was avoided for v1. Cost estimate ~0.05–0.1 ms/step (unmeasured). |
+| Page tables | Kernel `max_pages = pages_per_seq` of the RPA table (no context cap, no host-side branch) | Keeps the decision static per compiled graph (`fail_on_recompile` safe). SMEM estimate ~650 KiB at B=64, 131k context (risk below). |
+| RoPE | Gather the stock `cos_sin_cache` at `pos` (bf16, YaRN incl. `truncate`) | `reference.yarn_tables` always truncates the correction range. The GPT-OSS config uses `truncate: false`, so the kernel reference's tables would differ from stock. |
+| When MK runs | `ForwardMode.DECODE`, `spec_info is None`, no `input_embeds`/PP proxy/aux capture, `bs <= 64`, 1 token per request | All are static per compiled graph (mode, shapes), so there is one MK decode graph per batch bucket. EXTEND/MIXED/IDLE/verify/draft run the stock stack. |
+| Load-time disable (one log line) | pp>1, attn dp/cp/dcp>1, attn_tp != 8 KV heads, spec decoding, odd layers / non-alternating `layer_types`, head_dim != 64, checkpoint without expert tensors | — |
+| Trace-time error | Non-hybrid-SWA pool, pool layout not `[pages, page, 1, packing, 128]`, KV dtype not fp8_e4m3/bf16, KV scales != 1, DCP | The env var is an explicit opt-in. Raising beats a silent fallback that would make the A/B meaningless. |
+| fp8 K/V | Clamp to ±448 before the cast (kernel) | Stock `_quantize_kv_to_fp8` clamps. A plain cast to e4m3fn gives NaN on overflow. |
+
+## HBM budget (per rank = per TPU7x TensorCore device) [I]
+
+- MK weights: +8.66 GiB (TP MoE) / +8.62 GiB (EP).
+- Stock (CI recipe): GPT-OSS experts are dequantized to bf16 at load. EP8 is 16 experts × 36
+  layers × ~25M params × 2 B ≈ 29 GB, plus attention/embeddings/lm_head ≈ 1–2 GB.
+- KV pool: `MAX_TOTAL_TOKENS=1572864` fp8. The full pool is ~14.5 GB, plus the SWA pool.
+- MK weights are allocated during `load_weights`, before KV sizing. With `mem_fraction_static=0.6`
+  the KV pool may come out smaller in the MK arm than in stock. That is irrelevant for the
+  ≤64 × 1.5k-token benchmark but should be read off the server log (`KV Cache is allocated`).
+- Assuming ~96 GB HBM per device, stock + MK + KV ≈ 55–65 GB fits. **Not checked on hardware.**
+- Sharing proposals:
+  - (a) Serve prefill MoE from the MK MXFP4 bytes via gmm_v2's native-fp4 path (EP layout)
+    and drop the stock bf16 experts. That saves ~20 GB/rank.
+  - (b) Use EP MoE mode with an expert layout identical to a native-fp4 gmm_v2 layout, so
+    both paths read one copy.
+
+## Validation (CPU only)
+
+`test/registered/unit/hardware_backend/tpu/test_gptoss_decode_mk_serving.py`, 8 virtual CPU
+devices, Pallas interpret mode:
+
+| What | Result |
+|---|---|
+| Checkpoint → per-rank weights vs the kernel's `pack_weights` (TP and EP, all 8 ranks, shuffled stream order) | attention/router/norm/bias operands bit-identical; MXFP4 experts identical after dequant |
+| bf16 checkpoint path, and the quantizer vs `reference.mxfp4_quantize` | identical |
+| Mutation checks (byte order, gate/up swap, scale off-by-one) | each makes the test fail |
+| sglang metadata → kernel operands: `_build_metadata_host` page tables, full→SWA mapping with freed out-of-window pages, page-boundary lengths, bucket padding | write slots == `out_cache_loc` / `full_to_swa[out_cache_loc]`; window pages exact; RoPE rows exact |
+| One decode step, tiny dims: repacked weights + 2L per-layer pools + adapter glue through the megakernel, plus the per-layer KV writes, vs `reference.step` (TP/fp8 KV and EP/bf16 KV, one padding row) | rel err 3.5e-3 (same as the kernel's own tests). Only the live rows' new-token slots and page 0 change; K/V match the reference |
+| Runtime gating: `applies`, load-time disable reasons, generated op signature | pass |
+| Kernel suite `test_gptoss_decode_megakernel.py` (stacked pools) after the kernel edits | unchanged numbers |
+
+## Not validated / risks
+
+1. **Anything on TPU**:
+   - torch_tpu custom-op mechanics: a `cpu_export_jax_op` with 53 operands under `shard_map`
+     with `P()` per-rank blocks, the remote-DMA kernel inside the compiled decode graph next
+     to stock collectives (same `collective_id` 0), and the donation of 36 pools by the
+     write op.
+   - Compile time per bucket, VMEM/SMEM at real dims with `split_pools`. The AOT results in
+     DESIGN.md are for stacked pools and `max_pages <= 513`. The serving config uses
+     `max_pages = pages_per_seq ≈ 2050` (128k context). That is ~650 KiB SMEM at B=64; it may
+     not compile. Fallback options: lower `--context-length`, or page-table streaming in the
+     kernel.
+2. **Checkpoint format.**
+   - The tap expects HF names `model.layers.N.…` with MXFP4 `*_blocks/_scales` or bf16
+     `gate_up_proj/down_proj`.
+   - The CI recipe passes `QUANTIZATION=unquant`, and the format of
+     `gs://junyanxu-benchmark-models/gpt/gpt-oss-120b` was not checked. The job prints the
+     checkpoint's `quantization_config`.
+   - If neither format is found, the MK disables itself with a log line and the MK arm
+     equals stock.
+3. **Numerics vs stock** (expected small):
+   - The kernel rounds the residual to bf16 after every add. Stock's fused add+norm keeps f32.
+   - The MoE accumulation order differs.
+   - The kernel uses the same bf16 rope table but applies it in f32.
+   - Golden outputs and GSM8K in the job are the check.
+4. **Performance gaps (v1)**:
+   - Padding rows of a bucket are routed like real rows. Stock gmm also computes them.
+   - There are 36 extra small kernel launches for the KV writes.
+   - The MK weights are a second copy.
+   - The kernel's long-context × large-batch attention defect (T21 log) applies unchanged.
+   - Load time (measured on a Mac CPU, 4 threads): the MXFP4 repack is ~0.1 s/layer.
+     A bf16 checkpoint costs ~5 s/layer, about 3 min per rank, plus ~8.7 GiB of host staging
+     per rank.
+5. **Paths not covered**: spec decoding (EAGLE verify), DP attention, PP, DCP and KV offload
+   all keep the stock path or disable the MK at load.
+
+## How to run
+
+```bash
+# CPU tests (jax 0.10.2 + torch CPU; ~30 s)
+XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
+  python -m unittest test.registered.unit.hardware_backend.tpu.test_gptoss_decode_mk_serving
+
+# serving A/B on TPU: same server flags, the MK arm adds
+SGLANG_TPU_GPTOSS_DECODE_MK=1 bash benchmark/tpu/launch_server.sh
+```
