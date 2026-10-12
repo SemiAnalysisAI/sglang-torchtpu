@@ -18,6 +18,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_linear import (
     apply_tpu_static_fp8_linear,
     quantize_rmsnorm_fed_weight,
@@ -127,6 +128,24 @@ class TestStaticFp8Pack(CustomTestCase):
         w, g, _ = _inputs()
         with self.assertRaises(ValueError):
             quantize_rmsnorm_fed_weight(w[:, :250], g)
+
+
+class TestKimiK3StaticFp8Selector(CustomTestCase):
+    def test_parts_and_all(self):
+        from sglang_tpu.kimi_k3_static_fp8 import PARTS, selected_parts
+
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_front,kda_qkvg"):
+            self.assertEqual(selected_parts(), {"moe_front", "kda_qkvg"})
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all"):
+            self.assertEqual(selected_parts(), PARTS)
+        self.assertEqual(selected_parts(), frozenset())  # unset: everything bf16
+
+    def test_unknown_part_raises(self):
+        from sglang_tpu.kimi_k3_static_fp8 import selected_parts
+
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_frnt"):
+            with self.assertRaises(ValueError):
+                selected_parts()
 
 
 if __name__ == "__main__":

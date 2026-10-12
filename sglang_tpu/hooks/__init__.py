@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.kimi_k3 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        bind_kimi_k3_static_fp8,
         HookType.AFTER,
     ),
 ]
