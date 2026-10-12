@@ -704,6 +704,17 @@ class GptOssModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> torch.Tensor | PPProxyTensors:
+        # TPU decode megakernel (opt-in, see sglang_tpu.gptoss_decode_mk): all layers of a
+        # plain DECODE batch in one kernel; other modes take the stock stack below.
+        decode_mk = getattr(self, "_tpu_decode_mk", None)
+        if decode_mk is not None and decode_mk.applies(
+            forward_batch,
+            input_ids,
+            input_embeds,
+            pp_proxy_tensors,
+            self.layers_to_capture,
+        ):
+            return decode_mk.run(self, input_ids, forward_batch)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -915,6 +926,15 @@ class GptOssForCausalLM(nn.Module):
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
+        # TPU decode megakernel (opt-in, SGLANG_TPU_GPTOSS_DECODE_MK=1): copy this
+        # rank's kernel weights out of the checkpoint stream; stock loading is unchanged.
+        mk_tap = None
+        if _is_tpu and not is_nextn:
+            from sglang_tpu.gptoss_decode_mk.runtime import maybe_make_weight_tap
+
+            mk_tap = maybe_make_weight_tap(self)
+            if mk_tap is not None:
+                weights = mk_tap.wrap(weights)
         if quant_config_name == "mxfp4":
             self._load_weights_mxfp4(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
@@ -934,6 +954,8 @@ class GptOssForCausalLM(nn.Module):
             self._load_normal_weights(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+        if mk_tap is not None:
+            mk_tap.finish()
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         normal_weights = []
