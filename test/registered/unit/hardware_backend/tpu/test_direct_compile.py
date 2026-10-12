@@ -239,6 +239,48 @@ class TestDirectCompile(CustomTestCase):
                     self.assertIsNone(warmup_compiled_op(op, x))
                     self.assertTrue(torch.equal(op(x), x * 3))
 
+    def test_keyword_and_positional_calls_share_one_specialization(self):
+        # Warmup recipes pass a helper's inputs positionally; serving code names
+        # them. The DFlash bookkeeping op was warmed at every bucket that way
+        # and still hit fail_on_recompile at bs=16, because the specialization
+        # key saw two argument structures for one call.
+        compiled_fns = []
+
+        def compile_helper(fn, **kwargs):
+            compiled = MagicMock(side_effect=fn)
+            compiled.cache = {}
+            compiled_fns.append(compiled)
+            return compiled
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch.object(direct_compile, "direct_compile", side_effect=compile_helper),
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(False),
+        ):
+
+            @compiled_op()
+            def bookkeeping(candidates, target_predict, prefix_lens):
+                return candidates + target_predict + prefix_lens[:, None]
+
+            c = torch.ones((2, 3), dtype=torch.int64)
+            p = torch.arange(2, dtype=torch.int64)
+            warmup_compiled_op(bookkeeping, c, c, p)
+            out = bookkeeping(candidates=c, target_predict=c, prefix_lens=p)
+
+        self.assertTrue(torch.equal(out, c + c + p[:, None]))
+        (compiled,) = compiled_fns
+        warmup_call, serving_call = compiled.call_args_list
+        # Both spellings reach the compiled callable as one positional call,
+        # so the specialization key (which hashes the argument structure) is
+        # the same for warmup and serving.
+        self.assertEqual(serving_call.kwargs, {})
+        self.assertEqual(warmup_call.kwargs, {})
+        self.assertEqual(len(warmup_call.args), len(serving_call.args))
+        for warmed, served in zip(warmup_call.args, serving_call.args):
+            self.assertEqual(tuple(warmed.shape), tuple(served.shape))
+
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
         def add_one(x):

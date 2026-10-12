@@ -668,8 +668,16 @@ def assert_decode_reshard_topology(decode_host: str) -> None:
     url = f"http://{decode_host}:{DECODE_PORT}/server_info"
     with urllib.request.urlopen(url, timeout=60) as resp:
         info = json.loads(resp.read())
-    dp_size = int(info.get("dp_size") or 1)
-    dp_attention = bool(info.get("enable_dp_attention"))
+    # Attention DP is declared by width now: attn_dp_size carries the group
+    # count and dp_size the replica count (1). Older servers spelled it
+    # --dp-size N --enable-dp-attention and report dp_size=N; a dp_size > 1
+    # without the flag is N replicas, not DP attention.
+    attn_dp_size = int(info.get("attn_dp_size") or 1)
+    if attn_dp_size > 1:
+        dp_size, dp_attention = attn_dp_size, True
+    else:
+        dp_size = int(info.get("dp_size") or 1)
+        dp_attention = bool(info.get("enable_dp_attention"))
     tp_size = int(info.get("tp_size") or 0)
     attn_tp = tp_size // dp_size if dp_size else tp_size
     print(
@@ -872,6 +880,13 @@ class TestPdGptOss120bReshardConfiguration(unittest.TestCase):
                 assert_decode_reshard_topology("decode-host")
             served.update(tp_size=16, dp_size=2, enable_dp_attention=True)
             assert_decode_reshard_topology("decode-host")  # must not raise
+            # --attn-dp-size spelling: dp_size is the replica count (1).
+            served.update(tp_size=16, dp_size=1, attn_dp_size=2)
+            served["enable_dp_attention"] = True
+            assert_decode_reshard_topology("decode-host")  # must not raise
+            served.update(tp_size=16, dp_size=1, attn_dp_size=1)
+            with self.assertRaisesRegex(AssertionError, "dp_size=1"):
+                assert_decode_reshard_topology("decode-host")
 
             replies[:] = [_reply("same") for _ in range(CONCURRENT_WAVE_SIZE)]
             _assert_concurrent_wave_is_deterministic(stub_url, "prompt", "same")
