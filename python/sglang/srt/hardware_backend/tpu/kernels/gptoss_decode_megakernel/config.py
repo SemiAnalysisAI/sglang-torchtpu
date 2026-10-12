@@ -1,0 +1,151 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Geometry and tiling of the GPT-OSS TP8 decode megakernel (see DESIGN.md)."""
+
+from __future__ import annotations
+
+import dataclasses
+
+BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+
+
+def rup(x: int, m: int = 128) -> int:
+    return (x + m - 1) // m * m
+
+
+def cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+@dataclasses.dataclass(frozen=True)
+class DecodeConfig:
+    """One decode step (T=1 token per sequence) of B sequences through all L layers at TP=R.
+
+    Layer l is sliding-window when `l % 2 == 0` (GPT-OSS `layer_types`), so L must be even;
+    sliding layers read the SWA KV pool, full layers the full KV pool (sglang's SWAKVPool).
+    """
+
+    B: int = 1  # batch bucket (static per compile)
+    L: int = 36
+    H: int = 2880
+    NQ: int = 64
+    NKV: int = 8
+    D: int = 64
+    E: int = 128
+    TOPK: int = 4
+    I: int = 2880
+    window: int = 128  # attended tokens including the current one (sglang window_left 127)
+    eps: float = 1e-5
+    alpha: float = 1.702
+    limit: float = 7.0
+    rope_theta: float = 150000.0
+    rope_factor: float = 32.0
+    rope_orig: int = 4096
+    R: int = 8  # TP ranks
+    moe_mode: str = "tp"  # "tp": every rank holds I/R of every expert; "ep": E/R whole experts
+    kv_dtype: str = "bf16"  # "bf16" or "fp8" (float8_e4m3fn), sglang TPU fused-KV layout
+    page: int = 64
+    max_pages: int = 128  # page-table columns per sequence (context <= page * max_pages)
+    nb_full: int = 1024  # pages in the full-attention pool (per rank, per layer)
+    nb_swa: int = 1024  # pages in the SWA pool
+    npb: int = 2  # KV pages per attention block (one DMA per page)
+    tne: int = 384  # expert intermediate chunk (lanes) per streamed work item
+    w_slots: int = 3  # expert weight ring depth (w_slots - 1 items in flight)
+    vmem_mib: int = 60
+    ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
+
+    # ------------------------------------------------------------------ derived
+    @property
+    def Hp(self) -> int:
+        return rup(self.H)
+
+    @property
+    def BR(self) -> int:  # activation rows (bf16 sublane tile)
+        return rup(self.B, 16)
+
+    @property
+    def NQL(self) -> int:  # query heads per rank
+        return self.NQ // self.R
+
+    @property
+    def QWL(self) -> int:
+        return self.NQL * self.D
+
+    @property
+    def QKVWL(self) -> int:  # q | k (1 head, padded to 128 lanes) | v (same)
+        return self.QWL + 256
+
+    @property
+    def EL(self) -> int:  # experts per rank
+        return self.E if self.moe_mode == "tp" else self.E // self.R
+
+    @property
+    def IL_RAW(self) -> int:
+        return self.I // self.R if self.moe_mode == "tp" else self.I
+
+    @property
+    def IL(self) -> int:
+        return rup(self.IL_RAW, self.tne)
+
+    @property
+    def NJ(self) -> int:
+        return self.IL // self.tne
+
+    @property
+    def kv_packing(self) -> int:  # KV elements per 32-bit word (sglang `kv_packing`)
+        return 4 if self.kv_dtype == "fp8" else 2
+
+    @property
+    def VW(self) -> int:
+        return max(self.Hp, self.QKVWL, 128)
+
+    @property
+    def sliding(self) -> tuple[bool, ...]:
+        return tuple(l % 2 == 0 for l in range(self.L))
+
+    @property
+    def sm_scale(self) -> float:
+        return self.D**-0.5
+
+    def check(self) -> None:
+        assert self.D == 64, "head-pair lane packing assumes head_dim 64"
+        assert self.NKV == self.R, "v0: exactly one KV head per rank"
+        assert self.NQL % 2 == 0 and self.QWL % 128 == 0
+        assert self.L % 2 == 0, "layers come in (sliding, full) pairs"
+        assert self.E <= 128 and self.TOPK <= self.E and self.E % self.R == 0
+        assert self.I % self.R == 0 and self.moe_mode in ("tp", "ep")
+        assert self.kv_dtype in ("bf16", "fp8") and self.ar_dtype in ("bf16", "f32")
+        assert self.tne % 128 == 0 and self.w_slots >= 2
+        assert self.page % 8 == 0
+
+
+FULL = DecodeConfig()
+
+
+def full(B: int, **kw) -> DecodeConfig:
+    return dataclasses.replace(FULL, B=B, **kw)
+
+
+def tiny(B: int = 4, **kw) -> DecodeConfig:
+    """All structural constraints of the real config at a size the CPU interpreter runs.
+
+    H=240 exercises the hidden padding (Hp=256); NQ/NKV/D are the real head geometry so the
+    attention code path is exactly the real one; E=16 < 128 exercises the router padding.
+    """
+    base = dict(
+        L=2, H=240, E=16, TOPK=4, I=8 * 48, max_pages=4, nb_full=24, nb_swa=24, npb=2,
+        tne=128, w_slots=3, vmem_mib=32,
+    )
+    base.update(kw)
+    return DecodeConfig(B=B, **base)
