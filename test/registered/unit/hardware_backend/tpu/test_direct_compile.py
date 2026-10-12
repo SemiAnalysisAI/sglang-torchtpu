@@ -464,6 +464,42 @@ class TestDirectCompile(CustomTestCase):
                 artifact(((torch.ones(2),), {}))
             execute.assert_not_called()
 
+    def test_argument_layouts_do_not_depend_on_async_timing(self):
+        """A pending TPU input compiles with its materialized layout, not the default."""
+
+        class _Input:
+            def __init__(self, device_type, layout):
+                self.device = SimpleNamespace(type=device_type)
+                self.layout = layout  # None until materialized
+
+        def materialize(tensors, wait):
+            self.assertTrue(wait)
+            for tensor in tensors:
+                tensor.layout = ([1, 0], None)
+
+        host = _Input("cpu", None)
+        with (
+            patch.object(
+                direct_compile.tpu_torch_compile,
+                "get_device_layout_if_materialized",
+                side_effect=lambda tensor: tensor.layout,
+            ),
+            patch.object(
+                direct_compile, "synchronize", side_effect=materialize
+            ) as synchronize,
+        ):
+            ready = _Input("tpu", ([1, 0], None))
+            self.assertEqual(
+                direct_compile._argument_layouts([ready, host]), [[1, 0], []]
+            )
+            synchronize.assert_not_called()
+            queued = _Input("tpu", None)
+            self.assertEqual(
+                direct_compile._argument_layouts([queued, host]), [[1, 0], []]
+            )
+            synchronize.assert_called_once()
+            self.assertEqual(synchronize.call_args.args[0], [queued])
+
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_preserves_model_and_argument_layouts(self):
         """Compile against live buffer layouts, not placeholder defaults."""

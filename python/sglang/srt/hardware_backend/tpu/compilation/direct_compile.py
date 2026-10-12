@@ -20,6 +20,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
 from torch_tpu._internal.compile import tpu_torch_compile
+from torch_tpu._internal.sync.sync import synchronize
 
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
@@ -529,12 +530,7 @@ class CompiledFunction:
             len(inserted_callbacks),
         )
         # Placeholders do not retain the physical layout of their buffers.
-        argument_layouts = []
-        for tensor in flat_inputs:
-            layout = None
-            if tensor.device.type == "tpu":
-                layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
-            argument_layouts.append(layout[0] if layout is not None else [])
+        argument_layouts = _argument_layouts(flat_inputs)
         if rng_device is not None:
             argument_layouts.append([])
         pending_compile = None
@@ -780,6 +776,32 @@ def _selector_path(
 
 def _is_tpu_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.device.type == "tpu"
+
+
+def _argument_layouts(flat_inputs: Sequence[torch.Tensor]) -> list[list[int]]:
+    """Each input's minor-to-major layout for the compile request ([] = default).
+
+    The layouts are part of the persistent compile-cache key. A TPU input that
+    is still being produced asynchronously has no layout yet, so compiling
+    right away would key the same program on async timing: a queued warm-up
+    whose inputs are pending and a later compile with materialized inputs get
+    two cache entries. Materialize pending TPU inputs first.
+    """
+    pending = [
+        tensor
+        for tensor in flat_inputs
+        if tensor.device.type == "tpu"
+        and tpu_torch_compile.get_device_layout_if_materialized(tensor) is None
+    ]
+    if pending:
+        synchronize(pending, wait=True)
+    layouts = []
+    for tensor in flat_inputs:
+        layout = None
+        if tensor.device.type == "tpu":
+            layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+        layouts.append(layout[0] if layout is not None else [])
+    return layouts
 
 
 def _register_hidden_states_pytree(cls: type) -> None:
