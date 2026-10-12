@@ -734,7 +734,8 @@ _future_map_direct_handoff_patched = False
 def _patch_future_map_direct_handoff() -> None:
     """Route FutureMap.stash/publish through the TPU direct handoff, so an
     unchanged EAGLE3 top-k-1 decode batch skips the store/gather round trip.
-    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu."""
+    The resolve side is already hooked via resolve_device_accept_seq_lens_tpu.
+    Construction compiles the stores for every row count up front."""
     global _future_map_direct_handoff_patched
     if _future_map_direct_handoff_patched:
         return
@@ -744,15 +745,21 @@ def _patch_future_map_direct_handoff() -> None:
         flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
+        warm_future_map_stores_tpu,
     )
     from sglang.srt.managers.overlap_utils import FutureMap
 
+    orig_init = FutureMap.__init__
     orig_stash = FutureMap.stash
     orig_publish = FutureMap.publish
     orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
     orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
+
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        warm_future_map_stores_tpu(self)
 
     def stash(self, future_indices, payload):
         if not stash_tpu(self, future_indices, payload):
@@ -772,6 +779,7 @@ def _patch_future_map_direct_handoff() -> None:
         flush_direct_handoff_tpu(self)
         orig_resolve_mixed_spec_tails(self, batch)
 
+    FutureMap.__init__ = __init__
     FutureMap.stash = stash
     FutureMap.publish = publish
     FutureMap.stash_bonus_tokens = stash_bonus_tokens

@@ -214,3 +214,26 @@ def resolve_device_accept_seq_lens_tpu(
         return False
     batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]
     return True
+
+
+def warm_future_map_stores_tpu(future_map: FutureMap) -> None:
+    """Compile the future-buffer stores for every batch row count before serving.
+
+    On TPU, ``FutureMap._store`` is an eager ``index_copy_`` whose program is
+    specialized on the stored row count. The stash and publish stores run when a
+    direct handoff is flushed, at batch changes, so serving kept meeting new
+    exact row counts, one program each, long after a cache fill. Store zeros into
+    row 0, the request pool's padding row, for every count up to the pool size.
+    Host-built inputs keep the warm-up to the stores' own programs.
+    """
+    from sglang.srt.managers.overlap_utils import _DEBUG_ASSERT
+
+    # Debug mode poisons every row until its first real write.
+    if not future_map._use_dynamic_index or _DEBUG_ASSERT:
+        return
+    buffers = (future_map.output_tokens_buf, future_map.new_seq_lens_buf)
+    for rows in range(1, future_map.req_pool_size):
+        indices = torch.zeros(rows, dtype=torch.int64).to(future_map.device)
+        for buf in buffers:
+            values = torch.zeros(rows, dtype=buf.dtype).to(future_map.device)
+            future_map._store(buf, indices, values)

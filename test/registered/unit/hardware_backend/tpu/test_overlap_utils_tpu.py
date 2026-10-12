@@ -27,6 +27,7 @@ def tpu_future_map():
     """Install the TPU FutureMap patch on a CPU host, restoring it on exit."""
     with ExitStack() as stack:
         for name in (
+            "__init__",
             "stash",
             "publish",
             "stash_bonus_tokens",
@@ -260,6 +261,53 @@ class TestDirectHandoff(CustomTestCase):
             fm.output_tokens_buf[indices], torch.tensor([77, 12])
         )
         self.assertIsNone(fm.tpu_direct_handoff)
+
+
+class TestStoreWarmup(CustomTestCase):
+    def test_construction_stores_every_row_count_into_the_padding_row(self):
+        """Each row count's store program is compiled before serving, on row 0 only."""
+        algo = make_case()[0].spec_algo
+        stores = []
+        original_store = FutureMap._store
+
+        def record(self, buf, indices, values):
+            stores.append((buf, indices.tolist(), values.tolist()))
+            original_store(self, buf, indices, values)
+
+        with (
+            tpu_future_map(),
+            patch(
+                "sglang.srt.managers.overlap_utils._device_use_dynamic_index",
+                return_value=True,
+            ),
+            patch.object(FutureMap, "_store", record),
+        ):
+            fm = FutureMap(
+                device="cpu",
+                spec_algo=algo,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 16)),
+                needs_cpu_seq_lens=False,
+            )
+        self.assertEqual(
+            [(buf is fm.output_tokens_buf, len(rows)) for buf, rows, _ in stores],
+            [(True, 1), (False, 1), (True, 2), (False, 2), (True, 3), (False, 3)],
+        )
+        for buf, rows, values in stores:
+            self.assertEqual(set(rows), {0})
+            self.assertEqual(set(values), {0})
+        self.assertEqual(fm.output_tokens_buf[0].item(), 0)
+        self.assertEqual(fm.new_seq_lens_buf[0].item(), 0)
+
+    def test_other_devices_skip_the_warmup(self):
+        algo = make_case()[0].spec_algo
+        with tpu_future_map(), patch.object(FutureMap, "_store") as store:
+            FutureMap(
+                device="cpu",
+                spec_algo=algo,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 16)),
+                needs_cpu_seq_lens=False,
+            )
+        store.assert_not_called()
 
 
 if __name__ == "__main__":
