@@ -919,3 +919,121 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
             "TpuFusedMLATokenToKVPool.set_mla_kv_buffer was called; the Pallas "
             "MLA kernel owns cache writes (see set_kv_buffer)."
         )
+
+
+class TpuFusedDSATokenToKVPool(TpuFusedMLATokenToKVPool):
+    """The fused MLA KV pool, plus the index-key cache the DSA indexer needs.
+
+    Each layer that runs its own indexer gets one ``uint8`` buffer of index
+    keys. It is paged like the KV cache and uses the same page table. A layer
+    that reuses the previous layer's top-k result has no such buffer.
+
+    Like the KV cache, these buffers are written only by the op that uses them
+    (the indexer op), which updates them in place.
+
+    TODO(sglang-torchtpu#1072): the core pool sizer counts 132 bytes per index
+    key, not this pool's 256, so a pool sized from free memory comes out too
+    large (about 2.5% for GLM-5.2). Pass --max-total-tokens until the sizer can
+    ask the pool for its bytes per token.
+    """
+
+    # The index-key cache stores this many tokens per row of a page.
+    INDEX_KEY_TOKENS_PER_ROW = 4
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        *,
+        index_head_dim: int,
+        index_key_layers: list[bool],
+    ):
+        if len(index_key_layers) != layer_num:
+            raise ValueError(
+                f"index_key_layers has {len(index_key_layers)} entries for "
+                f"{layer_num} layers."
+            )
+        # Set these first: the base constructor calls _create_buffers.
+        self._index_head_dim = index_head_dim
+        self._index_key_layers = index_key_layers
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+    @classmethod
+    def index_key_record_bytes(cls, index_head_dim: int) -> int:
+        """Bytes one token's index key takes in the cache.
+
+        A record is the key's FP8 bytes in whole 128-byte lanes, then one scale
+        byte per lane, rounded up to whole lanes again. A 128-wide key takes
+        256 bytes. The indexer op checks the buffer's shape against what its
+        kernel reads, so a mistake here fails at the first compile.
+        """
+        lane = cls.HEAD_DIM_ALIGNMENT
+        key_bytes = _cdiv(index_head_dim, lane) * lane
+        return _cdiv(key_bytes + key_bytes // lane, lane) * lane
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        tokens_per_row = self.INDEX_KEY_TOKENS_PER_ROW
+        if self.page_size % tokens_per_row != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by "
+                f"{tokens_per_row} for the TPU index-key cache."
+            )
+        shape = (
+            self.num_pages,
+            self.page_size // tokens_per_row,
+            tokens_per_row,
+            self.index_key_record_bytes(self._index_head_dim),
+        )
+        logger.info(
+            "Allocating TPU DSA index-key buffers: layers=%d of %d, shape per layer=%s",
+            sum(self._index_key_layers),
+            self.layer_num,
+            shape,
+        )
+        # One whole tensor per layer, not a view of a shared one: the indexer
+        # op can only update a whole tensor in place.
+        self.index_key_buffer = [
+            _zeros_kv_buffer(shape, torch.uint8, self.device) if has_indexer else None
+            for has_indexer in self._index_key_layers
+        ]
+
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.index_key_buffer
+
+    def get_index_key_cache(self, layer_id: int) -> torch.Tensor:
+        buf = self.index_key_buffer[layer_id - self.start_layer]
+        if buf is None:
+            raise ValueError(
+                f"layer {layer_id} reuses the previous layer's top-k result "
+                "and has no index-key cache."
+            )
+        return buf
+
+    def get_kv_size_bytes(self):
+        index_key_bytes = sum(
+            get_tensor_size_bytes(buf)
+            for buf in self.index_key_buffer
+            if buf is not None
+        )
+        return super().get_kv_size_bytes() + index_key_bytes

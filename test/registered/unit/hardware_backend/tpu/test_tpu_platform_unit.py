@@ -140,10 +140,15 @@ class TestTpuCompileCache(CustomTestCase):
                 package_root / "attention/pallas/kernel.py",
                 package_root / "moe/pallas/kernel.py",
                 package_root / "attention_pallas.py",
+                package_root / "attention_pallas_mla.py",
+                package_root / "attention_pallas_mla_sparse.py",
                 package_root / "attention_pallas_rpa_base.py",
                 package_root / "attention_pallas_rpa_batched.py",
                 package_root / "attention_pallas_rpa_v3.py",
                 package_root / "distributed_topk_pallas.py",
+                package_root / "dsa_indexer_tpu.py",
+                package_root / "dsv4/sparsecore_topk.py",
+                package_root / "dsv4/streamindex_topk/kernel.py",
                 package_root / "kernels/distributed_topk.py",
                 package_root / "kernels/kernel.py",
                 package_root / "pallas_export.py",
@@ -380,6 +385,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
         self.assertEqual(self._resolved(args, "page_size"), 64)
 
+    def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
+        # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
+        # left to mean the model dtype.
+        args = self._args(attention_backend="pallas_tpu_mla_sparse")
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "kv_cache_dtype"), "fp8_e4m3")
+
     def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
         args = self._args(attention_backend="pallas_tpu_rpa_batched")
         self._apply(args)
@@ -604,6 +616,43 @@ class TestPrefillContextParallelValidation(CustomTestCase):
             attn_cp_size=2,
             moe_dp_size=2,
         )
+
+
+class TestDsaValidation(CustomTestCase):
+    """apply_server_args_defaults rejects the DSA setups TPU would serve wrongly."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+
+    def _apply_dsa(self, *, attention_backend, **config_fields):
+        args = self._args(
+            attention_backend=attention_backend,
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048, **config_fields
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+
+    def test_dsa_needs_the_sparse_backend_and_a_plain_top_k(self):
+        """TPU has one DSA backend, and its top-k kernel cannot force the
+        init/local positions in. Either mismatch must stop the launch: served
+        anyway, the model would attend over a different selection."""
+        self._apply_dsa(attention_backend="pallas_tpu_mla_sparse")
+        with self.assertRaisesRegex(ValueError, "pallas_tpu_mla_sparse"):
+            self._apply_dsa(attention_backend="pallas_tpu_mla")
+        for field in ("index_init_tokens", "index_local_tokens"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    self._apply_dsa(
+                        attention_backend="pallas_tpu_mla_sparse", **{field: 4}
+                    )
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
@@ -855,9 +904,9 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_nsa_raises(self):
-        with self.assertRaises(NotImplementedError):
-            self.platform.get_nsa_kv_pool_cls()
+    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+        cls = self.platform.get_dsa_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
