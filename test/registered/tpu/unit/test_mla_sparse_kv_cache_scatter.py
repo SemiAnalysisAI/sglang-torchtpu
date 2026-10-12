@@ -28,7 +28,7 @@ import sys
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import sweep
 
-register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
 # The DCP writer recompiles per rank at ~7s, so the 30 ranks of the four
 # (dcp_size, interleave_size) pairs are most of this file's 408s. The gate runs
 # the two small ones -- which still check the ownership partition exactly, over

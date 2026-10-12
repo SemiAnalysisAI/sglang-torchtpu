@@ -26,7 +26,7 @@ from __future__ import annotations
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.ci.gate_matrix import sweep
 
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 # Every (in_size, out_size, group_offset) case is its own Mosaic compile, so the
 # 192-case grid below costs ~400s. The gate pins the shapes and keeps the code
 # paths (num_groups, has_bias, weight_dtype, zero vs non-zero group_offset);
