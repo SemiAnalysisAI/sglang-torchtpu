@@ -362,7 +362,7 @@ class TestHybridLoadFailure(CustomTestCase):
         self.assertTrue(event.failed)
         self.assertFalse(event.query())  # nor before its cleanup may run
         event.synchronize()  # a resolved failure no longer raises
-        event.failure_handled = True
+        event.released = True
         self.assertTrue(event.query())
 
     def test_failure_on_another_rank_fails_the_load_here(self):
@@ -378,7 +378,7 @@ class TestHybridLoadFailure(CustomTestCase):
         self._fail(full_pool.load_futures[0])
         swa_pool.load_futures[0].ready = True
         self.assertFalse(ctrl.resolve_load_back(event, _other_rank(done=0, failed=0)))
-        self.assertFalse(event.resolved)
+        self.assertIsNone(event.failed)
 
     def test_successful_load_resolves_without_failure(self):
         ctrl, _, full_pool, swa_pool, event = self._start(True)

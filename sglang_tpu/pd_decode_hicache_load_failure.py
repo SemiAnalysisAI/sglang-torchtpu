@@ -36,10 +36,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    LoadBackEvent,
-    TpuRaidenHybridCacheController,
-)
+from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
+from sglang_tpu.raiden_transfer import LoadBackEvent
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +72,6 @@ def _fail_restores_of_failed_loads(transfer_queue, decode_reqs) -> None:
         if (
             dr.hicache_restore_status == HiCacheRestoreResult.READY
             and isinstance(event, LoadBackEvent)
-            and event.resolved
             and event.failed
         ):
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
@@ -98,17 +95,17 @@ def _release_failed_loads(cache, controller) -> None:
             return
         if not isinstance(event, LoadBackEvent) or not event.failed:
             continue
-        if event.failure_handled:
+        if event.released:
             continue
         if not hasattr(cache.tree_core, "_binding"):
             # Only the Rust tree core can tell whether the nodes are still in use.
-            raise event.local_error or RuntimeError(
+            raise event.error or RuntimeError(
                 "raiden HiCache load-back failed on another rank"
             )
         nodes = [n for anchor in ack.node_ids for n in loaded.get(anchor, [anchor])]
         if not all(_held_only_by_the_load(cache.tree_core, n) for n in nodes):
             return  # a request still holds them; it is aborted on this poll
-        event.failure_handled = True
+        event.released = True
 
 
 def _roll_back(cache, anchor: int, nodes: List[int]) -> None:

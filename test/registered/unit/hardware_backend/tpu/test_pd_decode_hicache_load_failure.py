@@ -21,10 +21,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import pd_decode_hicache_load_failure as lf
-from sglang_tpu.raiden_hybrid_cache_controller import (
-    LoadBackEvent,
-    TpuRaidenHybridCacheController,
-)
+from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
+from sglang_tpu.raiden_transfer import LoadBackEvent
 
 
 class _Done:
@@ -43,10 +41,9 @@ class _Done:
 
 def _event(failed: bool) -> LoadBackEvent:
     event = LoadBackEvent(
-        _Done(RuntimeError("raiden DMA failed: boom") if failed else None),
-        handles_failures=True,
+        [_Done(RuntimeError("raiden DMA failed: boom") if failed else None)]
     )
-    event.local_done()
+    event.landed()
     return event
 
 
@@ -108,9 +105,7 @@ def _dr(event=None, status=HiCacheRestoreResult.READY, index=0):
 class TestFailRestores(CustomTestCase):
     def test_restore_of_a_failed_load_is_failed_not_ready(self):
         failed, ok = _event(True), _event(False)
-        for event in (failed, ok):
-            event.resolved = True
-        failed.failed = True
+        failed.failed, ok.failed = True, False
         queue = SimpleNamespace(tree_cache=_Cache([]))
         dr_failed, dr_ok = _dr(failed), _dr(ok)
         lf._fail_restores_of_failed_loads(queue, [dr_failed, dr_ok])
@@ -132,7 +127,7 @@ class TestReleaseFailedLoads(CustomTestCase):
         cache = _Cache([ack], lock_refs={7: 1, 8: 1}, loaded={8: [7, 8]})
         lf._release_failed_loads(cache, cache.cache_controller)
         self.assertTrue(ack.finish_event.failed)
-        self.assertTrue(ack.finish_event.failure_handled)
+        self.assertTrue(ack.finish_event.released)
 
     def test_failed_load_waits_while_a_request_holds_a_node(self):
         failed_ack, next_ack = _ack(anchor=8, failed=True), _ack(anchor=9, failed=False)
@@ -140,10 +135,10 @@ class TestReleaseFailedLoads(CustomTestCase):
             [failed_ack, next_ack], lock_refs={7: 1, 8: 2}, loaded={8: [7, 8]}
         )
         lf._release_failed_loads(cache, cache.cache_controller)
-        self.assertFalse(failed_ack.finish_event.failure_handled)
+        self.assertFalse(failed_ack.finish_event.released)
         self.assertFalse(failed_ack.finish_event.query())
         # Acks are acked in order, so the walk stops at the held one.
-        self.assertFalse(next_ack.finish_event.resolved)
+        self.assertIsNone(next_ack.finish_event.failed)
 
 
 class TestRollBack(CustomTestCase):

@@ -130,6 +130,49 @@ class CombinedFutureEvent:
         return None
 
 
+class LoadBackEvent(CombinedFutureEvent):
+    """A HiCache load-back's DMAs, whose failure is cleaned up, not raised.
+
+    ``error`` keeps this rank's failure. ``failed`` stays None until every rank
+    agrees on the outcome (``TpuRaidenHybridCacheController.resolve_load_back``)
+    and then says whether the load failed on any rank. A failed load reports
+    done only once ``released`` lets its cleanup run, so ``loading_check``
+    cannot ack it earlier; an unsettled failure still raises from
+    ``synchronize()``.
+    """
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.error = None
+        self.failed = None
+        self.released = False
+
+    def landed(self) -> bool:
+        """This rank's view: True once every DMA has landed, failed or not."""
+        if self.error is None:
+            try:
+                if not super().query():
+                    return False
+            except RuntimeError as e:
+                self.error = e
+        return True
+
+    def query(self) -> bool:
+        if not self.landed():
+            return False
+        return self.released if self.failed else self.error is None
+
+    def synchronize(self) -> None:
+        if self.failed:
+            return
+        try:
+            super().synchronize()
+        except RuntimeError as e:
+            self.error = e
+        if self.error is not None and self.failed is None:
+            raise self.error
+
+
 class RaidenKVTransfer:
     """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
     page-granular D2H / H2D transfers.
