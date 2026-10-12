@@ -58,11 +58,18 @@ def xla_step_fn(c, mesh, MK, REF):
             k = REF.rope(qkv[:, c.QWL:c.QWL + c.D].reshape(B, 1, c.D), cos, sin)[:, 0]
             v = qkv[:, c.QWL + 128:c.QWL + 128 + c.D]
             kq, vq = k.astype(kvdt), v.astype(kvdt)
-            pages = pool[l // 2][pt]  # [B, MP, page, 1, packing, 128]
+            if sliding:  # only the window's pages; positions relative to its first page
+                plo = jnp.maximum(pos - (c.window - 1), 0) // c.page
+                widx = jnp.minimum(plo[:, None] + jnp.arange(c.NWP)[None, :], c.max_pages - 1)
+                pt_l = jnp.take_along_axis(pt, widx, axis=1)
+                pos_l = pos - plo * c.page
+            else:
+                pt_l, pos_l = pt, pos
+            pages = pool[l // 2][pt_l]  # [B, n_pages, page, 1, packing, 128]
             kh = pages[:, :, :, 0, 0, :c.D].reshape(B, -1, c.D)
             vh = pages[:, :, :, 0, 1, :c.D].reshape(B, -1, c.D)
             o = REF.attention(c, q, kq.astype(F32)[:, None], vq.astype(F32)[:, None],
-                              kh.astype(F32)[:, :, None], vh.astype(F32)[:, :, None], pos,
+                              kh.astype(F32)[:, :, None], vh.astype(F32)[:, :, None], pos_l,
                               W["sinks"][l][:, 0], sliding)
             part = jnp.dot(o.reshape(B, c.QWL).astype(BF16), W["wo"][l], preferred_element_type=F32)
             res = (res + lax.psum(part.astype(BF16).astype(F32), "tp") + vec[2, :c.Hp])
@@ -132,11 +139,13 @@ def main():
     ap.add_argument("--batch", type=int, nargs="+", default=[1, 8, 32, 64])
     ap.add_argument("--modes", nargs="+", default=["mk", "fallback", "xla"])
     ap.add_argument("--layers", type=int, default=36)
-    ap.add_argument("--ctx", type=int, default=1024, help="tokens already in every sequence")
+    ap.add_argument("--ctx", type=int, default=1024,
+                    help="tokens already in every sequence (e.g. 1024, 4096, 8192, 32768)")
     ap.add_argument("--kv", default="fp8", choices=["bf16", "fp8"])
     ap.add_argument("--moe", default="tp", choices=["tp", "ep"])
     ap.add_argument("--tne", type=int, default=384)
-    ap.add_argument("--npb", type=int, default=2)
+    ap.add_argument("--npb", type=int, default=8, help="KV pages per attention item (full layers)")
+    ap.add_argument("--kv-bufs", type=int, default=3, help="KV item buffers (prefetch depth + 1)")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--vmem-mib", type=int, default=60)
@@ -160,7 +169,23 @@ def main():
     mesh = Mesh(np.array(devs[:8]), ("tp",))
     shd, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     max_pages = -(-(args.ctx + 1) // 64)
-    nb = max(args.batch) * max_pages + 1
+    nb = max(args.batch) * max_pages + 1  # full pool: every page of every sequence
+    swa_ring = 4  # > NWP pages: sliding layers only ever touch the window's pages
+    nb_swa = max(args.batch) * swa_ring + 1
+
+    def rand_pool(spec, key):
+        """Finite random KV bits without an f32 intermediate (pools reach ~20 GiB/rank)."""
+        def f(k):
+            if spec.dtype == jnp.bfloat16:
+                bits = jax.random.bits(k, spec.shape, jnp.uint16) & jnp.uint16(0xBE7F)
+            else:  # fp8 e4m3fn: clearing bit 3 of the exponent avoids the NaN code
+                bits = jax.random.bits(k, spec.shape, jnp.uint8) & jnp.uint8(0xB7)
+            return jax.lax.bitcast_convert_type(bits, spec.dtype)
+        return jax.jit(f, out_shardings=shd)(key)
+
+    def new_pools(c):
+        return [rand_pool(s, k) for s, k in zip(MK.pool_specs(c),
+                                                jax.random.split(jax.random.PRNGKey(1), 2))]
 
     def rand(spec, key, scale):
         f = lambda k: (jax.random.normal(k, spec.shape, jnp.float32) * scale).astype(spec.dtype)
@@ -172,7 +197,7 @@ def main():
         extra = {} if args.cpu_smoke else dict(L=args.layers, tne=args.tne,
                                                vmem_mib=args.vmem_mib)
         c = mk_cfg(B, kv_dtype=args.kv, moe_mode=args.moe, npb=args.npb, nb_full=nb,
-                   nb_swa=nb, max_pages=max_pages, **extra)
+                   nb_swa=nb_swa, max_pages=max_pages, kv_bufs=args.kv_bufs, **extra)
         if W is None:  # weights do not depend on B
             keys = jax.random.split(jax.random.PRNGKey(0), 16)
             W = {}
@@ -181,16 +206,17 @@ def main():
                 W[k] = rand(s, keys[i], scale)
             # ln1 / ln2 = 1 so activations stay O(1)
             W["vec"] = W["vec"].at[:, :, 0:2, :].set(1.0)
-        pools = [rand(s, k, 0.5) for s, k in zip(MK.pool_specs(c), jax.random.split(
-            jax.random.PRNGKey(1), 2))]
+        pools = new_pools(c)
         x = jax.device_put(jax.random.normal(jax.random.PRNGKey(2), (B, c.H)).astype(jnp.bfloat16), rep)
         pos = jax.device_put(jnp.full((B,), args.ctx, jnp.int32), rep)
         pt = np.arange(1, 1 + B * max_pages, dtype=np.int32).reshape(B, max_pages)
-        pt_s = jax.device_put(jnp.asarray(pt), rep)
         pt_f = jax.device_put(jnp.asarray(pt[::-1].copy()), rep)
+        # SWA pool: page j of sequence b -> slot j % swa_ring of b's ring (window-distinct)
+        ptw = 1 + np.arange(B)[:, None] * swa_ring + np.arange(max_pages)[None, :] % swa_ring
+        pt_s = jax.device_put(jnp.asarray(ptw.astype(np.int32)), rep)
         for mode in args.modes:
             rec = dict(mode=mode, B=B, L=c.L, ctx=args.ctx, kv=c.kv_dtype, moe=c.moe_mode,
-                       tne=c.tne, npb=c.npb)
+                       tne=c.tne, npb=c.npb, kv_bufs=c.kv_bufs)
             try:
                 if mode == "xla":
                     fn = xla_step_fn(c, mesh, MK, REF)
@@ -219,8 +245,7 @@ def main():
                            finite=bool(jnp.all(jnp.isfinite(out.astype(jnp.float32)))))
             except Exception as e:  # noqa: BLE001
                 rec["error"] = (type(e).__name__ + ": " + str(e))[:2000]
-                pools = [rand(s, k, 0.5) for s, k in zip(MK.pool_specs(c), jax.random.split(
-                    jax.random.PRNGKey(1), 2))]
+                pools = new_pools(c)
             print(json.dumps(rec), flush=True)
 
 

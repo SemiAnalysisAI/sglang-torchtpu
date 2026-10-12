@@ -213,8 +213,10 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
             "awqkv": V((2, Hp, c.QKVWL), BF16),
             "awo": V((2, QWL, Hp), BF16),
             "awsink": V((2, c.NQL, 128), F32),
-            "kvb": V((2, c.npb * c.page, 1, c.kv_packing, 128), kvdt),
-            "sem_kv": pltpu.SemaphoreType.DMA((2, c.npb)),
+            "kvb": V((c.kv_bufs, c.TKMAX, 1, c.kv_packing, 128), kvdt),
+            "sem_kv": pltpu.SemaphoreType.DMA((c.kv_bufs,)),
+            "it_b": pltpu.SMEM((c.NIMAX,), I32),
+            "it_j": pltpu.SMEM((c.NIMAX,), I32),
         })
     if mode in ("mega", "moe"):
         s.update({
@@ -268,7 +270,7 @@ def vmem_bytes(c: DecodeConfig, mode: str = "mega") -> dict[str, int]:
 def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, interpret=False):
     """Return a per-rank callable (to be used under shard_map over axis "tp").
 
-    mode="mega": f(rank, pos, pt_swa, pt_full, x, cos, sin, *W, kv_swa, kv_full)
+    mode="mega": f(rank, pos, pt_win [B*NWP], pt_full [B*MP], x, cos, sin, *W, kv_swa, kv_full)
                  -> (out [BR, Hp] bf16, kvnew [L, BR, 1, packing, 128] (K slot 0, V slot 1))
     mode="attn": same operands with x := res [BR, Hp] f32 -> (partial f32, kvnew[1])
     mode="moe":  same operands with x := res [BR, Hp] f32 -> partial f32
@@ -279,8 +281,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     comm = mode == "mega" and c.R > 1
     B, BR, L, Hp, H, R = c.B, c.BR, c.L, c.Hp, c.H, c.R
     QWL, NQL, EL, NJ, T, NS = c.QWL, c.NQL, c.EL, c.NJ, c.tne, c.w_slots
-    PAGE, MP, NPB = c.page, c.max_pages, c.npb
-    TK = NPB * PAGE
+    PAGE, MP, NWP, NBUF = c.page, c.max_pages, c.NWP, c.kv_bufs
     W = c.window
     kvdt, ardt = kv_jdtype(c), ar_jdtype(c)
     scale = float(c.sm_scale)
@@ -291,7 +292,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     n_in = 7 + len(W_NAMES) + 2
 
     def kernel(*refs):
-        rank_s, pos_s, pts_s, ptf_s, x_ref, cos_ref, sin_ref = refs[:7]
+        rank_s, pos_s, ptw_s, ptf_s, x_ref, cos_ref, sin_ref = refs[:7]
         Wr = dict(zip(W_NAMES, refs[7:7 + len(W_NAMES)]))
         kv_swa, kv_full = refs[7 + len(W_NAMES):n_in]
         n_out = 1 if mode == "moe" else 2
@@ -331,10 +332,18 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         # RPA v3 does (validated by AOT compile only). The TPU interpreter cannot bitcast refs,
         # so interpret mode goes through a value reshape + `pltpu.bitcast`, which has the same
         # (documented) packing semantics: `packing` consecutive second-minor rows -> one word.
-        def load_words(ref, rows):
+        def load_words(slot, rows):  # first `rows` tokens of KV item buffer `slot`
             if interpret:
-                return pltpu.bitcast(ref[...].reshape(rows * c.kv_packing, 128), U32)
-            return ref.bitcast(U32).reshape(rows, 128)[...]
+                v = S["kvb"][slot, pl.ds(0, rows)]
+                return pltpu.bitcast(v.reshape(rows * c.kv_packing, 128), U32)
+            return S["kvb"].bitcast(U32).at[slot, pl.ds(0, rows)].reshape(rows, 128)[...]
+
+        def zero_kvb():  # stale-but-finite is all masking needs; VMEM starts arbitrary
+            if interpret:
+                S["kvb"][...] = jnp.zeros(S["kvb"].shape, kvdt)
+            else:
+                S["kvb"].bitcast(U32).reshape(NBUF * c.TKMAX, 128)[...] = jnp.zeros(
+                    (NBUF * c.TKMAX, 128), U32)
 
         def store_words(ref, w):
             rows = w.shape[0]
@@ -419,82 +428,117 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
         # ---------------------------------------------------------- B: paged attention
         def phase_b(s, pi, sliding):
+            """Attention for all sequences as one flat stream of (sequence, page-block) items.
+
+            Items are listed on the scalar core first; KV page DMAs then run `kv_bufs - 1`
+            items ahead of compute across sequence boundaries. Each item's pages share one
+            DMA semaphore (one page-sized wait per started page). Only pages holding
+            attended tokens are fetched; sliding layers see at most `NWP` window pages.
+            """
             pool = kv_swa if sliding else kv_full
-            pt = pts_s if sliding else ptf_s
             nb = c.nb_swa if sliding else c.nb_full
+            NPBL = c.npb_swa if sliding else c.npb
+            TKL = NPBL * PAGE
 
             def rng(b):
                 pos = pos_s[b]
                 lo = jnp.maximum(pos - (W - 1), 0) if sliding else jnp.int32(0)
-                blo = lo // TK
-                bhi = jnp.maximum(pos - 1, 0) // TK
-                return pos, lo, blo, jnp.maximum(bhi - blo + 1, 1)
+                plo = lo // PAGE  # first page holding an attended history token
+                npg = jnp.where(pos > 0, (jnp.maximum(pos - 1, 0) // PAGE) - plo + 1, 0)
+                return pos, lo, plo, npg, jnp.maximum((npg + NPBL - 1) // NPBL, 1)
 
-            def kv_cps(b, blk, slot):
-                ds = []
-                for i in range(NPB):
-                    pidx = jnp.minimum(blk * NPB + i, MP - 1)
-                    page = jnp.clip(pt[b * MP + pidx], 0, nb - 1)
-                    ds.append(cp(pool.at[pi, page], S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)],
-                                 S["sem_kv"].at[slot, i]))
-                return ds
+            def collect(b, k):
+                n = rng(b)[4]
 
-            for d in kv_cps(0, rng(0)[2], 0):
-                d.start()
-            tokoff = lax.broadcasted_iota(I32, (NQL, TK), 1)
+                def one(j, k):
+                    S["it_b"][k] = b
+                    S["it_j"][k] = j
+                    return k + 1
+
+                return lax.fori_loop(0, n, one, k)
+
+            n_items = lax.fori_loop(0, B, collect, jnp.int32(0))
+
+            def page_cp(slot, i, page):
+                return cp(pool.at[pi, page], S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)],
+                          S["sem_kv"].at[slot])
+
+            def kv_start(k, slot):
+                b, j = S["it_b"][k], S["it_j"][k]
+                _, _, plo, npg, _ = rng(b)
+                for i in range(NPBL):
+                    q = j * NPBL + i  # page index within the attended range
+
+                    @pl.when(q < npg)
+                    def _():
+                        if sliding:
+                            page = ptw_s[b * NWP + q]
+                        else:
+                            page = ptf_s[b * MP + jnp.minimum(plo + q, MP - 1)]
+                        page_cp(slot, i, jnp.clip(page, 0, nb - 1)).start()
+
+            def kv_wait(k, slot):
+                b, j = S["it_b"][k], S["it_j"][k]
+                npg = rng(b)[3]
+                for i in range(NPBL):
+                    @pl.when(j * NPBL + i < npg)
+                    def _():
+                        page_cp(slot, i, 0).wait()
+
+            for k in range(NBUF - 1):
+                @pl.when(k < n_items)
+                def _():
+                    kv_start(k, k)
+
+            tokoff = lax.broadcasted_iota(I32, (NQL, TKL), 1)
             row8 = lax.broadcasted_iota(I32, (NQL, 128), 0)
             lane8 = lax.broadcasted_iota(I32, (NQL, 128), 1)
             odd = (row8 % 2) == 1
             low = lane8 < 64
             sink = S["awsink"][s]
+            zeros = jnp.zeros((NQL, 128), F32)
 
-            def seq(b, t):
-                pos, lo, blo, n = rng(b)
+            def item(k, carry):
+                m, l_, acc = carry
+                slot = k % NBUF
+                kv_wait(k, slot)
+
+                @pl.when(k + NBUF - 1 < n_items)
+                def _():
+                    kv_start(k + NBUF - 1, (k + NBUF - 1) % NBUF)
+
+                b, j = S["it_b"][k], S["it_j"][k]
+                pos, lo, plo, npg, n = rng(b)
                 rows = pl.ds(pl.multiple_of(b * NQL, NQL), NQL)
                 qbf = S["qh"][rows].astype(BF16)
-                kr = S["kr8"][rows]
-                vr = S["vr8"][rows]
-                snew = jnp.sum(qbf.astype(F32) * kr, axis=1, keepdims=True)
+                # first item of a sequence: restart the online softmax from sink + new token
+                snew = jnp.sum(qbf.astype(F32) * S["kr8"][rows], axis=1, keepdims=True)
                 m0 = jnp.maximum(sink, snew)
                 pnew = jnp.exp(snew - m0)
-                l0 = jnp.exp(sink - m0) + pnew
-                acc0 = pnew.astype(BF16).astype(F32) * vr
+                first = j == 0
+                m = jnp.where(first, m0, m)
+                l_ = jnp.where(first, jnp.exp(sink - m0) + pnew, l_)
+                acc = jnp.where(first, pnew.astype(BF16).astype(F32) * S["vr8"][rows], acc)
 
-                def block(jj, carry):
-                    t, m, l_, acc = carry
-                    slot = t % 2
-                    for d in kv_cps(0, 0, slot):
-                        d.wait()
+                kt, vt = kv_decode(load_words(slot, TKL))
+                sc = lax.dot_general(qbf, kt, NT_DIMS, preferred_element_type=F32)
+                kpos = (plo + j * NPBL) * PAGE + tokoff
+                valid = (kpos >= lo) & (kpos < pos)
+                sc = jnp.where(valid, sc, NEG)
+                m_new = jnp.maximum(m, jnp.max(sc, axis=1, keepdims=True))
+                alpha = jnp.exp(m - m_new)
+                p = jnp.exp(sc - m_new[:, :1])
+                l_ = alpha * l_ + jnp.sum(p, axis=1, keepdims=True)
+                acc = alpha * acc + jnp.dot(p.astype(BF16), vt, preferred_element_type=F32)
 
-                    @pl.when(jj + 1 < n)
-                    def _():
-                        for d in kv_cps(b, blo + jj + 1, 1 - slot):
-                            d.start()
+                @pl.when(j == n - 1)
+                def _():
+                    o = jnp.where(low, acc / l_, 0.0)
+                    S["oh"][rows] = jnp.where(odd, pltpu.roll(o, 64, 1), o)
 
-                    @pl.when((jj + 1 == n) & (b + 1 < B))
-                    def _():
-                        for d in kv_cps(b + 1, rng(b + 1)[2], 1 - slot):
-                            d.start()
+                return m_new, l_, acc
 
-                    kt, vt = kv_decode(load_words(S["kvb"].at[slot], TK))
-                    sc = lax.dot_general(qbf, kt, NT_DIMS, preferred_element_type=F32)
-                    kpos = (blo + jj) * TK + tokoff
-                    valid = (kpos >= lo) & (kpos < pos)
-                    sc = jnp.where(valid, sc, NEG)
-                    m_new = jnp.maximum(m, jnp.max(sc, axis=1, keepdims=True))
-                    alpha = jnp.exp(m - m_new)
-                    p = jnp.exp(sc - m_new[:, :1])
-                    l_ = alpha * l_ + jnp.sum(p, axis=1, keepdims=True)
-                    acc = alpha * acc + jnp.dot(p.astype(BF16), vt, preferred_element_type=F32)
-                    return t + 1, m_new, l_, acc
-
-                t, _, l_, acc = lax.fori_loop(0, n, block, (t, m0, l0, acc0))
-                o = jnp.where(low, acc / l_, 0.0)
-                o = jnp.where(odd, pltpu.roll(o, 64, 1), o)
-                S["oh"][rows] = o
-                return t
-
-            lax.fori_loop(0, B, seq, jnp.int32(0))
+            lax.fori_loop(0, n_items, item, (zeros, zeros, zeros))
 
         def phase_c(s):
             # head pair (2j, 2j+1) occupy the two halves of o_proj input block j
@@ -606,6 +650,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 d.start()
             S["res"][...] = x_ref[...].astype(F32)
             S["oh"][...] = jnp.zeros((BR * NQL, 128), F32)
+            zero_kvb()
 
             def pair(p, _):
                 for s in (0, 1):
@@ -645,6 +690,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             S["res"][...] = x_ref[...]
             if mode == "attn":
                 S["oh"][...] = jnp.zeros((BR * NQL, 128), F32)
+                zero_kvb()
                 kn_descs = phase_a(l, 0, 0)
                 phase_b(0, l // 2, sliding=c.sliding[l])
                 for d in kn_descs:
@@ -685,27 +731,28 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
 
 def build_kv_scatter(c: DecodeConfig, *, interpret=False):
-    """f(pos, pt_swa, pt_full, kvnew, kv_swa, kv_full) -> (kv_swa, kv_full), in place.
+    """f(newpg, pos, kvnew, kv_swa, kv_full) -> (kv_swa, kv_full), in place.
 
-    Writes each live sequence's packed new-token slot `[1, packing, 128]` (K, V) into its
-    page with one HBM->HBM DMA along the (untiled) token dim, as RPA v3's cache update does.
+    `newpg [2*B]`: page of each sequence's new token in the SWA pool (first B) and in the
+    full pool. Writes each live sequence's packed new-token slot `[1, packing, 128]` (K, V)
+    with one HBM->HBM DMA along the (untiled) token dim, as RPA v3's cache update does.
     Not communicating, so XLA honours the pool aliasing (no pool copy).
     """
-    B, L, MP, PAGE = c.B, c.L, c.max_pages, c.page
+    B, L, PAGE = c.B, c.L, c.page
 
-    def kernel(pos_s, pts_s, ptf_s, kvn, kvs_in, kvf_in, kvs, kvf, sem):
+    def kernel(newpg_s, pos_s, kvn, kvs_in, kvf_in, kvs, kvf, sem):
         del kvs_in, kvf_in
 
         def pair(p, _):
             for s in (0, 1):
                 l = 2 * p + s
-                pool, pt = (kvs, pts_s) if s == 0 else (kvf, ptf_s)
+                pool = kvs if s == 0 else kvf
 
                 def cp(b):
                     pos = pos_s[b]
-                    page = pt[b * MP + pos // PAGE]
                     return pltpu.make_async_copy(kvn.at[l, pl.ds(b, 1)],
-                                                 pool.at[p, page, pl.ds(pos % PAGE, 1)], sem.at[0])
+                                                 pool.at[p, newpg_s[s * B + b], pl.ds(pos % PAGE, 1)],
+                                                 sem.at[0])
 
                 def start(b, _):
                     cp(b).start()
@@ -728,14 +775,27 @@ def build_kv_scatter(c: DecodeConfig, *, interpret=False):
         kernel,
         out_shape=(jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
                    jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype)),
-        in_specs=[smem] * 3 + [hbm] * 3,
+        in_specs=[smem] * 2 + [hbm] * 3,
         out_specs=(hbm, hbm),
         scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
-        input_output_aliases={4: 0, 5: 1},
+        input_output_aliases={3: 0, 4: 1},
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="gptoss_decode_kv_scatter",
     )
+
+
+def page_args(c: DecodeConfig, pos, pt_swa, pt_full):
+    """XLA-side page-table glue (tiny): window pages for sliding layers [B*NWP], the full
+    table [B*MP], and the new token's page in each pool [2*B]."""
+    B, MP, NWP = c.B, c.max_pages, c.NWP
+    plo = jnp.maximum(pos - (c.window - 1), 0) // c.page
+    widx = jnp.minimum(plo[:, None] + jnp.arange(NWP)[None, :], MP - 1)
+    ptw = jnp.take_along_axis(pt_swa, widx, axis=1)
+    cur = (pos // c.page)[:, None]
+    newpg = jnp.concatenate([jnp.take_along_axis(pt_swa, cur, 1)[:, 0],
+                             jnp.take_along_axis(pt_full, cur, 1)[:, 0]])
+    return ptw.reshape(-1).astype(I32), pt_full.reshape(-1).astype(I32), newpg.astype(I32)
 
 
 # ----------------------------------------------------------------------------- step
@@ -762,8 +822,7 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
         kv_s, kv_f = kv_s[0], kv_f[0]
         rank = rank.astype(I32)
         pos = pos.astype(I32)
-        pt_s = pt_s.reshape(-1).astype(I32)
-        pt_f = pt_f.reshape(-1).astype(I32)
+        pt_s, pt_f, newpg = page_args(c, pos, pt_s.astype(I32), pt_f.astype(I32))
         cos, sin = rope_tables(c, pos)
         xp = jnp.pad(x, ((0, c.BR - c.B), (0, c.Hp - c.H))).astype(BF16)
         wl = [W[k] for k in W_NAMES]
@@ -783,7 +842,7 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
                 kvns.append(kvn_l)
             out, kvn = res.astype(BF16), jnp.concatenate(kvns)
         if sc is not None:
-            kv_s, kv_f = sc(pos, pt_s, pt_f, kvn, kv_s, kv_f)
+            kv_s, kv_f = sc(newpg, pos, kvn, kv_s, kv_f)
         return out[:c.B, :c.H], kv_s[None], kv_f[None]
 
     w_spec = {k: P("tp") for k in W_NAMES}

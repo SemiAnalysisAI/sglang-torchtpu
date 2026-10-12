@@ -14,10 +14,14 @@ ahead-of-time compilation for `tpu7x:2x2x1` on a CPU host. Performance is **unme
    (GPT-OSS `layer_types`). Per layer:
    - **A.** RMSNorm, then QKV (+bias), then YaRN neox RoPE. q goes to per-sequence
      `[8, 128]` tiles. The new K/V are rounded to the KV dtype.
-   - **B.** Per sequence: attention over the paged KV pool, read **in place** with one DMA
-     per 64-token page. Pages are double-buffered across blocks and sequences. The current
-     token's K/V are attended from VMEM. Includes sinks, the 128-token window (sglang
-     `window_left=127`), and online softmax.
+   - **B.** Attention over the paged KV pool, read **in place**, run as one flat stream of
+     (sequence, page-block) work items. The scalar core first lists the items. Page DMAs
+     then run `kv_bufs - 1` items ahead of compute, across sequence boundaries. All pages
+     of an item share one semaphore, and only pages holding attended tokens are fetched.
+     A full layer uses `npb`=8 pages (512 tokens) per item. A sliding layer uses one item
+     per sequence with ≤3 window pages. The current token's K/V come from VMEM. Includes
+     sinks, the 128-token window (sglang `window_left=127`), and online softmax carried
+     across a sequence's items.
    - **C.** o_proj, then the **in-kernel all-reduce**, then `+ bo + residual` (rounded to bf16).
    - **D.** RMSNorm, then router (+bias), then top-4 over 128 with softmax over the top-4
      logits. The active-expert mask goes VMEM → SMEM by DMA, and the scalar core compacts
@@ -80,10 +84,14 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 - **Expert prefetch across layers.** Only the attention weights cross the layer boundary.
   Option: start the next layer's first chunk speculatively (e.g. from the previous step's
   routing).
-- **Attention.** One DMA per page per sequence and 8-row matmuls. Long contexts mean many
-  small DMAs. There is no split-K across sequences, and the page table sits fully in SMEM
-  (`B × max_pages` ints per pool type; default max_pages=128 = 8K context). 128K context
-  needs page-table streaming.
+- **Attention.** v0 (one DMA wait per 2-page block, depth-1 prefetch per sequence) scaled
+  badly with context on TPU: B32 went from 13.7 to 26.0 ms between ctx 1k and 4k. v1 adds
+  the flat item stream, 512-token items and cross-sequence prefetch. It is not yet measured
+  on TPU. Matmuls still have only 8 q rows.
+- **Page tables in SMEM.** The XLA glue passes the full layers' table `[B × max_pages]`,
+  only the window pages `[B × 3]` for sliding layers, and each new token's page `[2B]`.
+  B=64 at 32K context (max_pages=513, 128 KiB SMEM) compiles AOT. 128K context would need
+  page-table streaming.
 - **Integration (Phase 2).** Stacked pools vs sglang's per-layer tensors. The torch_tpu
   bridge also needs the per-layer fused pool viewed as `[pages, 64, 1, packing, 128]`
   without copies. Other gaps: k/v scales (only scale 1 here), final norm / lm_head inside

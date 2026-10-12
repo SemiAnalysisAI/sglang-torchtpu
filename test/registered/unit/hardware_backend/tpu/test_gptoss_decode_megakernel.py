@@ -34,7 +34,7 @@ def _rel(a, b):
 
 def _positions(c):
     cap = c.max_pages * c.page - 1
-    base = [0, 63, 130, cap, 64, 200, 127, 5]
+    base = [0, 63, 130, cap, 64, 200, 127, 5, 448, 1]
     return np.array([min(base[i % len(base)], cap) for i in range(c.B)], np.int32)
 
 
@@ -120,6 +120,11 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
 
     def test_four_layers_b1(self):
         self._check(C.tiny(B=1, L=4))
+
+    def test_long_context_deep_prefetch(self):
+        # several full-layer items per sequence, prefetch crossing sequence boundaries
+        self._check(C.tiny(B=4, max_pages=8, npb=2, kv_bufs=4, nb_swa=40, nb_full=40,
+                           kv_dtype="fp8"))
 
     def test_b16_npb1(self):
         self._check(dataclasses.replace(C.tiny(B=16, npb=1), nb_swa=72, nb_full=72))

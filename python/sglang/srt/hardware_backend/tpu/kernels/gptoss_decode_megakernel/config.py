@@ -59,7 +59,9 @@ class DecodeConfig:
     max_pages: int = 128  # page-table columns per sequence (context <= page * max_pages)
     nb_full: int = 1024  # pages in the full-attention pool (per rank, per layer)
     nb_swa: int = 1024  # pages in the SWA pool
-    npb: int = 2  # KV pages per attention block (one DMA per page)
+    npb: int = 8  # KV pages per attention work item, full layers (one DMA per page)
+    npb_swa: int = 3  # pages per item, sliding layers (>= NWP: one item per sequence)
+    kv_bufs: int = 3  # KV item buffers (kv_bufs - 1 items prefetched ahead of compute)
     tne: int = 384  # expert intermediate chunk (lanes) per streamed work item
     w_slots: int = 3  # expert weight ring depth (w_slots - 1 items in flight)
     vmem_mib: int = 60
@@ -107,6 +109,18 @@ class DecodeConfig:
         return 4 if self.kv_dtype == "fp8" else 2
 
     @property
+    def NWP(self) -> int:  # max pages holding the window's history tokens
+        return cdiv(self.window - 1, self.page) + 1
+
+    @property
+    def TKMAX(self) -> int:  # tokens per KV item buffer
+        return max(self.npb, self.npb_swa) * self.page
+
+    @property
+    def NIMAX(self) -> int:  # attention work items per layer, upper bound
+        return self.B * max(cdiv(self.max_pages, self.npb), 1) + self.B
+
+    @property
     def VW(self) -> int:
         return max(self.Hp, self.QKVWL, 128)
 
@@ -127,7 +141,8 @@ class DecodeConfig:
         assert self.I % self.R == 0 and self.moe_mode in ("tp", "ep")
         assert self.kv_dtype in ("bf16", "fp8") and self.ar_dtype in ("bf16", "f32")
         assert self.tne % 128 == 0 and self.w_slots >= 2
-        assert self.page % 8 == 0
+        assert self.page % 8 == 0 and self.kv_bufs >= 2
+        assert self.npb_swa >= self.NWP, "sliding layers: one work item per sequence"
 
 
 FULL = DecodeConfig()
@@ -145,6 +160,7 @@ def tiny(B: int = 4, **kw) -> DecodeConfig:
     """
     base = dict(
         L=2, H=240, E=16, TOPK=4, I=8 * 48, max_pages=4, nb_full=24, nb_swa=24, npb=2,
+        npb_swa=3, kv_bufs=3,
         tne=128, w_slots=3, vmem_mib=32,
     )
     base.update(kw)
