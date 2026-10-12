@@ -44,55 +44,6 @@ _SITE_FRAMES = 3
 _Sites = tuple[tuple[str, int], ...]
 
 
-def arm_fail_on_recompile(
-    *,
-    enable_torch_compile: bool,
-    speculative_algorithm: str | None,
-    enable_dp_attention: bool,
-) -> None:
-    """After warmup, freeze torch.compile so serving-time recompiles raise.
-
-    Speculative decoding keeps recompiles enabled with
-    SGLANG_TPU_ALLOW_SPEC_RECOMPILE. SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP also
-    skips most guard checks (see environ.py), except with speculative decoding
-    or DP attention.
-    """
-    if not enable_torch_compile:
-        return
-    skip_guard_eval = envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.get()
-    if skip_guard_eval and speculative_algorithm is not None:
-        # Draft / verify warmups have diverged from serving before; an
-        # unchecked divergence would run a stale graph silently.
-        logger.warning(
-            "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with speculative decoding."
-        )
-        skip_guard_eval = False
-    if skip_guard_eval and enable_dp_attention:
-        # Its traced code reads global state (gathered buffers, batch mode),
-        # whose guards need not tell the warmed variants apart.
-        logger.warning(
-            "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with DP attention."
-        )
-        skip_guard_eval = False
-    if speculative_algorithm is not None and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get():
-        logger.info(
-            "Warmup complete; leaving torch.compile recompiles enabled for "
-            "speculative decoding because SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
-        )
-        return
-    if skip_guard_eval:
-        torch.compiler.set_stance("fail_on_recompile", skip_guard_eval_unsafe=True)
-        logger.warning(
-            "Warmup complete; froze torch.compile via set_stance("
-            "'fail_on_recompile', skip_guard_eval_unsafe=True)."
-        )
-    else:
-        torch.compiler.set_stance("fail_on_recompile")
-        logger.info(
-            "Warmup complete; froze torch.compile via set_stance('fail_on_recompile')."
-        )
-
-
 class RecompileEvent(msgspec.Struct, frozen=True):
     """Programs that finished compiling since the previous check."""
 
