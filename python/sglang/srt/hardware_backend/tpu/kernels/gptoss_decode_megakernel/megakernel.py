@@ -333,7 +333,18 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
                 "w13r": V((NS, Hp, 2 * T), BF16),
                 "w2r": V((NS, T, Hp), BF16),
             })
-    if comm:
+    if comm and c.AR_RSAG:  # reduce-scatter chunks (AR dtype) + all-gather of f32 sums
+        CW = c.CWA
+        s.update({
+            "send": V((2, R, BR, CW), ardt), "recv": V((2, R, BR, CW), ardt),
+            "ag_send": V((2, BR, CW), F32), "ag_recv": V((2, R, BR, CW), F32),
+            "arout": V((BR, Hp), F32),
+            "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
+            "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
+            "agssem": pltpu.SemaphoreType.DMA((2, R - 1)),
+            "agrsem": pltpu.SemaphoreType.DMA((2, R - 1)),
+        })
+    elif comm:
         if c.AR_FOLD:  # live rows only, 128-lane chunks stacked as rows, f32
             s.update({"send": V((2, c.FR, 128), F32), "recv": V((2, R, c.FR, 128), F32),
                       "arout": V((BR, Hp), F32)})
@@ -476,12 +487,34 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         # One-shot all-to-all all-reduce, ported from vllm-torchtpu's generic megakernel
         # (`kernels/megakernel/comm.py`, non-RSAG path): every rank DMAs its partial into
         # slot `me` of every peer's receive buffer, then sums all R slots in rank order.
-        def ar_copies(slot, me):
+        def oneshot_copies(slot, me):
             return [pltpu.make_async_remote_copy(
                 src_ref=S["send"].at[slot], dst_ref=S["recv"].at[slot, me],
                 send_sem=S["ssem"].at[slot, off - 1], recv_sem=S["rsem"].at[slot, off - 1],
                 device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
                 for off in range(1, R)]
+
+        # RSAG (vllm-torchtpu comm.py RSAG path): rank r owns column chunk r. Round 1 sends
+        # chunk (me^off) of the partial to peer me^off; round 2 sends the f32 sum of my
+        # chunk to every peer. f32 in round 2 keeps the result identical to the one-shot sum.
+        def rs_copies(slot, me):
+            return [pltpu.make_async_remote_copy(
+                src_ref=S["send"].at[slot, me ^ off], dst_ref=S["recv"].at[slot, me],
+                send_sem=S["ssem"].at[slot, off - 1], recv_sem=S["rsem"].at[slot, off - 1],
+                device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
+                for off in range(1, R)]
+
+        def ag_copies(slot, me):
+            return [pltpu.make_async_remote_copy(
+                src_ref=S["ag_send"].at[slot], dst_ref=S["ag_recv"].at[slot, me],
+                send_sem=S["agssem"].at[slot, off - 1], recv_sem=S["agrsem"].at[slot, off - 1],
+                device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
+                for off in range(1, R)]
+
+        def ar_copies(slot, me):  # every descriptor of one AR (for send waits)
+            if c.AR_RSAG:
+                return rs_copies(slot, me) + ag_copies(slot, me)
+            return oneshot_copies(slot, me)
 
         NHB = Hp // 128
 
@@ -504,6 +537,43 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                     for d in ar_copies(slot, me):
                         d.wait_send()
 
+            if c.AR_RSAG:
+                CW = c.CWA
+                v = val.astype(ardt)
+                for j in range(R):
+                    w = max(0, min(Hp - j * CW, CW))
+                    if w == CW:
+                        S["send"][slot, j] = v[:, j * CW:(j + 1) * CW]
+                    else:
+                        S["send"][slot, j] = jnp.zeros((BR, CW), ardt)
+                        if w:
+                            S["send"][slot, j, :, 0:w] = v[:, j * CW:j * CW + w]
+                S["recv"][slot, me] = S["send"][slot, me]
+                descs = rs_copies(slot, me) if exchange else []
+                for d in descs:
+                    d.start()
+
+                def finish_rsag():
+                    for d in descs:
+                        d.wait_recv()
+                    red = S["recv"][slot, 0].astype(F32)
+                    for r in range(1, R):
+                        red = red + S["recv"][slot, r].astype(F32)
+                    S["ag_send"][slot] = red
+                    S["ag_recv"][slot, me] = red
+                    ags = ag_copies(slot, me) if exchange else []
+                    for d in ags:
+                        d.start()
+                    for d in ags:
+                        d.wait_recv()
+                    for j in range(R):
+                        w = max(0, min(Hp - j * CW, CW))
+                        if w:
+                            S["arout"][:, j * CW:j * CW + w] = S["ag_recv"][slot, j, :, 0:w]
+                    return S["arout"][...]
+
+                return finish_rsag
+
             if c.AR_FOLD:
                 v = val.astype(ardt).astype(F32)
                 for j in range(NHB):
@@ -511,7 +581,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             else:
                 S["send"][slot] = val.astype(ardt)
             S["recv"][slot, me] = S["send"][slot]
-            descs = ar_copies(slot, me) if exchange else []
+            descs = oneshot_copies(slot, me) if exchange else []
             for d in descs:
                 d.start()
 
@@ -835,10 +905,11 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         # ---------------------------------------------------------- composition
         if mode == "mega":
             if comm and not exchange:  # "ar" ablation: peers' slots must hold finite data
-                S["recv"][...] = jnp.zeros(S["recv"].shape, S["recv"].dtype)
-                S["send"][...] = jnp.zeros(S["send"].shape, S["send"].dtype)
-                if c.AR_FOLD:
-                    S["arout"][...] = jnp.zeros((BR, Hp), F32)
+                for k in ("recv", "send", "ag_recv"):
+                    if k in S:
+                        S[k][...] = jnp.zeros(S[k].shape, S[k].dtype)
+            if comm and c.AR_FOLD:
+                S["arout"][...] = jnp.zeros((BR, Hp), F32)
             if exchange:
                 me = lax.axis_index("tp").astype(I32)
                 barrier = pltpu.get_barrier_semaphore()

@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights")
     ap.add_argument("--w-dtype", choices=["bf16", "mxfp4", "fp8"], default=None)
     ap.add_argument("--kv-write", choices=["scatter", "kernel"], default="scatter")
+    ap.add_argument("--ar-mode", choices=["auto", "oneshot", "rsag"], default="auto")
     ap.add_argument("--ablate", nargs="*", default=[])
     ap.add_argument("--kv-bufs", type=int, default=3)
     ap.add_argument("--no-scatter", action="store_true", help="leave out the KV scatter call")
@@ -66,10 +67,12 @@ def main():
         c = config.full(B, L=args.layers, kv_dtype=args.kv, moe_mode=args.moe, tne=args.tne,
                         npb=args.npb, nb_full=args.nb, nb_swa=args.nb,
                         max_pages=args.max_pages, vmem_mib=args.vmem_mib, kv_bufs=args.kv_bufs,
-                        w_dtype=args.w_dtype or ("mxfp4" if args.mxfp4 else "bf16"),
+                        w_dtype=args.w_dtype or ("mxfp4" if args.mxfp4 else "fp8"),
+                        ar_mode=args.ar_mode,
                         ablate=tuple(args.ablate), kv_write=args.kv_write)
         rec = dict(mode="aot_" + args.topology, B=B, L=c.L, kv=c.kv_dtype, moe=c.moe_mode,
-                   w=c.w_dtype, max_pages=c.max_pages, kv_write=c.kv_write, ablate=args.ablate, ar_fold=c.AR_FOLD,
+                   w=c.w_dtype, max_pages=c.max_pages, kv_write=c.kv_write,
+                   ar="rsag" if c.AR_RSAG else "oneshot", ablate=args.ablate, ar_fold=c.AR_FOLD,
                    tne=c.tne, npb=c.npb, Hp=c.Hp, IL=c.IL, xla_ar=args.xla_ar,
                    scatter=not args.no_scatter)
         vm = MK.vmem_bytes(c, "mega")

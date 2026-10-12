@@ -73,8 +73,12 @@ class DecodeConfig:
     ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
     # expert weights: "bf16"; "mxfp4" (e2m1 codes + scale per 32 K, dequantized in VMEM);
     # "fp8" (MXFP4 converted offline to e4m3 x per-column power of two: exact, native MXU)
-    w_dtype: str = "bf16"
+    w_dtype: str = "fp8"
     ar_fold: bool = True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+    # "oneshot": push the full partial to all peers (1 round, 7x payload per rank);
+    # "rsag": reduce-scatter + all-gather of Hp/R column chunks (2 rounds, ~2.5x fewer bytes);
+    # "auto": rsag for B >= 16 (bandwidth-bound), oneshot below (latency-bound)
+    ar_mode: str = "auto"
     ablate: tuple[str, ...] = ()  # see ABLATIONS
     # "scatter": new K/V written by a separate non-collective call (safe default);
     # "kernel": the megakernel writes them into the aliased pools itself (one call per step)
@@ -157,8 +161,16 @@ class DecodeConfig:
         return rup(self.tne // 32, 16)
 
     @property
+    def AR_RSAG(self) -> bool:
+        return self.R > 1 and (self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.B >= 16))
+
+    @property
     def AR_FOLD(self) -> bool:
-        return self.ar_fold and self.B <= 4
+        return self.ar_fold and self.B <= 4 and not self.AR_RSAG
+
+    @property
+    def CWA(self) -> int:  # rsag column chunk per rank (lane multiple; last chunks padded)
+        return rup(cdiv(self.Hp, self.R), 128)
 
     @property
     def FR(self) -> int:  # folded all-reduce payload rows
@@ -188,6 +200,7 @@ class DecodeConfig:
         assert self.w_dtype in ("bf16", "mxfp4", "fp8")
         assert set(self.ablate) <= set(ABLATIONS), self.ablate
         assert self.kv_write in ("scatter", "kernel")
+        assert self.ar_mode in ("auto", "oneshot", "rsag")
         if self.w_dtype != "bf16":
             assert self.I % 32 == 0 and self.Hp % 128 == 0
         assert self.page % 8 == 0 and self.kv_bufs >= 2

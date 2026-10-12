@@ -124,13 +124,13 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
             self.assertTrue(np.all(changed <= exp_changed), "pool rows written outside new tokens")
 
     def test_tp_moe_bf16_kv_with_fallback(self):
-        self._check(C.tiny(B=4), also_fallback=True)
+        self._check(C.tiny(B=4, w_dtype="bf16"), also_fallback=True)
 
     def test_ep_moe_fp8_kv(self):
         self._check(C.tiny(B=4, moe_mode="ep", kv_dtype="fp8"))
 
     def test_four_layers_b1(self):
-        self._check(C.tiny(B=1, L=4))
+        self._check(C.tiny(B=1, L=4, w_dtype="bf16"))
 
     def test_long_context_deep_prefetch(self):
         # several full-layer items per sequence, prefetch crossing sequence boundaries
@@ -143,6 +143,9 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
 
     def test_mxfp4_ep_moe_fp8_kv(self):
         self._check(C.tiny(B=4, w_dtype="mxfp4", moe_mode="ep", kv_dtype="fp8"))
+
+    def test_rsag_allreduce_b4(self):
+        self._check(C.tiny(B=4, ar_mode="rsag", kv_dtype="fp8"), also_fallback=True)
 
     def test_ar_unfolded_b4(self):
         self._check(C.tiny(B=4, ar_fold=False))
@@ -170,7 +173,9 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
         self._check(C.tiny(B=4, kv_write="kernel", kv_dtype="fp8"))
 
     def test_b16_npb1(self):
-        self._check(dataclasses.replace(C.tiny(B=16, npb=1), nb_swa=72, nb_full=72))
+        # B=16 -> ar_mode "auto" picks reduce-scatter + all-gather
+        self._check(dataclasses.replace(C.tiny(B=16, npb=1, w_dtype="bf16"), nb_swa=72,
+                                        nb_full=72))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """TPU microbenchmark: GPT-OSS-120B TP8 decode megakernel step vs baselines (one 2x2x1 host).
 
-Random weights at real dims (bf16 experts), random KV pools, every sequence at context `--ctx`.
+Random weights at real dims (expert format per --w-dtype, default fp8), random KV pools, every
+sequence at context `--ctx`.
 Prints one JSON line per (mode, B). Modes:
 
   mk        one pallas_call per step (in-kernel all-reduce) + the in-place KV scatter kernel
@@ -10,7 +11,7 @@ Prints one JSON line per (mode, B). Modes:
 
 The stock sglang decode forward itself (torch_tpu, RPA v3, gmm_v2 MXFP4 MoE) is not
 reproduced here; compare against the T21 Phase-0 xprof forward-time numbers for that.
-Note the stock path reads MXFP4 experts (~4x fewer expert bytes than this bf16 v0).
+Note the stock path reads MXFP4 experts (0.57x the bytes of the fp8 expert format).
 
   python benchmark/kernels/gptoss_decode_megakernel/bench_decode_step.py \
       --batch 1 8 32 64 --modes mk fallback xla --ctx 1024
@@ -168,7 +169,9 @@ def main():
     ap.add_argument("--vmem-mib", type=int, default=60)
     ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights (stock format)")
     ap.add_argument("--w-dtype", choices=["bf16", "mxfp4", "fp8"], default=None,
-                    help="expert weight format (overrides --mxfp4); fp8 = MXFP4 converted to e4m3")
+                    help="expert weight format (default fp8 = MXFP4 converted to e4m3)")
+    ap.add_argument("--ar-mode", choices=["auto", "oneshot", "rsag"], default="auto",
+                    help="all-reduce algorithm (auto: rsag for B >= 16)")
     ap.add_argument("--ablate", nargs="*", default=[],
                     choices=["ar", "attn", "attn_kv", "moe", "experts"],
                     help="mk/fallback timing ablations (outputs wrong); see config.ABLATIONS")
@@ -228,7 +231,8 @@ def main():
         extra = {} if args.cpu_smoke else dict(L=args.layers, tne=args.tne,
                                                vmem_mib=args.vmem_mib)
         c = mk_cfg(B, kv_dtype=args.kv, moe_mode=args.moe, npb=args.npb, nb_full=nb,
-                   w_dtype=args.w_dtype or ("mxfp4" if args.mxfp4 else "bf16"),
+                   w_dtype=args.w_dtype or ("mxfp4" if args.mxfp4 else "fp8"),
+                   ar_mode=args.ar_mode,
                    ablate=tuple(args.ablate), kv_write=args.kv_write,
                    ar_fold=not args.no_ar_fold,
                    nb_swa=nb_swa, max_pages=max_pages, kv_bufs=args.kv_bufs, **extra)
@@ -266,6 +270,7 @@ def main():
             rec = dict(mode=mode, B=B, L=c.L, ctx=args.ctx, kv=c.kv_dtype, moe=c.moe_mode,
                        scatter=not args.no_scatter, kv_write=args.kv_write,
                        w=c.w_dtype, ablate=list(c.ablate), ar_fold=c.AR_FOLD,
+                       ar="rsag" if c.AR_RSAG else "oneshot",
                        tne=c.tne, npb=c.npb, kv_bufs=c.kv_bufs)
             try:
                 if mode == "xla":
