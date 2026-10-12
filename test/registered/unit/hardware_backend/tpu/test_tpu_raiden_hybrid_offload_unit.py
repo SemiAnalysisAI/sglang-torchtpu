@@ -41,20 +41,29 @@ from sglang_tpu.kv_pool_host import (
 from sglang_tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
-from sglang_tpu.raiden_transfer import RaidenKVTransfer
+from sglang_tpu.raiden_transfer import CombinedFutureEvent, RaidenKVTransfer
 
 
 class _FakeFuture:
     def __init__(self):
         self.ready = False
         self.synchronized = False
+        # Set to an exception to make the DMA land with it (RuntimeError) or
+        # miss its deadline in synchronize() (TimeoutError).
+        self.error = None
 
     def query(self) -> bool:
+        if self.ready and isinstance(self.error, RuntimeError):
+            raise self.error
         return self.ready
 
     def synchronize(self) -> None:
         self.synchronized = True
+        if isinstance(self.error, TimeoutError):
+            raise self.error
         self.ready = True
+        if self.error is not None:
+            raise self.error
 
 
 class _FakeHostPool:
@@ -281,6 +290,92 @@ class TestWriteThroughBehindInFlightForward(CustomTestCase):
         self.ctrl.start_writing()
         self.assertEqual(len(self.full_pool.backups), 1)
         self.assertEqual(self.syncs, [])
+
+
+class TestCombinedFutureEventFailure(CustomTestCase):
+    def test_failure_waits_for_every_dma(self):
+        failed, pending = _FakeFuture(), _FakeFuture()
+        failed.ready = True
+        failed.error = RuntimeError("raiden DMA failed: boom")
+        combined = CombinedFutureEvent([failed, pending])
+        # The other pool is still copying: no failure yet.
+        self.assertFalse(combined.query())
+        pending.ready = True
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            combined.query()
+
+    def test_synchronize_lands_every_dma_before_raising(self):
+        failed, other = _FakeFuture(), _FakeFuture()
+        failed.error = RuntimeError("raiden DMA failed: boom")
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            CombinedFutureEvent([failed, other]).synchronize()
+        self.assertTrue(other.synchronized)
+
+
+class TestHybridLoadRetry(CustomTestCase):
+    def _start(self):
+        ctrl = _make_controller()
+        ctrl.load_queue.append(_op())
+        producer_id = ctrl.start_loading()
+        full_pool = ctrl.mem_pool_host.anchor_entry.host_pool
+        swa_pool = ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
+        return ctrl, producer_id, full_pool, swa_pool
+
+    @staticmethod
+    def _fail(future):
+        future.ready = True
+        future.error = RuntimeError("raiden DMA failed: boom")
+
+    def test_failed_load_is_issued_again_into_the_same_pages(self):
+        ctrl, _, full_pool, swa_pool = self._start()
+        (ack,) = ctrl.ack_load_queue
+        self._fail(full_pool.load_futures[0])
+        swa_pool.load_futures[0].ready = True
+
+        self.assertFalse(ack.finish_event.query())
+        self.assertEqual(len(full_pool.loads), 2)
+        self.assertEqual(len(swa_pool.loads), 2)
+        for pool in (full_pool, swa_pool):
+            first, again = pool.loads
+            self.assertTrue(torch.equal(first[1], again[1]))  # host indices
+            self.assertTrue(torch.equal(first[2], again[2]))  # device indices
+        # Polling the same failure again must not retry twice.
+        self.assertFalse(ack.finish_event.query())
+        self.assertEqual(len(full_pool.loads), 2)
+
+        full_pool.load_futures[1].ready = True
+        swa_pool.load_futures[1].ready = True
+        self.assertTrue(ack.finish_event.query())
+
+    def test_forward_gate_waits_out_a_retried_load(self):
+        ctrl, producer_id, full_pool, _ = self._start()
+        full_pool.load_futures[0].error = RuntimeError("raiden DMA failed: boom")
+        ctrl.layer_done_counter.set_consumer(producer_id)
+        ctrl.layer_done_counter.wait()
+        self.assertEqual(len(full_pool.loads), 2)
+        self.assertTrue(full_pool.load_futures[1].synchronized)
+        (ack,) = ctrl.ack_load_queue
+        self.assertTrue(ack.finish_event.query())
+
+    def test_gives_up_after_the_retries(self):
+        ctrl, _, full_pool, swa_pool = self._start()
+        (ack,) = ctrl.ack_load_queue
+        for attempt in range(3):
+            self._fail(full_pool.load_futures[attempt])
+            swa_pool.load_futures[attempt].ready = True
+            if attempt < 2:
+                self.assertFalse(ack.finish_event.query())
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            ack.finish_event.query()
+        self.assertEqual(len(full_pool.loads), 3)
+
+    def test_timeout_is_not_retried(self):
+        ctrl, producer_id, full_pool, _ = self._start()
+        full_pool.load_futures[0].error = TimeoutError("raiden DMA did not complete")
+        ctrl.layer_done_counter.set_consumer(producer_id)
+        with self.assertRaises(TimeoutError):
+            ctrl.layer_done_counter.wait()
+        self.assertEqual(len(full_pool.loads), 1)
 
 
 class TestHybridLoad(CustomTestCase):

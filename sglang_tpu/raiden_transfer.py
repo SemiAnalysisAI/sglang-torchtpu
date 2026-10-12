@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Callable, List
 
 from sglang.srt.environ import envs
 
@@ -98,11 +99,92 @@ class CombinedFutureEvent:
         self._events = list(events)
 
     def query(self) -> bool:
-        return all(event.query() for event in self._events)
+        # A failed DMA is reported only once every DMA has landed: the others
+        # may still be copying into pages the caller would release on failure.
+        done, error = True, None
+        for event in self._events:
+            try:
+                done = event.query() and done
+            except RuntimeError as e:
+                error = error or e
+        if not done:
+            return False
+        if error is not None:
+            raise error
+        return True
 
     def synchronize(self) -> None:
+        # Waits for every DMA before raising the first failure, as query() does.
+        error = None
         for event in self._events:
-            event.synchronize()
+            try:
+                event.synchronize()
+            except RuntimeError as e:
+                error = error or e
+        if error is not None:
+            raise error
+
+    def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+    def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+
+class RetryingFutureEvent:
+    """An event over DMAs that ``issue`` starts again when they fail.
+
+    For a transfer whose source stays unchanged and whose destination stays
+    reserved until it is acknowledged, such as a HiCache load-back: issuing it
+    again rewrites the same bytes into the same pages, so a copy of the failed
+    attempt still in flight cannot corrupt them. After ``max_retries`` failed
+    attempts the last error is raised. A ``TimeoutError`` is not retried: the
+    DMA is still running.
+
+    Pollers on several threads (the scheduler's ack checks, a forward's gate)
+    may see the same failure; a lock makes it one retry.
+    """
+
+    def __init__(self, issue: Callable[[], object], max_retries: int, what: str):
+        self._issue = issue
+        self._retries_left = max_retries
+        self._what = what
+        self._lock = threading.Lock()
+        self._event = issue()
+
+    def _retry_locked(self, failed: object, error: RuntimeError) -> None:
+        if self._event is not failed:
+            return  # another poller already retried this attempt
+        if self._retries_left <= 0:
+            raise error
+        self._retries_left -= 1
+        logger.warning(
+            "raiden %s DMA failed (%s); issuing it again (%d retries left)",
+            self._what,
+            error,
+            self._retries_left,
+        )
+        self._event = self._issue()
+
+    def query(self) -> bool:
+        with self._lock:
+            event = self._event
+            try:
+                return event.query()
+            except RuntimeError as e:
+                self._retry_locked(event, e)
+                return False
+
+    def synchronize(self) -> None:
+        while True:
+            with self._lock:
+                event = self._event
+            try:
+                event.synchronize()
+                return
+            except RuntimeError as e:
+                with self._lock:
+                    self._retry_locked(event, e)
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
         return None

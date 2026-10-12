@@ -39,9 +39,13 @@ from sglang_tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
+    RetryingFutureEvent,
 )
 
 logger = logging.getLogger(__name__)
+
+# Times a failed load-back DMA is issued again before its error is raised.
+_LOAD_BACK_RETRIES = 2
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
 # while a forward may still write them; any other pool's slots are unfenced.
@@ -236,7 +240,15 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         # The consuming forward's CompiledForwardShim wait() polls the combined
         # event through the whole-batch gate (poll-only; never Await), so the
         # DMAs overlap whatever the scheduler runs before that forward.
-        finish_event = CombinedFutureEvent(self._issue_pool_dmas(op, load=True))
+        # A failed load is issued again into the same pages: the host pages
+        # stay host-locked and the device pages reserved until loading_check
+        # acks the load, and every consumer (the gate, the decode restore poll,
+        # loading_check) polls this same event.
+        finish_event = RetryingFutureEvent(
+            lambda: CombinedFutureEvent(self._issue_pool_dmas(op, load=True)),
+            max_retries=_LOAD_BACK_RETRIES,
+            what="HiCache load-back",
+        )
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
             HiCacheAck(
