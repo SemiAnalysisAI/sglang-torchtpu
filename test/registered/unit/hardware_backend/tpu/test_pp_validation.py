@@ -51,6 +51,8 @@ def _args(**overrides):
         disaggregation_mode="null",
         disaggregation_transfer_backend="mooncake",
         optimistic_prefill_attempts=0,
+        max_queued_requests=None,
+        enable_priority_scheduling=False,
         attn_cp_size=1,
         enable_prefill_cp=False,
         cp_strategy=None,
