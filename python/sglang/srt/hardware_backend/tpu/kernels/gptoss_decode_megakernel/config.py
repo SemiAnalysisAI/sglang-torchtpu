@@ -67,6 +67,9 @@ class DecodeConfig:
     vmem_mib: int = 60
     ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
     w_dtype: str = "bf16"  # expert weights: "bf16" or "mxfp4" (fp4 e2m1 codes + scale per 32 K)
+    # KV pools as L/2 SWA + L/2 full per-layer operands (sglang keeps one tensor per layer;
+    # stacking them would copy the pools) instead of two stacked [L/2, ...] operands
+    split_pools: bool = False
 
     # ------------------------------------------------------------------ derived
     @property

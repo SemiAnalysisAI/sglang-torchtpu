@@ -353,12 +353,17 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     aw_need = {"mega": AW_NAMES, "attn": ("wqkv", "wo", "vec", "sinks"), "moe": ("wr", "vec")}[mode]
     aw_dst = {"wqkv": "awqkv", "wo": "awo", "wr": "awr", "vec": "awvec", "sinks": "awsink"}
     WN = w_names(c)
-    n_in = 7 + len(WN) + 2
+    n_pool = L if c.split_pools else 2
+    n_in = 7 + len(WN) + n_pool
 
     def kernel(*refs):
         rank_s, pos_s, ptw_s, ptf_s, x_ref, cos_ref, sin_ref = refs[:7]
         Wr = dict(zip(WN, refs[7:7 + len(WN)]))
-        kv_swa, kv_full = refs[7 + len(WN):n_in]
+        pool_refs = refs[7 + len(WN):n_in]
+        if c.split_pools:  # per-layer refs, indexed by layer pair
+            kv_swa, kv_full = pool_refs[:L // 2], pool_refs[L // 2:]
+        else:
+            kv_swa, kv_full = pool_refs
         n_out = 1 if mode == "moe" else 2
         outs = refs[n_in:n_in + n_out]
         S = dict(zip(s_names, refs[n_in + n_out:]))
@@ -480,6 +485,8 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                     S["qh"][pl.ds(h, BR, stride=NQL)] = jnp.where(low, qv, 0.0)
             k = rp(qkv[:, QWL:QWL + 128])
             v = qkv[:, QWL + 128:QWL + 256]
+            if c.kv_dtype == "fp8":  # saturate like the stock path's fp8 KV quantization
+                k, v = jnp.clip(k, -448.0, 448.0), jnp.clip(v, -448.0, 448.0)
             kq, vq = k.astype(kvdt), v.astype(kvdt)
             kf, vf = kq.astype(F32), vq.astype(F32)
             for r in range(NQL):
@@ -523,9 +530,20 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
             n_items = lax.fori_loop(0, B, collect, jnp.int32(0))
 
-            def page_cp(slot, i, page):
-                return cp(pool.at[pi, page], S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)],
-                          S["sem_kv"].at[slot])
+            def page_cp(slot, i, page, lp=None):
+                lp = pi if lp is None else lp
+                src = pool[lp].at[page] if c.split_pools else pool.at[lp, page]
+                return cp(src, S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)], S["sem_kv"].at[slot])
+
+            def page_start(slot, i, page):
+                if c.split_pools and not isinstance(pi, int):
+                    # per-layer refs cannot be indexed by the traced pair index
+                    for lp in range(L // 2):
+                        @pl.when(pi == lp)
+                        def _():
+                            page_cp(slot, i, page, lp).start()
+                else:
+                    page_cp(slot, i, page).start()
 
             def kv_start(k, slot):
                 b, j = S["it_b"][k], S["it_j"][k]
@@ -539,7 +557,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                             page = ptw_s[b * NWP + q]
                         else:
                             page = ptf_s[b * MP + jnp.minimum(plo + q, MP - 1)]
-                        page_cp(slot, i, jnp.clip(page, 0, nb - 1)).start()
+                        page_start(slot, i, jnp.clip(page, 0, nb - 1))
 
             def kv_wait(k, slot):
                 b, j = S["it_b"][k], S["it_j"][k]
@@ -547,7 +565,8 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 for i in range(NPBL):
                     @pl.when(j * NPBL + i < npg)
                     def _():
-                        page_cp(slot, i, 0).wait()
+                        # a wait only uses the destination/semaphore: any layer's ref works
+                        page_cp(slot, i, 0, 0 if c.split_pools else None).wait()
 
             for k in range(NBUF - 1):
                 @pl.when(k < n_items)
@@ -790,7 +809,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 4 + [vmem] * 3 + [hbm] * (len(WN) + 2)
+    in_specs = [smem] * 4 + [vmem] * 3 + [hbm] * (len(WN) + n_pool)
     nkn = L if mode == "mega" else 1
     kn_shape = jax.ShapeDtypeStruct((nkn, BR, 1, c.kv_packing, 128), kvdt)
     if mode == "mega":
