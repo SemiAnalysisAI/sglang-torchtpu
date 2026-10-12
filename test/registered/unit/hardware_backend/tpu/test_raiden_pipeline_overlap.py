@@ -108,7 +108,7 @@ class Manager:
         self.pp_rank, self.pp_size = pp_rank, pp_size
         self.attn_tp_size, self.attn_tp_rank = 1, 0
         self._state_lock = threading.RLock()
-        self._aborted = set()
+        self._aborted = {}
         self._prefill = SimpleNamespace(send_blocks={}, send_swa_blocks={})
         self.kv_args = SimpleNamespace(total_kv_head_num=4, page_size=4)
         self._timeout_s = 60
@@ -119,7 +119,13 @@ class Manager:
         self._engine_poll_failing_since = {}
         self.failure_lock = threading.Lock()
         self.failure_records = {}
-        for method in ("_poll_engine_status", "_fail_room_locked", "is_aborted"):
+        for method in (
+            "_poll_engine_status",
+            "_fail_room_locked",
+            "is_aborted",
+            "_tombstone_reason_locked",
+            "_reply_room_failed",
+        ):
             setattr(
                 self, method, types.MethodType(getattr(RaidenKVManager, method), self)
             )
@@ -358,7 +364,7 @@ def test_abort_cancels_unclaimed_parts(world):
     start = prefill_pages(s, list(range(10, 18)))
     s.offer_part(ROOM, start, list(range(10, 18)))
     assert s.active(ROOM)
-    s.manager._aborted.add(ROOM)
+    s.manager._aborted[ROOM] = time.time()
     poll(s)
     assert f"{ROOM}.p0" in world.controller.cancelled
     assert not s.active(ROOM) and ROOM in s.failed
@@ -570,7 +576,7 @@ def test_abort_cancels_unclaimed_stage_part(staged):
     fence.ready = True
     s.stage_ready(ROOM, list(range(10, 15)), [30], fence)
     assert s.active(ROOM)
-    s.manager._aborted.add(ROOM)
+    s.manager._aborted[ROOM] = time.time()
     poll(s)
     assert f"{ROOM}.s0" in w.controller.cancelled
     assert not s.active(ROOM) and ROOM in s.failed
