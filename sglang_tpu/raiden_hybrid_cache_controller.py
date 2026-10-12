@@ -39,13 +39,70 @@ from sglang_tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
-    RetryingFutureEvent,
 )
 
 logger = logging.getLogger(__name__)
 
-# Times a failed load-back DMA is issued again before its error is raised.
-_LOAD_BACK_RETRIES = 2
+
+class LoadBackEvent:
+    """Completion of one load-back's raiden DMAs, and whether it failed.
+
+    Without ``handles_failures`` it is the combined event unchanged: a failed
+    DMA raises from ``query()`` and ``synchronize()``.
+
+    With it (a PD decode server, which cleans a failed load up), a failed DMA
+    is recorded instead of raised. ``resolve()`` (called through the
+    controller's rank-combining ``resolve_load_back``) settles one outcome every
+    rank acts on. A failed load stays not done for ``query()`` until its
+    cleanup may run (``failure_handled``), so ``loading_check`` cannot ack it
+    early, and ``synchronize()`` raises only an unresolved failure.
+    """
+
+    def __init__(self, event, handles_failures: bool):
+        self._event = event
+        self.handles_failures = handles_failures
+        self.local_error: Optional[RuntimeError] = None
+        self.resolved = False
+        self.failed = False
+        self.failure_handled = False
+
+    def local_done(self) -> bool:
+        """This rank's view: True once every DMA landed, failed or not."""
+        if self.local_error is not None:
+            return True
+        try:
+            return self._event.query()
+        except RuntimeError as e:
+            if not self.handles_failures:
+                raise
+            self.local_error = e
+            return True
+
+    def query(self) -> bool:
+        if not self.local_done():
+            return False
+        if self.resolved and self.failed:
+            return self.failure_handled
+        return self.local_error is None
+
+    def synchronize(self) -> None:
+        if self.resolved and self.failed:
+            return
+        try:
+            self._event.synchronize()
+        except RuntimeError as e:
+            if not self.handles_failures:
+                raise
+            self.local_error = e
+        if self.local_error is not None and not self.resolved:
+            raise self.local_error
+
+    def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+    def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
 # while a forward may still write them; any other pool's slots are unfenced.
@@ -67,6 +124,10 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
     # Set by the scheduler for the tree's controller; see fence_hicache_backups.
     kv_free_fence: Optional[KVFreeFence] = None
+
+    # A PD decode server cleans up a failed load-back (requests aborted, nodes
+    # rolled back); elsewhere a failed load still stops the server.
+    handles_load_back_failures = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -240,14 +301,9 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         # The consuming forward's CompiledForwardShim wait() polls the combined
         # event through the whole-batch gate (poll-only; never Await), so the
         # DMAs overlap whatever the scheduler runs before that forward.
-        # A failed load is issued again into the same pages: the host pages
-        # stay host-locked and the device pages reserved until loading_check
-        # acks the load, and every consumer (the gate, the decode restore poll,
-        # loading_check) polls this same event.
-        finish_event = RetryingFutureEvent(
-            lambda: CombinedFutureEvent(self._issue_pool_dmas(op, load=True)),
-            max_retries=_LOAD_BACK_RETRIES,
-            what="HiCache load-back",
+        finish_event = LoadBackEvent(
+            CombinedFutureEvent(self._issue_pool_dmas(op, load=True)),
+            handles_failures=self.handles_load_back_failures,
         )
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
@@ -280,9 +336,45 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         """
         if consumer_index < 0:
             return True
-        event = self.layer_done_counter.events[consumer_index]
-        done = torch.tensor(
-            int(event is None or event.query()), dtype=torch.int, device="cpu"
+        return self.resolve_load_back(
+            self.layer_done_counter.events[consumer_index], all_reduce
         )
-        all_reduce(done, torch.distributed.ReduceOp.MIN)
-        return bool(done.item())
+
+    def resolve_load_back(
+        self, event, all_reduce: Callable[[torch.Tensor, Any], None]
+    ) -> bool:
+        """True once ``event``'s DMAs landed on every rank; settles whether it failed.
+
+        A collective: every rank calls it for the same events in the same
+        order. A load failed if its DMA failed on any rank, and every rank then
+        sees ``event.failed`` set, so the cleanup is the same everywhere.
+        """
+        if not isinstance(event, LoadBackEvent):
+            # An unused slot (None) or another backend's event: completion only.
+            done = torch.tensor(
+                int(event is None or event.query()), dtype=torch.int, device="cpu"
+            )
+            all_reduce(done, torch.distributed.ReduceOp.MIN)
+            return bool(done.item())
+        if event.resolved:
+            # Resolved by a collective every rank took part in.
+            return True
+        # [done, -failed] MIN-reduces to [all done, -(any failed)].
+        status = torch.tensor(
+            [int(event.local_done()), -int(event.local_error is not None)],
+            dtype=torch.int,
+            device="cpu",
+        )
+        all_reduce(status, torch.distributed.ReduceOp.MIN)
+        if not status[0].item():
+            return False
+        event.resolved = True
+        event.failed = bool(status[1].item())
+        if event.failed:
+            logger.warning(
+                "raiden HiCache load-back failed on at least one rank "
+                "(this rank: %s); its requests are aborted and its nodes "
+                "rolled back to host-only",
+                event.local_error or "ok",
+            )
+        return True
