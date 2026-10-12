@@ -138,6 +138,7 @@ def is_cp_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
+@torch.compiler.assume_constant_result
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
     return is_cp_enabled() and uses_mla_backend()
