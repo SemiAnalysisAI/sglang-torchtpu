@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
