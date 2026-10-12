@@ -167,7 +167,7 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          echo "matrix=$(python3 .github/tpu-ci/plan_partitions.py --suite stage-a-test-tpu-unit)" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python3 .github/tpu-ci/plan_partitions.py --suite stage-a-test-tpu-unit --max-partitions 2)" >> "$GITHUB_OUTPUT"
 
   # Per-commit TPU suite on single-host 2x2x1 slices (sized from topology.yaml).
   unit:
