@@ -290,3 +290,10 @@ def _tpu_pci_device_ids() -> list[str]:
         except OSError:
             continue
     return sorted(ids)
+
+
+def initialize_jax_compile_cache() -> None:
+    """Build JAX's persistent compilation cache now instead of on first compile."""
+    from jax._src import compilation_cache
+
+    compilation_cache._initialize_cache()
