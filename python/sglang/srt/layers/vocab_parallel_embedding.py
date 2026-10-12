@@ -499,7 +499,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
-    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+    def _embed_local_shard(
+        self, input_: torch.Tensor, *, use_runtime_vocab_bounds: bool = False
+    ) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
 
@@ -538,7 +540,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.shard_indices.added_vocab_start_index,
             self.shard_indices.added_vocab_end_index,
         )
-        if _is_tpu and self._tpu_runtime_vocab_bounds_required:
+        if use_runtime_vocab_bounds:
             # Read the module attribute so direct_compile sees its lifted buffer,
             # not a captured tensor or rank-specialized Python bound constants.
             bounds = self._tpu_runtime_vocab_bounds
@@ -569,11 +571,18 @@ class VocabParallelEmbedding(torch.nn.Module):
         # placeholders, and torch._assert_async has no lowering there (the probe
         # is off by default anyway -- SGLANG_ENABLE_ASYNC_ASSERT). Other backends
         # keep the probe inside their compiled regions.
-        if not (_is_tpu and torch.compiler.is_compiling()):
+        check_input_ids = True
+        use_runtime_vocab_bounds = False
+        if _is_tpu:
+            check_input_ids = not torch.compiler.is_compiling()
+            use_runtime_vocab_bounds = self._tpu_runtime_vocab_bounds_required
+        if check_input_ids:
             maybe_detect_oob(
                 input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
             )
-        output_parallel = self._embed_local_shard(input_)
+        output_parallel = self._embed_local_shard(
+            input_, use_runtime_vocab_bounds=use_runtime_vocab_bounds
+        )
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)

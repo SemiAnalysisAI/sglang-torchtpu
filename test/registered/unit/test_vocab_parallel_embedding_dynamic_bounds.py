@@ -51,7 +51,8 @@ def load_embedding_methods():
         if isinstance(n, ast.AnnAssign)
         or (
             isinstance(n, ast.FunctionDef)
-            and n.name in {"prepare_tpu_runtime_vocab_bounds", "_embed_local_shard"}
+            and n.name
+            in {"prepare_tpu_runtime_vocab_bounds", "_embed_local_shard", "forward"}
         )
     ]
     namespace = {
@@ -61,6 +62,8 @@ def load_embedding_methods():
         "use_symmetric_memory": lambda *a, **kw: nullcontext(),
         "get_parallel": lambda: SimpleNamespace(tp_group=None),
         "is_allocation_symmetric": lambda: False,
+        "maybe_detect_oob": Mock(),
+        "get_attn_tp_context": lambda: SimpleNamespace(input_scattered=True),
     }
     module = ast.Module(body=[function, cls], type_ignores=[])
     exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102
@@ -79,6 +82,7 @@ class RuntimeBoundsTest(unittest.TestCase):
         layer.register_buffer("_tpu_runtime_vocab_bounds", None, persistent=False)
         layer.weight = torch.nn.Parameter(torch.empty(16, 3, device=device))
         layer.tp_size, layer.output_dtype = tp_size, None
+        layer.num_embeddings = 16
         layer.shard_indices = SimpleNamespace(
             **dict(
                 zip(
@@ -133,7 +137,7 @@ class RuntimeBoundsTest(unittest.TestCase):
         self.assertIsNone(layer._tpu_runtime_vocab_bounds)
         self.assertEqual(list(layer.named_buffers()), [])
         self.assertNotIn("_tpu_runtime_vocab_bounds", layer.state_dict())
-        layer._embed_local_shard(torch.tensor([4, 8, 12], dtype=torch.int64))
+        layer.forward(torch.tensor([4, 8, 12], dtype=torch.int64))
         self.assertIsNone(layer._tpu_runtime_vocab_bounds)
         single = self.layer(tp_size=1)
         single.prepare_tpu_runtime_vocab_bounds()
@@ -152,7 +156,7 @@ class RuntimeBoundsTest(unittest.TestCase):
         self.assertIs(layer._tpu_runtime_vocab_bounds, buffer)
         layer.shard_indices.org_vocab_start_index = 3
         with self.assertRaisesRegex(RuntimeError, "stale"):
-            layer._embed_local_shard(torch.tensor([4], dtype=torch.int64))
+            layer.forward(torch.tensor([4], dtype=torch.int64))
         layer.weight = torch.nn.Parameter(torch.ones(16, 3))
         layer.prepare_tpu_runtime_vocab_bounds()
         self.assertIs(layer._tpu_runtime_vocab_bounds, buffer)
@@ -170,7 +174,7 @@ class RuntimeBoundsTest(unittest.TestCase):
         )
         layer.to("meta")
         with self.assertRaisesRegex(RuntimeError, "wrong device"):
-            layer._embed_local_shard(torch.tensor([4], dtype=torch.int64))
+            layer.forward(torch.tensor([4], dtype=torch.int64))
         layer.to_empty(device="cpu")
         layer._tpu_runtime_vocab_bounds.fill_(-100)
         layer.prepare_tpu_runtime_vocab_bounds()
@@ -201,10 +205,10 @@ class RuntimeBoundsTest(unittest.TestCase):
         layer = self.layer()
         layer.weight.data.copy_(torch.arange(48).reshape(16, 3))
         ids = torch.tensor([-1, 4, 7, 8, 12, 14, 15], dtype=torch.int64)
-        expected = layer._embed_local_shard(ids)
+        expected = layer.forward(ids)
         layer._tpu_runtime_vocab_bounds_required = True
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            layer._embed_local_shard(ids)
+            layer.forward(ids)
         layer.prepare_tpu_runtime_vocab_bounds()
         layer.output_dtype = torch.float64
         buffer = layer._tpu_runtime_vocab_bounds.clone()
@@ -212,15 +216,41 @@ class RuntimeBoundsTest(unittest.TestCase):
         layer._tpu_runtime_vocab_bounds = buffer
         observed = Mock(wraps=self.mask)
         self.ns["get_masked_input_and_mask"] = observed
-        actual = layer._embed_local_shard(ids)
+        actual = layer.forward(ids)
         torch.testing.assert_close(actual, expected.double())
         self.assertTrue(
             all(isinstance(x, torch.Tensor) for x in observed.call_args.args[1:])
         )
         self.assertEqual(actual.dtype, torch.float64)
         self.ns["_is_tpu"] = False
-        layer._embed_local_shard(ids)
+        layer.forward(ids)
         self.assertTrue(all(type(x) is int for x in observed.call_args.args[1:]))
+
+    def test_forward_backend_and_compilation_guards(self):
+        layer = self.layer()
+        layer.weight.data.copy_(torch.arange(48).reshape(16, 3))
+        layer.prepare_tpu_runtime_vocab_bounds()
+        ids = torch.tensor([4, 7, 12], dtype=torch.int64)
+        observed = Mock(wraps=self.mask)
+        self.ns["get_masked_input_and_mask"] = observed
+        probe = self.ns["maybe_detect_oob"]
+        for is_tpu in (False, True):
+            for compiling in (False, True):
+                with self.subTest(is_tpu=is_tpu, compiling=compiling):
+                    self.ns["_is_tpu"] = is_tpu
+                    probe.reset_mock()
+                    with patch.object(
+                        torch.compiler, "is_compiling", return_value=compiling
+                    ):
+                        layer.forward(ids)
+                    self.assertEqual(probe.called, not (is_tpu and compiling))
+                    bounds = observed.call_args.args[1:]
+                    if is_tpu:
+                        self.assertTrue(
+                            all(isinstance(x, torch.Tensor) for x in bounds)
+                        )
+                    else:
+                        self.assertTrue(all(type(x) is int for x in bounds))
 
 
 class RuntimeBoundsDeclarationTest(unittest.TestCase):
