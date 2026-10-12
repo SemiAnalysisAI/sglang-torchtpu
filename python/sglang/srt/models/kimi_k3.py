@@ -667,6 +667,13 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
 
+        # Static-scale fp8 GEMVs, bound post-load by the TPU plugin
+        # (sglang_tpu.kimi_k3_static_fp8); callables that replace the bf16
+        # GEMVs. The front is [latent down-proj | shared gate_up] in one weight.
+        self._static_fp8_front = None
+        self._static_fp8_front_split: Optional[List[int]] = None
+        self._static_fp8_latent_up = None
+
         # Static eligibility for fusing the latent all-reduce with the RMSNorm
         # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
         # shared == 2*NORM_DIM (3584 / 7168). Decided once so the hot path
@@ -873,6 +880,11 @@ class KimiK3MoE(nn.Module):
             ):
                 y.mul_(self.routed_scaling_factor)
         return y
+
+    def _shared_experts_from_gate_up(self, gate_up: torch.Tensor) -> torch.Tensor:
+        """KimiK3MLP.forward after its gate_up GEMV (no DP gather, no prefix)."""
+        out, _ = self.shared_experts.down_proj(self.shared_experts.act_fn(gate_up))
+        return out
 
     def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
         if self.routed_expert_norm is None:
@@ -1089,6 +1101,13 @@ class KimiK3MoE(nn.Module):
         #   current: front ---------- dispatch ---------- routed GEMMs -- tail
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        static_front = None
+        if self._static_fp8_front is not None and hidden_states.shape[0] > 0:
+            static_front = torch.split(
+                self._static_fp8_front(hidden_states),
+                self._static_fp8_front_split,
+                dim=1,
+            )
         shared_input = None
         shared_output = None
         shared_event = None
@@ -1119,6 +1138,8 @@ class KimiK3MoE(nn.Module):
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
+            elif static_front is not None:
+                shared_output = self._shared_experts_from_gate_up(static_front[1])
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
 
@@ -1229,6 +1250,8 @@ class KimiK3MoE(nn.Module):
                 # quantized matmul does not accept an empty activation, so
                 # materialize its shape-only result without launching GEMM.
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+            elif static_front is not None:
+                routed_input = static_front[0]
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
         expert_output = run_experts(routed_input, topk_output)
@@ -1240,7 +1263,10 @@ class KimiK3MoE(nn.Module):
         else:
             latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+            if self._static_fp8_latent_up is not None:
+                out = self._static_fp8_latent_up(latent)
+            else:
+                out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
@@ -1530,6 +1556,8 @@ class KimiK3DeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.all_reduce_fusion = all_reduce_fusion
+        # Static-scale fp8 fused_qkvg_proj, bound post-load by the TPU plugin.
+        self._static_fp8_qkvg = None
         # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
         # hidden_states, so they overlap the wide [q,k,v,g] GEMM on the main
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
@@ -2112,7 +2140,10 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                if self._static_fp8_qkvg is not None:
+                    fused_states = self._static_fp8_qkvg(hidden_states)
+                else:
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
                 f_a = self.f_a_proj(hidden_states)[0]
@@ -2209,6 +2240,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
+        # Static-scale fp8 fused q_a / kv_a, bound post-load by the TPU plugin.
+        self._static_fp8_qkv_a = None
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
@@ -2366,6 +2399,11 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if isinstance(param, UninitializedParameter):
             param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
         param.data.copy_(loaded_weight)
+
+    def prepare_qkv_latent(self, hidden_states, forward_batch):
+        if self._static_fp8_qkv_a is not None:
+            return self._static_fp8_qkv_a(hidden_states)
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
 
     def dispatch_attn_forward_method(self, forward_batch) -> AttnForwardMethod:
         method = super().dispatch_attn_forward_method(forward_batch)
