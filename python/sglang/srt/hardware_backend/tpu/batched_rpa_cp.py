@@ -35,6 +35,8 @@ _GATHER_BUFFERS: dict = {}
 _AG_OP_NAME = "sglang_tpu_pallas::pcp_all_gather_rows"
 _AG_OP_CACHE: dict = {}
 _ORDER_CACHE: dict = {}
+_GLOBAL_AG_OP = None
+_GLOBAL_RING_OP = None
 # Row granularity of the exported all-gather: bounds the number of per-shape
 # exports (one per padded row count) and keeps the gathered chunks tile aligned.
 _AG_ROW_BUCKET = 16
@@ -75,7 +77,6 @@ def _rank_ordered_device_ids(world: int) -> list[int]:
     return ids
 
 
-@torch.compiler.assume_constant_result
 def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
     order = order or _PCP_MESH_ORDER
     if order == "native":
@@ -98,7 +99,6 @@ def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
     return jax.sharding.Mesh(devices, axis_names)
 
 
-@torch.compiler.assume_constant_result
 def _call_custom_kernel_supports_device_assignment() -> bool:
     try:
         from torch_tpu._internal.pallas import pallas as pallas_impl
@@ -131,7 +131,6 @@ def _export_mesh_op(name, fn, mesh, input_partition_specs, output_partition_spec
     return jax_op(name, fn, mesh=mesh, input_partition_specs=input_partition_specs)
 
 
-@torch.compiler.assume_constant_result
 def build_cp_all_gather_op(cp_size: int, attn_tp_size: int, mesh_order: str | None = None):
     """Export a `lax.all_gather` over the CP axis of the (pcp, model) mesh.
 
@@ -143,10 +142,12 @@ def build_cp_all_gather_op(cp_size: int, attn_tp_size: int, mesh_order: str | No
     [r * rows, (r + 1) * rows). Mesh position (c, t) is torch rank
     c * attn_tp_size + t, matching the attn_cp groups built in parallel_state.
     """
+    global _GLOBAL_AG_OP
     mesh_order = mesh_order or _PCP_MESH_ORDER
     key = (cp_size, attn_tp_size, mesh_order)
     cached = _AG_OP_CACHE.get(key)
     if cached is not None:
+        _GLOBAL_AG_OP = cached
         return cached
 
     import jax
@@ -185,8 +186,19 @@ def build_cp_all_gather_op(cp_size: int, attn_tp_size: int, mesh_order: str | No
         (P(),),
         (P(),),
     )
-    _AG_OP_CACHE[key] = op
-    return op
+
+    def _ag_fake(src):
+        return src.new_empty((cp_size, src.shape[0], src.shape[1]))
+
+    try:
+        op.register_fake(_ag_fake)
+    except Exception:
+        pass
+
+    target_op = getattr(op, "_opoverload", op)
+    _AG_OP_CACHE[key] = target_op
+    _GLOBAL_AG_OP = target_op
+    return target_op
 
 
 def cp_all_gather_padded(
@@ -209,7 +221,9 @@ def cp_all_gather_padded(
             src = torch.nn.functional.pad(src, (0, 0, 0, rows - local_len))
         src = src.contiguous()
         parallel = get_parallel()
-        op = build_cp_all_gather_op(cp_size, parallel.attn_tp_size)
+        op = _GLOBAL_AG_OP
+        if op is None:
+            op = build_cp_all_gather_op(cp_size, parallel.attn_tp_size)
         out = op(src).view(cp_size, rows, cols)
         # slot s holds rank (cp_rank - s) % cp_size -> rank r is slot (cp_rank - r) % cp_size
         cp_rank = parallel.attn_cp_rank
@@ -330,7 +344,6 @@ class PcpBatchedMetadata:
 _RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring"
 
 
-@torch.compiler.assume_constant_result
 def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
     """Register the PCP cache-phase (ring attention) op over the CP x TP mesh.
 
@@ -342,9 +355,11 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
     declared replicated (P()) so local and global shapes coincide, as in
     `fused_moe_rs_op`.
     """
+    global _GLOBAL_RING_OP
     key = (_RING_OP_NAME, cp_size, attn_tp_size)
     cached = _OP_CACHE.get(key)
     if cached is not None:
+        _GLOBAL_RING_OP = cached
         return cached
 
     import functools
@@ -462,8 +477,20 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
         (P(),) * num_tensor_args + (None,) * 5,
         (P(), P()),
     )
-    _OP_CACHE[key] = op
-    return op
+
+    def _ring_fake(queries, *args, **kwargs):
+        lse = queries.new_empty(queries.shape[0], queries.shape[1], dtype=torch.float32)
+        return torch.empty_like(queries), lse
+
+    try:
+        op.register_fake(_ring_fake)
+    except Exception:
+        pass
+
+    target_op = getattr(op, "_opoverload", op)
+    _OP_CACHE[key] = target_op
+    _GLOBAL_RING_OP = target_op
+    return target_op
 
 def build_batched_rpa_cp_op():
     """Register the CP-aware custom op for batched RPA."""
@@ -914,7 +941,9 @@ def batched_rpa_pcp_forward(
     if pcp_meta.cache_pages > 0:
         # kv_lens == cached prefix and kv_new_lens == 0, so the kernel's global
         # cache length is exactly the prefix. No KV is written in this phase.
-        ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
+        ring_op = _GLOBAL_RING_OP
+        if ring_op is None:
+            ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
         context_out, context_lse = ring_op(
             q_op,
             k_logical,
