@@ -14,6 +14,9 @@ program per operand length, and the rows are picked with ``index_select`` from
 an index built on the host, which costs one program per result length. Both
 sets are bounded by the capacity, so a server that has seen each batch size
 once compiles nothing more. Other devices keep the plain ops.
+
+``TpuBatchRowsBackend`` serves these through the core
+``sglang.srt.managers.batch_rows`` seam; ``apply_tpu_patches`` registers it.
 """
 
 from __future__ import annotations
@@ -24,8 +27,9 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.managers.batch_rows import BatchRowsBackend
 from sglang.srt.utils.common import next_power_of_2
+from sglang_tpu._logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -247,9 +251,23 @@ def precompile(device: torch.device) -> None:
                 torch.cat([b, a])
     torch.get_device_module(device).synchronize()
     if device.type == "tpu":
-        from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+        from sglang_tpu.compilation.recompilation_checker import (
             snapshot_recompilation_baseline,
         )
 
         snapshot_recompilation_baseline()
     logger.info("TPU batch rows warmup finished in %.3fs", time.perf_counter() - start)
+
+
+class TpuBatchRowsBackend(BatchRowsBackend):
+    """The scheduler's batch row operations on TPU (see the module docstring)."""
+
+    def merge_rows(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return merge_rows(a, b)
+
+    def filter_rows(self, t: torch.Tensor, keep_device: torch.Tensor) -> torch.Tensor:
+        return filter_rows(t, keep_device)
+
+    def warmup(self, max_running_requests: int, device: torch.device) -> None:
+        configure_capacity(max_running_requests)
+        precompile(device)

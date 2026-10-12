@@ -88,6 +88,25 @@ def _register_tpu_sampler_backend() -> None:
     _tpu_sampler_backend_registered = True
 
 
+_tpu_batch_rows_backend_registered = False
+
+
+def _register_tpu_batch_rows_backend() -> None:
+    """Route scheduler batch merge/filter through the TPU row operations, which
+    compile a bounded set of programs instead of one per batch-size pair (see
+    ``batch_rows``). Idempotent, like the sampler registration."""
+
+    global _tpu_batch_rows_backend_registered
+    if _tpu_batch_rows_backend_registered:
+        return
+
+    from sglang.srt.managers.batch_rows import register_batch_rows_backend
+    from sglang_tpu.batch_rows import TpuBatchRowsBackend
+
+    register_batch_rows_backend(TpuBatchRowsBackend())
+    _tpu_batch_rows_backend_registered = True
+
+
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
     if _dynamic_compile_unwrapped:
@@ -948,6 +967,7 @@ def apply_tpu_patches() -> None:
     _configure_eager_mode()
     _register_tpu_compile_backend()
     _register_tpu_sampler_backend()
+    _register_tpu_batch_rows_backend()
     _unwrap_dynamic_compile_fns()
     _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()

@@ -12,7 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.hardware_backend.tpu.batch_rows import filter_rows, merge_rows
+from sglang.srt.managers.batch_rows import filter_rows, merge_rows
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties

@@ -9,8 +9,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt import runtime_context
-from sglang.srt.hardware_backend.tpu import batch_rows
+from sglang.srt.managers import batch_rows as core_batch_rows
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu import batch_rows, patches
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -276,6 +277,31 @@ class TestPaddedRows(unittest.TestCase):
             self.assertTrue(torch.equal(batch_rows.merge_rows(a, b), torch.cat([a, b])))
             keep = torch.tensor([2, 0])
             self.assertTrue(torch.equal(batch_rows.filter_rows(a, keep), a[keep]))
+
+    def test_tpu_backend_serves_the_core_seam(self):
+        """The TPU registration routes merge/filter here and warms every length."""
+        a, keep = torch.arange(3), torch.tensor([2, 0])
+        with (
+            patch.object(
+                core_batch_rows, "_backend", core_batch_rows.BatchRowsBackend()
+            ),
+            patch.object(patches, "_tpu_batch_rows_backend_registered", False),
+        ):
+            patches._register_tpu_batch_rows_backend()
+            self.assertIsInstance(
+                core_batch_rows._backend, batch_rows.TpuBatchRowsBackend
+            )
+            with (
+                patch.object(batch_rows, "merge_rows") as merge,
+                patch.object(batch_rows, "filter_rows") as filter_,
+            ):
+                core_batch_rows.merge_rows(a, a)
+                core_batch_rows.filter_rows(a, keep)
+            merge.assert_called_once_with(a, a)
+            filter_.assert_called_once_with(a, keep)
+            core_batch_rows.warmup_batch_rows(CAPACITY - 1, torch.device("cpu"))
+        self.assertEqual(batch_rows._state.capacity, CAPACITY)
+        self.assertTrue(batch_rows._state.layouts_frozen)
 
 
 if __name__ == "__main__":

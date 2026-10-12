@@ -120,6 +120,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.batch_rows import warmup_batch_rows
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -1115,13 +1116,10 @@ class Scheduler(
                 self.draft_worker.init_cuda_graphs()
                 if current_platform.is_tpu():
                     self.precompile_tpu_spec_ops()
-            if current_platform.is_tpu():
-                from sglang.srt.hardware_backend.tpu import batch_rows
-
-                batch_rows.configure_capacity(
-                    self.tp_worker.model_runner.max_running_requests
-                )
-                batch_rows.precompile(torch.device(self.tp_worker.model_runner.device))
+            warmup_batch_rows(
+                self.tp_worker.model_runner.max_running_requests,
+                torch.device(self.tp_worker.model_runner.device),
+            )
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.
