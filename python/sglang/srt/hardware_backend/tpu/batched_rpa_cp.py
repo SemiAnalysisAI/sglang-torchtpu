@@ -34,6 +34,7 @@ _PCP_DEBUG_CALLS: dict[int, int] = {}
 _GATHER_BUFFERS: dict = {}
 _AG_OP_NAME = "sglang_tpu_pallas::pcp_all_gather_rows"
 _AG_OP_CACHE: dict = {}
+_ORDER_CACHE: dict = {}
 # Row granularity of the exported all-gather: bounds the number of per-shape
 # exports (one per padded row count) and keeps the gathered chunks tile aligned.
 _AG_ROW_BUCKET = 16
@@ -74,6 +75,7 @@ def _rank_ordered_device_ids(world: int) -> list[int]:
     return ids
 
 
+@torch.compiler.assume_constant_result
 def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
     order = order or _PCP_MESH_ORDER
     if order == "native":
@@ -96,6 +98,7 @@ def _get_pallas_mesh(axis_names, mesh_shape, order: str | None = None):
     return jax.sharding.Mesh(devices, axis_names)
 
 
+@torch.compiler.assume_constant_result
 def _call_custom_kernel_supports_device_assignment() -> bool:
     try:
         from torch_tpu._internal.pallas import pallas as pallas_impl
@@ -128,6 +131,7 @@ def _export_mesh_op(name, fn, mesh, input_partition_specs, output_partition_spec
     return jax_op(name, fn, mesh=mesh, input_partition_specs=input_partition_specs)
 
 
+@torch.compiler.assume_constant_result
 def build_cp_all_gather_op(cp_size: int, attn_tp_size: int, mesh_order: str | None = None):
     """Export a `lax.all_gather` over the CP axis of the (pcp, model) mesh.
 
@@ -209,9 +213,13 @@ def cp_all_gather_padded(
         out = op(src).view(cp_size, rows, cols)
         # slot s holds rank (cp_rank - s) % cp_size -> rank r is slot (cp_rank - r) % cp_size
         cp_rank = parallel.attn_cp_rank
-        order = torch.tensor(
-            [(cp_rank - r) % cp_size for r in range(cp_size)], device=out.device
-        )
+        _order_key = (cp_rank, cp_size, str(out.device))
+        order = _ORDER_CACHE.get(_order_key)
+        if order is None:
+            order = torch.tensor(
+                [(cp_rank - r) % cp_size for r in range(cp_size)], device=out.device
+            )
+            _ORDER_CACHE[_order_key] = order
         return out.index_select(0, order)[:, :max_len]
 
     group = group or get_parallel().attn_cp_group
@@ -322,6 +330,7 @@ class PcpBatchedMetadata:
 _RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring"
 
 
+@torch.compiler.assume_constant_result
 def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
     """Register the PCP cache-phase (ring attention) op over the CP x TP mesh.
 

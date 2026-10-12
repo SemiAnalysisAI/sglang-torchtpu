@@ -153,9 +153,18 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         if get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1:
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
                 build_batched_rpa_cp_op,
+                build_batched_rpa_pcp_ring_op,
+                build_cp_all_gather_op,
             )
 
             self._cp_op = build_batched_rpa_cp_op()
+            if get_parallel().attn_cp_size > 1:
+                build_batched_rpa_pcp_ring_op(
+                    get_parallel().attn_cp_size, get_parallel().attn_tp_size
+                )
+                build_cp_all_gather_op(
+                    get_parallel().attn_cp_size, get_parallel().attn_tp_size
+                )
 
     def init_forward_metadata(self, forward_batch):
         if self._pp_schedule_runner is not None:
