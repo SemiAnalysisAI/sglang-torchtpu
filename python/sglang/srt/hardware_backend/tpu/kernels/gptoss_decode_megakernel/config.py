@@ -18,6 +18,11 @@ from __future__ import annotations
 import dataclasses
 
 BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# Timing ablations (outputs become wrong): "ar" keeps pack + local reduce but skips the
+# cross-rank exchange (and the start barrier); "attn" skips the whole attention block incl.
+# its all-reduce; "attn_kv" skips only the paged attention core; "moe" skips router, experts
+# and their all-reduce; "experts" skips only the expert matmuls/stream.
+ABLATIONS = ("ar", "attn", "attn_kv", "moe", "experts")
 
 
 def rup(x: int, m: int = 128) -> int:
@@ -67,6 +72,8 @@ class DecodeConfig:
     vmem_mib: int = 60
     ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
     w_dtype: str = "bf16"  # expert weights: "bf16" or "mxfp4" (fp4 e2m1 codes + scale per 32 K)
+    ar_fold: bool = True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+    ablate: tuple[str, ...] = ()  # see ABLATIONS
 
     # ------------------------------------------------------------------ derived
     @property
@@ -145,6 +152,14 @@ class DecodeConfig:
         return rup(self.tne // 32, 16)
 
     @property
+    def AR_FOLD(self) -> bool:
+        return self.ar_fold and self.B <= 4
+
+    @property
+    def FR(self) -> int:  # folded all-reduce payload rows
+        return rup(self.B * (self.Hp // 128), 8)
+
+    @property
     def VW(self) -> int:
         return max(self.Hp, self.QKVWL, 128)
 
@@ -166,6 +181,7 @@ class DecodeConfig:
         assert self.kv_dtype in ("bf16", "fp8") and self.ar_dtype in ("bf16", "f32")
         assert self.tne % 128 == 0 and self.w_slots >= 2
         assert self.w_dtype in ("bf16", "mxfp4")
+        assert set(self.ablate) <= set(ABLATIONS), self.ablate
         if self.w_dtype == "mxfp4":
             assert self.I % 32 == 0 and self.Hp % 128 == 0
         assert self.page % 8 == 0 and self.kv_bufs >= 2

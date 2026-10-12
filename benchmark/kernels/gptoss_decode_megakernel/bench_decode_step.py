@@ -162,6 +162,11 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--vmem-mib", type=int, default=60)
     ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights (stock format)")
+    ap.add_argument("--ablate", nargs="*", default=[],
+                    choices=["ar", "attn", "attn_kv", "moe", "experts"],
+                    help="mk/fallback timing ablations (outputs wrong); see config.ABLATIONS")
+    ap.add_argument("--no-ar-fold", action="store_true",
+                    help="all-reduce full [BR, Hp] rows even for B <= 4")
     ap.add_argument("--cpu-smoke", action="store_true",
                     help="tiny dims + Pallas interpret mode on 8 virtual CPU devices (script check)")
     args = ap.parse_args()
@@ -210,7 +215,8 @@ def main():
         extra = {} if args.cpu_smoke else dict(L=args.layers, tne=args.tne,
                                                vmem_mib=args.vmem_mib)
         c = mk_cfg(B, kv_dtype=args.kv, moe_mode=args.moe, npb=args.npb, nb_full=nb,
-                   w_dtype="mxfp4" if args.mxfp4 else "bf16",
+                   w_dtype="mxfp4" if args.mxfp4 else "bf16", ablate=tuple(args.ablate),
+                   ar_fold=not args.no_ar_fold,
                    nb_swa=nb_swa, max_pages=max_pages, kv_bufs=args.kv_bufs, **extra)
         if W is None:  # weights do not depend on B
             keys = jax.random.split(jax.random.PRNGKey(0), 16)
@@ -237,7 +243,7 @@ def main():
         pt_s = jax.device_put(jnp.asarray(ptw.astype(np.int32)), rep)
         for mode in args.modes:
             rec = dict(mode=mode, B=B, L=c.L, ctx=args.ctx, kv=c.kv_dtype, moe=c.moe_mode,
-                       w=c.w_dtype,
+                       w=c.w_dtype, ablate=list(c.ablate), ar_fold=c.AR_FOLD,
                        tne=c.tne, npb=c.npb, kv_bufs=c.kv_bufs)
             try:
                 if mode == "xla":

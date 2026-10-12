@@ -268,6 +268,7 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
             "sem_kv": pltpu.SemaphoreType.DMA((c.kv_bufs,)),
             "it_b": pltpu.SMEM((c.NIMAX,), I32),
             "it_j": pltpu.SMEM((c.NIMAX,), I32),
+            "nit": pltpu.SMEM((1,), I32),  # items listed by the last attention prepare
         })
     if mode in ("mega", "moe"):
         s.update({
@@ -296,9 +297,12 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
                 "w2r": V((NS, T, Hp), BF16),
             })
     if comm:
+        if c.AR_FOLD:  # live rows only, 128-lane chunks stacked as rows, f32
+            s.update({"send": V((2, c.FR, 128), F32), "recv": V((2, R, c.FR, 128), F32),
+                      "arout": V((BR, Hp), F32)})
+        else:
+            s.update({"send": V((2, BR, Hp), ardt), "recv": V((2, R, BR, Hp), ardt)})
         s.update({
-            "send": V((2, BR, Hp), ardt),
-            "recv": V((2, R, BR, Hp), ardt),
             "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
             "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
         })
@@ -341,7 +345,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     c.check()
     assert mode in ("mega", "attn", "moe")
     assert (layer is None) == (mode == "mega")
-    comm = mode == "mega" and c.R > 1
+    comm = mode == "mega" and c.R > 1  # all-reduce buffers present
+    exchange = comm and "ar" not in c.ablate  # remote DMAs actually issued
+    AB = set(c.ablate) if mode == "mega" else set()
     B, BR, L, Hp, H, R = c.B, c.BR, c.L, c.Hp, c.H, c.R
     QWL, NQL, EL, NJ, T, NS = c.QWL, c.NQL, c.EL, c.NJ, c.tne, c.w_slots
     PAGE, MP, NWP, NBUF = c.page, c.max_pages, c.NWP, c.kv_bufs
@@ -435,27 +441,51 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
                 for off in range(1, R)]
 
-        def allreduce(slot, val, l):
+        NHB = Hp // 128
+
+        def ar_start(slot, val, l, used_before):
+            """Start the all-reduce of `val` [BR, Hp] f32; returns `finish() -> [BR, Hp] f32`.
+
+            The sends leave immediately; the caller can do independent work (e.g. the next
+            layer's KV prefetch) before `finish` waits for the 7 peer slots. No per-AR
+            barrier: slot reuse is safe because a rank can only reach the next use of a slot
+            after receiving every peer's contribution to the other slot in between.
+            With `AR_FOLD` only the B live rows travel, as [B*Hp/128, 128] f32 holding
+            AR-dtype-rounded values (same sum as an AR-dtype payload).
+            """
             if not comm:
-                return val.astype(ardt).astype(F32)
+                return lambda: val.astype(ardt).astype(F32)
             me = lax.axis_index("tp").astype(I32)
+            if exchange and used_before:
+                @pl.when(l > 0)  # this slot's sends from the previous layer have left
+                def _():
+                    for d in ar_copies(slot, me):
+                        d.wait_send()
 
-            @pl.when(l > 0)  # previous step's sends from this slot must have left
-            def _():
-                for d in ar_copies(slot, me):
-                    d.wait_send()
-
-            S["send"][slot] = val.astype(ardt)
+            if c.AR_FOLD:
+                v = val.astype(ardt).astype(F32)
+                for j in range(NHB):
+                    S["send"][slot, j * B:(j + 1) * B, :] = v[0:B, j * 128:(j + 1) * 128]
+            else:
+                S["send"][slot] = val.astype(ardt)
             S["recv"][slot, me] = S["send"][slot]
-            descs = ar_copies(slot, me)
+            descs = ar_copies(slot, me) if exchange else []
             for d in descs:
                 d.start()
-            for d in descs:
-                d.wait_recv()
-            tot = S["recv"][slot, 0].astype(F32)
-            for r in range(1, R):
-                tot = tot + S["recv"][slot, r].astype(F32)
-            return tot
+
+            def finish():
+                for d in descs:
+                    d.wait_recv()
+                tot = S["recv"][slot, 0].astype(F32)
+                for r in range(1, R):
+                    tot = tot + S["recv"][slot, r].astype(F32)
+                if not c.AR_FOLD:
+                    return tot
+                for j in range(NHB):
+                    S["arout"][0:B, j * 128:(j + 1) * 128] = tot[j * B:(j + 1) * B]
+                return S["arout"][...]
+
+            return finish
 
         # ---------------------------------------------------------- A: QKV + RoPE
         def phase_a(l, s, kn_idx):
@@ -491,14 +521,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             return (d,)
 
         # ---------------------------------------------------------- B: paged attention
-        def phase_b(s, pi, sliding):
-            """Attention for all sequences as one flat stream of (sequence, page-block) items.
-
-            Items are listed on the scalar core first; KV page DMAs then run `kv_bufs - 1`
-            items ahead of compute across sequence boundaries. Each item's pages share one
-            DMA semaphore (one page-sized wait per started page). Only pages holding
-            attended tokens are fetched; sliding layers see at most `NWP` window pages.
-            """
+        def attn_helpers(pi, sliding):
             pool = kv_swa if sliding else kv_full
             nb = c.nb_swa if sliding else c.nb_full
             NPBL = c.npb_swa if sliding else c.npb
@@ -510,18 +533,6 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 plo = lo // PAGE  # first page holding an attended history token
                 npg = jnp.where(pos > 0, (jnp.maximum(pos - 1, 0) // PAGE) - plo + 1, 0)
                 return pos, lo, plo, npg, jnp.maximum((npg + NPBL - 1) // NPBL, 1)
-
-            def collect(b, k):
-                n = rng(b)[4]
-
-                def one(j, k):
-                    S["it_b"][k] = b
-                    S["it_j"][k] = j
-                    return k + 1
-
-                return lax.fori_loop(0, n, one, k)
-
-            n_items = lax.fori_loop(0, B, collect, jnp.int32(0))
 
             def page_cp(slot, i, page):
                 return cp(pool.at[pi, page], S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)],
@@ -549,10 +560,37 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                     def _():
                         page_cp(slot, i, 0).wait()
 
+            return rng, kv_start, kv_wait, NPBL, TKL
+
+        def phase_b_prepare(pi, sliding):
+            """List the layer's (sequence, page-block) items on the scalar core and start the
+            first `kv_bufs - 1` items' page DMAs. Independent of the residual stream, so the
+            megakernel runs it for layer l+1 while layer l's MoE all-reduce is in flight."""
+            rng, kv_start, _, _, _ = attn_helpers(pi, sliding)
+
+            def collect(b, k):
+                n = rng(b)[4]
+
+                def one(j, k):
+                    S["it_b"][k] = b
+                    S["it_j"][k] = j
+                    return k + 1
+
+                return lax.fori_loop(0, n, one, k)
+
+            n_items = lax.fori_loop(0, B, collect, jnp.int32(0))
+            S["nit"][0] = n_items
             for k in range(NBUF - 1):
                 @pl.when(k < n_items)
                 def _():
                     kv_start(k, k)
+
+        def phase_b_run(s, pi, sliding):
+            """Attention for all sequences as one flat stream of the prepared items: KV page
+            DMAs run `kv_bufs - 1` items ahead of compute across sequence boundaries; each
+            item's pages share one DMA semaphore (one page-sized wait per started page)."""
+            rng, kv_start, kv_wait, NPBL, TKL = attn_helpers(pi, sliding)
+            n_items = S["nit"][0]
 
             tokoff = lax.broadcasted_iota(I32, (NQL, TKL), 1)
             row8 = lax.broadcasted_iota(I32, (NQL, 128), 0)
@@ -726,7 +764,12 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
         # ---------------------------------------------------------- composition
         if mode == "mega":
-            if comm:
+            if comm:  # peers' slots start at zero (matters only for the "ar" ablation)
+                S["recv"][...] = jnp.zeros(S["recv"].shape, S["recv"].dtype)
+                S["send"][...] = jnp.zeros(S["send"].shape, S["send"].dtype)
+                if c.AR_FOLD:
+                    S["arout"][...] = jnp.zeros((BR, Hp), F32)
+            if exchange:
                 me = lax.axis_index("tp").astype(I32)
                 barrier = pltpu.get_barrier_semaphore()
                 for off in range(1, R):
@@ -739,6 +782,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             S["oh"][...] = jnp.zeros((BR * NQL, 128), F32)
             zero_kvb()
 
+            if "attn" not in AB and "attn_kv" not in AB:
+                phase_b_prepare(0, sliding=True)
+
             def pair(p, _):
                 for s in (0, 1):
                     l = 2 * p + s
@@ -750,22 +796,44 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                         for d in aw_copies(l + 1, 1 - s):
                             d.start()
 
-                    kn_descs = phase_a(l, s, l)
-                    phase_b(s, p, sliding=(s == 0))
-                    for d in kn_descs:
-                        d.wait()
-                    tot = allreduce(0, phase_c(s), l)
-                    S["res"][...] = rnd(S["res"][...] + tot + vrow(s, V_BO, Hp))
-                    n_act, base = phase_d(s)
-                    tot = allreduce(1, phase_e(l, n_act, base), l)
-                    S["res"][...] = rnd(S["res"][...] + tot)
+                    if "attn" not in AB:
+                        kn_descs = phase_a(l, s, l)
+                        if "attn_kv" not in AB:
+                            phase_b_run(s, p, sliding=(s == 0))
+                        for d in kn_descs:
+                            d.wait()
+                        finish = ar_start(0, phase_c(s), l, True)
+                        S["res"][...] = rnd(S["res"][...] + finish() + vrow(s, V_BO, Hp))
+
+                    def prepare_next():
+                        if "attn" in AB or "attn_kv" in AB:
+                            return
+                        if s == 0:
+                            phase_b_prepare(p, sliding=False)
+                        else:
+                            @pl.when(p + 1 < L // 2)
+                            def _():
+                                phase_b_prepare(p + 1, sliding=True)
+
+                    if "moe" not in AB:
+                        n_act, base = phase_d(s)
+                        if "experts" in AB:
+                            part = jnp.zeros((BR, Hp), F32)
+                        else:
+                            part = phase_e(l, n_act, base)
+                        finish = ar_start(1, part, l, True)
+                        prepare_next()  # overlaps the MoE all-reduce
+                        S["res"][...] = rnd(S["res"][...] + finish())
+                    else:
+                        prepare_next()
                 return 0
 
             lax.fori_loop(0, L // 2, pair, 0)
             outs[0][...] = S["res"][...].astype(BF16)
-            if comm:
+            if exchange:
                 me = lax.axis_index("tp").astype(I32)
-                for slot in range(2):
+                used = [sl for sl, blk in ((0, "attn"), (1, "moe")) if blk not in AB]
+                for slot in used:
                     for d in ar_copies(slot, me):
                         d.wait_send()
         else:
@@ -779,7 +847,8 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 S["oh"][...] = jnp.zeros((BR * NQL, 128), F32)
                 zero_kvb()
                 kn_descs = phase_a(l, 0, 0)
-                phase_b(0, l // 2, sliding=c.sliding[l])
+                phase_b_prepare(l // 2, sliding=c.sliding[l])
+                phase_b_run(0, l // 2, sliding=c.sliding[l])
                 for d in kn_descs:
                     d.wait()
                 outs[0][...] = phase_c(0)
@@ -809,7 +878,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID if comm else None,
+            collective_id=COLLECTIVE_ID if exchange else None,
             vmem_limit_bytes=c.vmem_mib * 1024 * 1024,
         ),
         interpret=pltpu.InterpretParams() if interpret else False,

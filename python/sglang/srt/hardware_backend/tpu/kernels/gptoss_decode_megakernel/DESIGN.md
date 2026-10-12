@@ -44,7 +44,7 @@ token `[B, H]`; output is the last layer's residual stream `[B, H]`.
 | MoE sharding | Default `moe_mode="tp"`: every rank holds an I/8 slice (360, padded to 384) of all 128 experts. `"ep"` (16 whole experts/rank, I padded to 3072) is also implemented and tested | Stock uses EP8. TP-split is load-balanced at small B: at B=1 every rank streams 4 × 1/8 experts. Under EP, one rank may own 2–4 of the 4 routed experts. At B=64 the bytes are equal. |
 | Batch | `B` static per compile (buckets 1,2,4,8,16,32,64), padded to `BR = rup(B,16)` activation rows | Rows ≥ B are masked out of routing and attention |
 | Hidden padding | H=2880 → Hp=2944 (`rup(H,128)`) with zero weights/biases; RMSNorm divides by true H | 2944 = 23·128 is enough for lane tiles. 3072 is not needed. |
-| All-reduce | One-shot all-to-all over remote DMA: each rank sends its bf16 partial to all 7 peers' `recv[slot, me]`, then sums the 8 slots in rank order in f32. Two slots (attn / MoE). Sends are waited lazily before slot reuse. A barrier semaphore is used at kernel start. | Ported from vllm-torchtpu `kernels/megakernel/comm.py` (non-RSAG path). Rank-order f32 sum makes the residual stream (and so routing) identical on all ranks. |
+| All-reduce | One-shot push over remote DMA. Each rank DMAs its partial into its own slot of all 7 peers' receive buffers, waits for the 7 arrivals, then sums the 8 slots in rank order in f32. There are two slots (attention / MoE) and no per-AR barrier (one barrier at kernel start). Sends are waited lazily, just before the slot is reused one layer later. `ar_start` / `finish` are split. Between them the megakernel lists layer l+1's attention items and starts their first KV page DMAs, which overlaps the MoE AR. For B ≤ 4 (`ar_fold`) only the live rows travel, as `[B·23, 128]` f32 (B=1: 12 KB per peer instead of 94 KB). | Ported from vllm-torchtpu `kernels/megakernel/comm.py` (non-RSAG path). Rank-order f32 sum keeps the residual stream, and so routing, identical on all ranks. RS→local→AG would need 2 latency rounds per AR (RMSNorm and QKV need the full hidden), so one-shot is latency-optimal for these payloads. |
 | XLA fallback | `make_step(..., xla_ar=True)` builds per-layer `attn` / `moe` kernels from **the same phase bodies** with `lax.psum` in between (2L+1 calls) | Used to check the in-kernel AR: the outputs are bit-identical in interpret mode |
 | KV layout | Exactly sglang's fused TPU pool per layer: `[pages, 64, 1, packing, 128]` (K slot 0, V slot 1, fp8 slots 2–3 padding, head_dim zero-padded to 128). Read as uint32 words + shifts, like RPA v3 `load_bkv`. bf16 and fp8_e4m3 are both supported. | **Gap:** layers are stacked `[L/2, …]` per pool type (SWA pool / full pool, each with its own page table, as in SWAKVPool). Stock keeps one tensor per layer. |
 | New K/V write | Separate non-collective scatter kernel | XLA TPU does not place outputs of a `collective_id` pallas_call into live-out buffers. Aliasing the pool inside the megakernel would copy the whole pool every step (see vllm `_frozen/qwen35/pool_io.py`). AOT HLO shows no pool-sized copy. |
@@ -55,7 +55,8 @@ token `[B, H]`; output is the last layer's residual stream `[B, H]`.
 
 | B | scratch + resident operands | biggest items |
 |---|---|---|
-| 1, 2, 4, 8, 16 | 39.4 MiB (MXFP4 experts: 32.0) | w13 ring 12.9, wqkv×2 8.6, w2 ring 6.5, wo×2 5.8, wr×2 1.4, AR recv 1.4 |
+| 1, 2, 4 | 38.2 MiB (MXFP4 experts: 30.8; folded AR buffers) |
+| 8, 16 | 39.4 MiB (MXFP4: 32.0) | w13 ring 12.9, wqkv×2 8.6, w2 ring 6.5, wo×2 5.8, wr×2 1.4, AR recv 1.4 |
 | 32 | 42.3 MiB (MXFP4: 34.9) | AR recv 2.9 |
 | 64 | 48.0 MiB (MXFP4: 40.6) | AR recv 5.8 |
 
@@ -81,8 +82,11 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
   DMA bytes it saves. The fallback is the stock-style "per-32-K-group product then scale",
   or native fp4 MXU if Mosaic exposes it. Integration must convert the stock checkpoint
   layout (uint8 `[E, K/2, N]` + f32 scales `[E, K/32, 1, N]`) to this layout offline.
-- **AR cost.** The one-shot AR moves 7× payload per rank, with no RS/AG and no small-B
-  folding. It is not topology-aware: 2 TCs per chip, 2x2 chips.
+- **AR cost.** The one-shot AR moves 7× payload per rank (fine at decode sizes) and is not
+  topology-aware (2 TCs per chip, 2x2 chips). Expected cost per AR (estimate, not
+  measured): ~3–6 µs at B ≤ 4 (folded, 12–48 KB per peer), ~5–10 µs at B=8 (94 KB per
+  peer), ~10–15 µs at B=64 (377 KB per peer). Stock XLA all-reduce is ~41 µs. Use
+  `--ablate ar` on TPU to measure it.
 - **Expert prefetch across layers.** Only the attention weights cross the layer boundary.
   Option: start the next layer's first chunk speculatively (e.g. from the previous step's
   routing).
@@ -111,6 +115,16 @@ Per-rank HBM arguments are ≈34 GiB (bf16 weights, 36 layers) + pools.
 - `benchmark/kernels/gptoss_decode_megakernel/aot_compile.py`: tpu7x AOT check (needs libtpu, no TPU).
 - `benchmark/kernels/gptoss_decode_megakernel/bench_decode_step.py`: TPU microbenchmark (`mk` / `fallback` / `xla`).
   `--cpu-smoke` runs the script at tiny dims in interpret mode.
+
+## Timing ablations
+
+`DecodeConfig.ablate` / bench `--ablate` (outputs become wrong):
+
+- `ar`: pack + local reduce only. No remote DMAs, no barrier, no `collective_id`.
+- `attn`: skip the whole attention block, including its AR.
+- `attn_kv`: skip only the paged attention core (and the KV prefetch).
+- `moe`: skip router, experts and the MoE AR.
+- `experts`: skip only the expert stream and matmuls.
 
 ## How to run
 

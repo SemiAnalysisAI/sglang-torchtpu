@@ -136,6 +136,20 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
     def test_mxfp4_ep_moe_fp8_kv(self):
         self._check(C.tiny(B=4, w_dtype="mxfp4", moe_mode="ep", kv_dtype="fp8"))
 
+    def test_ar_unfolded_b4(self):
+        self._check(C.tiny(B=4, ar_fold=False))
+
+    def test_ablations_run(self):
+        # timing-only switches: they must compile/run and stay finite (outputs are wrong)
+        c0 = C.tiny(B=2)
+        d = _setup(c0)
+        full, _, _ = _run(c0, d, xla_ar=False)
+        for ab in C.ABLATIONS:
+            out, _, _ = _run(dataclasses.replace(c0, ablate=(ab,)), d, xla_ar=False)
+            out = np.asarray(out.astype(jnp.float32))
+            self.assertTrue(np.all(np.isfinite(out)), ab)
+            self.assertGreater(_rel(out, full), 1e-3, ab)
+
     def test_b16_npb1(self):
         self._check(dataclasses.replace(C.tiny(B=16, npb=1), nb_swa=72, nb_full=72))
 
