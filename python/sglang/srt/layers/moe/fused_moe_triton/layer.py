@@ -1250,6 +1250,9 @@ class FusedMoE(torch.nn.Module):
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
         expert_data = param.data[expert_id]
+        if getattr(param, "tpu_expert_kn_layout", False):
+            # TPU stores experts as (k, n) after loading; load into the (n, k) view.
+            expert_data = expert_data.transpose(0, 1)
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors

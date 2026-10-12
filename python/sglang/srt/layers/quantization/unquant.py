@@ -782,6 +782,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
+                # Online weight updates load through FusedMoE.weight_loader, which
+                # writes the original (n, k) layout into a transposed view of this.
+                getattr(layer, name).tpu_expert_kn_layout = True
                 # copy_or_rebind_param copies in place when the shape is
                 # unchanged, so a shape-preserving (square) transpose leaves the
                 # param pointing at `old`'s storage. Only free `old` when the
