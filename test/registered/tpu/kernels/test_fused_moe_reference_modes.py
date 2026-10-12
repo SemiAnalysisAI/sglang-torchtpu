@@ -81,6 +81,7 @@ def _run(
     w2_scale=None,
     w1_bias=None,
     w2_bias=None,
+    use_sc_gather=1,
     **kwargs,
 ):
     from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
@@ -97,7 +98,7 @@ def _run(
         w2_bias=w2_bias,
         topk=int(ids.shape[1]),
         activation_name=activation,
-        use_sc_gather=1,
+        use_sc_gather=use_sc_gather,
         **kwargs,
     )
     return jax.block_until_ready(out)
@@ -236,6 +237,10 @@ class TestFusedMoEReferenceModes(CustomTestCase):
             activation="swigluoai",
             w1_bias=_to_jax(b13),
             w2_bias=_to_jax(b2),
+            # As GPT-OSS serves (SGLANG_TPU_FUSED_MOE_SC_GATHER=0 in its
+            # recipes): SC gather does not lower when hidden is not a multiple
+            # of 128 (320 here, 2880 in the model).
+            use_sc_gather=0,
         )
 
         w1r, b1r, w2r, b2r = _gpt_oss_reference_weights(ckpt)
