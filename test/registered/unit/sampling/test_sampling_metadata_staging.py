@@ -26,6 +26,7 @@ class _Batch:
     def __init__(self, reqs, device):
         self.reqs = reqs
         self.device = device
+        self.batch_input_device = None
 
 
 def _req(**sampling_params):
