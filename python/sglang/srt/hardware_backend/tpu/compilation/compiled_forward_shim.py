@@ -641,6 +641,12 @@ def _pad_forward_batch_inputs(
 
     forward_batch.batch_size = pad_b
 
+    from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
+
+    if is_cp_active(forward_batch):
+        forward_batch.attn_cp_metadata = None
+        prepare_cp_forward(forward_batch)
+
     return real_q_out, real_b_out
 
 

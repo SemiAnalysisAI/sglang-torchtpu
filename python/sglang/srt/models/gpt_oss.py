@@ -53,6 +53,11 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_model_inputs,
+    is_cp_active,
+)
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -844,6 +849,51 @@ class GptOssForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if is_cp_active(forward_batch):
+            if input_embeds is None:
+                input_embeds = self.get_input_embeddings()(input_ids)
+            with cp_shard_model_inputs(
+                input_embeds,
+                positions,
+                forward_batch,
+                input_ids,
+            ) as (sharded_input_embeds, sharded_positions, model_input_ids):
+                hidden_states = self.model(
+                    model_input_ids,
+                    sharded_positions,
+                    forward_batch,
+                    input_embeds=sharded_input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+            if not self.pp_group.is_last_rank:
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if self.capture_aux_hidden_states
+                    else hidden_states
+                )
+            stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+            if aux_hidden_states is not None:
+                if isinstance(aux_hidden_states, torch.Tensor):
+                    aux_hidden_states = cp_gather_after_forward(
+                        aux_hidden_states, forward_batch, stream
+                    )
+                else:
+                    aux_hidden_states = [
+                        cp_gather_after_forward(aux, forward_batch, stream)
+                        for aux in aux_hidden_states
+                    ]
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+            )
+
         hidden_states = self.model(
             input_ids,
             positions,

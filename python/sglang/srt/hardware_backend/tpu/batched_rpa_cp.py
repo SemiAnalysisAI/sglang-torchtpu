@@ -708,8 +708,10 @@ def build_pcp_batched_metadata(
         pcp_write = []
         kv_new_lens = []
         run = 0
+        real_b = getattr(forward_batch, "_real_b", getattr(forward_batch, "_tpu_real_b", None))
         meta_num_reqs = len(meta.actual_seq_q_prev_list)
         for i in range(num_reqs):
+            is_valid_req = (i < real_b) if real_b is not None else (i < meta_num_reqs)
             if i < meta_num_reqs:
                 c_head = meta.actual_seq_q_prev_list[i]
                 c_tail = meta.actual_seq_q_next_list[i]
@@ -734,7 +736,7 @@ def build_pcp_batched_metadata(
             run += c_tail
             pcp_cu.append(run)
             q_pos_offsets.append(toff_tail)
-            pcp_write.append(True if i < meta_num_reqs else False)  # Tail chunk commits cache
+            pcp_write.append(is_valid_req)  # Tail chunk commits cache
             kv_new_lens.append(ext_len)
 
         c_per_req = (
@@ -743,6 +745,7 @@ def build_pcp_batched_metadata(
             else 1
         )
     else:
+        real_b = getattr(forward_batch, "_real_b", getattr(forward_batch, "_tpu_real_b", None))
         c_sizes = [max(1, int(l) // two_p) for l in extend_lens] if extend_lens is not None else []
         c_per_req = c_sizes[0] if len(c_sizes) > 0 else 1
         pcp_cu = [0]
@@ -751,6 +754,7 @@ def build_pcp_batched_metadata(
         kv_new_lens = []
         run = 0
         for i in range(num_reqs):
+            is_valid_req = (i < real_b) if real_b is not None else (i < len(c_sizes))
             c_len = c_sizes[i] if i < len(c_sizes) else 0
             prefix_len = prefix_lens_np[i] if i < len(prefix_lens_np) else 0
             ext_len = int(extend_lens[i]) if (extend_lens is not None and i < len(extend_lens)) else 0
@@ -765,7 +769,7 @@ def build_pcp_batched_metadata(
             run += c_len
             pcp_cu.append(run)
             q_pos_offsets.append(toff_tail)
-            pcp_write.append(True if i < len(c_sizes) else False)
+            pcp_write.append(is_valid_req)
             kv_new_lens.append(ext_len)
 
     pcp_cu_t = torch.tensor(pcp_cu, dtype=torch.int32, device=device)

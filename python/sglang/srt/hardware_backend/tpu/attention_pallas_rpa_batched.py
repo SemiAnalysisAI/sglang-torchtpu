@@ -202,6 +202,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 forward_batch=forward_batch,
                 num_local_tokens=num_local_tokens,
             )
+            if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
+                self.forward_metadata.pcp_metadata = self.pcp_forward_metadata
             req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
             if req_pool_indices is not None and hasattr(req_pool_indices, "tolist"):
                 try:
@@ -211,6 +213,8 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                     pass
         else:
             self.pcp_forward_metadata = None
+            if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
+                self.forward_metadata.pcp_metadata = None
             forward_mode = getattr(forward_batch, "forward_mode", None)
             if forward_mode is not None and forward_mode.is_extend():
                 req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
@@ -233,8 +237,9 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
     ) -> torch.Tensor:
         from sglang.srt.runtime_context import get_parallel
 
-        if get_parallel().attn_cp_size > 1 and self.pcp_forward_metadata is not None:
-            return self._forward_cp_extend(q, k, v, layer, forward_batch, **kwargs)
+        pcp_meta = self.pcp_forward_metadata or getattr(self.forward_metadata, "pcp_metadata", None)
+        if get_parallel().attn_cp_size > 1 and pcp_meta is not None:
+            return self._forward_cp_extend(q, k, v, layer, forward_batch, pcp_meta=pcp_meta, **kwargs)
         return super().forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
@@ -246,6 +251,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         v: torch.Tensor,
         layer,
         forward_batch,
+        pcp_meta=None,
         **kwargs,
     ) -> torch.Tensor:
         from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
@@ -273,6 +279,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             k_scale = None
             v_scale = None
 
+        pcp_meta = pcp_meta or self.pcp_forward_metadata or getattr(self.forward_metadata, "pcp_metadata", None)
         out = batched_rpa_pcp_forward(
             self._cp_op,
             q,
@@ -281,7 +288,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             kv_cache,
             layer,
             forward_batch,
-            self.pcp_forward_metadata,
+            pcp_meta,
             self.forward_metadata,
             k_scale=k_scale,
             v_scale=v_scale,

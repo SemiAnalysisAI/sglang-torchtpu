@@ -663,13 +663,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ) -> Any:
             backend = get_forward_context().attn_backend
             previous_metadata = backend.forward_metadata
+            previous_pcp_metadata = getattr(backend, "pcp_forward_metadata", None)
             # Attention reads metadata through the backend during tracing.
             backend.forward_metadata = attention_metadata
+            if hasattr(attention_metadata, "pcp_metadata"):
+                backend.pcp_forward_metadata = attention_metadata.pcp_metadata
             try:
                 with use_attention_rank_tensors(attention_rank_tensors):
                     return fn(input_ids, positions, forward_batch, *args, **kwargs)
             finally:
                 backend.forward_metadata = previous_metadata
+                if hasattr(backend, "pcp_forward_metadata"):
+                    backend.pcp_forward_metadata = previous_pcp_metadata
 
         compiled = direct_compile(
             trace_forward,
@@ -751,12 +756,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
+        is_cp = (
+            get_parallel().attn_cp_size > 1
+            and getattr(forward_batch, "attn_cp_metadata", None) is not None
+        )
         key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
+            is_cp,
         )
         return key
 
@@ -843,6 +853,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        setattr(forward_batch, "_real_b", real_b)
         spec_info = forward_batch.spec_info
         if spec_info is not None:
             spec_info.record_padding(
@@ -1191,6 +1202,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # precompile traces a different graph.
         if is_dp_attention_enabled():
             self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
+        if get_parallel().attn_cp_size > 1 and mode.is_context_parallel_extend():
+            self._set_cp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
         forward_batch.logits_output_mode = logits_output_mode
 
@@ -1277,6 +1290,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             [bs] * dp_size, dtype=torch.int64, device=device
         )
+
+    def _set_cp_attention_metadata(
+        self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
+    ) -> None:
+        """Set CP metadata on dummy batch so precompile traces the CP extend graph."""
+        from sglang.srt.layers.cp.utils import prepare_cp_forward
+
+        forward_batch.attn_cp_metadata = None
+        prepare_cp_forward(forward_batch)
 
     def _dummy_kv_slot(self) -> int:
         """KV-pool slot for dummy ``req_pool_indices``/``out_cache_loc``."""

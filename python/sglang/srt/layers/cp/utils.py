@@ -157,9 +157,9 @@ def prepare_cp_forward(forward_batch) -> None:
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
     num_tokens = (
-        sum(extend_lens_cpu)
-        if extend_lens_cpu is not None
-        else len(forward_batch.input_ids)
+        len(forward_batch.input_ids)
+        if getattr(forward_batch, "input_ids", None) is not None
+        else (sum(extend_lens_cpu) if extend_lens_cpu is not None else 0)
     )
     if forward_batch.attn_cp_metadata is None:
         forward_batch.attn_cp_metadata = strategy.build_metadata(

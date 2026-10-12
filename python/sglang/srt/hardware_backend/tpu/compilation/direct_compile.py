@@ -83,7 +83,7 @@ def insert_callback(
 
 
 SpecializationKey = Callable[..., Hashable]
-_STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
+_STATIC_INPUT_TYPES = (bool, int, float, str, Enum, type(None))
 
 
 def _resolve_dotted_attr(root: object, path: str) -> tuple[object, str, object]:
@@ -128,6 +128,8 @@ class KVPool(Protocol):
 tree_util.register_dataclass(ForwardBatch)
 tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
+from sglang.srt.hardware_backend.tpu.batched_rpa_cp import PcpBatchedMetadata
+tree_util.register_dataclass(PcpBatchedMetadata)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
 register_pp_proxy_pytree(tree_util)
 

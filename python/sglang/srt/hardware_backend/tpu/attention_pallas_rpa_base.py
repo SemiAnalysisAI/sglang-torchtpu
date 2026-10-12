@@ -36,7 +36,7 @@ Design notes
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import torch
 
@@ -107,6 +107,8 @@ class PallasForwardMetadata:
     # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
     # Backends without runtime tile selection leave this unset.
     prefill_kv_tile_hint: torch.Tensor | None = None
+    # Prefill Context Parallelism (PCP) metadata when CP is active
+    pcp_metadata: Any | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
