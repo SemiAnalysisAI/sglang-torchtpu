@@ -79,6 +79,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu_amx_available,
     _is_cuda,
     _is_hip,
+    _is_tpu,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
@@ -1582,6 +1583,10 @@ class BailingMoeV3ForCausalLM(nn.Module):
             )
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
+            if _is_tpu:
+                # Assign unconditionally: repeat loads re-assign the same
+                # tensor, and the bind must not wait for a compiled forward.
+                self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 awq_dequantize = _get_awq_dequantize()
                 if awq_dequantize is None:
