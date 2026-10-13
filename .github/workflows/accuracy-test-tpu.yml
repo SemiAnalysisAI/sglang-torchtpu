@@ -5,7 +5,7 @@
 # The accuracy stage: it runs on its own 10 AM / 5 PM schedule below rather
 # than inside the nightly, and is also the isolated trigger, for collecting a
 # datapoint on demand without waiting for a slot:
-#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
+#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-20b] [-f ref=<branch>]
 #
 # Single-host models go through run_suite; multihost accuracy uses JobSets.
 # Each model uses the same serving recipe for scheduled and manual runs.
@@ -34,7 +34,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, full-set, day-10am, day-5pm, gpt-oss-120b, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
+        options: [all, full-set, day-10am, day-5pm, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -106,48 +106,6 @@ jobs:
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  accuracy:
-    needs: [build, plan]
-    # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
-    if: >-
-      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","day-10am","gpt-oss-120b"]'), needs.plan.outputs.model) }}
-    strategy:
-      # A broken benchmark must not cancel the others' scores.
-      fail-fast: false
-      matrix:
-        # One suite (= one file, one job, one slice) per benchmark, each paired
-        # with the name its Kubernetes objects get. JobSet validates the POD name,
-        # tpu-ci-<run_name>-<5 rand>-slice-0-0-<5 rand>, against 63 chars, which
-        # leaves run_name 34; the suite itself (38-41) is rejected at admission.
-        # Suites stay spelled out: the pr-gate lint greps this file for each
-        # nightly-accuracy registration's literal suite. The next model adds its
-        # legs here and a choice above; selection stays in the job-level `if`
-        # while a single model is the only single-host entrant.
-        include:
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
-            run_name: accuracy-gpt-oss-120b-aime
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
-            run_name: accuracy-gpt-oss-120b-gpqa
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
-            run_name: accuracy-gpt-oss-120b-mmlupro
-    name: ${{ matrix.suite }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ inputs.image || needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.suite }}
-      run_name: ${{ matrix.run_name }}
-      nightly: true
-      weights_pvc: model-weights
-      # Admission is separate; each eval file gets a 90-minute runtime budget.
-      timeout_per_file: 5400
     permissions:
       contents: read
       id-token: write

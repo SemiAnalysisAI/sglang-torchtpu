@@ -15,6 +15,7 @@
 #   SUITE          self: the run_suite suite the files register to
 #   EXEC_CMD       exec: the command every host runs
 #   TEST_FILES     space-separated test files of the group
+#   RANK_FILES     self: TEST_FILES split into one lane per rank, '|'-separated
 #   MODEL_PATH     serve model dir (gcsfuse mount path + weights prefix + model subdir)
 #   TP_SIZE/EP_SIZE  parallelism (== HOSTS x devices_per_host)
 #   EXTRA_ARGS     loader/serve flags appended by the recipe (gcsfuse-tuned; see README)
@@ -28,8 +29,8 @@
 #     recipe (it owns model + config); rank 0 runs each TEST_FILES entry in LIVE-SERVER mode
 #     against the one server; workers serve until the leader tears down, then exit 0.
 #   * self   -- single-host tests that launch their own server. There is no 1-host slice,
-#     so rank 0 drops the slice-wide TPU env and runs each file through run_suite on its
-#     own host; the other ranks exit 0 and idle.
+#     so every rank drops the slice-wide TPU env and runs its own lane of files through
+#     run_suite on its own host.
 #   * exec   -- mirrors the in-project exec mode: every host runs EXEC_CMD; rank 0 gates.
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -110,6 +111,12 @@ spec:
                       export HF_HUB_CACHE=/weights/hf-hub HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
                       # gpt-oss's harmony encoding loads its tiktoken vocab from here.
                       export TIKTOKEN_ENCODINGS_BASE=/weights/datasets/tiktoken
+                      # HF datasets read a prepared Arrow cache; it writes lock files, so
+                      # the read-only bucket copy is linked into a writable tree.
+                      [ -d /tmp/hf-datasets ] || cp -rs /weights/datasets/hf-datasets /tmp/hf-datasets
+                      export HF_DATASETS_CACHE=/tmp/hf-datasets HF_DATASETS_OFFLINE=1
+                      # Runtime pip installs (the gpt-oss evals) come from staged wheels.
+                      export PIP_NO_INDEX=1 PIP_FIND_LINKS=/weights/datasets/wheels
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} mode=${MODE} nnodes=$NNODES rank=$RANK"
@@ -138,12 +145,12 @@ spec:
                       fi
 
                       if [ "${MODE}" = "self" ]; then
-                        if [ "$RANK" != "0" ]; then
-                          echo "rank $RANK idle for single-host tests; exiting 0"; exit 0
-                        fi
-                        echo "== test files: ${TEST_FILES} =="
+                        # Each host runs its own lane of single-host files.
+                        IFS='|' read -ra LANES <<<"${RANK_FILES}"
+                        MY_FILES="${LANES[$RANK]:-}"
+                        echo "== test files (rank $RANK): ${MY_FILES} =="
                         # libtpu on GKE is env-driven: the injected TPU_* vars describe the
-                        # whole slice, so a single-host engine would wait for its idle peer.
+                        # whole slice, so a single-host engine would wait for its peers.
                         # Without them, local hardware discovery finds this host alone.
                         unset TPU_WORKER_ID TPU_WORKER_HOSTNAMES TPU_PROCESS_ADDRESSES \
                               TPU_TOPOLOGY TPU_TOPOLOGY_WRAP TPU_TOPOLOGY_ALT TPU_HOST_BOUNDS \
@@ -151,9 +158,9 @@ spec:
                         for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
                         rc=0
                         # One run_suite per file: each prints its own TIMINGS record.
-                        for f in ${TEST_FILES}; do
+                        for f in ${MY_FILES}; do
                           python3 test/run_suite.py --hw tpu --suite ${SUITE} --nightly --continue-on-error \
-                            --test-file "$f" --timeout-per-file ${TIMEOUT_PER_FILE} || rc=1
+                            --test-file "$f" --timeout-from-est-time || rc=1
                         done
                         exit $rc
                       fi

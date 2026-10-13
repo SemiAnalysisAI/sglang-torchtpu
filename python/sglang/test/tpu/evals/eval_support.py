@@ -445,6 +445,42 @@ def _restore_gpt_oss_sampler(sampler: Any) -> None:
     del sampler._sglang_original_call
 
 
+# gpt_oss.evals reads its data from these URLs; a copy staged in the weights
+# bucket replaces each one, for clusters without internet egress.
+_GPT_OSS_EVAL_DATA_MIRRORS = {
+    "https://openaipublic.blob.core.windows.net/simple-evals/": "/weights/datasets/simple-evals/",
+    "https://huggingface.co/datasets/opencompass/AIME2025/raw/main/": "/weights/datasets/AIME2025/",
+}
+
+
+def _mirrored_reader(read):
+    def wrapper(path, *args, **kwargs):
+        if isinstance(path, str):
+            for url, local_dir in _GPT_OSS_EVAL_DATA_MIRRORS.items():
+                if path.startswith(url) and os.path.exists(
+                    local_dir + path[len(url) :]
+                ):
+                    path = local_dir + path[len(url) :]
+        return read(path, *args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _gpt_oss_eval_data_mirrors():
+    import pandas
+
+    read_csv, read_json = pandas.read_csv, pandas.read_json
+    pandas.read_csv, pandas.read_json = (
+        _mirrored_reader(read_csv),
+        _mirrored_reader(read_json),
+    )
+    try:
+        yield
+    finally:
+        pandas.read_csv, pandas.read_json = read_csv, read_json
+
+
 def gpqa_openai_runner(
     model: str,
     n_repeats: int,
@@ -496,11 +532,13 @@ def gpqa_openai_runner(
         )
         _bound_gpt_oss_sampler(sampler, sampler_module)
         try:
-            result = GPQAEval(
-                n_repeats=n_repeats,
-                n_threads=n_threads,
-                num_examples=num_examples,
-            )(sampler)
+            with _gpt_oss_eval_data_mirrors():
+                gpqa = GPQAEval(
+                    n_repeats=n_repeats,
+                    n_threads=n_threads,
+                    num_examples=num_examples,
+                )
+            result = gpqa(sampler)
         finally:
             _restore_gpt_oss_sampler(sampler)
         print(
@@ -549,7 +587,9 @@ def aime25_openai_runner(
         )
         _bound_gpt_oss_sampler(sampler, sampler_module)
         try:
-            result = AIME25Eval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+            with _gpt_oss_eval_data_mirrors():
+                aime = AIME25Eval(n_repeats=n_repeats, n_threads=n_threads)
+            result = aime(sampler)
         finally:
             _restore_gpt_oss_sampler(sampler)
         print(

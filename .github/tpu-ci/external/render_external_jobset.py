@@ -44,6 +44,7 @@ Usage: render_external_jobset.py --list-groups
 """
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -57,6 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # path). _scan gives us registration + `disabled` handling; names_from_path gives the #552
 # path-derived display/compact names. Importing here means future changes to them flow through.
 sys.path.insert(0, os.path.dirname(HERE))
+from discover_multihost import _literal  # noqa: E402
 from discover_multihost import _scan as _scan_suite  # noqa: E402
 from test_names import names_from_path  # noqa: E402
 
@@ -69,7 +71,10 @@ _ACTIVE_DEADLINE = 9000
 # Same budgets as the in-project render_jobset.py for the modes it shares.
 _PD_TIMEOUT = 8700
 _EXEC_TIMEOUT = 7200
-_SELF_TIMEOUT_PER_FILE = 3600
+# Mirrors sglang.test.ci.ci_utils.derive_timeout_per_file, which run_suite's
+# --timeout-from-est-time applies to each self-launch file on the pod.
+_DERIVED_TIMEOUT_FACTOR = 1.5
+_DERIVED_TIMEOUT_SLACK = 1800
 # DNS-1035 label budget for the run name (children append suffixes).
 _RUN_NAME_MAX = 40
 
@@ -96,7 +101,9 @@ def _scan(cfg, root, nightly_only):
     for suite, sl in cfg["suites"].items():
         if sl.get("self_launch"):
             for path in _scan_suite(root, suite, nightly_only, launch_var=None):
-                found.append((path, suite, "self", {}))
+                found.append(
+                    (path, suite, "self", {"est_time": _est_time(path, suite)})
+                )
             continue
         for path, spec in _scan_suite(root, suite, nightly_only).items():
             found.append((path, suite, "launch", spec))
@@ -174,24 +181,63 @@ def _cmd_groups(entries, mode, slice_hosts):
     return groups
 
 
+def _est_time(path, suite):
+    """The est_time of `path`'s register_tpu_ci call for `suite`."""
+    for node in ast.walk(ast.parse(open(path).read())):
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "register_tpu_ci"
+        ):
+            kw = {k.arg: k.value for k in node.keywords}
+            if "suite" in kw and _literal(kw["suite"]) == suite:
+                return int(_literal(kw["est_time"]))
+    sys.exit(f"{path}: no register_tpu_ci(suite={suite!r}) with an est_time")
+
+
 def _self_groups(entries, cfg):
-    """Self-launch files, dealt across their suite's slices: one bundle per slice."""
+    """Self-launch files, longest first onto the least-loaded host: one bundle per slice.
+
+    Every host of a slice is a single-host machine of its own, so each one runs a
+    lane of files and the slice finishes with its longest lane.
+    """
     by_suite = {}
-    for path, suite, _, _ in entries:
-        by_suite.setdefault(suite, []).append(path)
+    for path, suite, _, spec in entries:
+        by_suite.setdefault(suite, []).append((spec["est_time"], path))
     groups = []
-    for suite, paths in sorted(by_suite.items()):
-        n = len(cfg["suites"][suite]["nodepool_vars"])
-        for k in range(min(n, len(paths))):
-            bundle = paths[k::n]
+    for suite, files in sorted(by_suite.items()):
+        sl = cfg["suites"][suite]
+        hosts = int(sl["hosts"])
+        n = min(len(sl["nodepool_vars"]), -(-len(files) // hosts))
+        lanes = [[0, []] for _ in range(n * hosts)]
+        for est, path in sorted(files, key=lambda f: (-f[0], f[1])):
+            lane = min(lanes, key=lambda l: l[0])
+            lane[0] += est
+            lane[1].append((est, path))
+        for k in range(n):
+            mine = [lane[1] for lane in lanes[k * hosts : (k + 1) * hosts]]
+            bundle = [f for lane in mine for f in lane]
             groups.append(
                 {
                     "name": f"{suite}-bundle-{k}",
                     "run_name": dns_safe(f"selfhost-{k}"),
                     "mode": "self",
                     "suite": suite,
-                    "files": " ".join(bundle),
-                    "timeout_per_file": _SELF_TIMEOUT_PER_FILE,
+                    "files": " ".join(path for _, path in bundle),
+                    # Rank r runs lane r; '|' separates the lanes.
+                    "rank_files": "|".join(
+                        " ".join(path for _, path in lane) for lane in mine
+                    ),
+                    # Only sizes the JobSet deadline; each file's own limit is
+                    # derived from its est_time on the pod.
+                    "timeout_per_file": max(
+                        int(
+                            max(
+                                est * _DERIVED_TIMEOUT_FACTOR,
+                                est + _DERIVED_TIMEOUT_SLACK,
+                            )
+                        )
+                        for est, _ in bundle
+                    ),
                 }
             )
     return groups
@@ -299,6 +345,7 @@ def render(cfg, a):
         "ACCELERATOR": cl["accelerator"],
         "ACTIVE_DEADLINE": str(a.active_deadline or _active_deadline(g)),
         "TEST_FILES": g["files"],
+        "RANK_FILES": g.get("rank_files", ""),
         "TIMEOUT_PER_FILE": str(g["timeout_per_file"]),
         "WEIGHTS_BUCKET": w["bucket"],
         "WEIGHTS_MOUNT_OPTIONS": w["mount_options"],

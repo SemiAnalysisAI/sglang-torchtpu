@@ -87,11 +87,17 @@ The cluster has **no internet egress**. Pods copy `weights/datasets/gsm8k/test.j
 `/tmp/test.jsonl` (the GSM8K evals' download cache) and run HF offline against
 `weights/hf-hub`, a flat hub cache (`models--<org>--<name>/refs/main` +
 `snapshots/<rev>/`), with gpt-oss's harmony vocab read from `weights/datasets/tiktoken`.
-A test that pulls a new HF repo id or dataset needs it staged there first.
+`datasets.load_dataset` reads `weights/datasets/hf-datasets`, a *prepared* Arrow cache
+(`HF_DATASETS_CACHE` layout; the raw hub cache does not load offline), symlinked into a
+writable `/tmp/hf-datasets` for its lock files. Build it in the CI image with
+`HF_DATASETS_CACHE=<dir> python -c 'load_dataset(...)'` and upload `<dir>` minus `*.lock`.
+The gpt-oss evals read `weights/datasets/{simple-evals,AIME2025}` in place of their URLs,
+and runtime `pip install`s resolve from `weights/datasets/wheels` only.
+A test that pulls a new HF repo id, dataset, URL or package needs it staged there first.
 
 | Declared in | Suite | What runs |
 |---|---|---|
-| the test: registration only | `external-nightly-1host` | Single-host tests that launch their own server. Rank 0 of a 2x2x2 slice drops the slice-wide TPU env and runs each file through `run_suite`; rank 1 idles. Files are dealt across the slices, one bundle per slice. |
+| the test: registration only | `external-nightly-1host` | Single-host tests that launch their own server. Each rank of a 2x2x2 slice drops the slice-wide TPU env and runs its own lane of files through `run_suite`. Files are dealt longest-first onto the least-loaded host, and each file's timeout comes from its `est_time`. |
 | `external-topology.yaml`: the suite's `commands`, entry with `pd: {prefill_hosts, decode_hosts}` | `external-nightly-2x2x2` | P/D: `prefill` and `decode` replicated jobs run `cmd` with `CI_PD_ROLE` set (`jobset-external-tpu-pd.yaml`). 1+1 shares one slice; 2+2 takes a slice pair. |
 | `external-topology.yaml`: the suite's `commands`, entry without `pd` | `external-nightly-2x2x2` | Every host runs `cmd`; rank 0's exit code gates. |
 
