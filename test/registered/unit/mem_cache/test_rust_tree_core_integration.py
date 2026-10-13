@@ -3628,18 +3628,27 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
         for component in (ComponentType.FULL, ComponentType.SWA)
     }
 
+    backup_requests = []
+
     def evict_one_mamba_state():
         tracker, frees = {ComponentType.MAMBA: 0}, {}
         core.evict_device_start(ComponentType.MAMBA, 1)
         try:
             step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
-            assert step.node_id is None and step.mamba_backup_node_id is None
+            assert step.node_id is None
+            if step.mamba_backup_node_id is not None:
+                # write_back first backs up device-only state of a node whose
+                # Full KV is on host; finishing with no host copy is the
+                # failed-backup fallback drop.
+                backup_requests.append(step.mamba_backup_node_id)
+                step = core.finish_mamba_state_eviction(step.mamba_backup_node_id)
             _accumulate_step(step, tracker, frees, {})
         finally:
             core.evict_device_end(ComponentType.MAMBA)
         return [value.tolist() for value in frees.get(ComponentType.MAMBA, [])]
 
     assert evict_one_mamba_state() == ([] if pin_ancestor else [[211]])
+    assert backup_requests == ([] if pin_ancestor else [parent])
     # The actual Mamba DMA source remains protected by its own device lock.
     assert core.get_component_device_value(child, ComponentType.MAMBA).tolist() == [202]
     core.sanity_check([(child, child)] + active, [])
@@ -3647,6 +3656,8 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
         assert core.get_component_device_value(node, component).tolist() == indices
     cache._finish_write_through_ack(child)
     assert evict_one_mamba_state() == [[202]]
+    # The child's Mamba state reached Host with its own backup.
+    assert backup_requests == ([] if pin_ancestor else [parent])
     core.sanity_check(active, [])
     cache.dec_lock_ref(leaf, leaf_lock)
     if extra_lock is not None:
