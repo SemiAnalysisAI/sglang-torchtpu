@@ -25,6 +25,18 @@ if TYPE_CHECKING:
 __all__ = ["SRTPlatform", "PlatformEnum"]
 
 
+class WeightUpdateReceiver:
+    """Receives online weight updates over a platform transport instead of a torch.distributed broadcast."""
+
+    def receive(
+        self, names: list[str], dtypes: list[Any], shapes: list[Any], device: Any
+    ) -> list[tuple[str, torch.Tensor]]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
 class SRTPlatform(DeviceMixin):
     """
     Base class for SRT hardware platform backends.
@@ -91,6 +103,12 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.memory_pool import MambaPool
 
         return MambaPool
+
+    def create_weight_update_receiver(
+        self, backend: str, *, tp_rank: int
+    ) -> Optional[WeightUpdateReceiver]:
+        """A receiver for weight-update groups of this ``backend``; None means a torch.distributed group."""
+        return None
 
     def get_kda_attn_backend_cls(self) -> type:
         """Return the KDA (Kimi delta attention) linear-attention backend class."""

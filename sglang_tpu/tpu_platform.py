@@ -864,6 +864,13 @@ class TpuSRTPlatform(SRTPlatform):
 
         return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
+    def create_weight_update_receiver(self, backend: str, *, tp_rank: int):
+        from sglang_tpu import shared_slice
+
+        if backend != shared_slice.BACKEND_NAME:
+            return None
+        return shared_slice.receiver(tp_rank)
+
     def get_kda_attn_backend_cls(self) -> type:
         from sglang_tpu.attention_kda_pallas import TpuKDAAttnBackend
 
@@ -995,6 +1002,13 @@ class TpuSRTPlatform(SRTPlatform):
                 "TorchTPU backend initialization requires worker WORLD_SIZE. "
                 "Initialize it from the scheduler worker bootstrap."
             )
+        from sglang_tpu import shared_slice
+
+        shared = shared_slice.spec()
+        if shared is not None:
+            # libtpu builds the whole slice, trainer included, from these
+            job = shared_slice.enter_slice_env(shared)
+            world_size = os.environ["WORLD_SIZE"]
 
         from sglang_tpu.compile_cache import (
             add_pallas_kernel_sources_to_compile_cache_key,
@@ -1037,6 +1051,8 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        if shared is not None:
+            shared_slice.join(shared, job)
         from sglang_tpu.models import register_tpu_models
 
         register_tpu_models()
