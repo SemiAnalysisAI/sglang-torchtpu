@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVReceiver,
@@ -1172,6 +1173,30 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
         self.assertFalse(mgr.maybe_start_pull(ROOM))
         mgr._engine.start_read.assert_not_called()
         self.assertEqual(len(mgr._pulling), 0)
+
+
+class TestSendBlockAccounting(CustomTestCase):
+    """A page listed twice for one room fails at the send, not at the closing
+    registration raiden rejects 5 s later."""
+
+    def test_a_page_sent_twice_for_one_room_raises_with_both_positions(self):
+        mgr = _prefill_manager()
+        self.assertEqual(mgr.append_send_blocks(ROOM, [3, 4, 5]), 0)
+        self.assertEqual(mgr.append_send_blocks(ROOM, [6]), 3)
+        with self.assertRaisesRegex(
+            RuntimeError, r"room 7: KV page 4 .* positions 1 and 5 "
+        ):
+            mgr.append_send_blocks(ROOM, [7, 4, 8])
+        with self.assertRaisesRegex(RuntimeError, r"KV page 9 .* positions 4 and 6"):
+            mgr.append_send_blocks(ROOM, [9, 10, 9])
+        # Nothing of a rejected send is recorded.
+        self.assertEqual(mgr._prefill.send_blocks[ROOM], [3, 4, 5, 6])
+
+    def test_rooms_keep_separate_page_lists(self):
+        mgr = _prefill_manager()
+        mgr.append_send_blocks(ROOM, [3, 4])
+        self.assertEqual(mgr.append_send_blocks(OTHER_ROOM, [4, 3]), 0)
+        self.assertEqual(mgr._prefill.send_blocks[OTHER_ROOM], [4, 3])
 
 
 class TestSenderLeases(unittest.TestCase):

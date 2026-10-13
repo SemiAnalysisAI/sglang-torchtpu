@@ -1579,6 +1579,13 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
+            # The next checkpoint can dedup the request's own pages past
+            # cache_protected_len and free them while a transfer still lists them.
+            if (
+                self.tree_cache.supports_prefix_sharing()
+                and not req.skip_radix_cache_insert
+            ):
+                end_idx = min(end_idx, req.kv.cache_protected_len)
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:

@@ -61,6 +61,22 @@ ROOM_SCOPED_SEND_ERRNOS = frozenset(
 )
 
 
+def _first_repeated_block(
+    accumulated: List[int], block_ids: List[int]
+) -> Optional[tuple[int, int, int]]:
+    """The first page of ``block_ids`` already in ``accumulated`` or repeated
+    within ``block_ids``, with both positions in the room's send order."""
+    position = {}
+    for pos, block in enumerate(accumulated):
+        position.setdefault(block, pos)
+    base = len(accumulated)
+    for pos, block in enumerate(block_ids):
+        first = position.setdefault(block, base + pos)
+        if first != base + pos:
+            return block, first, base + pos
+    return None
+
+
 class RaidenSenderMixin:
     """Prefill-side methods of ``RaidenKVManager``."""
 
@@ -168,13 +184,22 @@ class RaidenSenderMixin:
         """Records a chunk's pages and returns its start index in the request.
 
         None means the decode aborted the room; the pages are not recorded and
-        the caller must not offer them.
+        the caller must not offer them. A page recorded twice was freed and
+        handed out again under a pending transfer: raise, naming both positions.
         """
         with self._state_lock:
             if room in self._aborted:
                 return None
             accumulated = self._prefill.send_blocks.setdefault(room, [])
             start = len(accumulated)
+            repeated = _first_repeated_block(accumulated, block_ids)
+            if repeated is not None:
+                block, first, second = repeated
+                raise RuntimeError(
+                    f"room {room}: KV page {block} is listed twice for one "
+                    f"request, at send positions {first} and {second} "
+                    f"(this send starts at {start}, {len(block_ids)} pages)"
+                )
             accumulated.extend(block_ids)
             if swa_block_ids is not None:
                 self._prefill.send_swa_blocks[room] = list(swa_block_ids)
