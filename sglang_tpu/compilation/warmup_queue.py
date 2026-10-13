@@ -20,8 +20,8 @@ logger = get_logger(__name__)
 class WarmupQueue:
     calls: list[PendingCall] = field(default_factory=list)
     # Run after every warmup finishes. TpuGraphRunner uses these callbacks to
-    # snapshot and attach the target's recompilation checker (when enabled),
-    # then log "TpuGraphRunner precompile done".
+    # snapshot and attach the target's recompilation checker (when enabled).
+    # Sampling warmup follows the queue drain in ModelRunner.prewarm_sampling.
     completions: list[Callable[[], None]] = field(default_factory=list)
 
     def wait(self) -> None:

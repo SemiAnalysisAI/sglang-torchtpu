@@ -35,7 +35,6 @@ from sglang.srt.compilation.support_torch_compile import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.core_compile_annotations import (
     annotate_core_compile_boundaries,
@@ -58,7 +57,6 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang_tpu.sampler import TpuSampler
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -330,20 +328,8 @@ class TpuGraphRunner:
         self._finish_warmup(installed_policies)
 
     def _finish_warmup(self, installed_policies: list[CompilePolicy]) -> None:
-        runner = self.model_runner
-        if (
-            not runner.is_draft_worker
-            and runner.pp_group.is_last_rank
-            and runner.model_config.is_generation
-            and isinstance(runner.sampler, TpuSampler)
-        ):
-            runner.sampler.warmup_small_top_k(
-                max_batch_size=get_exec().graph.torch_compile_max_bs,
-                vocab_size=runner.model_config.vocab_size,
-                device=torch.device(runner.device),
-            )
-        # Baseline after model warmup. Later TPU speculative-op and KV-offload
-        # warmup refresh the shared baseline in their own completion paths.
+        # Baseline after model warmup. Later speculative-op, sampling, and
+        # KV-offload warmups refresh it in their own completion paths.
         if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             # A draft model precompiles later, from precompile_draft, and installs
             # the checker itself once that is done.
@@ -352,8 +338,7 @@ class TpuGraphRunner:
                     policies=installed_policies,
                     model_label=type(self.model).__name__,
                 )
-        # PD harnesses wait for this marker before issuing requests.
-        logger.info("TpuGraphRunner precompile done")
+        logger.info("TpuGraphRunner model warmup done")
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

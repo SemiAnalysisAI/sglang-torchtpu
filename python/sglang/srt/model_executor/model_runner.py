@@ -1122,6 +1122,7 @@ class ModelRunner:
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm the sampling path after graph initialization."""
+        current_platform.prewarm_sampling(self)
         self.sampling_prewarm_result = SamplingPrewarmResult()
         return self.sampling_prewarm_result
 
