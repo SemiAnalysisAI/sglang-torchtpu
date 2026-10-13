@@ -170,3 +170,30 @@ Diagnostics:
   bitcast-convert, collective and fusion ops ≥ 64 MB in the optimized HLO. Dump with
   `LIBTPU_INIT_ARGS="--xla_dump_to=... --xla_dump_hlo_as_text"`.
 - The values file wires all of this through `MK_ABLATIONS`, `MK_HLO_DUMP=1` and `MK_KV_WRITE`.
+
+## Kernel 69b2033324 merged (fp8 experts, AR fold / rsag)
+
+- **Experts default to fp8.** The format is e4m3 times a per-column power-of-two scale, the
+  kernel's `fp8_pack` rule.
+  - The load tap still streams the checkpoint into the MXFP4 layout.
+  - `weights.mxfp4_to_fp8` then converts it per (layer, expert block) and counts elements
+    that are not exactly representable.
+  - The count is logged at load (`MXFP4 -> fp8 experts on rank r: N inexact`). If N > 0, the
+    integration stays on the MXFP4 expert path.
+  - Tests: the result is bit-identical to `pack_weights(w_dtype="fp8")` for TP and EP.
+  - Cost: ~1.5 min per rank on a Mac CPU (unmeasured on the pod), plus ~15 GiB host staging
+    per rank.
+- **HBM per rank:** fp8 experts are 14.96 GiB (TP) / 14.92 GiB (EP), vs MXFP4 8.66 / 8.62
+  GiB. That is +6.3 GiB over the MXFP4 integration; expect ~43.5 GB load mem vs the 37.17
+  measured in j-b120d683.
+- **Kernel interface:** the kernel takes `newpg [2B]` as an SMEM operand. `split_pools`
+  requires `kv_write="scatter"`, so the serving path keeps the separate KV write op.
+- **Env knobs for A/B** (prefix `SGLANG_TPU_GPTOSS_DECODE_MK_`; unset means kernel
+  defaults):
+  - `W_DTYPE=fp8|mxfp4`
+  - `AR_MODE=auto|oneshot|rsag`
+  - `AR_FOLD=0|1`
+  - `NPB`, `NPB_SWA`, `KV_BUFS`, `W_SLOTS`, `VMEM_MIB`
+  - `KERNEL_ABLATE=ar,attn,...` (the kernel's own ablations; outputs wrong)
+
+  The effective values are logged in the `decode megakernel ON (...)` line.

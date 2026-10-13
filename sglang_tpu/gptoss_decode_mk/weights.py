@@ -46,7 +46,14 @@ V_LN1, V_LN2, V_BO, V_BQKV, V_BR = range(5)
 
 AW_NAMES = ("wqkv", "wo", "wr", "vec", "sinks")
 EW_NAMES_FP4 = ("w13q", "w13s", "b13", "w2q", "w2s", "b2")
-W_NAMES = AW_NAMES + EW_NAMES_FP4
+EW_NAMES_FP8 = ("w13", "c13", "b13", "w2", "c2", "b2")
+W_NAMES = AW_NAMES + EW_NAMES_FP4  # what the streaming builder produces
+
+
+def w_names(c: DecodeConfig) -> tuple[str, ...]:
+    """Operand names of ``c.w_dtype`` (``megakernel.w_names``)."""
+    return AW_NAMES + {"mxfp4": EW_NAMES_FP4, "fp8": EW_NAMES_FP8}[c.w_dtype]
+
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
@@ -82,22 +89,40 @@ REQUIRED_KEYS = frozenset(v for v in _KEYS.values() if v not in _COVERS)
 
 def per_rank_specs(c: DecodeConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Shapes/dtypes of one rank's operands: ``megakernel.packed_specs`` minus the R axis
-    (uint32 code words as int32)."""
-    assert c.w_dtype == "mxfp4", "serving integration streams MXFP4 experts only"
+    (uint32 code words as int32 on the host)."""
     L, Hp, EL, NJ, T = c.L, c.Hp, c.EL, c.NJ, c.tne
-    return {
+    out = {
         "wqkv": ((L, Hp, c.QKVWL), torch.bfloat16),
         "wo": ((L, c.QWL, Hp), torch.bfloat16),
         "wr": ((L, Hp, 128), torch.bfloat16),
         "vec": ((L, 8, c.VW), torch.float32),
         "sinks": ((L, c.NQL, 128), torch.float32),
-        "w13q": ((L, EL, NJ, Hp // 8, 2 * T), torch.int32),
-        "w13s": ((L, EL, NJ, c.SR13, 2 * T), torch.bfloat16),
         "b13": ((L, EL, NJ, 1, 2 * T), torch.float32),
-        "w2q": ((L, EL, NJ, T // 8, Hp), torch.int32),
-        "w2s": ((L, EL, NJ, c.SR2, Hp), torch.bfloat16),
         "b2": ((L, EL, 1, Hp), torch.float32),
     }
+    if c.w_dtype == "mxfp4":
+        out.update(
+            {
+                "w13q": ((L, EL, NJ, Hp // 8, 2 * T), torch.int32),
+                "w13s": ((L, EL, NJ, c.SR13, 2 * T), torch.bfloat16),
+                "w2q": ((L, EL, NJ, T // 8, Hp), torch.int32),
+                "w2s": ((L, EL, NJ, c.SR2, Hp), torch.bfloat16),
+            }
+        )
+    elif c.w_dtype == "fp8":
+        out.update(
+            {
+                "w13": ((L, EL, NJ, Hp, 2 * T), torch.float8_e4m3fn),
+                "c13": ((L, EL, NJ, 1, 2 * T), torch.float32),
+                "w2": ((L, EL, NJ, T, Hp), torch.float8_e4m3fn),
+                "c2": ((L, EL, NJ, 1, Hp), torch.float32),
+            }
+        )
+    else:
+        raise ValueError(
+            f"serving integration supports mxfp4/fp8 experts, not {c.w_dtype}"
+        )
+    return {k: out[k] for k in w_names(c)}
 
 
 def per_rank_bytes(c: DecodeConfig) -> int:
@@ -108,6 +133,83 @@ def per_rank_bytes(c: DecodeConfig) -> int:
             numel *= s
         n += numel * torch.empty((), dtype=dt).element_size()
     return n
+
+
+# signed e2m1 value of each 4-bit code (sign bit 8)
+_E2M1 = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+)
+
+
+def mxfp4_dequant_kn(words: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Kernel MXFP4 layout -> f32 values: words ``[..., K/8, N]`` (int32/uint32 bits, code
+    k of word r = row 8r+k) and bf16 scales ``[..., >=K/32, N]`` -> ``[..., K, N]``."""
+    w = words.to(torch.int64) & 0xFFFFFFFF
+    codes = torch.stack(
+        [(w >> (4 * k)) & 15 for k in range(8)], dim=-2
+    )  # [..., K/8, 8, N]
+    codes = codes.reshape(*w.shape[:-2], w.shape[-2] * 8, w.shape[-1])
+    K = codes.shape[-2]
+    s = scales[..., : K // 32, :].float().repeat_interleave(32, dim=-2)
+    return _E2M1.to(codes.device)[codes] * s
+
+
+def fp8_pack_kn(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """``[..., K, N]`` f32 -> (e4m3 ``[..., K, N]``, f32 ``[..., 1, N]``, inexact count) with
+    ``megakernel.fp8_pack``'s rule: per-column scale 2^(floor(log2 colmax) - 7)."""
+    colmax = w.abs().amax(dim=-2, keepdim=True)
+    g = torch.where(
+        colmax > 0,
+        torch.floor(torch.log2(colmax.clamp_min(1e-38))) - 7,
+        torch.zeros_like(colmax),
+    )
+    f = torch.exp2(g)
+    w8 = (w / f).to(torch.float8_e4m3fn)
+    bad = int((w8.float() * f != w).sum())
+    return w8, f, bad
+
+
+def mxfp4_to_fp8(c: DecodeConfig, mx: dict[str, torch.Tensor], expert_block: int = 16):
+    """Per-rank MXFP4 operands -> the fp8 expert operands (attention/router/biases shared).
+    Returns (operands in ``w_names(fp8 config)``, number of inexact expert elements).
+    Converts in (layer, expert-block) pieces into preallocated outputs so the host
+    temporaries stay small (8 ranks convert at once on one host)."""
+    import dataclasses
+
+    c8 = dataclasses.replace(c, w_dtype="fp8")
+    out = {k: mx[k] for k in AW_NAMES + ("b13", "b2")}
+    for k, (shape, dt) in per_rank_specs(c8).items():
+        if k not in out:
+            out[k] = torch.empty(shape, dtype=dt)
+    bad = 0
+    for l in range(c.L):
+        for e0 in range(0, c.EL, expert_block):
+            e = slice(e0, min(e0 + expert_block, c.EL))
+            for q, s, w8n, fn in (
+                ("w13q", "w13s", "w13", "c13"),
+                ("w2q", "w2s", "w2", "c2"),
+            ):
+                w8, f, b = fp8_pack_kn(mxfp4_dequant_kn(mx[q][l, e], mx[s][l, e]))
+                out[w8n][l, e], out[fn][l, e] = w8, f
+                bad += b
+    return {k: out[k] for k in w_names(c8)}, bad
 
 
 # ----------------------------------------------------------------------------- primitives
@@ -292,6 +394,9 @@ class MkWeightBuilder:
     """
 
     def __init__(self, c: DecodeConfig, rank: int, device: str | torch.device = "cpu"):
+        import dataclasses
+
+        c = dataclasses.replace(c, w_dtype="mxfp4")  # streams MXFP4; see mxfp4_to_fp8
         c.check()
         self.c, self.rank = c, rank
         self.out = {
@@ -420,7 +525,13 @@ class MkWeightBuilder:
 
 
 def config_from_hf(
-    hf_config, *, tp_size: int, moe_mode: str = "tp", B: int = 1, **kw
+    hf_config,
+    *,
+    tp_size: int,
+    moe_mode: str = "tp",
+    w_dtype: str = "fp8",
+    B: int = 1,
+    **kw,
 ) -> Optional[DecodeConfig]:
     """Kernel geometry from a GPT-OSS HF config; pools/page tables are filled in at trace
     time (``adapter.trace_config``)."""
@@ -445,7 +556,7 @@ def config_from_hf(
         limit=float(getattr(hf_config, "swiglu_limit", 7.0)),
         R=tp_size,
         moe_mode=moe_mode,
-        w_dtype="mxfp4",
+        w_dtype=w_dtype,
         split_pools=True,
         **kw,
     )

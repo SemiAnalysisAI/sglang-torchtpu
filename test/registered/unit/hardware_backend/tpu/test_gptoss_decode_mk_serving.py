@@ -17,6 +17,7 @@ Run (8 virtual CPU devices, jax + torch CPU):
     python -m unittest test.registered.unit.hardware_backend.tpu.test_gptoss_decode_mk_serving
 """
 
+import dataclasses
 import os
 import unittest
 
@@ -182,6 +183,10 @@ def _build_rank(c, ck, r, seed=1):
 def _to_jax(t):
     if t.dtype == torch.bfloat16:
         return jnp.asarray(t.float().numpy()).astype(jnp.bfloat16)
+    if t.dtype == torch.float8_e4m3fn:  # bit-exact through the raw bytes
+        return jax.lax.bitcast_convert_type(
+            jnp.asarray(t.view(torch.uint8).numpy()), jnp.float8_e4m3fn
+        )
     return jnp.asarray(t.numpy())
 
 
@@ -228,6 +233,37 @@ class TestWeightRepack(unittest.TestCase):
 
     def test_ep_matches_pack_weights(self):
         self._check_mode("ep")
+
+    def test_fp8_matches_pack_weights(self):
+        # MXFP4 stream -> fp8 experts == the kernel's own fp8 pack_weights, bit for bit
+        for moe_mode in ("tp", "ep"):
+            c = _cfg(moe_mode=moe_mode)
+            ck = _checkpoint(c, seed=6)
+            c8 = dataclasses.replace(c, w_dtype="fp8")
+            ref = MK.pack_weights(c8, _global_layers(c, ck))
+            for r in (0, 3, 7):
+                mine, bad = W.mxfp4_to_fp8(c, _build_rank(c, ck, r))
+                self.assertEqual(bad, 0)
+                self.assertEqual(tuple(mine), MK.w_names(c8))
+                for k in MK.w_names(c8):
+                    a = (
+                        np.asarray(_to_jax(mine[k]).astype(jnp.float32))
+                        if mine[k].dtype != torch.float8_e4m3fn
+                        else mine[k].float().numpy()
+                    )
+                    np.testing.assert_array_equal(
+                        a,
+                        np.asarray(ref[k][r].astype(jnp.float32)),
+                        err_msg=f"{moe_mode} r{r} {k}",
+                    )
+                    self.assertEqual(
+                        tuple(mine[k].shape), tuple(MK.packed_specs(c8)[k].shape[1:])
+                    )
+
+    def test_fp8_inexact_is_counted(self):
+        w = torch.tensor([[2.0**-17], [1.0]])  # below e4m3's subnormal range: inexact
+        _, _, bad = W.fp8_pack_kn(w)
+        self.assertEqual(bad, 1)
 
     def test_quantizer_matches_reference(self):
         rng = np.random.default_rng(2)
@@ -291,12 +327,13 @@ class TestWeightRepack(unittest.TestCase):
     def test_full_size_budget(self):
         # per-rank HBM of the megakernel weights at the real GPT-OSS-120B geometry
         for mode in ("tp", "ep"):
-            c = C.full(1, w_dtype="mxfp4", moe_mode=mode)
-            gib = W.per_rank_bytes(c) / 2**30
-            print(
-                f"GPT-OSS-120B megakernel weights per rank ({mode} MoE, MXFP4): {gib:.2f} GiB"
-            )
-            self.assertLess(gib, 14.0)
+            for wd in ("mxfp4", "fp8"):
+                c = C.full(1, w_dtype=wd, moe_mode=mode)
+                gib = W.per_rank_bytes(c) / 2**30
+                print(
+                    f"GPT-OSS-120B megakernel weights per rank ({mode} MoE, {wd}): {gib:.2f} GiB"
+                )
+                self.assertLess(gib, 17.0)
 
 
 def _alloc(rng, n_pages_total, used):
@@ -452,6 +489,64 @@ class TestDecodeMapping(unittest.TestCase):
             self.assertIn("tpu_custom_call", hlo)
             self.assertNotIn("has_side_effect = true", hlo)
 
+    def test_fp8_step_lowering(self):
+        c = A.trace_config(
+            dataclasses.replace(_cfg(B=2), w_dtype="fp8"),
+            B=2,
+            pps=4,
+            kv_dtype=jnp.float8_e4m3fn,
+            nb_swa=24,
+            nb_full=24,
+            page=64,
+        )
+        mesh = Mesh(np.array(jax.devices()[:8]), ("tp",))
+        sds = jax.ShapeDtypeStruct
+        tmap = {
+            torch.bfloat16: jnp.bfloat16,
+            torch.float32: jnp.float32,
+            torch.float8_e4m3fn: jnp.float8_e4m3fn,
+        }
+        ws = [sds(sh, tmap[dt]) for sh, dt in W.per_rank_specs(c).values()]
+        pools = [sds((24, 64, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(c.L)]
+        args = (
+            [
+                sds((2, c.H), jnp.bfloat16),
+                sds((2,), jnp.int32),
+                sds((8,), jnp.int32),
+                sds((8,), jnp.int32),
+                sds((256, 64), jnp.bfloat16),
+                sds((1,), jnp.int32),
+            ]
+            + ws
+            + pools
+        )
+
+        def per_rank(x, kl, pi, spi, cs, rank, *rest):
+            return A.per_rank_step(
+                c,
+                rank,
+                x,
+                kl,
+                pi,
+                spi,
+                cs,
+                list(rest[: len(ws)]),
+                list(rest[len(ws) :]),
+            )
+
+        f = jax.shard_map(
+            per_rank,
+            mesh=mesh,
+            in_specs=(P(),) * len(args),
+            out_specs=(P(),) * 4,
+            check_vma=False,
+        )
+        with _tpu7x_info():
+            txt = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+        self.assertEqual(txt.count("stablehlo.bitcast_convert"), 0)
+        self.assertEqual(txt.count("tpu_custom_call"), 1)
+        self.assertNotIn("has_side_effect = true", txt)
+
     def test_uint32_weights_and_noop_step_lowering(self):
         # serving stores code words as uint32: the step must not bitcast (copy) them; the
         # int32 fallback shows the 2 weight-sized bitcast_converts seen in the j-b120d683 run
@@ -601,12 +696,19 @@ def _rel(a, b):
 class TestEndToEndTinyStep(unittest.TestCase):
     """Repacked weights + split pools + adapter glue through the megakernel (interpret)."""
 
-    def _run(self, moe_mode, kv_dtype):
+    def _run(self, moe_mode, kv_dtype, w_dtype="mxfp4"):
         B = 4
         c0 = _cfg(B=B, moe_mode=moe_mode, kv_dtype=kv_dtype)
         ck = _checkpoint(c0, seed=3)
         layers = _global_layers(c0, ck)
         ranks = [_build_rank(c0, ck, r) for r in range(c0.R)]
+        if (
+            w_dtype == "fp8"
+        ):  # the serving default: MXFP4 converted to e4m3 x column scale
+            conv = [W.mxfp4_to_fp8(c0, h) for h in ranks]
+            self.assertEqual(sum(b for _, b in conv), 0)
+            ranks = [h for h, _ in conv]
+            c0 = dataclasses.replace(c0, w_dtype="fp8")
         names = MK.w_names(c0)
         Wst = [jnp.stack([_to_jax(ranks[r][k]) for r in range(c0.R)]) for k in names]
 
@@ -695,7 +797,7 @@ class TestEndToEndTinyStep(unittest.TestCase):
         )
         rel = _rel(out[:3], ref[:3])
         print(
-            f"serving step {moe_mode}/{kv_dtype}: megakernel(repacked, split pools) vs "
+            f"serving step {moe_mode}/{kv_dtype}/{c0.w_dtype}: megakernel(repacked, split pools) vs "
             f"reference rel {rel:.2e}"
         )
         self.assertLess(rel, 1e-2)
@@ -726,7 +828,7 @@ class TestEndToEndTinyStep(unittest.TestCase):
             )
 
     def test_tp_moe_fp8_kv(self):
-        self._run("tp", "fp8")
+        self._run("tp", "fp8", w_dtype="fp8")
 
     def test_ep_moe_bf16_kv(self):
         self._run("ep", "bf16")

@@ -152,6 +152,7 @@ def per_rank_step(
         s["pos"],
         s["ptw"],
         s["ptf"],
+        s["newpg"],
         s["xp"],
         s["cos"],
         s["sin"],

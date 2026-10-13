@@ -33,6 +33,7 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 ENV_ENABLE = "SGLANG_TPU_GPTOSS_DECODE_MK"
+ENV_PREFIX = "SGLANG_TPU_GPTOSS_DECODE_MK_"
 ENV_MOE_MODE = "SGLANG_TPU_GPTOSS_DECODE_MK_MOE"  # "tp" (default) or "ep"
 MAX_BATCH = 64
 
@@ -52,6 +53,23 @@ ENV_ABLATE = "SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE"
 ABLATIONS = ("", "none", "noop_kernel", "no_kv_write", "no_mk")
 # =0: keep MXFP4 code words as int32 on device (bitcast to uint32 inside the op)
 ENV_U32 = "SGLANG_TPU_GPTOSS_DECODE_MK_U32"
+
+
+def kernel_knobs_from_env() -> dict:
+    """Kernel A/B knobs (unset = kernel defaults): w_dtype fp8|mxfp4, ar_mode
+    auto|oneshot|rsag, ar_fold 0|1, npb, npb_swa, kv_bufs, kernel ablations (comma list)."""
+    e = os.environ.get
+    kw: dict = {"w_dtype": e(ENV_PREFIX + "W_DTYPE", "fp8").strip().lower()}
+    if e(ENV_PREFIX + "AR_MODE"):
+        kw["ar_mode"] = e(ENV_PREFIX + "AR_MODE").strip().lower()
+    if e(ENV_PREFIX + "AR_FOLD"):
+        kw["ar_fold"] = e(ENV_PREFIX + "AR_FOLD").strip() not in ("0", "false")
+    for k in ("NPB", "NPB_SWA", "KV_BUFS", "W_SLOTS", "VMEM_MIB"):
+        if e(ENV_PREFIX + k):
+            kw[k.lower()] = int(e(ENV_PREFIX + k))
+    if e(ENV_PREFIX + "KERNEL_ABLATE"):
+        kw["ablate"] = tuple(a for a in e(ENV_PREFIX + "KERNEL_ABLATE").split(",") if a)
+    return kw
 
 
 def enabled_by_env() -> bool:
@@ -130,6 +148,31 @@ class WeightTap:
         model = self.causal_lm.model
         device = next(model.parameters()).device
         host = self.builder.finalize()
+        if self.c.w_dtype == "fp8":
+            import dataclasses
+            import time
+
+            from sglang_tpu.gptoss_decode_mk.weights import mxfp4_to_fp8
+
+            t = time.time()
+            host8, bad = mxfp4_to_fp8(self.c, host)
+            logger.info(
+                "GPT-OSS decode megakernel: MXFP4 -> fp8 experts on rank %d: %d inexact "
+                "elements (%.0f s)",
+                self.rank,
+                bad,
+                time.time() - t,
+            )
+            if bad:
+                logger.warning(
+                    "GPT-OSS decode megakernel: fp8 experts would not be exact (%d "
+                    "elements); using the MXFP4 expert path",
+                    bad,
+                )
+                self.c = dataclasses.replace(self.c, w_dtype="mxfp4")
+            else:
+                host = host8
+            del host8
         self.builder = None
         mk = GptOssDecodeMK(self.c, self.rank, self.tp_size, host, device)
         del host
@@ -138,11 +181,19 @@ class WeightTap:
         from sglang_tpu.gptoss_decode_mk.weights import per_rank_bytes
 
         logger.info(
-            "GPT-OSS decode megakernel ON (rank %d/%d, %s MoE): %.2f GiB extra weights per "
+            "GPT-OSS decode megakernel ON (rank %d/%d, %s MoE, %s experts, ar_mode=%s "
+            "ar_fold=%s npb=%d npb_swa=%d kv_bufs=%d ablate=%s): %.2f GiB extra weights per "
             "rank; DECODE batches <= %d use it, everything else uses the stock layers.",
             self.rank,
             self.tp_size,
             self.c.moe_mode,
+            self.c.w_dtype,
+            self.c.ar_mode,
+            self.c.ar_fold,
+            self.c.npb,
+            self.c.npb_swa,
+            self.c.kv_bufs,
+            ",".join(self.c.ablate) or "-",
             per_rank_bytes(self.c) / 2**30,
             MAX_BATCH,
         )
@@ -171,7 +222,10 @@ def maybe_make_weight_tap(causal_lm: nn.Module) -> Optional[WeightTap]:
 
     moe_mode = os.environ.get(ENV_MOE_MODE, "tp").strip().lower()
     c = config_from_hf(
-        causal_lm.config, tp_size=parallel.attn_tp_size, moe_mode=moe_mode
+        causal_lm.config,
+        tp_size=parallel.attn_tp_size,
+        moe_mode=moe_mode,
+        **kernel_knobs_from_env(),
     )
     return WeightTap(causal_lm, c, parallel.attn_tp_rank, parallel.attn_tp_size)
 
@@ -212,8 +266,10 @@ def get_step_op(c0, tp_size: int, noop: bool = False):
     from torch_tpu._internal.pallas import get_pallas_mesh
 
     from sglang_tpu.gptoss_decode_mk import adapter as A
-    from sglang_tpu.gptoss_decode_mk.weights import W_NAMES
+    from sglang_tpu.gptoss_decode_mk.weights import w_names
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    W_NAMES = w_names(c0)
 
     mesh = get_pallas_mesh(("tp",), (tp_size,))
     L = c0.L
@@ -362,11 +418,11 @@ class GptOssDecodeMK(nn.Module):
 
     def __init__(self, c, rank: int, tp_size: int, host: dict, device):
         super().__init__()
-        from sglang_tpu.gptoss_decode_mk.weights import W_NAMES
+        from sglang_tpu.gptoss_decode_mk.weights import w_names
 
         self.c, self.rank, self.tp_size = c, rank, tp_size
-        self.w_names = W_NAMES
-        for k in W_NAMES:
+        self.w_names = w_names(c)
+        for k in self.w_names:
             self.register_buffer(
                 "w_" + k, _to_device(host[k], device), persistent=False
             )
