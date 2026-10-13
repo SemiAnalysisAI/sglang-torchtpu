@@ -11,6 +11,11 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.attn_residual import (
+    aggregate,
+    aggregate_fused_add,
+    register_attn_residual_ops,
+)
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
 logger = logging.getLogger(__name__)
@@ -22,6 +27,17 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
+        register_attn_residual_ops,
+        HookType.AFTER,
+    ),
+    ("sglang.srt.layers.attn_residual._aggregate", aggregate, HookType.AROUND),
+    (
+        "sglang.srt.layers.attn_residual._aggregate_fused_add",
+        aggregate_fused_add,
+        HookType.AROUND,
     ),
 ]
 
