@@ -1195,6 +1195,13 @@ class TpuSRTPlatform(SRTPlatform):
             "set_stance('fail_on_recompile')."
         )
 
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return tier-1 misses, including compiles and persistent-cache loads."""
+        get_cache_misses = getattr(
+            getattr(torch, "tpu", None), "_get_cache_misses", None
+        )
+        return None if get_cache_misses is None else int(get_cache_misses())
+
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel
         from sglang_tpu.pp_stage_chips import (

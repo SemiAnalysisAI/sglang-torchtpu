@@ -254,6 +254,14 @@ class SRTPlatform(DeviceMixin):
         compile ahead of serving freeze or monitor compilation here."""
         pass
 
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return a monotonic platform compilation-cache miss counter.
+
+        A platform may return ``None`` when its runtime exposes no such
+        counter. Implementations should not synchronize device execution.
+        """
+        return None
+
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
     def prepare_model_parallel_groups(self) -> None:
