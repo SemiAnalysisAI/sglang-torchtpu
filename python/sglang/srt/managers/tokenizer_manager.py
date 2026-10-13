@@ -232,7 +232,6 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 @dataclasses.dataclass
-@dataclasses.dataclass
 class HealthCheckWaiter:
     """What an in-flight /health_generate probe waits on.
 
@@ -249,6 +248,7 @@ class HealthCheckWaiter:
             self.event.set()
 
 
+@dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
 

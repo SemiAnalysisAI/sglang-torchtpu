@@ -165,6 +165,19 @@ class TestHealthGenerateOwnRid(CustomTestCase):
         self.assertFalse(waiter.ok)
 
 
+class TestRequestStateStillConstructs(unittest.TestCase):
+    def test_req_state_keeps_its_dataclass_constructor(self):
+        """Regression: inserting HealthCheckWaiter above ReqState must not steal its decorator."""
+        import dataclasses
+
+        from sglang.srt.managers.tokenizer_manager import ReqState
+
+        self.assertTrue(dataclasses.is_dataclass(ReqState))
+        self.assertTrue(dataclasses.is_dataclass(HealthCheckWaiter))
+        fields = {f.name for f in dataclasses.fields(ReqState)}
+        self.assertTrue({"out_list", "finished", "event", "obj"} <= fields)
+
+
 class TestSchedulerDeferredProbeCarriesRid(unittest.TestCase):
     def test_maybe_send_health_check_signal_sends_the_probes_rid(self):
         sent = []
