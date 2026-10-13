@@ -48,7 +48,7 @@ def _capacity_for_shape(
             dtype_out=jnp.dtype(dtype_q),
             kv_layout=layout,
         )
-        vmem = pltpu.get_tpu_info().vmem_capacity_bytes
+        vmem = max(0, pltpu.get_tpu_info().vmem_capacity_bytes - 65536)
         decode, mixed = calculate_block_sizes(model, serve, vmem)
         block = decode if mode == "decode" else mixed
         cfg = configs.RpaConfigs(

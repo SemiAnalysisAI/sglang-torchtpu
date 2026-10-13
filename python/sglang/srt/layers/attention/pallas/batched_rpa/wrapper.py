@@ -277,13 +277,16 @@ class BaseBlockSizeCalculator:
         vmem_limit_bytes: int,
         decode_query_size: int = 1,
     ):
-        self.model_cfgs = model_cfgs
-        self.serve_cfgs = serve_cfgs
-        self.vmem_limit_bytes = vmem_limit_bytes
-        self.decode_query_size = decode_query_size
-
         tpu_info = pltpu.get_tpu_info()
         self.tpu_info = tpu_info
+        # TPU v7x (and v5p) reserves 64 KiB of hardware VMEM for system/stack
+        # structures. Requesting the raw capacity_bytes causes XLA to lower the
+        # scoped allocation beneath Pallas, corrupting DMA offsets. Clamp to
+        # the safe capacity.
+        safe_vmem_cap = max(0, tpu_info.vmem_capacity_bytes - 65536)
+        self.vmem_limit_bytes = min(vmem_limit_bytes, safe_vmem_cap)
+        self.decode_query_size = decode_query_size
+
         num_lanes = tpu_info.num_lanes
         num_sublanes = tpu_info.num_sublanes
         self.mxu_column_size = tpu_info.mxu_column_size
@@ -657,6 +660,8 @@ def calculate_block_sizes(
     decode_query_size: int = 1,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
+    safe_vmem_cap = max(0, pltpu.get_tpu_info().vmem_capacity_bytes - 65536)
+    vmem_limit_bytes = min(vmem_limit_bytes, safe_vmem_cap)
     calculator_cls = (
         RingBlockSizeCalculator
         if serve_cfgs.pcp_ring_axis_name is not None
@@ -849,8 +854,11 @@ def ragged_paged_attention(
         out_dtype = queries.dtype
     if mask_value is None:
         mask_value = jnp.finfo(out_dtype).min
+    safe_vmem_cap = max(0, pltpu.get_tpu_info().vmem_capacity_bytes - 65536)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        vmem_limit_bytes = safe_vmem_cap
+    else:
+        vmem_limit_bytes = min(vmem_limit_bytes, safe_vmem_cap)
 
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
