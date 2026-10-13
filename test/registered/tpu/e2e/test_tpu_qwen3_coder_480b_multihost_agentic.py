@@ -16,8 +16,8 @@ dashboard. The sweep harness stays this recipe's own run_nightly.sh; only the
 test machinery is shared. Metric names are bare leg tags (no namespace) --
 this file's dashboard trend predates the matrix and must not split.
 
-Runs on the external cluster, which serves the weights from its GCS bucket, so no
-hydration step is needed.
+The weights are already on the shared model-weights-filestore PVC, so no hydration
+step is needed.
 """
 
 import os
@@ -29,15 +29,16 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
     est_time=1800,
-    suite="external-nightly-2x2x2",
+    suite="nightly-tpu-multihost",
     nightly=True,
     labels=["multihost", "qwen3-coder-480b", "agentic"],
 )
 
-# Own launch group: the 480B agentic recipe, weights from the external bucket.
+# Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
+    "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
-    "weights": "Qwen3-Coder-480B-A35B-Instruct-FP8",
+    "weights_pvc": "model-weights",
 }
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
