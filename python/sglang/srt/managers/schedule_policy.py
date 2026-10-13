@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_prefix_accounting import swa_prefix_admission
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -730,8 +731,11 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
+        self.log_full_kv_device_hit_tokens = 0
+        self.log_full_kv_host_hit_tokens = 0
         self.log_swa_miss_tokens = 0
         self.log_swa_miss_reqs = 0
+        self.log_swa_restored_tokens = 0
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -1015,11 +1019,12 @@ class PrefillAdder:
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
-        # Host load-back can restore a missing SWA window, so only the part of
-        # the match-time miss that the admitted prefix still leaves out counts.
-        swa_miss = min(req.swa_miss_len, max(0, req.full_kv_hit_length - prefix_len))
-        self.log_swa_miss_tokens += swa_miss
-        self.log_swa_miss_reqs += int(swa_miss > 0)
+        swa = swa_prefix_admission(match=req.swa_prefix_match, prefix_len=prefix_len)
+        self.log_full_kv_device_hit_tokens += swa.full_kv_device_hit
+        self.log_full_kv_host_hit_tokens += swa.full_kv_host_hit
+        self.log_swa_miss_tokens += swa.swa_miss
+        self.log_swa_miss_reqs += int(swa.swa_miss > 0)
+        self.log_swa_restored_tokens += swa.swa_restored
 
         fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
         reason = None

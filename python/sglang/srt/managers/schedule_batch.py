@@ -109,7 +109,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
-    compute_swa_miss_len,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -120,6 +119,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_prefix_accounting import (
+    SwaPrefixMatch,
+    swa_prefix_match,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1188,8 +1191,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
-        self.swa_miss_len = 0
-        self.full_kv_hit_length = 0
+        self.swa_prefix_match = SwaPrefixMatch()
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
@@ -1692,10 +1694,9 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
-            self.swa_miss_len = compute_swa_miss_len(
+            self.swa_prefix_match = swa_prefix_match(
                 tree_cache=tree_cache, match_result=match_result
             )
-            self.full_kv_hit_length = match_result.full_kv_hit_length
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:

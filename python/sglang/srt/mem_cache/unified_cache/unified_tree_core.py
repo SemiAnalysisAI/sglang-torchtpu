@@ -890,6 +890,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_device_hit_length,
             action,
         ) = self._match_prefix_helper(key, params.ignore_swa_kv_miss)
         return self._match_post_processor(
@@ -899,6 +900,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_device_hit_length,
             action,
         )
 
@@ -908,6 +910,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
+        int,
         int,
         int,
         Optional[CacheAction | ComponentAction],
@@ -924,6 +927,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node = node
         best_match_device_value_len = 0
         full_kv_hit_length = 0
+        # Leading tokens whose Full KV is on device; stops growing at the first host-only node.
+        full_kv_device_hit_length = 0
+        full_kv_on_device = True
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         components = self.components
@@ -974,6 +980,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
+            full_kv_on_device = full_kv_on_device and not child.evicted
+            if full_kv_on_device:
+                full_kv_device_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -995,6 +1004,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_device_hit_length,
             action,
         )
 
@@ -1032,6 +1042,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
         full_kv_hit_length: int,
+        full_kv_device_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
         node_update = best_match_node
@@ -1065,6 +1076,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            full_kv_device_hit_length=full_kv_device_hit_length,
         )
 
         for component in self.components:

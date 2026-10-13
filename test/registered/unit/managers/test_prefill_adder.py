@@ -25,6 +25,10 @@ from sglang.srt.mem_cache.prefill_budget import (
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.swa_prefix_accounting import (
+    SwaPrefixMatch,
+    swa_prefix_admission,
+)
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -129,8 +133,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
-        req.swa_miss_len = 0
-        req.full_kv_hit_length = 0
+        req.swa_prefix_match = SwaPrefixMatch()
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -546,13 +549,16 @@ class TestPrefillAdder(CustomTestCase):
     def test_swa_miss_counted_once_per_admitted_req(self):
         adder = self.create_adder(self.create_running_batch())
         req = self.create_mock_req("swa-limited", priority=0, max_new_tokens=1)
-        req.swa_miss_len = 24
-        req.full_kv_hit_length = 24
+        req.swa_prefix_match = SwaPrefixMatch(
+            full_kv_hit_length=24, full_kv_device_hit_length=16
+        )
         req.materialized_host_hit_len.return_value = 0
 
         adder._account_prefill_cache_admission(req, prefix_len=0)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
         self.assertEqual(adder.log_swa_miss_reqs, 1)
+        self.assertEqual(adder.log_full_kv_device_hit_tokens, 16)
+        self.assertEqual(adder.log_full_kv_host_hit_tokens, 8)
 
         clean = self.create_mock_req("clean", priority=0, max_new_tokens=1)
         clean.materialized_host_hit_len.return_value = 0
@@ -560,30 +566,43 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_swa_miss_reqs, 1)
 
         retracted = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
-        retracted.swa_miss_len = 16
-        retracted.full_kv_hit_length = 16
+        retracted.swa_prefix_match = SwaPrefixMatch(
+            full_kv_hit_length=16, full_kv_device_hit_length=16
+        )
         retracted.retracted_stain = True
         adder._account_prefill_cache_admission(retracted, prefix_len=0)
         self.assertEqual(adder.log_swa_miss_tokens, 24)
         self.assertEqual(adder.log_swa_miss_reqs, 1)
+        self.assertEqual(adder.log_full_kv_device_hit_tokens, 16)
 
-    def test_swa_miss_excludes_prefix_restored_by_load_back(self):
-        adder = self.create_adder(self.create_running_batch())
-        restored = self.create_mock_req("restored", priority=0, max_new_tokens=1)
-        restored.swa_miss_len = 16
-        restored.full_kv_hit_length = 32
-        restored.materialized_host_hit_len.return_value = 0
-        adder._account_prefill_cache_admission(restored, prefix_len=32)
-        self.assertEqual(adder.log_swa_miss_tokens, 0)
-        self.assertEqual(adder.log_swa_miss_reqs, 0)
-
-        partial = self.create_mock_req("partial", priority=0, max_new_tokens=1)
-        partial.swa_miss_len = 16
-        partial.full_kv_hit_length = 32
-        partial.materialized_host_hit_len.return_value = 0
-        adder._account_prefill_cache_admission(partial, prefix_len=24)
-        self.assertEqual(adder.log_swa_miss_tokens, 8)
-        self.assertEqual(adder.log_swa_miss_reqs, 1)
+    def test_swa_admission_splits_restored_missed_and_declined(self):
+        """Admitting device-resident FULL past the device hit means its SWA window was
+        restored, whether or not the node's FULL is also backed up (and so already in
+        the host hit); a declined load-back shrinks the prefix but is not an SWA miss."""
+        cases = [
+            # reusable_length, prefix_len, swa_miss, swa_restored
+            (16, 32, 0, 16),
+            (16, 24, 8, 8),
+            (16, 16, 16, 0),
+            (16, 8, 16, 0),
+            (16, 40, 0, 16),
+            # FULL backed up but on device, SWA only on host: in the host hit.
+            (32, 32, 0, 16),
+            (32, 16, 0, 0),
+        ]
+        for reusable_length, prefix_len, swa_miss, swa_restored in cases:
+            with self.subTest(reusable_length=reusable_length, prefix_len=prefix_len):
+                match = SwaPrefixMatch(
+                    full_kv_hit_length=32,
+                    full_kv_device_hit_length=32,
+                    device_hit_length=16,
+                    reusable_length=reusable_length,
+                )
+                got = swa_prefix_admission(match=match, prefix_len=prefix_len)
+                self.assertEqual(got.swa_miss, swa_miss)
+                self.assertEqual(got.swa_restored, swa_restored)
+                self.assertEqual(got.full_kv_device_hit, 32)
+                self.assertEqual(got.full_kv_host_hit, 0)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

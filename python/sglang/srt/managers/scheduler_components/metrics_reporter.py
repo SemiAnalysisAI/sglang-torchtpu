@@ -104,8 +104,11 @@ class PrefillStats:
     log_device_hit_tokens: int = 0
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
+    log_full_kv_device_hit_tokens: int = 0
+    log_full_kv_host_hit_tokens: int = 0
     log_swa_miss_tokens: int = 0
     log_swa_miss_reqs: int = 0
+    log_swa_restored_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
 
@@ -126,8 +129,11 @@ class PrefillStats:
             log_device_hit_tokens=adder.log_device_hit_tokens,
             log_host_hit_tokens=adder.log_host_hit_tokens,
             log_storage_hit_tokens=adder.log_storage_hit_tokens,
+            log_full_kv_device_hit_tokens=adder.log_full_kv_device_hit_tokens,
+            log_full_kv_host_hit_tokens=adder.log_full_kv_host_hit_tokens,
             log_swa_miss_tokens=adder.log_swa_miss_tokens,
             log_swa_miss_reqs=adder.log_swa_miss_reqs,
+            log_swa_restored_tokens=adder.log_swa_restored_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -816,9 +822,12 @@ class SchedulerMetricsReporter:
                 host_hit_tokens=prefill_stats.log_host_hit_tokens,
                 storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
             )
-            self.metrics_collector.increment_swa_miss(
-                tokens=prefill_stats.log_swa_miss_tokens,
-                reqs=prefill_stats.log_swa_miss_reqs,
+            self.metrics_collector.increment_swa_prefix(
+                full_kv_device_hit_tokens=prefill_stats.log_full_kv_device_hit_tokens,
+                full_kv_host_hit_tokens=prefill_stats.log_full_kv_host_hit_tokens,
+                swa_miss_tokens=prefill_stats.log_swa_miss_tokens,
+                swa_miss_reqs=prefill_stats.log_swa_miss_reqs,
+                swa_restored_tokens=prefill_stats.log_swa_restored_tokens,
             )
 
             # Basics
@@ -1247,6 +1256,13 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+        swa_host_pool = self.scheduler.tree_cache.swa_host_pool()
+        if swa_host_pool is not None:
+            swa_host_total = swa_host_pool.logical_size
+            self.stats.hicache_host_swa_used_tokens = (
+                swa_host_total - swa_host_pool.available_size()
+            )
+            self.stats.hicache_host_swa_total_tokens = swa_host_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

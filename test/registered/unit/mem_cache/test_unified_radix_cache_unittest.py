@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
-    compute_swa_miss_len,
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -61,6 +60,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_prefix_accounting import (
+    swa_prefix_admission,
+    swa_prefix_match,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentDeviceSlot,
@@ -6861,17 +6864,25 @@ class UnifiedRadixCacheSuite:
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         cache.insert(params)
         masked = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        miss = compute_swa_miss_len(tree_cache=cache, match_result=masked)
+        match = swa_prefix_match(tree_cache=cache, match_result=masked)
+        miss = swa_prefix_admission(match=match, prefix_len=0).swa_miss
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.assertEqual(miss, 0)
             return
         self.assertEqual(len(masked.device_indices), 0)
         self.assertEqual(miss, len(seq))
+        self.assertEqual(match.full_kv_device_hit_length, len(seq))
 
         clean = list(range(1000, 1000 + 4 * self.cfg.page_size))
         self._insert(cache, allocator, req_to_token_pool, clean)
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", clean))))
-        self.assertEqual(compute_swa_miss_len(tree_cache=cache, match_result=result), 0)
+        clean_match = swa_prefix_match(tree_cache=cache, match_result=result)
+        self.assertEqual(
+            swa_prefix_admission(
+                match=clean_match, prefix_len=len(result.device_indices)
+            ).swa_miss,
+            0,
+        )
 
     def test_has_swa_host_pool_flag_matches_attached_pool(self):
         """init_hicache caches SWA host-pool presence on the tree core after
@@ -7234,6 +7245,29 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
+
+    def test_full_kv_device_hit_length_stops_at_host_only_leaf(self):
+        """full_kv_device_hit_length covers only the leading device-resident FULL;
+        a host-only leaf still counts toward full_kv_hit_length."""
+        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+SWA")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(
+            result.full_kv_device_hit_length,
+            len(tokens) - _node_key_length(cache, leaf),
+        )
 
     def test_swa_branching_seqlen_uses_device_full_hit(self):
         if (

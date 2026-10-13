@@ -293,6 +293,8 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        full_kv_device_hit_length: Leading part of `full_kv_hit_length` whose
+                            Full KV is on device.
     """
 
     device_indices: torch.Tensor
@@ -306,20 +308,9 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    full_kv_device_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
-
-
-def compute_swa_miss_len(
-    *, tree_cache: BasePrefixCache, match_result: MatchResult
-) -> int:
-    """Prefix tokens with full KV on device or host that the match cut because
-    their SWA window was not on device; admission discounts what load-back restores.
-    Zero unless SWA is the cache's only validator besides full KV."""
-    if not tree_cache.swa_is_only_match_cut():
-        return 0
-    usable = len(match_result.device_indices) + match_result.host_hit_length
-    return max(0, match_result.full_kv_hit_length - usable)
 
 
 def zero_match_result(
@@ -341,6 +332,7 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        full_kv_device_hit_length=0,
     )
 
 
@@ -662,6 +654,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_mamba(self) -> bool:
         return False
+
+    def swa_host_pool(self):
+        """The SWA host KV pool under HiCache, or None."""
+        return None
 
     def swa_is_only_match_cut(self) -> bool:
         """True when a missing SWA window is the only thing that can stop a match

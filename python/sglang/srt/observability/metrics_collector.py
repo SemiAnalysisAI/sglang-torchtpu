@@ -162,6 +162,9 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Zero when the cache has no SWA host pool; the gauges are then not exported.
+    hicache_host_swa_used_tokens: int = 0
+    hicache_host_swa_total_tokens: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -694,6 +697,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            self.hicache_host_swa_used_tokens = Gauge(
+                name="sglang:hicache_host_swa_used_tokens",
+                documentation="Number of tokens currently used in the host SWA KV cache.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_swa_total_tokens = Gauge(
+                name="sglang:hicache_host_swa_total_tokens",
+                documentation="Total capacity of the host SWA KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -955,15 +970,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
         # Kept out of prefill_effective_tokens_total: its modes sum to the
-        # hit-rate denominator, and these tokens are already counted as input.
-        # Not pre-seeded, so models without SWA never export these series.
+        # hit-rate denominator. Not pre-seeded, so caches other than full KV + SWA
+        # never export these series. Each request is counted once, at admission.
+        self.prefill_full_kv_hit_tokens_total = Counter(
+            name="sglang:prefill_full_kv_hit_tokens_total",
+            documentation=(
+                "Prefix tokens whose full-attention KV was cached at match time, "
+                "by where it was (device or host), whether or not SWA allowed reuse."
+            ),
+            labelnames=list(labels.keys()) + ["location"],
+        )
         self.prefill_swa_miss_tokens_total = Counter(
             name="sglang:prefill_swa_miss_tokens_total",
             documentation=(
                 "Prefix tokens whose full-attention KV was cached on device or "
-                "host but recomputed because their SWA window was missing. "
-                "Counted once per admitted request; zero unless the cache holds "
-                "only full KV and SWA."
+                "host but recomputed because their SWA window was missing."
             ),
             labelnames=list(labels.keys()),
         )
@@ -972,6 +993,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation=(
                 "Admitted requests with at least one prefix token in "
                 "sglang:prefill_swa_miss_tokens_total."
+            ),
+            labelnames=list(labels.keys()),
+        )
+        self.prefill_swa_restored_tokens_total = Counter(
+            name="sglang:prefill_swa_restored_tokens_total",
+            documentation=(
+                "Prefix tokens whose full-attention KV was on device and that were "
+                "reused only after load-back restored their SWA window from host or "
+                "storage; already counted as hits in "
+                "sglang:prefill_effective_tokens_total."
             ),
             labelnames=list(labels.keys()),
         )
@@ -1396,10 +1427,32 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **self.labels, mode=mode
                 ).inc(delta)
 
-    def increment_swa_miss(self, *, tokens: int, reqs: int) -> None:
-        if tokens > 0:
-            self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(tokens)
-            self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(reqs)
+    def increment_swa_prefix(
+        self,
+        *,
+        full_kv_device_hit_tokens: int,
+        full_kv_host_hit_tokens: int,
+        swa_miss_tokens: int,
+        swa_miss_reqs: int,
+        swa_restored_tokens: int,
+    ) -> None:
+        for location, tokens in (
+            ("device", full_kv_device_hit_tokens),
+            ("host", full_kv_host_hit_tokens),
+        ):
+            if tokens > 0:
+                self.prefill_full_kv_hit_tokens_total.labels(
+                    **self.labels, location=location
+                ).inc(tokens)
+        if swa_miss_tokens > 0:
+            self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(
+                swa_miss_tokens
+            )
+            self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(swa_miss_reqs)
+        if swa_restored_tokens > 0:
+            self.prefill_swa_restored_tokens_total.labels(**self.labels).inc(
+                swa_restored_tokens
+            )
 
     def increment_forward_execution_seconds(
         self,
@@ -1542,6 +1595,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            if stats.hicache_host_swa_total_tokens > 0:
+                self._log_gauge(
+                    self.hicache_host_swa_used_tokens,
+                    stats.hicache_host_swa_used_tokens,
+                )
+                self._log_gauge(
+                    self.hicache_host_swa_total_tokens,
+                    stats.hicache_host_swa_total_tokens,
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
