@@ -510,6 +510,12 @@ def _register_attention_backends() -> None:
 
         return TpuPallasSparseMlaAttnBackend(runner)
 
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
+
 
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
