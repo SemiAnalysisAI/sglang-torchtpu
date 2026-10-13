@@ -939,6 +939,13 @@ class TpuSRTPlatform(SRTPlatform):
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
+    def enter_spec_decode_batch(self, batch: ScheduleBatch) -> None:
+        """Run an EAGLE3 decode step at its batch bucket when the decode
+        prepare built one (see spec_decode_bucket.py)."""
+        from sglang_tpu.spec_decode_bucket import enter_decode_bucket
+
+        enter_decode_bucket(batch)
+
     def get_batch_input_device(self, batch: ScheduleBatch) -> Optional[str]:
         """Place eligible TPU inputs on CPU until decoder padding/materialization."""
         # Opt-in: off returns None, so batches keep the device-only contract.

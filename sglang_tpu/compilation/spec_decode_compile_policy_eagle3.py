@@ -226,7 +226,35 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward
-        return super().install()
+        installed = super().install()
+        if installed and not self.is_draft_worker:
+            self._register_decode_batch_bucket()
+        return installed
+
+    def _register_decode_batch_bucket(self) -> None:
+        """Let the decode step run at the batch bucket from scheduling on.
+
+        Not with DP attention, whose phases pad to the widest peer, or PP.
+        """
+        if (
+            is_dp_attention_enabled()
+            or get_parallel().pp_size > 1
+            or self.speculative_eagle_topk != 1
+            or self.b_bucketer is None
+        ):
+            return
+        from sglang_tpu.spec_decode_bucket import (
+            register_decode_batch_bucket,
+        )
+
+        b_bucketer = self.b_bucketer
+
+        def bucket(num_reqs: int) -> int | None:
+            if num_reqs > b_bucketer.max_val:
+                return None
+            return b_bucketer.next_bucket(num_reqs)
+
+        register_decode_batch_bucket(bucket)
 
     def compile_fused_draft_steps(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Compile the multi-step EAGLE draft loop with the selected tracer."""

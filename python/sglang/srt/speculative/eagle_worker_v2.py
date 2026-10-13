@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -1578,6 +1579,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # A backend may run the whole step on decode-prepared inputs (TPU:
+            # the batch bucket); the scheduler restores its own fields.
+            current_platform.enter_spec_decode_batch(batch)
 
             if batch.spec_info is None:
                 capture_mode = (
