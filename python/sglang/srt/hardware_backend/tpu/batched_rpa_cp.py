@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -264,7 +265,7 @@ def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tens
     """
     meta = forward_batch.attn_cp_metadata
     direct_idx = getattr(meta, "direct_reorder_index", None)
-    if is_tpu() and direct_idx is not None:
+    if direct_idx is not None:
         cp_size = get_parallel().attn_cp_size
         op = _GLOBAL_AG_OP
         if op is None:

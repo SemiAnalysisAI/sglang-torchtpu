@@ -43,7 +43,7 @@ def pad_logical_token_to_physical(metadata: Any) -> None:
     metadata.max_rank_len = [physical_rank_len] * len(logical_tokens)
 
     if hasattr(metadata, "perm") and metadata.perm is not None:
-        stride = max(physical_rank_len, getattr(metadata, "stride", physical_rank_len))
+        stride = physical_rank_len
         metadata.stride = stride
         parallel = get_parallel()
         cp_rank = parallel.attn_cp_rank

@@ -255,7 +255,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             perm, device=device, dtype=torch.int32
         )
 
-        stride = max(int(num_tokens), max(per_rank_actual_token))
+        stride = max(per_rank_actual_token) if per_rank_actual_token else int(num_tokens)
         gathered_to_rk = []
         for r, n in enumerate(per_rank_actual_token):
             for k in range(n):
