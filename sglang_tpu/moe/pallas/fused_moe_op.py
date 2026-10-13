@@ -266,6 +266,47 @@ def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
     return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
 
 
+def _fp4_whole_expert_decode_tiles(base_tile_info, routed_rows, num_route_experts):
+    """Wrap a gmm_v2 ``tile_info``: one rhs tile per expert for decode on
+    packed FP4 that gmm_v2 dequantizes in VMEM (MXFP4's 32-wide scale blocks).
+
+    The W4A16 path is bound by the VPU dequantizing each rhs tile, not by HBM.
+    With under one routed row per expert (decode), splitting an expert into
+    K/N tiles adds per-tile pipeline steps without reusing any weights, so
+    the whole ``[K, N]`` expert is one tile and ``tile_m`` the 16-row
+    sublane minimum. Prefill-sized batches, other rhs formats and experts
+    whose packed buffers plus the bf16 staging tile overflow VMEM keep
+    ``base_tile_info``.
+    """
+    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+
+    def resolve(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act):
+        if isinstance(base_tile_info, TileSizes):
+            return base_tile_info
+        return base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+
+    def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        import jax
+
+        if routed_rows >= num_route_experts or not rhs_cfgs.dequantize_in_vmem:
+            return resolve(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        tile_m = 16
+        elems = dims.size_k * dims.size_n * (2 if fuse_act else 1)
+        lhs_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
+        # Three pipelined packed buffers, the bf16 dequantized tile, and the
+        # double-buffered lhs/out tiles plus the f32 accumulator.
+        need = (
+            3 * elems * jax.dtypes.itemsize_bits(rhs_cfgs.dtype) // 8
+            + elems * lhs_bytes
+            + tile_m * (2 * dims.size_k * lhs_bytes + elems // dims.size_k * 8)
+        )
+        if need > vmem_limit_bytes:
+            return resolve(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        return TileSizes(tile_m=tile_m, tile_k=dims.size_k, tile_n=dims.size_n)
+
+    return wrapped
+
+
 # 3 pipelined rhs buffers + unpack staging tile + scales/lhs/acc/out.
 _PACKED_RHS_VMEM_DIVISOR = 5
 
@@ -696,9 +737,15 @@ def _fused_moe_jax(
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
-    gmm1_tiling = _dividing_tile_k(
-        _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
-    )
+    gmm1_tile_info = gmm1_tile_info or calculate_tiling
+    # Expert ids the routing addresses (global under EP group offsets): decode
+    # has fewer routed rows than that.
+    route_experts = global_num_experts if use_group_offset else num_experts
+    if w1_packed:
+        gmm1_tile_info = _fp4_whole_expert_decode_tiles(
+            gmm1_tile_info, m * topk, route_experts
+        )
+    gmm1_tiling = _dividing_tile_k(_vmem_safe_packed_tile_n(gmm1_tile_info))
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -786,11 +833,14 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    gmm2_tiling = _dividing_tile_k(
-        _vmem_safe_packed_tile_n(
-            _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
-        )
+    gmm2_tile_info = _gmm2_tile_source(
+        gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed
     )
+    if w2_packed:
+        gmm2_tile_info = _fp4_whole_expert_decode_tiles(
+            gmm2_tile_info, m * topk, route_experts
+        )
+    gmm2_tiling = _dividing_tile_k(_vmem_safe_packed_tile_n(gmm2_tile_info))
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,

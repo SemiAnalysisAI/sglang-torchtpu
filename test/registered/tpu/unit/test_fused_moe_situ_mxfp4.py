@@ -101,11 +101,56 @@ class TestFusedMoEMxfp4Situ(CustomTestCase):
         )
 
     def test_packed_mxfp4_bf16_act_matches_dequantized_reference(self):
+        self._check_against_reference()
+
+    def test_decode_whole_expert_tiles_match_dequantized_reference(self):
+        # Fewer routed rows (M * TOPK = 8) than experts (16): every packed
+        # GMM runs one whole-expert rhs tile.
+        self._check_against_reference(num_experts=16, m=2)
+
+    def test_whole_expert_tiles_only_for_dequantized_decode(self):
+        from types import SimpleNamespace
+
+        from sglang_tpu.moe.pallas.fused_moe_op import (
+            _fp4_whole_expert_decode_tiles,
+        )
+        from sglang_tpu.moe.pallas.gmm_v2 import TileSizes
+
+        base = TileSizes(tile_m=128, tile_k=512, tile_n=256)
+        dims = SimpleNamespace(size_k=3584, size_n=1536)
+        lhs = SimpleNamespace(dtype=jnp.dtype(jnp.bfloat16))
+        fp4 = SimpleNamespace(
+            dtype=jnp.dtype(jnp.float4_e2m1fn), dequantize_in_vmem=True
+        )
+        limit = 64 * 2**20
+        decode = _fp4_whole_expert_decode_tiles(base, 16, 896)
+        self.assertEqual(
+            decode(dims, lhs, fp4, limit, "situ"),
+            TileSizes(tile_m=16, tile_k=3584, tile_n=1536),
+        )
+        # Prefill-sized batches, non-dequantized rhs and VMEM overflow keep base.
+        self.assertEqual(
+            _fp4_whole_expert_decode_tiles(base, 1024 * 16, 896)(
+                dims, lhs, fp4, limit, "situ"
+            ),
+            base,
+        )
+        fp8 = SimpleNamespace(
+            dtype=jnp.dtype(jnp.float8_e4m3fn), dequantize_in_vmem=False
+        )
+        self.assertEqual(decode(dims, lhs, fp8, limit, "situ"), base)
+        self.assertEqual(decode(dims, lhs, fp4, 16 * 2**20, "situ"), base)
+
+    def _check_against_reference(self, num_experts=None, m=None):
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
             process_mxfp4_moe_weights_bf16,
             process_mxfp4_moe_weights_native,
         )
 
+        if num_experts is not None:
+            self.E = num_experts
+        if m is not None:
+            self.M = m
         hf = self._hf_mxfp4(seed=0)
         w13, w13_s, _, w2, w2_s, _ = process_mxfp4_moe_weights_native(
             *hf, w13_interleaved=False
