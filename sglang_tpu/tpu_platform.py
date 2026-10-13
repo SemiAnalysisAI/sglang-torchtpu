@@ -970,7 +970,7 @@ class TpuSRTPlatform(SRTPlatform):
         # and retain their device contract.
         if (
             get_flags().capture.enable_torch_compile
-            and batch.spec_algorithm.is_none()
+            and (batch.spec_algorithm.is_none() or _eagle_prefill_can_stage(batch))
             and batch.dllm_config is None
             and not batch.model_config.is_encoder_decoder
             and not getattr(batch.model_config, "use_ngram_embedding", False)
@@ -1256,3 +1256,21 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+
+def _eagle_prefill_can_stage(batch) -> bool:
+    """An EAGLE3 prefill whose host-born inputs can stay on CPU until padding.
+
+    The EAGLE worker rotates the draft's prefill ids on the host and writes its
+    device-produced tail tokens after the upload; spec decode moves the batch
+    back to the device (it consumes device-produced lengths between phases).
+    Multimodal targets rotate their input embeds on the device, so they keep
+    the device contract.
+    """
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    return (
+        batch.spec_algorithm.is_eagle3()
+        and batch.forward_mode == ForwardMode.EXTEND
+        and not getattr(batch.model_config, "is_multimodal", False)
+    )
