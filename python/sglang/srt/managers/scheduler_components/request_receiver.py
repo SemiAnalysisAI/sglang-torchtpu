@@ -88,14 +88,14 @@ class SchedulerRequestReceiver:
         local_reqs are aborts the caller decided on this rank; they ride the
         same broadcast as the pulled requests.
         """
+        if self.heartbeat is not None:
+            self.heartbeat.beat()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
-        if self.heartbeat is not None:
-            self.heartbeat.beat()
                 return []
 
         recv_reqs = self._pull_raw_reqs()
