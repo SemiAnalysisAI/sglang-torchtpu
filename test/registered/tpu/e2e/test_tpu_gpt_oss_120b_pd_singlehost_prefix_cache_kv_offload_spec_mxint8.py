@@ -1,13 +1,13 @@
-"""GPT-OSS-120B P/D multihost MXINT8 KV multi-turn long-context test.
+"""GPT-OSS-120B P/D MXINT8 KV multi-turn long-context test (issue #1066).
 
-Topology: a 2-host prefill engine and a 2-host decode engine (TP16/EP16 each,
-four hosts total) run on separate TPU slices and transfer KV through Raiden.
+Topology: one TP8/EP8 host per engine (1P+1D), transferring KV through Raiden.
 Both engines store target KV as MXINT8 (draft KV stays bf16) and run EAGLE3
 speculative decoding, because the P/D handoff carries the spec bootstrap state.
 Prefix caching and hierarchical KV offload (HiCache, raiden io) run only on the
-prefill engine. Prefill rank 0 launches the prefill engine, waits for decode,
-starts the mini-LB, checks both engines' resolved configuration, and then runs
-three gates through the cluster:
+prefill engine. The shared PDSingleHostTestCase fixture launches the recipe
+(benchmark/tpu/recipe/configs/gpt_oss_120b/pd_singlehost_mxint8_multiturn.py):
+the decode pod serves, and the prefill pod starts its engine and the mini-LB,
+checks both engines' resolved configuration and runs three gates:
 
 1. GSM8K with a speculative accept-length floor. It runs first because the
    decode's reported accept length is cumulative since boot.
@@ -20,24 +20,19 @@ three gates through the cluster:
    bootstrap, retry and retraction errors, and each session recalling a secret
    planted in its first turn. TTFT and P->D transfer time are recorded per turn.
 
-The launch helpers are copied from
-test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py, as the other
-multihost P/D tests do.
-
 MXINT8 needs a backend extension: in-tree,
 KVCacheConfigurator._validate_mxint8 rejects it, so with the default dtype both
 engines fail at startup until the TPU image ships that extension. Setting
 PD_KV_CACHE_DTYPE=bfloat16 runs the same harness on bf16 KV, which validates
-everything except the MXINT8 numerics.
+everything except the MXINT8 numerics; the external nightly does that until the
+extension ships.
 """
 
 import argparse
-import enum
 import json
 import math
 import os
 import re
-import signal
 import socket
 import subprocess
 import sys
@@ -61,7 +56,6 @@ SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
     from sglang.test.test_utils import dump_metric
-    from sglang.test.tpu import model_config_main
     from sglang.test.tpu.utils.kv_offload_probe import (
         mean_accept_length,
         plan_eviction,
@@ -71,33 +65,36 @@ try:
         synthetic_prompt,
         validate_probe,
     )
+    from sglang.test.tpu.utils.pd_singlehost_base import (
+        PDSingleHostTestCase,
+        peer_hostname,
+    )
 except ModuleNotFoundError as exc:
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
         return None
 
-    def model_config_main(*_args, **_kwargs):
-        return None
-
     dump_metric = None
     mean_accept_length = plan_eviction = probe_prompt = run_probe = None
-    spec_failures = synthetic_prompt = validate_probe = None
+    spec_failures = synthetic_prompt = validate_probe = peer_hostname = None
+    PDSingleHostTestCase = unittest.TestCase
 
 
-# Not nightly-registered yet: the job is opt-in (`only:` choice and combo) until
-# the TPU image ships the MXINT8 backend extension. Then set nightly=True and add
-# the job to a scheduled selection.
+# The external nightly runs this with PD_KV_CACHE_DTYPE=bfloat16
+# (.github/tpu-ci/external/external-topology.yaml) until the TPU image ships the
+# MXINT8 backend extension; then drop that override.
 register_tpu_ci(
-    est_time=10800,
+    est_time=5400,
     suite="tpu-integration",
+    nightly=True,
     labels=[
-        "multihost",
+        "singlehost",
         "gpt-oss-120b",
         "pd",
+        "spec",
         "prefix-cache",
         "kv-offload",
-        "spec",
         "mxint8",
         "long-context",
         "multi-turn",
@@ -107,30 +104,27 @@ register_tpu_ci(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))
 BENCH = os.path.join(REPO, "benchmark", "tpu")
+LAUNCH_CONFIG_MODULE = "recipe/configs/gpt_oss_120b/pd_singlehost_mxint8_multiturn.py"
 
 E = os.environ.get
 
 PREFILL_PORT = int(E("PREFILL_PORT", "30000"))
 DECODE_PORT = int(E("DECODE_PORT", "30000"))
-LB_PORT = int(E("LB_PORT", "8000"))
-BOOTSTRAP_PORT = int(E("BOOTSTRAP_PORT", "8998"))
-WAIT_SECS = int(E("WAIT_SECS", "3600"))
-KEEP_UP = E("KEEP_UP", "0") == "1"
+WAIT_SECS = int(E("WAIT_SECS", "5400"))
 PYTHON = E("PYTHON", "python3")
+RENDER_JOBSET = os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py")
 
+PREFILL_ROLE = "prefill"
+DECODE_ROLE = "decode"
+SELF_HOST_ENV = "PD_SELF_HOST"
+DECODE_HOST_ENV = "PD_DECODE_HOST"
+LOCAL_HOST = "127.0.0.1"
 
-class Role(str, enum.Enum):
-    """Execution roles in the P/D cluster."""
+RUN_NAME = "pd-sh-gpt-120b-mxint8-mt"
+PREFILL_LOG = "/tmp/pd_mxint8_multiturn_prefill.log"
+DECODE_LOG = "/tmp/pd_mxint8_multiturn_decode.log"
 
-    PREFILL = "prefill"
-    DECODE = "decode"
-
-
-PREFILL_LOG = "/tmp/pd_prefill.log"
-DECODE_LOG = "/tmp/pd_decode.log"
-LB_LOG = "/tmp/pd_lb.log"
-
-TEST_NAME = "gpt-oss-120b-pd-multihost-mxint8-multiturn"
+TEST_NAME = "gpt-oss-120b-pd-singlehost-mxint8-multiturn"
 SERVED_MODEL_NAME = "gpt-oss-120b"
 DEFAULT_MODEL_PATH = "/weights/gpt-oss-120b"
 HF_REPO_ID = "openai/gpt-oss-120b"
@@ -138,6 +132,11 @@ MODEL_ENV = "GPT_OSS_MODEL"
 DRAFT_MODEL_ENV = "GPT_OSS_DRAFT_MODEL"
 DEFAULT_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 
+# One tpu7x host per engine: 4 chips x 2 TensorCores.
+TP_SIZE = 8
+EP_SIZE = 8
+# The values below are set in the launch recipe; the test reads them back from
+# each engine's /server_info and sizes its probes against them.
 # MXINT8 KV needs a power-of-two page of at least 128 tokens, and P/D needs the
 # same page size (and KV dtype) on both engines.
 PAGE_SIZE = 128
@@ -166,31 +165,10 @@ DRAFT_KV_CACHE_DTYPE = "bfloat16"
 MAX_TOTAL_TOKENS = 245760
 # A host pool of 3x the device pool (~737k tokens) holds every session's
 # prefix (~369k tokens), and the offload probe plus its fillers (~504k tokens).
-HICACHE_RATIO = "3"
+HICACHE_RATIO = 3
 HICACHE_WRITE_POLICY = "write_through"
-# EAGLE3 loads the target + draft model and captures verify/draft graphs on top,
-# so give it the same headroom as the passing single-host P/D spec gate.
-MEM_FRACTION_PREFILL = "0.6"
-MEM_FRACTION_DECODE = "0.6"
-QUANTIZATION = ""
-MAX_RUNNING_REQUESTS = 16
 DISAGG_TRANSFER_BACKEND = "raiden"
-EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
-# Bound the compile grid + allow spec recompiles: the unbounded bs<=max_running
-# verify-graph capture spikes host RAM and OOM-kills the decode. RESHARD off:
-# symmetric prefill/decode TP needs no strided reshard.
-EXTRA_LAUNCH_ENV: Dict[str, str] = {
-    "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
-    "TPU_COMPILE_BS": "1 2 4 16",
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "SGLANG_RAIDEN_RESHARD": "0",
-}
-
-# EAGLE3 speculative decoding, shared by both engines: the P/D handoff carries
-# the spec bootstrap state, so the prefill loads the draft model too.
-SPEC_NUM_STEPS = 3
-SPEC_EAGLE_TOPK = 1
-SPEC_NUM_DRAFT_TOKENS = 4
+RETRACTION_BACKUP = "cpu_tensor"
 
 # The single-host GPT-OSS EAGLE3 gate measured about 0.785 over 200 examples.
 # A 0.75 baseline with the default 0.03 tolerance enforces a 0.72 score floor.
@@ -198,16 +176,15 @@ SPEC_NUM_DRAFT_TOKENS = 4
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B_SPEC", "0.75"))
 ATOL = float(E("GSM8K_ATOL", "0.03"))
 NUM_EXAMPLES = int(E("GSM8K_NUM_EXAMPLES", "200"))
-# Match client concurrency to MAX_RUNNING_REQUESTS and the largest
+# Match client concurrency to the recipe's max_running_requests and the largest
 # compiled batch.
 NUM_THREADS = int(E("GSM8K_NUM_THREADS", "16"))
 MAX_TOKENS = int(E("GSM8K_MAX_TOKENS", "1024"))
 SPEC_ACCEPT_LENGTH_THRESHOLD = float(E("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90"))
-HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "3600"))
+HEALTH_TIMEOUT = float(E("HEALTH_TIMEOUT", "5400"))
 
 # Defaults of the env-tunable probe and multi-turn knobs. The CPU tests check
-# these, not the knobs: model_config_main also runs them in integration mode,
-# under whatever overrides the job sets.
+# these, not the knobs, so an operator's overrides cannot fail them.
 DEFAULT_OFFLOAD_PROBE_TOKENS = 126000
 DEFAULT_MT_SESSIONS = 3
 DEFAULT_MT_TURNS = 15
@@ -249,321 +226,37 @@ def resolve_kv_cache_dtype(env: Optional[Mapping[str, str]] = None) -> str:
     return dtype
 
 
-def resolve_draft_model_path(env: Optional[Mapping[str, str]] = None) -> str:
-    values = os.environ if env is None else env
-    return values.get(DRAFT_MODEL_ENV) or DEFAULT_DRAFT_MODEL_PATH
-
-
-def _spec_server_args(env: Optional[Mapping[str, str]] = None) -> List[str]:
-    return [
-        "--speculative-algorithm",
-        "EAGLE3",
-        "--speculative-draft-model-path",
-        resolve_draft_model_path(env),
-        "--speculative-num-steps",
-        str(SPEC_NUM_STEPS),
-        "--speculative-eagle-topk",
-        str(SPEC_EAGLE_TOPK),
-        "--speculative-num-draft-tokens",
-        str(SPEC_NUM_DRAFT_TOKENS),
-        "--speculative-draft-kv-cache-dtype",
-        DRAFT_KV_CACHE_DTYPE,
-        "--watchdog-timeout",
-        "7200",
-    ]
-
-
-class PodTopology:
-    """Topology parsed from slice-local environment."""
-
-    def __init__(
-        self,
-        role: str,
-        group_rank: int,
-        group_hosts: int,
-        group_hostnames: Tuple[str, ...],
-    ) -> None:
-        self.role = role
-        self.group_rank = group_rank
-        self.group_hosts = group_hosts
-        self.group_hostnames = group_hostnames
-
-    @property
-    def is_prefill_leader(self) -> bool:
-        return self.role == Role.PREFILL.value and self.group_rank == 0
-
-    @classmethod
-    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "PodTopology":
-        values = os.environ if env is None else env
-        role = values.get("CI_PD_ROLE", "")
-        valid_roles = {r.value for r in Role}
-        if role not in valid_roles:
-            raise ValueError(f"CI_PD_ROLE must be one of {valid_roles}, got {role!r}")
-        hostnames = tuple(
-            h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
-        )
-        if not hostnames:
-            hostnames = (socket.gethostname(),)
-        return cls(
-            role=role,
-            group_rank=int(values.get("TPU_WORKER_ID", "0")),
-            group_hosts=len(hostnames),
-            group_hostnames=hostnames,
-        )
-
-
-def get_role(topology: PodTopology) -> Role:
-    """Resolve strongly-typed Role from pod topology."""
-    return Role(topology.role)
-
-
-def peer_group_hostname(hostname: str, from_role: str, to_role: str) -> str:
-    """Map a pod hostname of one replicated job onto its peer job pod."""
-    needle, replacement = f"-{from_role}-", f"-{to_role}-"
-    if needle not in hostname:
-        raise ValueError(f"hostname {hostname!r} has no {needle!r} segment")
-    return hostname.replace(needle, replacement)
-
-
 def resolve_model_path(env: Optional[Mapping[str, str]] = None) -> str:
-    """Resolve model path from environment or default constant."""
     values = os.environ if env is None else env
     return values.get(MODEL_ENV) or values.get("MODEL") or DEFAULT_MODEL_PATH
 
 
-def validate_model_source(model_path: str) -> None:
-    """Validate model checkpoint directory exists when path is local."""
+def resolve_draft_model_path(env: Optional[Mapping[str, str]] = None) -> str:
+    values = os.environ if env is None else env
+    return (
+        values.get(DRAFT_MODEL_ENV)
+        or values.get("DRAFT_MODEL")
+        or DEFAULT_DRAFT_MODEL_PATH
+    )
+
+
+def validate_model_source(model_path: str, *, label: str) -> None:
+    """Fail clearly for a missing mounted checkpoint; HF ids resolve remotely."""
     if not os.path.isabs(model_path):
         return
     if not os.path.isfile(os.path.join(model_path, "config.json")):
         raise FileNotFoundError(
-            f"GPT-OSS-120B checkpoint incomplete or missing at {model_path}; "
-            f"provision it on the weights volume or set {MODEL_ENV}"
+            f"{label} checkpoint incomplete or missing at {model_path}; provision "
+            f"it or set {MODEL_ENV if label == 'target' else DRAFT_MODEL_ENV}"
         )
 
 
-def _common_launch_env(
-    group_hosts: int, env: Optional[Mapping[str, str]] = None
-) -> Dict[str, str]:
+def self_hostname(env: Optional[Mapping[str, str]] = None) -> str:
     values = os.environ if env is None else env
-    tp_size = int(values.get("TP_SIZE", str(8 * group_hosts)))
-    return {
-        "MODEL": resolve_model_path(values),
-        "TP_SIZE": str(tp_size),
-        "EP_SIZE": values.get("EP_SIZE", str(tp_size)),
-        "PAGE_SIZE": str(PAGE_SIZE),
-        "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-        "QUANTIZATION": QUANTIZATION,
-        "KV_CACHE_DTYPE": resolve_kv_cache_dtype(values),
-        # Keep radix caching available to the prefill engine, where shared
-        # prefixes are matched. The decode engine's disaggregation setting still
-        # leaves its own radix cache off, avoiding the spec-incompatible path.
-        "DISABLE_RADIX_CACHE": "0",
-        # The multi-turn gate reads P->D transfer timing and the P/D failure
-        # counters from both engines' /metrics.
-        "ENABLE_METRICS": "1",
-        "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
-        "CONTEXT_LEN": str(CONTEXT_LEN),
-        "CHUNKED_PREFILL_SIZE": values.get("CHUNKED_PREFILL_SIZE", "4096"),
-        "MAX_PREFILL_TOKENS": values.get("MAX_PREFILL_TOKENS", "4096"),
-        "MAX_RUNNING": values.get("MAX_RUNNING", str(MAX_RUNNING_REQUESTS)),
-        "TORCH_COMPILE_MAX_BS": values.get(
-            "TORCH_COMPILE_MAX_BS", str(MAX_RUNNING_REQUESTS)
-        ),
-        "PYTHON": PYTHON,
-        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
-        **EXTRA_LAUNCH_ENV,
-    }
-
-
-def build_prefill_env(
-    group_hosts: int, env: Optional[Mapping[str, str]] = None
-) -> Dict[str, str]:
-    """Construct environment dictionary for prefill engine."""
-    values = os.environ if env is None else env
-    extra_args = [
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        *EXTRA_SERVER_ARGS,
-        "--enable-hierarchical-cache",
-        "--hicache-ratio",
-        HICACHE_RATIO,
-        "--hicache-io-backend",
-        "raiden",
-        "--hicache-mem-layout",
-        "page_first_fused",
-        "--hicache-write-policy",
-        HICACHE_WRITE_POLICY,
-        "--enable-cache-report",
-        "--disaggregation-transfer-backend",
-        DISAGG_TRANSFER_BACKEND,
-        "--skip-server-warmup",
-        "--sampling-backend",
-        "pytorch",
-        *_spec_server_args(values),
-        "--max-total-tokens",
-        str(MAX_TOTAL_TOKENS),
-    ]
-    if values.get("EXTRA_PREFILL_ARGS"):
-        extra_args.append(values["EXTRA_PREFILL_ARGS"])
-
-    return {
-        **_common_launch_env(group_hosts, values),
-        "MEM_FRACTION_STATIC": values.get("MEM_FRACTION_STATIC", MEM_FRACTION_PREFILL),
-        "PORT": str(PREFILL_PORT),
-        "BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
-
-
-def build_decode_env(
-    group_hosts: int, env: Optional[Mapping[str, str]] = None
-) -> Dict[str, str]:
-    """Construct environment dictionary for decode engine."""
-    values = os.environ if env is None else env
-    extra_args = [
-        "--served-model-name",
-        SERVED_MODEL_NAME,
-        "--max-total-tokens",
-        str(MAX_TOTAL_TOKENS),
-        *EXTRA_SERVER_ARGS,
-        "--disaggregation-transfer-backend",
-        DISAGG_TRANSFER_BACKEND,
-        # No raiden hicache retraction backup here: the single-host P/D EAGLE3
-        # gate omits it (spec draft KV is not offloaded), so keep the decode
-        # engine's memory profile matched to what is validated with spec.
-        "--skip-server-warmup",
-        "--sampling-backend",
-        "pytorch",
-        *_spec_server_args(values),
-    ]
-    if values.get("EXTRA_DECODE_ARGS"):
-        extra_args.append(values["EXTRA_DECODE_ARGS"])
-
-    return {
-        **_common_launch_env(group_hosts, values),
-        "MEM_FRACTION_STATIC": values.get("MEM_FRACTION_STATIC", MEM_FRACTION_DECODE),
-        "PORT": str(DECODE_PORT),
-        "EXTRA_ARGS": " ".join(extra_args).strip(),
-    }
-
-
-def _tee_command(argv: Tuple[str, ...], log_path: str) -> Tuple[str, ...]:
-    quoted = " ".join(f"'{a}'" for a in argv)
-    return ("bash", "-c", f"set -o pipefail; {quoted} 2>&1 | tee -a '{log_path}'")
-
-
-def _launch(
-    cmd: Tuple[str, ...],
-    log_path: str,
-    extra_env: Optional[Dict[str, str]] = None,
-    cwd: Optional[str] = None,
-) -> subprocess.Popen:
-    env = dict(os.environ)
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.Popen(
-        _tee_command(cmd, log_path=log_path),
-        env=env,
-        start_new_session=True,
-        cwd=cwd,
-    )
-
-
-def execute_prefill(
-    worker_id: int = 0,
-    group_hosts: int = 2,
-    env: Optional[Mapping[str, str]] = None,
-    log_path: str = PREFILL_LOG,
-) -> subprocess.Popen:
-    """Launch prefill engine on specified worker rank."""
-    launch_env = build_prefill_env(group_hosts, env)
-    launch_env["NODE_RANK"] = str(worker_id)
-    launch_env["TPU_WORKER_ID"] = str(worker_id)
-    return _launch(
-        ("bash", os.path.join(BENCH, "launch_prefill.sh")),
-        log_path=log_path,
-        extra_env=launch_env,
-        cwd=BENCH,
-    )
-
-
-def execute_decode(
-    worker_id: int = 0,
-    group_hosts: int = 2,
-    env: Optional[Mapping[str, str]] = None,
-    log_path: str = DECODE_LOG,
-) -> subprocess.Popen:
-    """Launch decode engine on specified worker rank."""
-    launch_env = build_decode_env(group_hosts, env)
-    launch_env["NODE_RANK"] = str(worker_id)
-    launch_env["TPU_WORKER_ID"] = str(worker_id)
-    return _launch(
-        ("bash", os.path.join(BENCH, "launch_decode.sh")),
-        log_path=log_path,
-        extra_env=launch_env,
-        cwd=BENCH,
-    )
-
-
-def execute_router(
-    prefill_host: str,
-    decode_host: str,
-    port: int = LB_PORT,
-    prefill_port: int = PREFILL_PORT,
-    decode_port: int = DECODE_PORT,
-    log_path: str = LB_LOG,
-) -> subprocess.Popen:
-    """Launch mini-LB router connecting prefill and decode engines."""
-    cmd = (
-        PYTHON,
-        "-m",
-        "sglang_router.launch_router",
-        "--pd-disaggregation",
-        "--mini-lb",
-        "--prefill",
-        f"http://{prefill_host}:{prefill_port}",
-        "--decode",
-        f"http://{decode_host}:{decode_port}",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
-    )
-    return _launch(cmd, log_path=log_path)
-
-
-def _kill(proc: Optional[subprocess.Popen]) -> None:
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
-def _http_ok(url: str, timeout: int = 5) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return 200 <= r.status < 300
-    except (urllib.error.URLError, TimeoutError, OSError, ConnectionError):
-        return False
-
-
-def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
-    deadline = time.time() + secs
-    while time.time() < deadline:
-        for p in procs:
-            if p is not None and p.poll() is not None:
-                raise RuntimeError(f"process for {url} exited rc={p.returncode}")
-        if _http_ok(url):
-            return
-        time.sleep(10)
-    raise TimeoutError(f"{url} not ready after {secs}s")
+    if values.get(SELF_HOST_ENV):
+        return values[SELF_HOST_ENV]
+    hostnames = [h for h in values.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
+    return hostnames[0] if hostnames else socket.gethostname()
 
 
 def startup_failure_hint(log_path: str, kv_cache_dtype: str) -> Optional[str]:
@@ -799,9 +492,9 @@ def _normalize_dtype(value: Any) -> str:
 def engine_configuration_failures(
     prefill_info: Mapping[str, Any],
     decode_info: Mapping[str, Any],
-    launch_env: Mapping[str, str],
+    kv_cache_dtype: str,
 ) -> List[str]:
-    """Compare both engines' resolved /server_info with what this test launched.
+    """Compare both engines' resolved /server_info with what the recipe sets.
 
     A silently ignored or overridden flag would leave a gate passing on a
     configuration it was not written for, so check the settings it relies on.
@@ -809,21 +502,20 @@ def engine_configuration_failures(
     failures: List[str] = []
     shared = {
         "disaggregation_transfer_backend": DISAGG_TRANSFER_BACKEND,
-        "tp_size": int(launch_env["TP_SIZE"]),
-        "ep_size": int(launch_env["EP_SIZE"]),
+        "tp_size": TP_SIZE,
+        "ep_size": EP_SIZE,
         "page_size": PAGE_SIZE,
         "context_length": CONTEXT_LEN,
         "enable_metrics": True,
     }
-    for role, info in (("prefill", prefill_info), ("decode", decode_info)):
+    for role, info in ((PREFILL_ROLE, prefill_info), (DECODE_ROLE, decode_info)):
         for key, want in {**shared, "disaggregation_mode": role}.items():
             if info.get(key) != want:
                 failures.append(f"{role}: {key}={info.get(key)!r}, expected {want!r}")
         kv_dtype = _normalize_dtype(info.get("kv_cache_dtype"))
-        if kv_dtype != launch_env["KV_CACHE_DTYPE"]:
+        if kv_dtype != kv_cache_dtype:
             failures.append(
-                f"{role}: kv_cache_dtype={kv_dtype!r}, expected "
-                f"{launch_env['KV_CACHE_DTYPE']!r}"
+                f"{role}: kv_cache_dtype={kv_dtype!r}, expected {kv_cache_dtype!r}"
             )
         draft_dtype = _normalize_dtype(info.get("speculative_draft_kv_cache_dtype"))
         if draft_dtype != DRAFT_KV_CACHE_DTYPE:
@@ -871,18 +563,18 @@ def engine_configuration_failures(
 
 
 def check_engine_configuration(
-    prefill_url: str, decode_url: str, launch_env: Mapping[str, str]
+    prefill_url: str, decode_url: str, kv_cache_dtype: str
 ) -> None:
     prefill_info = _http_json(f"{prefill_url}/server_info")
     decode_info = _http_json(f"{decode_url}/server_info")
-    failures = engine_configuration_failures(prefill_info, decode_info, launch_env)
+    failures = engine_configuration_failures(prefill_info, decode_info, kv_cache_dtype)
     if failures:
         raise RuntimeError(
-            "engine configuration differs from the test's launch settings:\n  "
+            "engine configuration differs from the launch recipe:\n  "
             + "\n  ".join(failures)
         )
     print(
-        f"[{TEST_NAME}] engines verified: {launch_env['KV_CACHE_DTYPE']} target KV, "
+        f"[{TEST_NAME}] engines verified: {kv_cache_dtype} target KV, "
         f"{DRAFT_KV_CACHE_DTYPE} draft KV, page {PAGE_SIZE}, context {CONTEXT_LEN}, "
         f"device pools {prefill_info['max_total_num_tokens']} (prefill) / "
         f"{decode_info['max_total_num_tokens']} (decode) tokens",
@@ -1572,14 +1264,9 @@ def build_model_config(
         "model": SERVED_MODEL_NAME,
         "test_name": TEST_NAME,
         "variant": (
-            f"PD-2host-TP16+EP16-raiden+EAGLE3+prefixcache+kvoffload+{kv_cache_dtype}KV"
+            f"PD-1P1D-TP8+EP8-raiden+EAGLE3+prefixcache+kvoffload+{kv_cache_dtype}KV"
             "+128k-multiturn"
         ),
-        "launch": {
-            "external": True,
-            "health_timeout": HEALTH_TIMEOUT,
-            "tag": "gpt-oss-120b-pd-mxint8-multiturn-e2e",
-        },
         "gates": [
             {
                 "dataset": "gsm8k",
@@ -1608,111 +1295,141 @@ def build_model_config(
     }
 
 
-def _serve_worker(topology: PodTopology, role: Role) -> int:
-    """Serve prefill or decode worker shard until termination."""
-    if role == Role.DECODE:
-        proc = execute_decode(
-            worker_id=topology.group_rank, group_hosts=topology.group_hosts
+class TestPdSingleHostMxint8MultiTurnGptOss120bIntegration(PDSingleHostTestCase):
+    """Configure the shared P/D fixture for this test's recipe and gates."""
+
+    config_module = LAUNCH_CONFIG_MODULE
+    repo_root = REPO
+    cwd = BENCH
+    log_path = PREFILL_LOG
+    decode_log_path = DECODE_LOG
+    self_hostname = staticmethod(self_hostname)
+    decode_host_env = DECODE_HOST_ENV
+    tag = "pd-singlehost-mxint8-multiturn"
+    health_timeout = 2 * WAIT_SECS + 300
+    health_generate_timeout = HEALTH_TIMEOUT
+
+    @classmethod
+    def _urls(cls) -> Tuple[str, str]:
+        return (
+            f"http://{LOCAL_HOST}:{PREFILL_PORT}",
+            f"http://{cls.decode_hostname()}:{DECODE_PORT}",
         )
-    else:
-        proc = execute_prefill(
-            worker_id=topology.group_rank, group_hosts=topology.group_hosts
-        )
 
-    try:
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                return rc
-            time.sleep(10)
-    finally:
-        _kill(proc)
+    @classmethod
+    def build_model_config(cls) -> Dict[str, Any]:
+        return build_model_config(*cls._urls())
 
+    @classmethod
+    def check_server_configuration(cls) -> None:
+        check_engine_configuration(*cls._urls(), resolve_kv_cache_dtype())
 
-def _serve_prefill_leader(topology: PodTopology) -> int:
-    """Serve prefill, start the mini-LB, check the engines, then run the gates."""
-    # Run the router on the prefill leader to avoid requesting another pod.
-    procs = []
-    self_host = topology.group_hostnames[0]
-    decode_host = peer_group_hostname(
-        self_host, from_role=Role.PREFILL.value, to_role=Role.DECODE.value
-    )
-    prefill_url = f"http://127.0.0.1:{PREFILL_PORT}"
-    decode_url = f"http://{decode_host}:{DECODE_PORT}"
-    launch_env = _common_launch_env(topology.group_hosts)
-
-    try:
-        procs.append(execute_prefill(worker_id=0, group_hosts=topology.group_hosts))
+    @classmethod
+    def setUpClass(cls) -> None:
+        validate_model_source(resolve_model_path(), label="target")
+        validate_model_source(resolve_draft_model_path(), label="draft")
         try:
-            _wait_http_200(f"{prefill_url}/health", WAIT_SECS, tuple(procs))
-        except RuntimeError:
-            hint = startup_failure_hint(PREFILL_LOG, launch_env["KV_CACHE_DTYPE"])
+            super().setUpClass()
+        except BaseException:
+            log = PREFILL_LOG if os.environ.get("CI_PD_ROLE") == PREFILL_ROLE else None
+            hint = log and startup_failure_hint(log, resolve_kv_cache_dtype())
             if hint:
                 print(f"[{TEST_NAME}] {hint}", flush=True)
             raise
-        _wait_http_200(f"{decode_url}/health", WAIT_SECS)
 
-        procs.append(
-            execute_router(
-                prefill_host=self_host,
-                decode_host=decode_host,
-                port=LB_PORT,
-                prefill_port=PREFILL_PORT,
-                decode_port=DECODE_PORT,
-            )
-        )
-        _wait_http_200(f"http://127.0.0.1:{LB_PORT}/health", 300, tuple(procs))
-
-        check_engine_configuration(prefill_url, decode_url, launch_env)
-        model_config_main(
-            build_model_config(prefill_url=prefill_url, decode_url=decode_url),
-            base_url=f"http://127.0.0.1:{LB_PORT}",
-        )
-        return 0
-    finally:
-        if not KEEP_UP:
-            for p in procs:
-                _kill(p)
+    def test_accuracy(self) -> None:
+        self.run_evaluations()
 
 
-def serve_role(topology: PodTopology, role: Role) -> int:
-    """Dispatch and execute service behavior according to role and rank."""
-    # model_config_main invokes unittest, so remove the CLI mode first.
-    sys.argv = [sys.argv[0]]
-    if topology.is_prefill_leader:
-        return _serve_prefill_leader(topology)
-    return _serve_worker(topology, role)
+def render_jobset_yaml(
+    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
+    lane: str = "nightly",
+    weights_pvc: str = "model-weights",
+    run_name: str = RUN_NAME,
+) -> str:
+    """Render one full prefill host plus one full decode host."""
+    rel_path = os.path.relpath(__file__, REPO)
+    cmd = [
+        PYTHON,
+        RENDER_JOBSET,
+        "--pd-prefill-hosts",
+        "1",
+        "--pd-decode-hosts",
+        "1",
+        "--lane",
+        lane,
+        "--image",
+        image,
+        "--weights-pvc",
+        weights_pvc,
+        "--name",
+        run_name,
+        "--files",
+        rel_path,
+        "--exec",
+        f"python3 {rel_path} integration",
+    ]
+    return subprocess.check_output(cmd, text=True)
 
 
-class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
+def launch_plan(role: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """The launcher's dry-run plan for one engine of the recipe, without a TPU."""
+    child_env = {
+        k: v
+        for k, v in os.environ.items()
+        # Operator overrides the recipe reads; the CPU checks pin its defaults.
+        if k
+        not in (KV_CACHE_DTYPE_ENV, MODEL_ENV, "MODEL", DRAFT_MODEL_ENV, "DRAFT_MODEL")
+    }
+    child_env.update(env or {})
+    output = subprocess.check_output(
+        [
+            sys.executable,
+            "-m",
+            "benchmark.tpu.launch_server",
+            "--config",
+            f"{LAUNCH_CONFIG_MODULE}:{role.upper()}_CONFIG",
+            "--runtime-envs",
+            json.dumps({"FORCE_SINGLE_HOST": "1", "SGLANG_HOST_IP": LOCAL_HOST}),
+            "--dry-run",
+        ],
+        cwd=REPO,
+        env=child_env,
+        text=True,
+    )
+    return json.loads(output)
+
+
+class TestPdSingleHostMxint8MultiTurnGptOss120bConfiguration(unittest.TestCase):
     """Host-side configuration and gate-logic tests runnable without TPU hardware."""
 
     PLAN = MultiTurnPlan(sessions=2, turns=3, user_tokens=8128, output_tokens=64)
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plans = {role: launch_plan(role) for role in (PREFILL_ROLE, DECODE_ROLE)}
+
     def test_both_engines_share_the_launch_contract(self) -> None:
-        for env_fn in (build_prefill_env, build_decode_env):
-            env = env_fn(2, env={})
-            args = env["EXTRA_ARGS"]
-            self.assertIn("--disaggregation-transfer-backend raiden", args)
-            self.assertIn("--skip-server-warmup", args)
-            self.assertIn("--sampling-backend pytorch", args)
-            self.assertIn("--reasoning-parser gpt-oss", args)
-            self.assertIn(f"--max-total-tokens {MAX_TOTAL_TOKENS}", args)
-            self.assertEqual(env["TP_SIZE"], "16")
-            self.assertEqual(env["EP_SIZE"], "16")
-            self.assertEqual(env["PAGE_SIZE"], "128")
-            self.assertEqual(env["CONTEXT_LEN"], "131072")
-            self.assertEqual(env["KV_CACHE_DTYPE"], "mxint8")
-            self.assertEqual(env["QUANTIZATION"], "")
-            self.assertEqual(env["ENABLE_METRICS"], "1")
-            self.assertEqual(env["DISABLE_RADIX_CACHE"], "0")
-            self.assertEqual(env["TPU_COMPILE_BS"], "1 2 4 16")
-            self.assertEqual(env["SGLANG_TPU_FUSED_MOE_SC_GATHER"], "0")
+        for role, plan in self.plans.items():
+            with self.subTest(role):
+                args = plan["server_args"]
+                self.assertEqual(args["disaggregation_mode"], role)
+                self.assertEqual(args["disaggregation_transfer_backend"], "raiden")
+                self.assertEqual(args["tp_size"], TP_SIZE)
+                self.assertEqual(args["ep_size"], EP_SIZE)
+                self.assertEqual(args["page_size"], PAGE_SIZE)
+                self.assertEqual(args["context_length"], CONTEXT_LEN)
+                self.assertEqual(args["max_total_tokens"], MAX_TOTAL_TOKENS)
+                self.assertEqual(args["kv_cache_dtype"], "mxint8")
+                self.assertIsNone(args["quantization"])
+                self.assertTrue(args["enable_metrics"])
+                self.assertTrue(args["skip_server_warmup"])
+                self.assertEqual(args["reasoning_parser"], "gpt-oss")
+                self.assertEqual(args["tpu_compile_bs"], [1, 2, 4, 16])
 
     def test_kv_cache_dtype_override(self) -> None:
-        override = {KV_CACHE_DTYPE_ENV: "bfloat16"}
-        for env_fn in (build_prefill_env, build_decode_env):
-            self.assertEqual(env_fn(2, env=override)["KV_CACHE_DTYPE"], "bfloat16")
+        bf16 = launch_plan(PREFILL_ROLE, env={KV_CACHE_DTYPE_ENV: "bfloat16"})
+        self.assertEqual(bf16["server_args"]["kv_cache_dtype"], "bfloat16")
         self.assertEqual(resolve_kv_cache_dtype({KV_CACHE_DTYPE_ENV: ""}), "mxint8")
         for rejected in ("fp8_e4m3", "bf16", "auto"):
             with self.subTest(rejected=rejected):
@@ -1721,86 +1438,60 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
 
     def test_both_engines_run_eagle3_with_bf16_draft_kv(self) -> None:
         # The P/D handoff carries spec bootstrap state, so BOTH engines run spec.
-        for env_fn in (build_prefill_env, build_decode_env):
-            args = env_fn(2, env={})["EXTRA_ARGS"]
-            self.assertIn("--speculative-algorithm EAGLE3", args)
-            self.assertIn(
-                "--speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16", args
+        for plan in self.plans.values():
+            args = plan["server_args"]
+            self.assertEqual(args["speculative_algorithm"], "EAGLE3")
+            self.assertEqual(
+                args["speculative_draft_model_path"], DEFAULT_DRAFT_MODEL_PATH
             )
-            self.assertIn("--speculative-eagle-topk 1", args)
-            self.assertIn("--speculative-draft-kv-cache-dtype bfloat16", args)
+            self.assertEqual(args["speculative_eagle_topk"], 1)
+            self.assertEqual(args["speculative_draft_kv_cache_dtype"], "bfloat16")
 
     def test_hierarchical_cache_runs_only_on_prefill(self) -> None:
-        prefill_args = build_prefill_env(2, env={})["EXTRA_ARGS"]
-        self.assertIn("--enable-hierarchical-cache", prefill_args)
-        self.assertIn("--hicache-ratio 3", prefill_args)
-        self.assertIn("--hicache-io-backend raiden", prefill_args)
-        self.assertIn("--hicache-mem-layout page_first_fused", prefill_args)
-        self.assertIn("--hicache-write-policy write_through", prefill_args)
-        self.assertIn("--enable-cache-report", prefill_args)
-        decode_args = build_decode_env(2, env={})["EXTRA_ARGS"]
-        self.assertNotIn("hicache", decode_args)
-        self.assertNotIn("--disaggregation-decode-enable-radix-cache", decode_args)
-
-    def test_raiden_port_does_not_collide_with_service_ports(self) -> None:
-        for env_fn in (build_prefill_env, build_decode_env):
-            env = env_fn(2, env={})
-            raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
-            for port in (PREFILL_PORT, DECODE_PORT, LB_PORT, BOOTSTRAP_PORT):
-                self.assertNotIn(port, range(raiden_base, raiden_base + 4 * 16))
+        prefill = self.plans[PREFILL_ROLE]["server_args"]
+        self.assertFalse(prefill["disable_radix_cache"])
+        self.assertTrue(prefill["enable_hierarchical_cache"])
+        self.assertEqual(prefill["hicache_ratio"], HICACHE_RATIO)
+        self.assertEqual(prefill["hicache_io_backend"], "raiden")
+        self.assertEqual(prefill["hicache_mem_layout"], "page_first_fused")
+        self.assertEqual(prefill["hicache_write_policy"], HICACHE_WRITE_POLICY)
+        self.assertTrue(prefill["enable_cache_report"])
+        decode = self.plans[DECODE_ROLE]["server_args"]
+        self.assertFalse(any(key.startswith("hicache") for key in decode))
+        self.assertFalse(decode.get("enable_hierarchical_cache"))
+        self.assertFalse(decode.get("disaggregation_decode_enable_radix_cache"))
+        self.assertEqual(
+            decode["disaggregation_decode_retraction_backup"], RETRACTION_BACKUP
+        )
 
     def test_peer_hostname_maps_prefill_to_decode(self) -> None:
+        prefill = f"tpu-ci-{RUN_NAME}-prefill-0-0"
         self.assertEqual(
-            peer_group_hostname(
-                "tpu-ci-pd-mh-gpt-120b-mxint8-mt-prefill-0-0",
-                from_role=Role.PREFILL.value,
-                to_role=Role.DECODE.value,
-            ),
-            "tpu-ci-pd-mh-gpt-120b-mxint8-mt-decode-0-0",
+            peer_hostname(prefill, from_role=PREFILL_ROLE, to_role=DECODE_ROLE),
+            f"tpu-ci-{RUN_NAME}-decode-0-0",
         )
-
-    def test_get_role_resolution(self) -> None:
-        leader = PodTopology.from_env(
-            {
-                "CI_PD_ROLE": "prefill",
-                "TPU_WORKER_ID": "0",
-                "TPU_WORKER_HOSTNAMES": "a-prefill-0-0,a-prefill-0-1",
-            }
+        self.assertEqual(self_hostname({SELF_HOST_ENV: "p.svc"}), "p.svc")
+        self.assertEqual(
+            self_hostname({"TPU_WORKER_HOSTNAMES": "a-prefill-0-0,b"}), "a-prefill-0-0"
         )
-        self.assertEqual(get_role(leader), Role.PREFILL)
-        self.assertTrue(leader.is_prefill_leader)
-        self.assertEqual(leader.group_hosts, 2)
-        worker = PodTopology.from_env(
-            {
-                "CI_PD_ROLE": "prefill",
-                "TPU_WORKER_ID": "1",
-                "TPU_WORKER_HOSTNAMES": "a-prefill-0-0,a-prefill-0-1",
-            }
-        )
-        self.assertFalse(worker.is_prefill_leader)
-        decode = PodTopology.from_env(
-            {
-                "CI_PD_ROLE": "decode",
-                "TPU_WORKER_ID": "0",
-                "TPU_WORKER_HOSTNAMES": "a-decode-0-0,a-decode-0-1",
-            }
-        )
-        self.assertEqual(get_role(decode), Role.DECODE)
-        self.assertFalse(decode.is_prefill_leader)
-        with self.assertRaisesRegex(ValueError, "CI_PD_ROLE"):
-            PodTopology.from_env({"CI_PD_ROLE": "router"})
-
-    def test_benchmark_directory_resolves(self) -> None:
-        for script in ("launch_prefill.sh", "launch_decode.sh", "launch_server.sh"):
-            self.assertTrue(
-                os.path.isfile(os.path.join(BENCH, script)),
-                f"BENCH does not point at benchmark/tpu: {BENCH}",
-            )
 
     def test_local_model_path_validation(self) -> None:
         with self.assertRaisesRegex(FileNotFoundError, MODEL_ENV):
-            validate_model_source("/weights/definitely-missing-gpt-oss-120b")
-        validate_model_source(HF_REPO_ID)
+            validate_model_source(
+                "/weights/definitely-missing-gpt-oss-120b", label="target"
+            )
+        with self.assertRaisesRegex(FileNotFoundError, DRAFT_MODEL_ENV):
+            validate_model_source("/weights/definitely-missing-draft", label="draft")
+        validate_model_source(HF_REPO_ID, label="target")
+
+    @unittest.skipUnless(
+        os.path.exists(RENDER_JOBSET), "renderer is not shipped in the runtime image"
+    )
+    def test_dry_run_renders_one_host_per_role(self) -> None:
+        yaml_content = render_jobset_yaml()
+        self.assertIn("name: prefill", yaml_content)
+        self.assertIn("name: decode", yaml_content)
+        self.assertIn(f"{os.path.basename(__file__)} integration", yaml_content)
 
     def test_startup_hint_names_the_missing_mxint8_extension(self) -> None:
         import tempfile
@@ -2071,8 +1762,8 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         info = {
             "disaggregation_mode": role,
             "disaggregation_transfer_backend": "raiden",
-            "tp_size": 16,
-            "ep_size": 16,
+            "tp_size": TP_SIZE,
+            "ep_size": EP_SIZE,
             "page_size": PAGE_SIZE,
             "context_length": CONTEXT_LEN,
             "enable_metrics": True,
@@ -2093,9 +1784,8 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         return info
 
     def test_engine_configuration_failures(self) -> None:
-        launch_env = _common_launch_env(2, env={})
         prefill, decode = self._server_info("prefill"), self._server_info("decode")
-        self.assertEqual(engine_configuration_failures(prefill, decode, launch_env), [])
+        self.assertEqual(engine_configuration_failures(prefill, decode, "mxint8"), [])
         cases = {
             "target dtype": (dict(prefill, kv_cache_dtype="bfloat16"), decode),
             "draft dtype": (
@@ -2103,6 +1793,7 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
                 dict(decode, speculative_draft_kv_cache_dtype="mxint8"),
             ),
             "page size": (dict(prefill, page_size=64), decode),
+            "two hosts": (dict(prefill, tp_size=16, ep_size=16), decode),
             "small pool": (prefill, dict(decode, max_total_num_tokens=65536)),
             "no metrics": (dict(prefill, enable_metrics=False), decode),
             "prefill hicache off": (
@@ -2125,13 +1816,12 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         }
         for name, (p, d) in cases.items():
             with self.subTest(name):
-                self.assertTrue(engine_configuration_failures(p, d, launch_env))
-        bf16_env = _common_launch_env(2, env={KV_CACHE_DTYPE_ENV: "bfloat16"})
+                self.assertTrue(engine_configuration_failures(p, d, "mxint8"))
         self.assertEqual(
             engine_configuration_failures(
                 dict(prefill, kv_cache_dtype="bf16"),
                 dict(decode, kv_cache_dtype="bfloat16"),
-                bf16_env,
+                "bfloat16",
             ),
             [],
         )
@@ -2184,8 +1874,8 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
         self.assertIn("mxint8KV", config["variant"])
 
     def test_operator_overrides_reach_the_run_but_not_the_cpu_checks(self) -> None:
-        # model_config_main also runs these CPU tests in the integration job,
-        # under its overrides (e.g. the combo job's kv_cache_dtype=bfloat16).
+        # The nightly runs the integration case under PD_KV_CACHE_DTYPE=bfloat16;
+        # the run must see it, and the CPU checks (which pass env={}) must not.
         from unittest import mock
 
         overrides = {
@@ -2207,21 +1897,28 @@ class TestPdGptOss120bMxint8Configuration(unittest.TestCase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="P/D multihost MXINT8 KV multi-turn long-context test"
+        description="One-host-per-engine GPT-OSS P/D MXINT8 KV multi-turn test"
     )
     parser.add_argument(
         "mode",
         nargs="?",
         default="unittest",
-        choices=["unittest", "integration"],
-        help="Execution mode (default: unittest)",
+        choices=["unittest", "integration", "integration_dry_run"],
     )
     args, extra_args = parser.parse_known_args()
 
-    if args.mode == "integration":
-        topology = PodTopology.from_env()
-        role = get_role(topology)
-        sys.exit(serve_role(topology, role))
-    else:
-        sys.argv = [sys.argv[0], "TestPdGptOss120bMxint8Configuration", *extra_args]
-        unittest.main(verbosity=2)
+    if args.mode == "integration_dry_run":
+        print(render_jobset_yaml())
+        sys.exit(0)
+    # Run only the selected case: the integration job must not also run the
+    # CPU checks under its env overrides.
+    test_case = (
+        TestPdSingleHostMxint8MultiTurnGptOss120bIntegration
+        if args.mode == "integration"
+        else TestPdSingleHostMxint8MultiTurnGptOss120bConfiguration
+    )
+    unittest.main(
+        defaultTest=test_case.__name__,
+        argv=[sys.argv[0], *extra_args],
+        verbosity=2,
+    )

@@ -1,12 +1,6 @@
-# Isolated trigger for the registered GPT-OSS-120B 2P+2D feature tests.
-# pd-mh-gpt-120b-pc-offload-spec (the default) also runs in the external
-# nightly (.github/tpu-ci/external/external-topology.yaml).
-# pd-mh-gpt-120b-mxint8-multiturn (issue #1066) runs only from here: it needs
-# an image with the MXINT8 KV backend extension, so on any other image
-# dispatch it with kv_cache_dtype=bfloat16 to run the same harness on bf16 KV.
+# Isolated trigger for the registered GPT-OSS-120B 2P+2D feature test.
+# The same test also runs from nightly-test-tpu.yml.
 #   gh workflow run combo-test-tpu.yml [-f ref=<branch>]
-#   gh workflow run combo-test-tpu.yml -f ref=<branch> \
-#     -f only=pd-mh-gpt-120b-mxint8-multiturn -f kv_cache_dtype=bfloat16
 name: Combo Test (TPU)
 
 on:
@@ -16,22 +10,6 @@ on:
         description: "Git ref to test"
         required: false
         default: main
-      only:
-        description: "Which combo test to run"
-        required: false
-        default: pd-mh-gpt-120b-pc-offload-spec
-        type: choice
-        options:
-          - pd-mh-gpt-120b-pc-offload-spec
-          - pd-mh-gpt-120b-mxint8-multiturn
-      kv_cache_dtype:
-        description: "Target KV dtype for pd-mh-gpt-120b-mxint8-multiturn"
-        required: false
-        default: mxint8
-        type: choice
-        options:
-          - mxint8
-          - bfloat16
 
 concurrency:
   # Different refs can use separate nightly slices. Runs for one ref serialize.
@@ -49,7 +27,6 @@ jobs:
 
   pd-mh-gpt-120b-pc-offload-spec:
     needs: build
-    if: ${{ (inputs.only || 'pd-mh-gpt-120b-pc-offload-spec') == 'pd-mh-gpt-120b-pc-offload-spec' }}
     name: pd-mh-gpt-120b-pc-offload-spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -64,29 +41,6 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
       weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pc-offload-spec
-    permissions:
-      contents: read
-      id-token: write
-
-  # The test reads PD_KV_CACHE_DTYPE; kv_cache_dtype is a fixed choice, so it
-  # is safe inside the single-quoted exec command.
-  pd-mh-gpt-120b-mxint8-multiturn:
-    needs: build
-    if: ${{ inputs.only == 'pd-mh-gpt-120b-mxint8-multiturn' }}
-    name: pd-mh-gpt-120b-mxint8-multiturn
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_mxint8
-      lane: nightly
-      hosts: 2
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: env PD_KV_CACHE_DTYPE=${{ inputs.kv_cache_dtype || 'mxint8' }} python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_mxint8.py integration
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_mxint8.py
-      weights_pvc: model-weights
-      run_name: pd-mh-gpt-120b-mxint8-mt
     permissions:
       contents: read
       id-token: write
