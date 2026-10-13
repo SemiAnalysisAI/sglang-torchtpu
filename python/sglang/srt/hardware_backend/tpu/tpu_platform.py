@@ -308,9 +308,11 @@ class TpuSRTPlatform(SRTPlatform):
         _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang.srt.hardware_backend.tpu.env_override import (
+            apply_prefill_cp_sparse_core_override,
             apply_small_kv_pool_vmem_prefetch_override,
         )
 
+        apply_prefill_cp_sparse_core_override(attn_cp_size=cfg.attn_cp_size)
         apply_small_kv_pool_vmem_prefetch_override(
             max_total_tokens=cfg.max_total_tokens,
             num_hidden_layers=_resolve_num_hidden_layers(cfg),
