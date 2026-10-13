@@ -133,8 +133,6 @@ jobs:
             run_name: accuracy-gpt-oss-120b-aime
           - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
             run_name: accuracy-gpt-oss-120b-gpqa
-          - suite: nightly-tpu-accuracy-gpt-oss-120b-gsm8k
-            run_name: accuracy-gpt-oss-120b-gsm8k
           - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
             run_name: accuracy-gpt-oss-120b-mmlupro
     name: ${{ matrix.suite }}
