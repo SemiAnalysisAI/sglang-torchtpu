@@ -884,6 +884,183 @@ class TestDecodeHonorsRoomFailed(unittest.TestCase):
         self.assertEqual(decode.failure_records, {})
         self.assertFalse(decode.is_failed(ROOM))
 
+    def test_notice_keeps_pages_under_an_unsettled_transfer(self):
+        """ROOM_FAILED can land while the prefill is still pushing into the
+        room's receive plan, or while the decode's own read runs. The room is
+        not released to the scheduler until raiden settles that transfer."""
+        from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
+
+        def push(decode):
+            decode._reshard_plans = {ROOM: {str(ROOM): ROOM}}
+
+        def pull(decode):
+            decode._pulling = StagingAdmission(4)
+            decode._pulling.admit(str(ROOM), 1)
+
+        for name, start in (("push", push), ("pull", pull)):
+            with self.subTest(name):
+                decode = _decode_manager()
+                decode.request_status[ROOM] = KVPoll.Transferring
+                start(decode)
+                recv = _receiver(decode)
+                recv.init_time = time.time()
+                decode._dispatch(RoomFailed(room=ROOM, reason="gone").to_frames())
+                with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+                    self.assertEqual(recv.poll(), KVPoll.Transferring)
+                    self.assertIsNone(recv.conclude_state)
+                    with decode._state_lock:
+                        decode._native_failed.add(str(ROOM))  # raiden settles it
+                    self.assertEqual(recv.poll(), KVPoll.Failed)
+
+
+class TestPrefillTellsDecodeRoomFailed(unittest.TestCase):
+    """A room the prefill fails after the decode's last request reaches the
+    decode as ROOM_FAILED, instead of after the decode's own timeout (#1337)."""
+
+    DECODE = "tcp://10.0.0.2:5555"
+
+    def _pulled(self, mgr, room=ROOM, port=5555):
+        """A sender whose decode has sent its pull request and now waits."""
+        sender = _gate_sender(mgr, room)
+        mgr._dispatch(PullReq(room, "10.0.0.2", port, 4).to_frames())
+        return sender
+
+    @staticmethod
+    def _native_failure(mgr, *req_ids):
+        mgr._engine = Mock()
+        mgr._engine.poll_stats_with_details.return_value = _polled(failed=req_ids)
+
+    def _notices(self, mgr):
+        return [
+            (endpoint, RoomFailed.from_frames(frames))
+            for endpoint, frames in _sent_frames(mgr)
+        ]
+
+    def test_read_failure_fails_the_waiting_decode_room_once(self):
+        mgr = _gate_manager()
+        sender = self._pulled(mgr)
+        other = self._pulled(mgr, OTHER_ROOM, port=5556)
+        self._native_failure(mgr, str(ROOM))
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        [(endpoint, note)] = self._notices(mgr)
+        self.assertEqual((endpoint, note.room), (self.DECODE, ROOM))
+        self.assertIn(f"failed room {ROOM}", note.reason)
+        self.assertEqual(other.poll(), KVPoll.WaitingForInput)
+        self.assertEqual(len(_sent_frames(mgr)), 1)
+
+        decode = _decode_manager()
+        decode.request_status[ROOM] = KVPoll.Transferring
+        decode.request_status[OTHER_ROOM] = KVPoll.Transferring
+        recv = _receiver(decode)
+        recv.init_time = time.time()
+        decode._dispatch(_sent_frames(mgr)[0][1])
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            self.assertEqual(recv.poll(), KVPoll.Failed)
+        with self.assertRaisesRegex(Exception, f"failed room {ROOM}"):
+            recv.failure_exception()
+        self.assertEqual(decode.request_status[OTHER_ROOM], KVPoll.Transferring)
+
+    def test_notice_is_not_held_back_by_active_io(self):
+        mgr = _gate_manager()
+        sender = self._pulled(mgr)
+        mgr._send_reads[ROOM] = {f"{ROOM}#0"}  # an unsettled chunk read
+        self._native_failure(mgr, str(ROOM))
+
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        [(endpoint, _)] = self._notices(mgr)
+        self.assertEqual(endpoint, self.DECODE)
+
+    def test_reshard_push_failure_tells_the_reply_endpoint(self):
+        mgr = _gate_manager()
+        sender = _gate_sender(mgr, ROOM)
+        mgr._prefill.reshard_req[ROOM] = dict(reply_addr=("10.0.0.2", 5555))
+        mgr._run_reshard_push = Mock(side_effect=RuntimeError("push broke"))
+        mgr._do_reshard_push(ROOM)
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        [(endpoint, note)] = self._notices(mgr)
+        self.assertEqual(endpoint, self.DECODE)
+        self.assertIn("push broke", note.reason)
+
+    def test_local_abort_tells_the_decode(self):
+        mgr = _gate_manager()
+        sender = self._pulled(mgr)
+
+        sender.abort()
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        [(endpoint, note)] = self._notices(mgr)
+        self.assertEqual(endpoint, self.DECODE)
+        self.assertEqual(note.reason, "Aborted by AbortReq.")
+
+    def test_pipeline_consumers_are_told(self):
+        mgr = _gate_manager()
+        mgr._pipeline = SimpleNamespace(
+            lock=threading.RLock(), replies={ROOM: {"tcp://10.0.0.3:6000": {}}}
+        )
+        mgr.notify_decode_room_failed(ROOM)
+        [(endpoint, note)] = self._notices(mgr)
+        self.assertEqual((endpoint, note.room), ("tcp://10.0.0.3:6000", ROOM))
+
+    def test_decode_abort_is_not_answered(self):
+        mgr = _gate_manager()
+        sender = self._pulled(mgr)
+        mgr._dispatch(_abort_frame(ROOM))
+        # The read the decode abandoned fails natively as well.
+        self._native_failure(mgr, str(ROOM))
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertEqual(_sent_frames(mgr), [])
+
+    def test_decode_abort_before_the_sender_is_not_answered(self):
+        mgr = _gate_manager()
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
+        mgr._dispatch(_abort_frame(ROOM))
+        sender = _gate_sender(mgr, ROOM)
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertEqual(_sent_frames(mgr), [])
+
+    def test_decode_silence_is_not_answered(self):
+        mgr = _gate_manager()
+        mgr.bootstrap_timeout = 1
+        sender = _gate_sender(mgr, ROOM)
+        # The decode asked to reshard, got its blocks, and went quiet.
+        mgr._prefill.reshard_req[ROOM] = dict(reply_addr=("10.0.0.2", 5555))
+        mgr._prefill.reshard_replied_at[ROOM] = time.time() - 10
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertIn("timed out", mgr.failure_records[ROOM])
+        self.assertEqual(_sent_frames(mgr), [])
+
+    def test_a_later_reply_does_not_fail_the_decode_room_twice(self):
+        mgr = _gate_manager()
+        sender = self._pulled(mgr)
+        mgr._engine = Mock()
+        mgr._engine.register_read.side_effect = RuntimeError("registration broke")
+        with self.assertRaises(RuntimeError):
+            mgr._register_sender_read(ROOM, mgr._engine, str(ROOM), ROOM, [1])
+        mgr._engine.poll_stats_with_details.return_value = _polled()
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        # A duplicate pull request finds the tombstone: the existing reply.
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
+        notices = self._notices(mgr)
+        self.assertEqual([e for e, _ in notices], [self.DECODE, self.DECODE])
+        self.assertIn("register_read failed", notices[0][1].reason)
+
+        decode = _decode_manager()
+        decode.request_status[ROOM] = KVPoll.Transferring
+        decode._fail_room_locked = Mock(wraps=decode._fail_room_locked)
+        for _, frames in _sent_frames(mgr):
+            decode._dispatch(frames)
+        decode._fail_room_locked.assert_called_once()
+        self.assertEqual(decode.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("register_read failed", decode.failure_records[ROOM])
+
 
 class TestSenderTerminalPrecedence(unittest.TestCase):
     def _sender(self, **overrides):
