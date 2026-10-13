@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, runs_dsa_densely
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -296,12 +296,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hf_config = self.draft_runner.model_config.hf_config
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
-        # Models that run DSA densely (GLM-5.3-Flash on TPU) have no indexer
-        # top-k to share; relaying one also disables TPU device-accept routing.
+        # Dense-DSA models have no indexer top-k to share; relaying one also
+        # disables TPU device-accept routing.
         self.index_share_for_mtp_iteration = (
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
-            and is_deepseek_dsa(hf_config)
+            and not runs_dsa_densely(hf_config)
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.

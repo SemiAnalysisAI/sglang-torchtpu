@@ -198,6 +198,13 @@ _TPU_GLM5_NEXT_ARCHS = (
 GLM5_NEXT_TPU_MLA_ROPE_PAD = 64
 
 
+def runs_dsa_densely(config) -> bool:
+    """DSA model served with dense attention: no indexer runs, so there is no
+    top-k to compute, relay or share."""
+    # TODO(Bob-Chen222): drop once GLM-5.3-Flash's kpool DSA runs on TPU.
+    return _hf_arch(config) in _TPU_GLM5_NEXT_ARCHS and is_tpu()
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -219,12 +226,7 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-        and not (
-            _hf_arch(config) == "GlmMoeDsaForCausalLM"
-            and _hf_attr(config, "tpu_dense_dsa_max_context") is not None
-        )
-        # The TPU Flash model (glm5_next_tpu) evaluates DSA densely.
-        and not (_hf_arch(config) in _TPU_GLM5_NEXT_ARCHS and is_tpu())
+        and not runs_dsa_densely(config)
     )
 
 
