@@ -307,6 +307,15 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _is_cp_decode(self, forward_batch) -> bool:
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().attn_dcp_size <= 1:
+            return False
+        if (
+            (hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling") and torch.compiler.is_compiling())
+            or (hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "is_compiling") and torch._dynamo.is_compiling())
+        ):
+            return True
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
         if req_pool_indices is None:
             return False
@@ -314,9 +323,6 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             reqs = req_pool_indices.tolist()
             return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
         except Exception:
-            # During torch.compile / direct_compile tracing, req_pool_indices is a
-            # placeholder/proxy tensor that cannot be materialized with .tolist().
-            # Under CP (attn_cp_size > 1 or attn_dcp_size > 1), trace the CP decode path.
             return True
 
     def forward_decode(
@@ -332,7 +338,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         from sglang.srt.runtime_context import get_parallel
 
         if not forward_batch.forward_mode.is_idle() and (
-            (get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1)
+            get_parallel().attn_dcp_size > 1
             and self._is_cp_decode(forward_batch)
         ):
             return self._forward_cp_decode(q, k, v, layer, forward_batch, **kwargs)
