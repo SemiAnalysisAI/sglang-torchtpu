@@ -97,24 +97,31 @@ def _gates_and_collapse(
         mixes[:, hc : 2 * hc] * s1 + base[:, hc : 2 * hc]
     )
 
-    # comb row i is a [bt, hc] value over columns j; rows normalize over lanes,
-    # columns across the hc row values.
-    rows = []
+    # Sinkhorn with tokens on lanes: c[i][j] is a [1, bt] row, so every row and
+    # column sum is an elementwise add of hc rows. With tokens on sublanes each
+    # row sum was a cross-lane reduction, and 20 rounds of them form one serial
+    # chain (about 6 of the seam's ~10 us at decode).
+    logits = (mixes[:, 2 * hc :] * s2 + base[:, 2 * hc :]).T  # [hc * hc, bt]
+    c = [[logits[i * hc + j : i * hc + j + 1] for j in range(hc)] for i in range(hc)]
+
+    def row_sum(r):
+        return functools.reduce(jnp.add, r)
+
     for i in range(hc):
-        lo = 2 * hc + i * hc
-        r = mixes[:, lo : lo + hc] * s2 + base[:, lo : lo + hc]
-        r = jnp.exp(r - jnp.max(r, axis=-1, keepdims=True))
-        rows.append(r / jnp.sum(r, axis=-1, keepdims=True) + hc_eps)
+        top = functools.reduce(jnp.maximum, c[i])
+        e = [jnp.exp(v - top) for v in c[i]]
+        total = row_sum(e)
+        c[i] = [v / total + hc_eps for v in e]
 
-    def col_norm(rs):
-        col = functools.reduce(jnp.add, rs) + hc_eps
-        return [r / col for r in rs]
+    def col_norm(c):
+        cols = [row_sum([c[i][j] for i in range(hc)]) + hc_eps for j in range(hc)]
+        return [[c[i][j] / cols[j] for j in range(hc)] for i in range(hc)]
 
-    rows = col_norm(rows)
+    c = col_norm(c)
     for _ in range(iters - 1):
-        rows = [r / (jnp.sum(r, axis=-1, keepdims=True) + hc_eps) for r in rows]
-        rows = col_norm(rows)
-    comb_ref[...] = jnp.concatenate(rows, axis=-1)
+        c = [[v / (row_sum(c[i]) + hc_eps) for v in c[i]] for i in range(hc)]
+        c = col_norm(c)
+    comb_ref[...] = jnp.concatenate([v for r in c for v in r], axis=0).T
 
     layer = functools.reduce(
         jnp.add, [pre[:, i : i + 1] * s for i, s in enumerate(streams)]
