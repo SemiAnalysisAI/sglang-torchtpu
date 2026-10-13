@@ -455,7 +455,11 @@ class GptOssDecodeMK(nn.Module):
             "GPT-OSS decode megakernel ops: kv_write=%s ablate=%s weight dtypes %s",
             self.kv_write_mode,
             self.ablate or "none",
-            {k: str(getattr(self, "w_" + k).dtype) for k in ("w13q", "w2q")},
+            {
+                k: str(getattr(self, "w_" + k).dtype)
+                for k in self.w_names
+                if k in ("w13q", "w2q", "w13", "w2")  # expert matrices (mxfp4 | fp8)
+            },
         )
 
     @staticmethod
@@ -516,9 +520,12 @@ class GptOssDecodeMK(nn.Module):
 
     def run(self, model, input_ids: torch.Tensor, forward_batch) -> torch.Tensor:
         """Embedding -> megakernel (all layers) -> in-place KV writes -> final norm."""
-        eager = not torch.compiler.is_compiling()
-        if self.diag is not None:
-            self.diag.on_run(eager, input_ids.shape[0])
+        # Everything below must stay dynamo-traceable (fullgraph): no context managers,
+        # locks, host timers or syncs. Under torch.compile ``diag`` is the constant None
+        # (is_compiling() is a trace-time constant), so the diagnostics only run eagerly.
+        diag = None if torch.compiler.is_compiling() else self.diag
+        if diag is not None:
+            diag.on_run(input_ids.shape[0])
         attn_backend = self._get_attn_backend()  # what RadixAttention uses
         pool = attn_backend.token_to_kv_pool
         self._check_backend(attn_backend, pool, model)
@@ -530,7 +537,7 @@ class GptOssDecodeMK(nn.Module):
             return model.norm(x)
         cos_sin = model.layers[0].self_attn.rotary_emb.cos_sin_cache
         weights = [getattr(self, "w_" + k) for k in self.w_names]
-        t0 = self.diag.tick(eager, x) if self.diag is not None else None
+        t0 = diag.tick(x) if diag is not None else None
         hidden, kvn, newpg, off = self._step_op(
             x,
             meta.kv_lens,
@@ -541,7 +548,7 @@ class GptOssDecodeMK(nn.Module):
             *weights,
             *pools,
         )
-        t1 = self.diag.tick(eager, hidden) if self.diag is not None else None
+        t1 = diag.tick(hidden) if diag is not None else None
         B = x.shape[0]
         if self.ablate == "no_kv_write":  # timing only: the KV pools go stale
             pass
@@ -553,8 +560,8 @@ class GptOssDecodeMK(nn.Module):
                 self._kv_write_op(
                     pg_swa if l % 2 == 0 else pg_full, off, kvn[l], pools[i]
                 )
-        if self.diag is not None:
-            self.diag.on_eager_times(eager, t0, t1, self.diag.tick(eager, pools[0]))
+        if diag is not None:
+            diag.on_eager_times(t0, t1, diag.tick(pools[0]))
         # the stock stack's residual stream is not used on this path
         forward_batch.residual_stream = None
         return model.norm(hidden)
@@ -581,8 +588,9 @@ class _Diagnostics:
 
     - Every decode-MK ``run`` executed *eagerly* (outside a compiled graph: graph break,
       compile disabled or fallback) is counted, and its op times are measured with a
-      device sync around the step op and the KV write.
-    - A daemon thread logs every 30 s: MK traces vs eager runs, and torch._dynamo's
+      device sync around the step op and the KV write. Nothing here is ever called
+      from inside a dynamo trace (``run`` uses ``diag=None`` while compiling).
+    - A daemon thread logs every 30 s: MK eager runs, and torch._dynamo's
       graph-break / unique-graph / recompile counters (graph breaks around the custom ops
       would split the decode forward into several executables with host round trips).
     Inside a compiled graph the ops cannot be timed from the host; use the
@@ -593,7 +601,6 @@ class _Diagnostics:
         import threading
 
         self.rank = rank
-        self.traces = 0
         self.eager = 0
         self.buckets: set[int] = set()
         self.eager_ms: list[tuple[float, float]] = []
@@ -606,17 +613,12 @@ class _Diagnostics:
             return None
         return cls(rank)
 
-    def on_run(self, eager: bool, bs: int) -> None:
+    def on_run(self, bs: int) -> None:  # eager runs only
         with self.lock:
             self.buckets.add(int(bs))
-            if eager:
-                self.eager += 1
-            else:
-                self.traces += 1
+            self.eager += 1
 
-    def tick(self, eager: bool, t: torch.Tensor):
-        if not eager:
-            return None
+    def tick(self, t: torch.Tensor):  # eager runs only
         import time
 
         try:
@@ -627,8 +629,8 @@ class _Diagnostics:
             pass
         return time.perf_counter()
 
-    def on_eager_times(self, eager, t0, t1, t2) -> None:
-        if eager and None not in (t0, t1, t2):
+    def on_eager_times(self, t0, t1, t2) -> None:
+        if None not in (t0, t1, t2):
             with self.lock:
                 self.eager_ms.append(((t1 - t0) * 1e3, (t2 - t1) * 1e3))
 
@@ -646,8 +648,8 @@ class _Diagnostics:
                     em = self.eager_ms[-50:]
                     self.eager_ms.clear()
                     msg = (
-                        f"MK diag rank{self.rank}: traces={self.traces} "
-                        f"eager_runs={self.eager} buckets={sorted(self.buckets)}"
+                        f"MK diag rank{self.rank}: eager_runs={self.eager} "
+                        f"eager_buckets={sorted(self.buckets)}"
                     )
                 if em:
                     s = sorted(a for a, _ in em)

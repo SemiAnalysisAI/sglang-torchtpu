@@ -929,5 +929,193 @@ class TestRuntimeGating(unittest.TestCase):
         self.assertEqual(f(*range(len(names))), tuple(range(len(names))))
 
 
+# CPU stand-ins for the torch_tpu ops (same call signatures as the real ones)
+_FAKE_L, _FAKE_PAGES, _FAKE_PAGE = 4, 6, 8
+
+
+@torch.library.custom_op("mk_cpu_test::step", mutates_args=())
+def _fake_step_impl(
+    x: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    swa_page_indices: torch.Tensor,
+    cos_sin: torch.Tensor,
+    rank: torch.Tensor,
+    rest: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B = x.shape[0]
+    hidden = x * 2
+    kvn = torch.ones(_FAKE_L, 2, B, 128, dtype=x.dtype)
+    newpg = torch.cat([swa_page_indices[:B], page_indices[:B]]).to(torch.int32)
+    off = (kv_lens.clamp(min=1) - 1).remainder(_FAKE_PAGE).to(torch.int32)
+    return hidden, kvn, newpg, off
+
+
+@_fake_step_impl.register_fake
+def _(x, kv_lens, page_indices, swa_page_indices, cos_sin, rank, rest):
+    B = x.shape[0]
+    return (
+        torch.empty_like(x),
+        x.new_empty(_FAKE_L, 2, B, 128),
+        torch.empty(2 * B, dtype=torch.int32),
+        torch.empty(B, dtype=torch.int32),
+    )
+
+
+@torch.library.custom_op("mk_cpu_test::kv_write_layers", mutates_args=("pools",))
+def _fake_kv_write_layers_impl(
+    newpg: torch.Tensor, off: torch.Tensor, kvn: torch.Tensor, pools: list[torch.Tensor]
+) -> None:
+    for p in pools:
+        p[0, 0] += 1
+
+
+@torch.library.custom_op("mk_cpu_test::kv_write", mutates_args=("pool",))
+def _fake_kv_write_impl(
+    pg: torch.Tensor, off: torch.Tensor, kvn: torch.Tensor, pool: torch.Tensor
+) -> None:
+    pool[0, 0] += 1
+
+
+def _fake_step(x, kv_lens, pi, spi, cs, rank, *rest):
+    return _fake_step_impl(x, kv_lens, pi, spi, cs, rank, list(rest))
+
+
+def _fake_kv_write_layers(newpg, off, kvn, *pools):
+    _fake_kv_write_layers_impl(newpg, off, kvn, list(pools))
+
+
+class TestRunUnderTorchCompile(unittest.TestCase):
+    """``GptOssDecodeMK.run`` (the code inside the decode graph) traces under
+    ``torch.compile(fullgraph=True)`` for every diagnostics / ablation / KV-write setting,
+    with CPU stand-ins for the torch_tpu ops (catches e.g. context managers, locks or host
+    timers inside the traced region, which made e2e3 fail in decode precompile)."""
+
+    def _model(self):
+        from types import SimpleNamespace as NS
+
+        L = _FAKE_L
+
+        class Attn(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = NS(k_scale_float=None, v_scale_float=1.0)
+                self.rotary_emb = NS(cos_sin_cache=torch.randn(64, 64))
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attn()
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(32, 128)
+                self.norm = torch.nn.LayerNorm(128)
+                self.layers = torch.nn.ModuleList([Layer() for _ in range(L)])
+
+        class Pool:
+            def __init__(self):
+                self.layers_mapping = {l: (l // 2, l % 2 == 0) for l in range(L)}
+                self.bufs = [
+                    torch.zeros(
+                        _FAKE_PAGES, _FAKE_PAGE, 1, 2, 128, dtype=torch.bfloat16
+                    )
+                    for _ in range(L)
+                ]
+
+            def get_fused_kv_buffer(self, l):
+                return self.bufs[l]
+
+        class Backend:
+            def __init__(self, B):
+                self.token_to_kv_pool = Pool()
+                self.forward_metadata = NS(
+                    kv_lens=torch.arange(1, B + 1, dtype=torch.int32),
+                    page_indices=torch.arange(B * 2, dtype=torch.int32),
+                    swa_page_indices=torch.arange(B * 2, dtype=torch.int32),
+                    decode_query_size=1,
+                )
+                self._dcp = 1
+
+        return Model().eval(), Backend
+
+    def _check(self, env: dict, B: int = 4):
+        import sys
+        import types
+        from unittest import mock
+
+        from sglang_tpu.gptoss_decode_mk import runtime as RT
+
+        model, Backend = self._model()
+        backend = Backend(B)
+        fc = types.ModuleType("sglang.srt.model_executor.forward_context")
+        fc.get_attn_backend = lambda: backend
+        c = dataclasses.replace(_cfg(B=B), L=_FAKE_L, w_dtype="fp8")
+        host = {k: torch.zeros(2, dtype=torch.float32) for k in W.w_names(c)}
+        full_env = {RT.ENV_TIMING: "0", RT.ENV_ABLATE: "", RT.ENV_KV_WRITE: "layers"}
+        full_env.update(env)
+        # (not patch.dict(sys.modules): restoring it would drop torch._dynamo & co.
+        # imported during the test, whose op registrations cannot be re-run)
+        old_fc = sys.modules.get(fc.__name__)
+        sys.modules[fc.__name__] = fc
+        self.addCleanup(
+            lambda: (
+                sys.modules.pop(fc.__name__, None)
+                if old_fc is None
+                else sys.modules.__setitem__(fc.__name__, old_fc)
+            )
+        )
+        with (
+            mock.patch.dict(os.environ, full_env),
+            mock.patch.object(RT, "get_step_op", lambda *a, **k: _fake_step),
+            mock.patch.object(
+                RT, "get_kv_write_layers_op", lambda L: _fake_kv_write_layers
+            ),
+            mock.patch.object(RT, "get_kv_write_op", lambda: _fake_kv_write_impl),
+        ):
+            mk = RT.GptOssDecodeMK(c, 0, 8, host, "cpu")
+
+            class FB:  # ForwardBatch is a plain (data)class
+                residual_stream = object()
+
+            fb = FB()
+            ids = torch.arange(B)
+
+            def fwd(ids):
+                return mk.run(model, ids, fb)
+
+            torch._dynamo.reset()
+            with torch.no_grad():
+                eager = fwd(ids)  # eager path: diagnostics active when TIMING=1
+                compiled = torch.compile(fwd, fullgraph=True, backend="eager")(ids)
+            torch.testing.assert_close(compiled, eager)
+            self.assertIsNone(fb.residual_stream)
+            if mk.diag is not None:  # only the eager run is counted
+                self.assertEqual(mk.diag.eager, 1)
+        return backend
+
+    def test_timing_and_ablations_fullgraph(self):
+        from sglang_tpu.gptoss_decode_mk import runtime as RT
+
+        for timing in ("0", "1"):
+            for ablate in RT.ABLATIONS:
+                for kvw in ("layers", "per_layer"):
+                    with self.subTest(timing=timing, ablate=ablate, kv_write=kvw):
+                        backend = self._check(
+                            {
+                                RT.ENV_TIMING: timing,
+                                RT.ENV_ABLATE: ablate,
+                                RT.ENV_KV_WRITE: kvw,
+                            }
+                        )
+                        writes = float(
+                            backend.token_to_kv_pool.bufs[0][0, 0].float().max()
+                        )
+                        # eager + compiled run each write once unless writes are ablated
+                        want = 0.0 if ablate in ("no_kv_write", "no_mk") else 2.0
+                        self.assertEqual(writes, want)
+
+
 if __name__ == "__main__":
     unittest.main()

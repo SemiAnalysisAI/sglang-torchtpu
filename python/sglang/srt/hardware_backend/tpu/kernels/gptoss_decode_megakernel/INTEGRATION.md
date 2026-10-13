@@ -156,10 +156,15 @@ int32 for an A/B. This is unconfirmed until the HLO dump or xprof shows it.
 
 Diagnostics:
 - `SGLANG_TPU_GPTOSS_DECODE_MK_TIMING=1` starts a log every 30 s:
-  - MK traces vs eager runs (an eager run means the decode forward is not compiled around
-    the op, i.e. a graph break);
+  - MK eager runs (an eager run means the decode forward is not compiled around the
+    op, i.e. a graph break or compile off);
   - dynamo graph-break/unique-graph counters with the top reasons;
   - synced step-op/KV-write times if a run happens eagerly.
+  `run()` touches the diagnostics only when `torch.compiler.is_compiling()` is False.
+  58b1d7d28f called them (a `threading.Lock` context manager) inside the traced region,
+  which failed decode precompile in j-b0b0a5fd ("Unsupported context manager").
+  `TestRunUnderTorchCompile` now traces `run()` with `fullgraph=True` on CPU for every
+  TIMING × ABLATE × KV_WRITE setting.
 - `SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE` gives timing-only arms whose outputs are wrong:
   - `noop_kernel`: the same op, operands and glue, but a trivial kernel that only takes the
     operands. It measures marshalling and relayout of the weights/pools.
