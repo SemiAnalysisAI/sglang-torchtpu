@@ -326,6 +326,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.retracted_stain = False
     request.host_hit_length = request.swa_host_hit_length = 0
     request.storage_hit_length = request.host_loaded_length = 0
+    request.swa_miss_len = request.full_kv_hit_length = 0
     request.materialized_host_hit_len.return_value = 0
     request.fulfilled_storage_hit_len.return_value = 0
     request.needs_host_load_back.return_value = False

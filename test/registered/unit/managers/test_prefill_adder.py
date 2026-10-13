@@ -129,6 +129,8 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.swa_miss_len = 0
+        req.full_kv_hit_length = 0
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -540,6 +542,48 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_device_hit_tokens, 8)
         self.assertEqual(adder.log_host_hit_tokens, 0)
         self.assertEqual(adder.log_storage_hit_tokens, 12)
+
+    def test_swa_miss_counted_once_per_admitted_req(self):
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("swa-limited", priority=0, max_new_tokens=1)
+        req.swa_miss_len = 24
+        req.full_kv_hit_length = 24
+        req.materialized_host_hit_len.return_value = 0
+
+        adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_tokens, 24)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+        clean = self.create_mock_req("clean", priority=0, max_new_tokens=1)
+        clean.materialized_host_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(clean, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+        retracted = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
+        retracted.swa_miss_len = 16
+        retracted.full_kv_hit_length = 16
+        retracted.retracted_stain = True
+        adder._account_prefill_cache_admission(retracted, prefix_len=0)
+        self.assertEqual(adder.log_swa_miss_tokens, 24)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
+
+    def test_swa_miss_excludes_prefix_restored_by_load_back(self):
+        adder = self.create_adder(self.create_running_batch())
+        restored = self.create_mock_req("restored", priority=0, max_new_tokens=1)
+        restored.swa_miss_len = 16
+        restored.full_kv_hit_length = 32
+        restored.materialized_host_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(restored, prefix_len=32)
+        self.assertEqual(adder.log_swa_miss_tokens, 0)
+        self.assertEqual(adder.log_swa_miss_reqs, 0)
+
+        partial = self.create_mock_req("partial", priority=0, max_new_tokens=1)
+        partial.swa_miss_len = 16
+        partial.full_kv_hit_length = 32
+        partial.materialized_host_hit_len.return_value = 0
+        adder._account_prefill_cache_admission(partial, prefix_len=24)
+        self.assertEqual(adder.log_swa_miss_tokens, 8)
+        self.assertEqual(adder.log_swa_miss_reqs, 1)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

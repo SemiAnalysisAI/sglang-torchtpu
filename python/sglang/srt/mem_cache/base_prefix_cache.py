@@ -310,6 +310,18 @@ class MatchResult(NamedTuple):
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
 
+def compute_swa_miss_len(
+    *, tree_cache: BasePrefixCache, match_result: MatchResult
+) -> int:
+    """Prefix tokens with full KV on device or host that the match cut because
+    their SWA window was not on device; admission discounts what load-back restores.
+    Zero unless SWA is the cache's only validator besides full KV."""
+    if not tree_cache.swa_is_only_match_cut():
+        return 0
+    usable = len(match_result.device_indices) + match_result.host_hit_length
+    return max(0, match_result.full_kv_hit_length - usable)
+
+
 def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
@@ -649,6 +661,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
+        return False
+
+    def swa_is_only_match_cut(self) -> bool:
+        """True when a missing SWA window is the only thing that can stop a match
+        short of `full_kv_hit_length`, so the gap is attributable to SWA."""
         return False
 
     def release_session(self, session_id: str) -> None:

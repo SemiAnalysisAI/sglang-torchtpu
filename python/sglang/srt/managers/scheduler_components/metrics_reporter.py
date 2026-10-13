@@ -104,6 +104,8 @@ class PrefillStats:
     log_device_hit_tokens: int = 0
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
+    log_swa_miss_tokens: int = 0
+    log_swa_miss_reqs: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
 
@@ -124,6 +126,8 @@ class PrefillStats:
             log_device_hit_tokens=adder.log_device_hit_tokens,
             log_host_hit_tokens=adder.log_host_hit_tokens,
             log_storage_hit_tokens=adder.log_storage_hit_tokens,
+            log_swa_miss_tokens=adder.log_swa_miss_tokens,
+            log_swa_miss_reqs=adder.log_swa_miss_reqs,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -721,6 +725,7 @@ class SchedulerMetricsReporter:
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{self._cached_token_tier_msg(prefill_stats)}"
+            f"{self._swa_miss_msg(prefill_stats)}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
@@ -810,6 +815,10 @@ class SchedulerMetricsReporter:
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
                 host_hit_tokens=prefill_stats.log_host_hit_tokens,
                 storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
+            )
+            self.metrics_collector.increment_swa_miss(
+                tokens=prefill_stats.log_swa_miss_tokens,
+                reqs=prefill_stats.log_swa_miss_reqs,
             )
 
             # Basics
@@ -1190,6 +1199,12 @@ class SchedulerMetricsReporter:
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.shutdown()
+
+    def _swa_miss_msg(self, prefill_stats: PrefillStats) -> str:
+        # Omitted when zero, so the line is unchanged on models without SWA.
+        if not prefill_stats.log_swa_miss_tokens:
+            return ""
+        return f"#swa-miss-token: {prefill_stats.log_swa_miss_tokens}, "
 
     def _cached_token_tier_msg(self, prefill_stats: PrefillStats) -> str:
         """Break #cached-token down by the tier that served it.

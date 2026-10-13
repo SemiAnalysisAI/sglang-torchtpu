@@ -954,6 +954,27 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
+        # Kept out of prefill_effective_tokens_total: its modes sum to the
+        # hit-rate denominator, and these tokens are already counted as input.
+        # Not pre-seeded, so models without SWA never export these series.
+        self.prefill_swa_miss_tokens_total = Counter(
+            name="sglang:prefill_swa_miss_tokens_total",
+            documentation=(
+                "Prefix tokens whose full-attention KV was cached on device or "
+                "host but recomputed because their SWA window was missing. "
+                "Counted once per admitted request; zero unless the cache holds "
+                "only full KV and SWA."
+            ),
+            labelnames=list(labels.keys()),
+        )
+        self.prefill_swa_miss_reqs_total = Counter(
+            name="sglang:prefill_swa_miss_reqs_total",
+            documentation=(
+                "Admitted requests with at least one prefix token in "
+                "sglang:prefill_swa_miss_tokens_total."
+            ),
+            labelnames=list(labels.keys()),
+        )
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1374,6 +1395,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.prefill_effective_tokens_total.labels(
                     **self.labels, mode=mode
                 ).inc(delta)
+
+    def increment_swa_miss(self, *, tokens: int, reqs: int) -> None:
+        if tokens > 0:
+            self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(tokens)
+            self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(reqs)
 
     def increment_forward_execution_seconds(
         self,

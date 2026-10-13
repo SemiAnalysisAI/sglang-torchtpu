@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
+    compute_swa_miss_len,
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -6835,6 +6836,42 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 99])))
         )
         self.assertEqual(result.full_kv_hit_length, 4)
+
+    def test_swa_miss_len_reports_swa_masked_prefix(self):
+        """Resident FULL under SWA tombstones counts as an SWA miss on Full+SWA;
+        a clean prefix, and any cache with Mamba or without SWA, reports zero."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = list(range(1, 1 + 4 * self.cfg.page_size))
+        value = self._alloc(allocator, len(seq))
+        params = InsertParams(
+            key=RadixKey(array("q", seq)),
+            value=value[: len(seq)],
+            component_evicted_seqlens=(
+                {ComponentType.SWA: len(seq)} if self.cfg.has_swa else {}
+            ),
+        )
+        if self.cfg.has_mamba:
+            req = Req(
+                rid="swa-miss-mamba",
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            req_to_token_pool.alloc([req])
+            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
+        cache.insert(params)
+        masked = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        miss = compute_swa_miss_len(tree_cache=cache, match_result=masked)
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.assertEqual(miss, 0)
+            return
+        self.assertEqual(len(masked.device_indices), 0)
+        self.assertEqual(miss, len(seq))
+
+        clean = list(range(1000, 1000 + 4 * self.cfg.page_size))
+        self._insert(cache, allocator, req_to_token_pool, clean)
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", clean))))
+        self.assertEqual(compute_swa_miss_len(tree_cache=cache, match_result=result), 0)
 
     def test_has_swa_host_pool_flag_matches_attached_pool(self):
         """init_hicache caches SWA host-pool presence on the tree core after
