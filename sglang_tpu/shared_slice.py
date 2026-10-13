@@ -8,6 +8,7 @@ build with job-local worlds (TORCH_TPU_JOB_DEVICE_IDS), so neither job waits on 
 programs, and a libtpu without the 0.0.49 SparseCore regression (0.0.48 works).
 """
 
+import json
 import logging
 import math
 import os
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 ENV_VAR = "SGLANG_TPU_SHARED_SLICE"
 BACKEND_NAME = "tpu_shared_slice"
+TRANSFER_ALIGN_BYTES = 4096
 _TIMEOUT = timedelta(minutes=30)
 
 
@@ -62,12 +64,15 @@ def enter_slice_env(shared: SharedSlice) -> JobRank:
 class SharedSliceReceiver(WeightUpdateReceiver):
     """Receives each update bucket from the trainer rank paired with this TP rank."""
 
-    def __init__(self, backend, src_slice_rank: int):
+    def __init__(self, backend, store, src_slice_rank: int, slice_rank: int):
         self._backend = backend
+        self._store = store
         self._src_slice_rank = src_slice_rank
+        self._slice_rank = slice_rank
         self._next_tag = 0
 
     def receive(self, names, dtypes, shapes, device) -> list[tuple[str, torch.Tensor]]:
+        """Ignores ``names`` (trainer rank 0's): the paired rank posts its own, its experts differ."""
         dtypes = [_dtype(dtype) for dtype in dtypes]
         numels = [math.prod(shape) for shape in shapes]
         regions = packed_regions(numels, dtypes)
@@ -81,6 +86,10 @@ class SharedSliceReceiver(WeightUpdateReceiver):
         # wait() returns once the buffer is announced, not once the data lands; a read waits for it,
         # and freeing the buffer before that crashes the sender
         packed[:1].cpu()
+        key = bucket_names_key(self._src_slice_rank, self._slice_rank, self._next_tag)
+        own_names = json.loads(self._store.get(key))
+        self._store.delete_key(key)
+        assert len(own_names) == len(shapes), (len(own_names), len(shapes))
         return [
             (
                 name,
@@ -89,15 +98,12 @@ class SharedSliceReceiver(WeightUpdateReceiver):
                 .view(shape),
             )
             for name, dtype, shape, numel, (offset, _) in zip(
-                names, dtypes, shapes, numels, regions
+                own_names, dtypes, shapes, numels, regions
             )
         ]
 
     def close(self) -> None:
         pass
-
-
-TRANSFER_ALIGN_BYTES = 4096
 
 
 def packed_regions(
@@ -109,10 +115,8 @@ def packed_regions(
     """
     regions, offset = [], 0
     for numel, dtype in zip(numels, dtypes):
-        size = max(
-            TRANSFER_ALIGN_BYTES,
-            -(-numel * dtype.itemsize // TRANSFER_ALIGN_BYTES) * TRANSFER_ALIGN_BYTES,
-        )
+        blocks = max(1, math.ceil(numel * dtype.itemsize / TRANSFER_ALIGN_BYTES))
+        size = blocks * TRANSFER_ALIGN_BYTES
         regions.append((offset, size))
         offset += size
     return regions
@@ -125,6 +129,8 @@ def _dtype(dtype) -> torch.dtype:
 @dataclass
 class _State:
     backend: object = None
+    store: object = None
+    slice_rank: int = -1
 
 
 _state = _State()
@@ -138,9 +144,8 @@ def join(shared: SharedSlice, job: JobRank) -> None:
     from torch_tpu._internal.distributed import tpu_distributed
 
     slice_rank = shared.rank_offset + job.rank
-    device_id = (
-        tpu_distributed.global_device_id()
-    )  # starts the runtime, which joins the slice
+    # starts the runtime, which joins the slice
+    device_id = tpu_distributed.global_device_id()
     store = dist.TCPStore(
         shared.store_host, shared.store_port, shared.size, slice_rank == 0, _TIMEOUT
     )
@@ -152,6 +157,7 @@ def join(shared: SharedSlice, job: JobRank) -> None:
     _state.backend = tpu_distributed.create_process_group(
         PrefixStore(BACKEND_NAME, store), slice_rank, shared.size, _TIMEOUT
     )
+    _state.store, _state.slice_rank = store, slice_rank
     os.environ["RANK"] = os.environ["LOCAL_RANK"] = str(job.rank)
     os.environ["WORLD_SIZE"] = os.environ["LOCAL_WORLD_SIZE"] = str(job.size)
     logger.info(
@@ -165,4 +171,14 @@ def join(shared: SharedSlice, job: JobRank) -> None:
 def receiver(tp_rank: int) -> SharedSliceReceiver:
     """The trainer's rank i (slice rank i) sends to TP rank i."""
     assert _state.backend is not None, f"{ENV_VAR} is unset or the slice was not joined"
-    return SharedSliceReceiver(_state.backend, src_slice_rank=tp_rank)
+    return SharedSliceReceiver(
+        _state.backend,
+        _state.store,
+        src_slice_rank=tp_rank,
+        slice_rank=_state.slice_rank,
+    )
+
+
+def bucket_names_key(src_slice_rank: int, dst_slice_rank: int, tag: int) -> str:
+    """Store key of a bucket's names; must match miles.utils.tpu_shared_slice.bucket_names_key."""
+    return f"bucket_names:{src_slice_rank}:{dst_slice_rank}:{tag}"
