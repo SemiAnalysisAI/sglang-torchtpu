@@ -30,10 +30,11 @@ _COMPILATION_CACHE_ENV_RENAMES = (
 
 # Append instead of setdefault so caller-supplied flags are preserved.
 _SPARSE_CORE_OFFLOAD_OVERRIDES = (
-    # SparseCore offload for collectives and buffer copies can halt SparseCore
-    # cores or return corrupted values on TPU v7x (libtpu 0.0.46-0.0.49).
+    # SparseCore offload for collectives, buffer copies, and strided reshapes
+    # can halt SparseCore cores on TPU v7x (libtpu 0.0.46-0.0.49).
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
     "--xla_tpu_enable_offloading_copy_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_reshape_to_sparsecore=false",
 )
 
 _ASSOCIATIVE_SCAN_OVERRIDES = (
