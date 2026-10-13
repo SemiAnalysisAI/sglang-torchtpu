@@ -173,7 +173,6 @@ class TestRequestStateStillConstructs(unittest.TestCase):
         from sglang.srt.managers.tokenizer_manager import ReqState
 
         self.assertTrue(dataclasses.is_dataclass(ReqState))
-        self.assertTrue(dataclasses.is_dataclass(HealthCheckWaiter))
         fields = {f.name for f in dataclasses.fields(ReqState)}
         self.assertTrue({"out_list", "finished", "event", "obj"} <= fields)
 

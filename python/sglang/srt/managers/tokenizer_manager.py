@@ -231,16 +231,12 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
-@dataclasses.dataclass
 class HealthCheckWaiter:
-    """What an in-flight /health_generate probe waits on.
+    """What one in-flight /health_generate probe waits on; resolved exactly once."""
 
-    `event` is set exactly once, by the probe's own first output, by the scheduler's
-    HealthCheckOutput for its rid, or by the probe failing. `ok` is the verdict.
-    """
-
-    event: asyncio.Event
-    ok: bool = False
+    def __init__(self, event: asyncio.Event):
+        self.event = event
+        self.ok = False
 
     def resolve(self, ok: bool):
         if not self.event.is_set():
