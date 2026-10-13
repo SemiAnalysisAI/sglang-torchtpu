@@ -1149,7 +1149,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
             ),
         )
 
-    @torch.inference_mode()
+    # No ctx guard here: every TPU-validated family guards the CausalLM
+    # forward only (deepseek_v2, qwen3, kimi_k3). A per-layer
+    # _DecoratorContextManager wrapper makes Dynamo trace the context
+    # factory inside each decoder layer, which trips AttributeError under
+    # the TPU backend.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1765,6 +1769,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.model.capture_aux_hidden_states = True
         self.model.layers_to_capture = list(layer_ids)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
