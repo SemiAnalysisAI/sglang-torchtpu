@@ -452,6 +452,145 @@ class TestDecodeMapping(unittest.TestCase):
             self.assertIn("tpu_custom_call", hlo)
             self.assertNotIn("has_side_effect = true", hlo)
 
+    def test_uint32_weights_and_noop_step_lowering(self):
+        # serving stores code words as uint32: the step must not bitcast (copy) them; the
+        # int32 fallback shows the 2 weight-sized bitcast_converts seen in the j-b120d683 run
+        c = A.trace_config(
+            _cfg(B=2),
+            B=2,
+            pps=4,
+            kv_dtype=jnp.float8_e4m3fn,
+            nb_swa=24,
+            nb_full=24,
+            page=64,
+        )
+        mesh = Mesh(np.array(jax.devices()[:8]), ("tp",))
+        sds = jax.ShapeDtypeStruct
+        specs = W.per_rank_specs(c)
+        tmap = {torch.bfloat16: jnp.bfloat16, torch.float32: jnp.float32}
+        pools = [sds((24, 64, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(c.L)]
+        for wdt, want_bitcasts in ((jnp.uint32, 0), (jnp.int32, 2)):
+            ws = [sds(specs[k][0], tmap.get(specs[k][1], wdt)) for k in W.W_NAMES]
+            args = (
+                [
+                    sds((2, c.H), jnp.bfloat16),
+                    sds((2,), jnp.int32),
+                    sds((8,), jnp.int32),
+                    sds((8,), jnp.int32),
+                    sds((256, 64), jnp.bfloat16),
+                    sds((1,), jnp.int32),
+                ]
+                + ws
+                + pools
+            )
+            for fn in (A.per_rank_step, A.per_rank_noop):
+
+                def per_rank(x, kl, pi, spi, cs, rank, *rest, fn=fn):
+                    return fn(
+                        c,
+                        rank,
+                        x,
+                        kl,
+                        pi,
+                        spi,
+                        cs,
+                        list(rest[: len(ws)]),
+                        list(rest[len(ws) :]),
+                    )
+
+                f = jax.shard_map(
+                    per_rank,
+                    mesh=mesh,
+                    in_specs=(P(),) * len(args),
+                    out_specs=(P(),) * 4,
+                    check_vma=False,
+                )
+                with _tpu7x_info():
+                    txt = (
+                        jax.jit(f)
+                        .trace(*args)
+                        .lower(lowering_platforms=("tpu",))
+                        .as_text()
+                    )
+                self.assertEqual(txt.count("stablehlo.bitcast_convert"), want_bitcasts)
+                self.assertEqual(txt.count("tpu_custom_call"), 1)
+                self.assertNotIn("has_side_effect = true", txt)
+
+    def test_noop_step_interpret(self):
+        c = A.trace_config(
+            _cfg(B=2),
+            B=2,
+            pps=4,
+            kv_dtype=jnp.float8_e4m3fn,
+            nb_swa=24,
+            nb_full=24,
+            page=64,
+        )
+        specs = W.per_rank_specs(c)
+        tmap = {torch.bfloat16: jnp.bfloat16, torch.float32: jnp.float32}
+        ws = [
+            jnp.zeros(specs[k][0], tmap.get(specs[k][1], jnp.uint32)) for k in W.W_NAMES
+        ]
+        pools = [jnp.zeros((24, 64, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(c.L)]
+        x = jnp.ones((2, c.H), jnp.bfloat16)
+        out, kvn, newpg, off = jax.jit(
+            lambda *a: A.per_rank_noop(
+                c,
+                a[0],
+                a[1],
+                a[2],
+                a[3],
+                a[4],
+                a[5],
+                list(a[6 : 6 + len(ws)]),
+                list(a[6 + len(ws) :]),
+                interpret=True,
+            )
+        )(
+            jnp.zeros((1,), jnp.int32),
+            x,
+            jnp.asarray([3, 0], jnp.int32),
+            jnp.ones((8,), jnp.int32),
+            jnp.ones((8,), jnp.int32),
+            jnp.zeros((256, 64), jnp.bfloat16),
+            *ws,
+            *pools,
+        )
+        np.testing.assert_array_equal(np.asarray(out.astype(jnp.float32)), 1.0)
+        self.assertEqual(kvn.shape, (c.L, c.BR, 1, 4, 128))
+        self.assertEqual(list(np.asarray(off)), [2, 0])
+
+
+class _tpu7x_info:
+    """Pallas TPU lowering needs chip info; pretend TPU7x (as tpu_info_for_cpu_export)."""
+
+    def __enter__(self):
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental.pallas import tpu as pltpu
+
+        self.saved = (
+            pltpu.get_tpu_info,
+            tpu_info.get_tpu_info,
+            getattr(tpu_info, "get_device_kind", None),
+            getattr(tpu_info, "is_tpu_device", None),
+        )
+        info = tpu_info.get_tpu_info_for_chip(
+            tpu_info.chip_version_from_device_kind("TPU7x"), 1
+        )
+        pltpu.get_tpu_info = tpu_info.get_tpu_info = lambda: info
+        tpu_info.get_device_kind = lambda: "TPU7x"
+        tpu_info.is_tpu_device = lambda: True
+
+    def __exit__(self, *exc):
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental.pallas import tpu as pltpu
+
+        pltpu.get_tpu_info, tpu_info.get_tpu_info, dk, it = self.saved
+        if dk is not None:
+            tpu_info.get_device_kind = dk
+        if it is not None:
+            tpu_info.is_tpu_device = it
+
 
 def _rel(a, b):
     a = np.asarray(jnp.asarray(a).astype(jnp.float32))

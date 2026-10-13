@@ -142,3 +142,31 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
 # serving A/B on TPU: same server flags, the MK arm adds
 SGLANG_TPU_GPTOSS_DECODE_MK=1 bash benchmark/tpu/launch_server.sh
 ```
+
+## Overhead investigation (after j-b120d683: correct, but ITL c1 6.46 ms vs stock 4.87)
+
+Lead suspect, found by lowering the step op for TPU at real dims on CPU: with code words
+stored as int32 the op contains two weight-sized `bitcast_convert`s (w13q 5.2 GB, w2q
+2.6 GB per rank). They are inside the manual (`shard_map`) region feeding the Mosaic call.
+If XLA materializes them rather than folding them into a bitcast, each step reads and writes
+~7.8 GB. At ~3.5 TB/s per device that is ~4.5 ms, which matches the c1 excess. The code words
+are now uploaded as genuine `torch.uint32` device tensors (`_to_device`), so the op has no
+bitcast; a CPU test checks the TPU lowering. `SGLANG_TPU_GPTOSS_DECODE_MK_U32=0` restores
+int32 for an A/B. This is unconfirmed until the HLO dump or xprof shows it.
+
+Diagnostics:
+- `SGLANG_TPU_GPTOSS_DECODE_MK_TIMING=1` starts a log every 30 s:
+  - MK traces vs eager runs (an eager run means the decode forward is not compiled around
+    the op, i.e. a graph break);
+  - dynamo graph-break/unique-graph counters with the top reasons;
+  - synced step-op/KV-write times if a run happens eagerly.
+- `SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE` gives timing-only arms whose outputs are wrong:
+  - `noop_kernel`: the same op, operands and glue, but a trivial kernel that only takes the
+    operands. It measures marshalling and relayout of the weights/pools.
+  - `no_kv_write`: skips the KV write op.
+  - `no_mk`: skips both MK ops; this is the floor of embed + norm + logits + sampling.
+- `SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE=per_layer`: the 36 single-pool write calls.
+- `benchmark/tpu/gptoss_decode_mk/hlo_big_ops.py <dump>` lists copy, convert,
+  bitcast-convert, collective and fusion ops ≥ 64 MB in the optimized HLO. Dump with
+  `LIBTPU_INIT_ARGS="--xla_dump_to=... --xla_dump_hlo_as_text"`.
+- The values file wires all of this through `MK_ABLATIONS`, `MK_HLO_DUMP=1` and `MK_KV_WRITE`.

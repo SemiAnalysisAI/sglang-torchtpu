@@ -44,6 +44,14 @@ _KV_WRITE_LAYERS_OPS: dict = {}
 # "layers" (default): one Pallas call writes all layers' K/V (L aliased pools);
 # "per_layer": one call per layer pool
 ENV_KV_WRITE = "SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE"
+# =1: diagnostics thread + eager-run detection (see _Diagnostics)
+ENV_TIMING = "SGLANG_TPU_GPTOSS_DECODE_MK_TIMING"
+# timing-only ablations (wrong outputs!): "noop_kernel" (same op + operands, the kernel
+# only touches them), "no_kv_write" (skip the KV write op), "no_mk" (skip both MK ops)
+ENV_ABLATE = "SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE"
+ABLATIONS = ("", "none", "noop_kernel", "no_kv_write", "no_mk")
+# =0: keep MXFP4 code words as int32 on device (bitcast to uint32 inside the op)
+ENV_U32 = "SGLANG_TPU_GPTOSS_DECODE_MK_U32"
 
 
 def enabled_by_env() -> bool:
@@ -187,7 +195,7 @@ def _signature_fn(names: list[str], n_out: int, body):
     return ns["gptoss_decode_mk_step"]
 
 
-def get_step_op(c0, tp_size: int):
+def get_step_op(c0, tp_size: int, noop: bool = False):
     """Torch op ``(x, kv_lens, page_indices, swa_page_indices, cos_sin, rank, *W, *pools)
     -> (hidden [B, H], kvn [L, BR, 1, packing, 128], newpg [2B], off [B])``.
 
@@ -196,7 +204,7 @@ def get_step_op(c0, tp_size: int):
     compiles once. Each rank passes its own blocks as replicated (``P()``) operands of a
     ``shard_map`` over the ``"tp"`` mesh, as ``fused_moe_rs_op`` / ``pp_wave`` do.
     """
-    key = (c0, tp_size)
+    key = (c0, tp_size, noop)
     if key in _STEP_OPS:
         return _STEP_OPS[key]
     import jax
@@ -236,7 +244,8 @@ def get_step_op(c0, tp_size: int):
             c.kv_dtype,
             A.smem_bytes_estimate(c) // 1024,
         )
-        return A.per_rank_step(
+        step = A.per_rank_noop if noop else A.per_rank_step
+        return step(
             c, rank, x, kv_lens, page_indices, swa_page_indices, cos_sin, weights, pools
         )
 
@@ -246,7 +255,7 @@ def get_step_op(c0, tp_size: int):
     )
     fn = _signature_fn(names, 4, smap)
     op = cpu_export_jax_op(
-        STEP_OP_NAME,
+        STEP_OP_NAME + ("_noop" if noop else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -358,14 +367,21 @@ class GptOssDecodeMK(nn.Module):
         self.c, self.rank, self.tp_size = c, rank, tp_size
         self.w_names = W_NAMES
         for k in W_NAMES:
-            self.register_buffer("w_" + k, host[k].to(device), persistent=False)
+            self.register_buffer(
+                "w_" + k, _to_device(host[k], device), persistent=False
+            )
         self.register_buffer(
             "rank_t",
             torch.tensor([rank], dtype=torch.int32, device=device),
             persistent=False,
         )
+        self.ablate = os.environ.get(ENV_ABLATE, "").strip().lower()
+        if self.ablate not in ABLATIONS:
+            raise ValueError(
+                f"{ENV_ABLATE}={self.ablate!r}; expected one of {ABLATIONS}"
+            )
         # register the ops eagerly, outside any torch.compile trace
-        self._step_op = get_step_op(c, tp_size)
+        self._step_op = get_step_op(c, tp_size, noop=self.ablate == "noop_kernel")
         self.kv_write_mode = os.environ.get(ENV_KV_WRITE, "layers").strip().lower()
         if self.kv_write_mode == "per_layer":
             self._kv_write_op = get_kv_write_op()
@@ -378,6 +394,13 @@ class GptOssDecodeMK(nn.Module):
         self._get_attn_backend = get_attn_backend
         # pool operand order: SWA, then full layers
         self.layer_ids = pool_layer_order(c.L)
+        self.diag = _Diagnostics.maybe_start(rank)
+        logger.info(
+            "GPT-OSS decode megakernel ops: kv_write=%s ablate=%s weight dtypes %s",
+            self.kv_write_mode,
+            self.ablate or "none",
+            {k: str(getattr(self, "w_" + k).dtype) for k in ("w13q", "w2q")},
+        )
 
     @staticmethod
     def applies(
@@ -437,14 +460,21 @@ class GptOssDecodeMK(nn.Module):
 
     def run(self, model, input_ids: torch.Tensor, forward_batch) -> torch.Tensor:
         """Embedding -> megakernel (all layers) -> in-place KV writes -> final norm."""
+        eager = not torch.compiler.is_compiling()
+        if self.diag is not None:
+            self.diag.on_run(eager, input_ids.shape[0])
         attn_backend = self._get_attn_backend()  # what RadixAttention uses
         pool = attn_backend.token_to_kv_pool
         self._check_backend(attn_backend, pool, model)
         meta = attn_backend.forward_metadata
         pools = [pool.get_fused_kv_buffer(l) for l in self.layer_ids]
         x = model.embed_tokens(input_ids)
+        if self.ablate == "no_mk":  # timing only: everything but the two MK ops
+            forward_batch.residual_stream = None
+            return model.norm(x)
         cos_sin = model.layers[0].self_attn.rotary_emb.cos_sin_cache
         weights = [getattr(self, "w_" + k) for k in self.w_names]
+        t0 = self.diag.tick(eager, x) if self.diag is not None else None
         hidden, kvn, newpg, off = self._step_op(
             x,
             meta.kv_lens,
@@ -455,8 +485,11 @@ class GptOssDecodeMK(nn.Module):
             *weights,
             *pools,
         )
+        t1 = self.diag.tick(eager, hidden) if self.diag is not None else None
         B = x.shape[0]
-        if self.kv_write_mode == "layers":
+        if self.ablate == "no_kv_write":  # timing only: the KV pools go stale
+            pass
+        elif self.kv_write_mode == "layers":
             self._kv_write_op(newpg, off, kvn, *pools)
         else:
             pg_swa, pg_full = newpg[:B], newpg[B:]
@@ -464,6 +497,117 @@ class GptOssDecodeMK(nn.Module):
                 self._kv_write_op(
                     pg_swa if l % 2 == 0 else pg_full, off, kvn[l], pools[i]
                 )
+        if self.diag is not None:
+            self.diag.on_eager_times(eager, t0, t1, self.diag.tick(eager, pools[0]))
         # the stock stack's residual stream is not used on this path
         forward_batch.residual_stream = None
         return model.norm(hidden)
+
+
+def _to_device(t: torch.Tensor, device) -> torch.Tensor:
+    """Upload; MXFP4 code words become genuine uint32 device tensors when torch_tpu can
+    hold them (a base tensor of the kernel's dtype: no bitcast in the graph, and no dtype
+    view, which torch_tpu would materialize as a copy), else stay int32."""
+    if t.dtype == torch.int32 and os.environ.get(ENV_U32, "1") != "0":
+        try:
+            u = t.view(torch.uint32).to(device)
+            assert u._base is None and u.dtype == torch.uint32
+            return u
+        except Exception as e:  # noqa: BLE001 - keep int32 + in-graph bitcast
+            logger.warning(
+                "uint32 weights unavailable on %s (%s); using int32", device, e
+            )
+    return t.to(device)
+
+
+class _Diagnostics:
+    """``SGLANG_TPU_GPTOSS_DECODE_MK_TIMING=1``: where does the integration spend time?
+
+    - Every decode-MK ``run`` executed *eagerly* (outside a compiled graph: graph break,
+      compile disabled or fallback) is counted, and its op times are measured with a
+      device sync around the step op and the KV write.
+    - A daemon thread logs every 30 s: MK traces vs eager runs, and torch._dynamo's
+      graph-break / unique-graph / recompile counters (graph breaks around the custom ops
+      would split the decode forward into several executables with host round trips).
+    Inside a compiled graph the ops cannot be timed from the host; use the
+    ``SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE`` arms and xprof for that.
+    """
+
+    def __init__(self, rank: int):
+        import threading
+
+        self.rank = rank
+        self.traces = 0
+        self.eager = 0
+        self.buckets: set[int] = set()
+        self.eager_ms: list[tuple[float, float]] = []
+        self.lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True, name="mk-diag").start()
+
+    @classmethod
+    def maybe_start(cls, rank: int):
+        if os.environ.get(ENV_TIMING, "0") in ("", "0"):
+            return None
+        return cls(rank)
+
+    def on_run(self, eager: bool, bs: int) -> None:
+        with self.lock:
+            self.buckets.add(int(bs))
+            if eager:
+                self.eager += 1
+            else:
+                self.traces += 1
+
+    def tick(self, eager: bool, t: torch.Tensor):
+        if not eager:
+            return None
+        import time
+
+        try:
+            from torch_tpu._internal.sync.sync import synchronize
+
+            synchronize([t], wait=True)
+        except Exception:  # noqa: BLE001 - timing is best effort
+            pass
+        return time.perf_counter()
+
+    def on_eager_times(self, eager, t0, t1, t2) -> None:
+        if eager and None not in (t0, t1, t2):
+            with self.lock:
+                self.eager_ms.append(((t1 - t0) * 1e3, (t2 - t1) * 1e3))
+
+    def _loop(self) -> None:
+        import time
+
+        while True:
+            time.sleep(30)
+            try:
+                from torch._dynamo.utils import counters
+
+                gb = counters.get("graph_break", {})
+                stats = counters.get("stats", {})
+                with self.lock:
+                    em = self.eager_ms[-50:]
+                    self.eager_ms.clear()
+                    msg = (
+                        f"MK diag rank{self.rank}: traces={self.traces} "
+                        f"eager_runs={self.eager} buckets={sorted(self.buckets)}"
+                    )
+                if em:
+                    s = sorted(a for a, _ in em)
+                    w = sorted(b for _, b in em)
+                    msg += (
+                        f" eager step-op ms med {s[len(s) // 2]:.2f} "
+                        f"kv-write ms med {w[len(w) // 2]:.2f} (n={len(em)})"
+                    )
+                msg += (
+                    f" | dynamo graph_breaks={sum(gb.values())} "
+                    f"unique_graphs={stats.get('unique_graphs', 0)} "
+                    f"calls_captured={stats.get('calls_captured', 0)}"
+                )
+                top = sorted(gb.items(), key=lambda kv: -kv[1])[:3]
+                if top:
+                    msg += " top: " + "; ".join(f"{n}x {r[:160]}" for r, n in top)
+                logger.info(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.info("MK diag failed: %s", e)

@@ -161,6 +161,48 @@ def per_rank_step(
     return out[: c.B, : c.H], kvn, s["newpg"], s["off"]
 
 
+def per_rank_noop(
+    c: DecodeConfig,
+    rank,
+    x,
+    kv_lens,
+    page_indices,
+    swa_page_indices,
+    cos_sin,
+    weights,
+    pools,
+    *,
+    interpret: bool = False,
+):
+    """Timing ablation with ``per_rank_step``'s operands and outputs: the same glue, and a
+    trivial Pallas kernel that takes every weight and pool as an HBM operand (so the same
+    operand layout constraints, and any marshalling/relayout they cause, apply) but only
+    copies x through. Outputs are wrong by design."""
+    s = step_inputs(c, kv_lens, page_indices, swa_page_indices, cos_sin, x)
+    wl = [
+        lax.bitcast_convert_type(w, jnp.uint32) if w.dtype == jnp.int32 else w
+        for w in weights
+    ]
+    n_hbm = len(wl) + len(pools)
+
+    def kernel(pos_s, xp_ref, *refs):
+        refs[n_hbm][...] = xp_ref[...]
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    out = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((c.BR, c.Hp), BF16),
+        in_specs=[smem, vmem] + [hbm] * n_hbm,
+        out_specs=vmem,
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="gptoss_decode_mk_noop",
+    )(s["pos"], s["xp"], *wl, *pools)
+    kvn = jnp.zeros((c.L, c.BR, 1, c.kv_packing, 128), pools[0].dtype)
+    return out[: c.B, : c.H], kvn, s["newpg"], s["off"]
+
+
 # ----------------------------------------------------------------------------- KV write
 #
 # No `has_side_effects`: torch_tpu compiles the forward as one SPMD program, and the XLA
