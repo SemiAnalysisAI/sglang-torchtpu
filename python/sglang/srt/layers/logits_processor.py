@@ -1399,14 +1399,14 @@ class LogitsProcessor(nn.Module):
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
+        # On TPU, static logits buffers are not used and eager cast/copy operations
+        # on large vocab tensors trigger SparseCore halts on TPU v7x. Return logits directly.
+        if is_tpu() or logits.device.type in ("tpu", "privateuseone"):
+            return logits
         # The shared logits buffer is keyed by vocab width and rows; skip it
         # when this batch has a different logits shape than the graph buffer.
-        # On TPU, in-place copy_ into a static buffer forces an eager TorchTPU JIT
-        # dispatch that halts SparseCore; return logits directly without copy_.
         if (
-            logits.device.type != "tpu"
-            and not is_tpu()
-            and logits_buffer is not None
+            logits_buffer is not None
             and tuple(logits_buffer.shape) == tuple(logits.shape)
         ):
             assert logits_buffer.dtype == torch.float
