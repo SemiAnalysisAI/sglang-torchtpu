@@ -30,10 +30,17 @@ _COMPILATION_CACHE_ENV_RENAMES = (
 
 # Append instead of setdefault so caller-supplied flags are preserved.
 _SPARSE_CORE_OFFLOAD_OVERRIDES = (
-    # TODO(wyzhang): drop after the torchtpu fix.
-    # SparseCore offload for the all-reduce after embed lookup can return
-    # wrong values inside compiled regions on TP=8 dense Qwen.
+    # SparseCore offload for collectives, gathers, scatters, and buffer copies can
+    # halt SparseCore cores or return corrupted values on TPU v7x (libtpu 0.0.46-0.0.49).
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
+    "--xla_tpu_enable_offloading_copy_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_scatter_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_reduce_to_sparsecore=false",
+    "--xla_tpu_offload_all_supported_gathers_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_sort_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_dynamic_padding_to_sparsecore=false",
+    "--xla_tpu_offload_convolution_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_compute_offload=false",
 )
 
 _ASSOCIATIVE_SCAN_OVERRIDES = (
@@ -67,6 +74,7 @@ _PREFILL_CP_SPARSE_CORE_OVERRIDES = (
     "--xla_tpu_offload_gather_to_sparsecore=false",
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
     "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all=false",
 )
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth
