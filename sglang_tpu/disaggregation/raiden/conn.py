@@ -28,7 +28,7 @@ import math
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -70,6 +70,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 
@@ -125,6 +126,7 @@ class RaidenKVManager(
             Chunk.TAG: self._on_chunk,
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
+            RoomFailed.TAG: self._on_room_failed,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
@@ -159,7 +161,7 @@ class RaidenKVManager(
             self.pp_size,
         )
         self._control_port = base_port + 4 * self._local_rank
-        self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
+        self._timeout_s = envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
         # Raiden reads its own TPU_RAIDEN_DYNAMIC_HOST_STAGING when the engine is
         # built in this process. Store the resolved value back so later reads
         # do not mistake the variable set here for the deprecated alias.
@@ -531,6 +533,7 @@ class RaidenKVManager(
                 self._completed_recv.update(received)
                 self._native_failed.update(failed)
                 self._failed.update(failed)
+            self._log_settled_transfers(sent=sent, received=received)
             return
         if self._engine is None and self._swa_engine is None:
             return
@@ -562,6 +565,10 @@ class RaidenKVManager(
                     settled_plans = self._settled_cleared_plans_locked()
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
+                self._log_settled_transfers(
+                    sent=[self._norm_req_id(t.req_id) for t in done_send],
+                    received=[self._norm_req_id(t.req_id) for t in done_recv],
+                )
                 if real_failed:
                     logger.error(
                         "RaidenKVManager rank%d failed=%s",
@@ -574,6 +581,22 @@ class RaidenKVManager(
                 self._stale_plans.remove(entry)
         for uuid, _room, _fut in settled_stale:
             self._unregister_plan(uuid)
+
+    def _log_settled_transfers(
+        self, *, sent: Iterable[str], received: Iterable[str]
+    ) -> None:
+        for rid in sent:
+            logger.info(
+                "RaidenKVManager rank%d prefill read served | req_id=%s",
+                self.attn_tp_rank,
+                rid,
+            )
+        for rid in received:
+            logger.info(
+                "RaidenKVManager rank%d decode pull done | req_id=%s",
+                self.attn_tp_rank,
+                rid,
+            )
 
     def _poll_engine_status(
         self, *, name: str, engine: Any
@@ -773,10 +796,15 @@ class RaidenKVManager(
         if sock is None and monitor is None:
             return
         with send_lock if send_lock is not None else contextlib.nullcontext():
+            if sock is not None:
+                # libzmq's I/O thread reports a peer drop with a blocking send
+                # to the monitor. Once the monitor is closed that send never
+                # returns, and no socket of this context delivers again, so
+                # the socket stops reporting before either end is closed.
+                sock.disable_monitor()
+                sock.close(linger=0)
             if monitor is not None:
                 monitor.close()
-            if sock is not None:
-                sock.close(linger=0)
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no

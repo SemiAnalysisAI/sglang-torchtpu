@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -50,6 +51,24 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    supports_mamba_extra_buffer: bool = False
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        """Whether this model's recurrent backend can reuse prefix checkpoints.
+
+        Called for models with recurrent state. Preserve the shared cache
+        behavior by default; plugins may restrict their supported backends.
+        """
+        return True
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        """Validate platform-specific recurrent prefix-cache constraints.
+
+        ``hf_config`` is provided for extra-buffer strategies. The default
+        adds no restrictions to the shared backend validation.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -74,6 +93,19 @@ class SRTPlatform(DeviceMixin):
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
 
+    def get_mha_kv_bytes_per_token(
+        self,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        """Per-token, per-layer bytes of this platform's MHA pool; ``None`` means
+        the generic ``num_kv_heads * (head_dim + v_head_dim) * itemsize``."""
+        del num_kv_heads, head_dim, v_head_dim, kv_cache_dtype
+        return None
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
 
@@ -85,6 +117,15 @@ class SRTPlatform(DeviceMixin):
         from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 
         return get_mha_host_pool_cls(device_pool)
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        """Scope host-pool construction for an explicit HiCache ratio or size.
+
+        The context covers target and draft pools. By default, each host pool
+        performs its own admission check; platforms may share a budget instead.
+        Automatic sizing manages its own budget and does not call this hook.
+        """
+        return nullcontext()
 
     def get_mamba_pool_cls(self) -> type:
         """Return the recurrent (GDN / mamba) state pool class for this platform."""
@@ -187,12 +228,37 @@ class SRTPlatform(DeviceMixin):
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
         return False
 
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def supports_moe_dp_pipeline_stages(self) -> bool:
+        """Whether a pipeline stage may replicate its experts over its own
+        devices (--moe-dp-size > 1 with --pp-size > 1)."""
+        return False
+
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        """Whether the SWA allocator's full-to-SWA index mapping is host-resident,
+        so SWA segment frees require host indices."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def on_warmup_complete(self) -> None:
+        """Called once on the scheduler thread, the first time it goes idle after
+        a forward (the server warmup request has drained). Platforms that
+        compile ahead of serving freeze or monitor compilation here."""
+        pass
+
+    # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
+    # entry until the seam PR merges upstream.
+    def prepare_model_parallel_groups(self) -> None:
+        """Called on every rank once the model-parallel groups are built,
+        before their first collective."""
         pass
 
     # ------------------------------------------------------------------
