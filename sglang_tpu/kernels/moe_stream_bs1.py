@@ -23,10 +23,19 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _LHS_QUANT_BLOCK = 512
+# One expert's FP8 w1 + w2 blocks, double-buffered. Arbitrary margin under the
+# default scoped VMEM limit; larger experts keep the route-meta + gmm_v2 path.
+_EXPERT_BLOCK_BUDGET = 24 * 1024 * 1024
 
 
 def supports(tokens: int, hidden: int, two_n: int) -> bool:
-    return tokens == 1 and hidden % 128 == 0 and two_n % 256 == 0
+    expert_bytes = hidden * two_n + (two_n // 2) * hidden
+    return (
+        tokens == 1
+        and hidden % 128 == 0
+        and two_n % 256 == 0
+        and 2 * expert_bytes <= _EXPERT_BLOCK_BUDGET
+    )
 
 
 def _block_quant_dot(x, w, w_scale, *, fp8_dtype):
