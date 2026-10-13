@@ -391,8 +391,9 @@ def _patch_set_device_tolerate_mismatch() -> None:
     def wrapped(cls, device):
         try:
             return orig_set_device(device)
-        except ValueError as e:
-            if "Cannot set TPU device" in str(e):
+        except (ValueError, RuntimeError) as e:
+            # newer torch_tpu reserves set_device for itself; the binding is its call either way
+            if "Cannot set TPU device" in str(e) or "internal to TorchTPU" in str(e):
                 idx = (
                     device.index
                     if hasattr(device, "index") and device.index is not None
