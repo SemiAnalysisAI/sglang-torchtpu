@@ -1396,6 +1396,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             expert_group_offset=expert_group_offset,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
+            w_layer_idx=getattr(layer, "_moe_layer_idx_tensor", None),
         )
         if no_combine:
             # The EP kernel masks by ownership only; zero-weight slots stay zero

@@ -3252,6 +3252,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._megakernel_runner = None
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        if self._megakernel_runner is not None:
+            self._megakernel_runner.prepare_batch(forward_batch)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -3290,6 +3295,13 @@ class KimiK3LinearForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if (
+            self._megakernel_runner is not None
+            and forward_batch.forward_mode.is_decode()
+            and input_ids is not None
+            and int(input_ids.shape[0]) <= self._megakernel_runner.max_rows
+        ):
+            return self._megakernel_runner.forward_decode(input_ids, forward_batch)
         embeds = input_embeds if input_embeds is not None else inputs_embeds
         hidden_states = self.model(
             input_ids, positions, forward_batch, embeds, pp_proxy_tensors
@@ -3529,6 +3541,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        # Release parameter references before post_load_weights so per-layer
+        # MoE weight rebinding and in-place 5D stacking can immediately free
+        # the original parameter storages on TPU.
+        del params_dict, expert_params_lookup, expert_params_mapping
+        args = loaded_weight = param = weight_loader = None
         self.post_load_weights()
         return loaded_params
 
@@ -3644,6 +3661,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 "KDA kernel reads conv weight / dt_bias / A_log copies built at "
                 "load time. Restart the server to change weights."
             )
+            from sglang_tpu.kimi_k3_megakernel.runner import (
+                KimiK3MegakernelRunner,
+                is_megakernel_enabled,
+            )
+
+            if is_megakernel_enabled():
+                self._megakernel_runner = KimiK3MegakernelRunner.from_model(self)
+                self.logits_processor.use_tpu_distributed_top_k = False
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
@@ -3797,6 +3822,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        if self.language_model is not None:
+            self.language_model.prepare_forward_batch(forward_batch)
 
     @property
     def logits_processor(self):
@@ -4153,7 +4182,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         vision_params = (
             None
             if self.config.language_only
-            else dict(self.named_parameters(remove_duplicate=False))
+            else {
+                name: param
+                for name, param in self.named_parameters(remove_duplicate=False)
+                if "vision_tower" in name or "mm_projector" in name
+            }
         )
 
         def stream_language_weights():
@@ -4171,6 +4204,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     weight_loader(param, loaded_weight)
                     continue
                 yield name.replace("language_model.", ""), loaded_weight
+            if vision_params is not None:
+                vision_params.clear()
 
         if self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())

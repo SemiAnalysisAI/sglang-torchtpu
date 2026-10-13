@@ -330,9 +330,15 @@ TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], Til
 class IndexMaps:
     """Index maps for GMM kernel."""
 
-    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
+    def __init__(
+        self,
+        metadata_ref: MetadataRef,
+        cfgs: GmmConfigs,
+        rhs_group_offset: jax.Array | int = 0,
+    ):
         self.metadata_ref = metadata_ref
         self.cfgs = cfgs
+        self.rhs_group_offset = rhs_group_offset
 
     def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -352,7 +358,7 @@ class IndexMaps:
         *,
         offset: int = 0,
     ):
-        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        group_id = self.metadata_ref.gm_id_to_group_id[gm_id] + self.rhs_group_offset
         return (group_id, k_id, offset + n_id)
 
     def rhs_bias_index_map(
@@ -444,11 +450,13 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
 
 
 def generate_block_specs(
-    metadata_ref: MetadataRef, cfgs: GmmConfigs
+    metadata_ref: MetadataRef,
+    cfgs: GmmConfigs,
+    rhs_group_offset: jax.Array | int = 0,
 ) -> Tuple[Tuple[pl.BlockSpec, RhsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
-    index_map = IndexMaps(metadata_ref, cfgs)
+    index_map = IndexMaps(metadata_ref, cfgs, rhs_group_offset=rhs_group_offset)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
     lhs_block_spec = pl.BlockSpec(
@@ -994,14 +1002,22 @@ def kernel_main(
         f" equal to size_n {cfgs.dims.size_n}"
     )
 
+    if rhs_ref.weight.ndim == 5:
+        rhs_ref = dataclasses.replace(
+            rhs_ref,
+            weight=rhs_ref.weight.reshape(
+                -1, rhs_ref.weight.shape[3], rhs_ref.weight.shape[4]
+            ),
+        )
+
     # Pack along K (2nd minor dim) so that pltpu.bitcast can unpack inside the
     # kernel.
     # [G, K, N] -> [G, K//packing, N] uint32
     if cfgs.rhs_cfgs.quant_dtype is not None:
         rhs_weight = rhs_ref.weight
         rhs_weight = rhs_weight.bitcast(jnp.uint32)
-        assert rhs_weight.shape == (
-            cfgs.dims.size_group,
+        assert rhs_weight.shape[0] % cfgs.dims.size_group == 0
+        assert rhs_weight.shape[1:] == (
             cfgs.dims.size_k // cfgs.rhs_cfgs.packing,
             cfgs.dims.size_n * (2 if cfgs.fuse_act else 1),
         )
@@ -1015,7 +1031,10 @@ def kernel_main(
         cfgs=cfgs,
     )
 
-    in_specs, out_specs = generate_block_specs(metadata_ref, cfgs)
+    rhs_group_offset = group_offset_ref[1] if group_offset_ref.shape[0] > 1 else 0
+    in_specs, out_specs = generate_block_specs(
+        metadata_ref, cfgs, rhs_group_offset=rhs_group_offset
+    )
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -1222,7 +1241,11 @@ def validate_inputs(
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k_raw, size_n = rhs.shape
+    if rhs.ndim == 5:
+        rhs_groups = rhs.shape[0] * rhs.shape[1] * rhs.shape[2]
+        size_k_raw, size_n = rhs.shape[3], rhs.shape[4]
+    else:
+        rhs_groups, size_k_raw, size_n = rhs.shape
     if packed_fp4:
         # uint8-packed float4: 2 codes per byte, so real K = shape[1] * 2.
         size_k = size_k_raw * 2
@@ -1232,10 +1255,19 @@ def validate_inputs(
     else:
         size_k = size_k_raw
     size_lhs_group = group_sizes.shape[0]
+    if rhs_scale is not None and rhs_groups > rhs_scale.shape[0]:
+        size_group = rhs_scale.shape[0]
+    elif rhs_bias is not None and rhs_groups > rhs_bias.shape[0]:
+        size_group = rhs_bias.shape[0]
+    elif rhs_groups > size_lhs_group:
+        size_group = size_lhs_group
+    else:
+        size_group = rhs_groups
 
     assert size_group <= size_lhs_group
+    assert rhs_groups % size_group == 0
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k_raw, size_n)
+    assert rhs.shape[-2:] == (size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1244,7 +1276,7 @@ def validate_inputs(
         assert size_n % rhs_scale.shape[3] == 0
         assert size_k % num_quant_blocks == 0
 
-    assert group_offset.shape == (1,)
+    assert group_offset.shape in ((1,), (2,))
 
     size_lhs_sublane = lhs_sublane_tiling(lhs.dtype)
     size_lhs_sublane = min(size_lhs_sublane, size_m)
@@ -1367,10 +1399,10 @@ def make_gmm_configs(
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
-        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+        if rhs_scale.shape[3] != rhs.shape[-1] and rhs_scale.shape[3] % 128 == 0:
             scale_block_n = 128
         else:
-            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+            scale_block_n = rhs.shape[-1] // rhs_scale.shape[3]
         if fuse_act is not None:
             assert dims.size_n % scale_block_n == 0, (
                 f"fused activation requires the gate/up boundary "
@@ -1617,6 +1649,7 @@ def gmm_v2(
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
     dequantize_rhs: bool = False,
     rhs_channel_scale: jax.Array | None = None,
+    rhs_group_offset: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1665,6 +1698,11 @@ def gmm_v2(
     else:
         if jnp.isscalar(group_offset):
             group_offset = group_offset[None]
+    if rhs_group_offset is not None:
+        rhs_group_offset = jnp.asarray(rhs_group_offset, dtype=jnp.int32).reshape(1)
+        group_offset = jnp.concatenate(
+            [group_offset.reshape(1).astype(jnp.int32), rhs_group_offset]
+        )
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)

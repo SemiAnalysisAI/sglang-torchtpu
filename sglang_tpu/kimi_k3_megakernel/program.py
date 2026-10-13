@@ -75,7 +75,12 @@ def state_shapes(rows: int, context: int, layers: int = 93):
 
 
 def make_local_step(
-    weight_names, *, batch_size: int, layers: int = 93, recipe: str = "tuned"
+    weight_names,
+    *,
+    batch_size: int,
+    layers: int = 93,
+    recipe: str = "tuned",
+    rank: int | None = 0,
 ):
     """Per-rank step body for ``jax.shard_map`` over the ``"tp"`` axis."""
     import jax
@@ -100,6 +105,7 @@ def make_local_step(
             batch_size=batch_size,
             layers=layers,
             sequence_rows=1,
+            rank=rank,
             **options,
         )
         # [1, B, vocab / 32] on each rank -> [B, vocab] everywhere.
@@ -110,7 +116,13 @@ def make_local_step(
 
 
 def make_decode_program(
-    mesh, weight_names, *, batch_size: int, layers: int = 93, recipe: str = "tuned"
+    mesh,
+    weight_names,
+    *,
+    batch_size: int,
+    layers: int = 93,
+    recipe: str = "tuned",
+    rank: int | None = 0,
 ):
     """Flat jax.Array entry point of one decode step plus its bridge metadata.
 
@@ -127,7 +139,11 @@ def make_decode_program(
     output_specs = (P(),) + (P("tp"),) * STATE_COUNT
     sharded = jax.shard_map(
         make_local_step(
-            weight_names, batch_size=batch_size, layers=layers, recipe=recipe
+            weight_names,
+            batch_size=batch_size,
+            layers=layers,
+            recipe=recipe,
+            rank=rank,
         ),
         mesh=mesh,
         in_specs=input_specs,

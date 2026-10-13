@@ -84,7 +84,19 @@ def _e8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
     treat all values uniformly.
     """
     assert scale_u8.dtype == torch.uint8, f"expected uint8 e8m0, got {scale_u8.dtype}"
-    return torch.exp2(scale_u8.to(torch.int32).to(torch.float32) - 127.0)
+    # Construct exact IEEE-754 float32 powers of two via exponent bit-shift on
+    # CPU rather than torch.exp2 (which XLA lowers to a polynomial approximation
+    # on TPU that introduces a 1-ULP mantissa error). For scale_u8 == 0
+    # (2**-127), use the exact IEEE-754 subnormal representation 1 << 22.
+    scale_cpu = scale_u8.cpu()
+    bits = torch.where(
+        scale_cpu == 0,
+        torch.tensor(1 << 22, dtype=torch.int32),
+        scale_cpu.to(torch.int32) << 23,
+    )
+    out = bits.view(torch.float32).clone()
+    return out.to(scale_u8.device) if scale_u8.device.type != "cpu" else out
+
 
 
 def _flatten_block_bytes(packed_blocks: torch.Tensor) -> torch.Tensor:
@@ -402,6 +414,11 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) ->
     (:func:`process_mxfp4_moe_weights_native`). Interleaved GPT-OSS (SWIGLUOAI)
     stays on the bf16 dequant-at-load path.
     """
+    if layer.w13_weight.ndim == 5 or (
+        getattr(layer, "w13_weight_scale", None) is not None
+        and layer.w13_weight_scale.ndim == 4
+    ):
+        return
     # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...].
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
     # The packed path does not pad K, so it needs a lane-aligned hidden size.
@@ -437,6 +454,28 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) ->
             layer.w2_weight_bias.data,
             w13_interleaved=w13_interleaved,
         )
+    for _attr, _new_t in (
+        ("w13_weight", w13),
+        ("w13_weight_scale", w13_scale),
+        ("w13_weight_bias", w13_bias),
+        ("w2_weight", w2),
+        ("w2_weight_scale", w2_scale),
+        ("w2_weight_bias", w2_bias),
+    ):
+        _old_p = getattr(layer, _attr, None)
+        if isinstance(_old_p, torch.Tensor) and (
+            _new_t is None
+            or _old_p.untyped_storage().data_ptr()
+            != _new_t.untyped_storage().data_ptr()
+        ):
+            _old_data = _old_p.data
+            _old_p.data = torch.empty(0, dtype=_old_data.dtype, device=_old_data.device)
+            if (
+                _old_data.untyped_storage().data_ptr()
+                != _old_p.data.untyped_storage().data_ptr()
+            ):
+                _old_data.untyped_storage().resize_(0)
+            del _old_data
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = w13_scale
     layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)

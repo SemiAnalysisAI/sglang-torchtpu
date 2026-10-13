@@ -120,6 +120,7 @@ def _route_hidden_states(
     expert_tensor_parallel,
     on_local_selection,
     after_selection,
+    active_rows=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
 
@@ -182,6 +183,9 @@ def _route_hidden_states(
 
         counts_before_selection = local_route_counts
         owned_locally = winners // local_expert_count == rank // expert_tensor_parallel
+        # SGLANG-PATCH: padded rows (positions[r] < 0) own no local expert routes.
+        if active_rows is not None:
+            owned_locally = owned_locally & active_rows
         destination_mask = owned_locally[:, None] & (
             route_slots == counts_before_selection[:, None]
         )
@@ -1226,6 +1230,7 @@ def moe(
     token_scatter_output: bool = False,
     routed_reduce_scatter: bool = False,
     after_experts=None,
+    active_rows=None,
 ) -> None:
     """Execute one mixture-of-experts layer inside a Pallas program."""
     batch_size, hidden_size = hidden_ref.shape
@@ -1535,10 +1540,13 @@ def moe(
         ):
             del unused_selected_experts
             nonlocal shared_route_prefix, prefetched_expert_count
-            shared_route_prefix *= jnp.all(winners == winners[0]).astype(jnp.int32)
+            owned_bits = owned_locally.astype(jnp.int32)
+            shared_route_prefix *= (
+                jnp.all(winners == winners[0]) & jnp.all(owned_bits == owned_bits[0])
+            ).astype(jnp.int32)
             should_prefetch = (
                 shared_route_prefix
-                * owned_locally.astype(jnp.int32)[0]
+                * owned_bits[0]
                 * (route_counts[0] < expert_prefetch_slot_count).astype(jnp.int32)
             )
 
@@ -1577,6 +1585,7 @@ def moe(
             expert_tensor_parallel=expert_tensor_parallel,
             on_local_selection=prefetch_shared_route_prefix,
             after_selection=overlap_routing_with_latent_gather,
+            active_rows=active_rows,
         )
         selected_experts_vmem[...] = jnp.pad(
             selected_experts,
@@ -2503,7 +2512,10 @@ def mla(
     weight_copies.output_gate.start()
     weight_copies.output.start()
 
-    positions = jnp.stack(tuple(position_ref[index] for index in range(batch_size)))
+    # SGLANG-PATCH: clamp negative positions on padded rows to 0.
+    positions = jnp.stack(
+        tuple(jnp.maximum(position_ref[index], 0) for index in range(batch_size))
+    )
 
     def make_key_cache_copy(block, batch_offset):
         return tpu.make_async_copy(
@@ -2610,7 +2622,8 @@ def mla(
     def attend_cache_tile_body(tile_index, *, compute_output_gate: bool):
         batch_offset = tile_index * cache_batch_tile_size
         tile_positions = tuple(
-            position_ref[batch_offset + index] for index in range(cache_batch_tile_size)
+            jnp.maximum(position_ref[batch_offset + index], 0)
+            for index in range(cache_batch_tile_size)
         )
         head_positions = jnp.stack(
             tuple(position for position in tile_positions for _ in range(3))
@@ -2740,7 +2753,8 @@ def mla(
         first_row = sequence * sequence_rows
         rows = pl.ds(first_row, sequence_rows)
         row_positions = tuple(
-            position_ref[first_row + index] for index in range(sequence_rows)
+            jnp.maximum(position_ref[first_row + index], 0)
+            for index in range(sequence_rows)
         )
         position_column = jnp.stack(row_positions)[:, None]
         first_block = row_positions[0] // 128
@@ -3677,8 +3691,22 @@ def stack(
     def shape(value):
         return jax.ShapeDtypeStruct(value.shape, value.dtype)
 
+    # SGLANG-PATCH: accept SGLang's uint8 MXFP4 expert arrays (4x sublanes)
+    # and bitcast their HBM refs to uint32 inside the Pallas body.
+    def _local_weight(name, value):
+        if name in ("expert_gu", "expert_down") and value.dtype == jnp.uint8:
+            if value.shape[2] % 4 != 0:
+                raise ValueError(
+                    f"{name} uint8 sublanes must be divisible by 4: {value.shape}"
+                )
+            return jax.ShapeDtypeStruct(
+                (value.shape[1], value.shape[2] // 4, *value.shape[3:]),
+                jnp.uint32,
+            )
+        return jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
+
     local_weights = {
-        name: jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
+        name: _local_weight(name, value)
         for name, value in weights.items()
     }
     mla_scoped_scratch = _mla_scoped_scratch(
@@ -3696,6 +3724,11 @@ def stack(
 
     def body(position_ref, state_row_ref, prefix_ref, embedding_ref, *refs):
         layer_weights = dict(zip(NAMES, refs[: len(NAMES)], strict=True))
+        for _expert_name in ("expert_gu", "expert_down"):
+            if layer_weights[_expert_name].dtype == jnp.uint8:
+                layer_weights[_expert_name] = layer_weights[_expert_name].bitcast(
+                    jnp.uint32
+                )
         output_residual_ref, final_normalization_ref = refs[
             len(NAMES) : len(NAMES) + len(EPILOGUE)
         ]
@@ -4307,14 +4340,16 @@ def stack(
                             batch_offset = tile_index * mla_cache_batch_tile_size
                             positions = jnp.stack(
                                 tuple(
-                                    position_ref[batch_offset + row_index]
+                                    jnp.maximum(
+                                        position_ref[batch_offset + row_index], 0
+                                    )
                                     for row_index in range(mla_cache_batch_tile_size)
                                 )
                             )
                             cache_reads = []
                             for row_index in range(mla_cache_batch_tile_size):
                                 batch_index = batch_offset + row_index
-                                position = position_ref[batch_index]
+                                position = jnp.maximum(position_ref[batch_index], 0)
                                 cache_reads.extend(
                                     (
                                         tpu.make_async_copy(
@@ -4382,7 +4417,7 @@ def stack(
                             cache_writes = []
                             for row_index in range(mla_cache_batch_tile_size):
                                 batch_index = batch_offset + row_index
-                                position = position_ref[batch_index]
+                                position = jnp.maximum(position_ref[batch_index], 0)
                                 cache_writes.extend(
                                     (
                                         tpu.make_async_copy(
@@ -4421,7 +4456,7 @@ def stack(
                             # and write it back.
                             first_row = sequence * sequence_rows
                             row_positions = tuple(
-                                position_ref[first_row + index]
+                                jnp.maximum(position_ref[first_row + index], 0)
                                 for index in range(sequence_rows)
                             )
                             first_block = row_positions[0] // 128
@@ -4738,6 +4773,12 @@ def stack(
                     after_experts=after_experts,
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
+                    active_rows=(
+                        jnp.stack(
+                            tuple(position_ref[row] for row in range(batch_size))
+                        )
+                        >= 0
+                    ),
                 )
 
             def run_dense_mlp():
@@ -5122,6 +5163,7 @@ def decode_local(
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    rank=None,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5150,7 +5192,11 @@ def decode_local(
     aux_hidden_layers = tuple(aux_hidden_layers)
 
     # Compose true-batched layer primitives without the batch-one fused stack.
-    rank = jax.lax.axis_index("tp")
+    # SGLANG-PATCH: allow callers going through torch_tpu's jax.export bridge to
+    # pass rank=0 (with tokens pre-shifted by rank * vocabulary on device) so the
+    # outer shard_map graph does not emit stablehlo.partition_id.
+    if rank is None:
+        rank = jax.lax.axis_index("tp")
     vocabulary = weights["embedding"].shape[0]
 
     if batched_decoder_boundaries:
