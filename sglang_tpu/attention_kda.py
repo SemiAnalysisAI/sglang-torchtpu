@@ -170,7 +170,8 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             layer.A_log,
             layer.dt_bias,
             self._query_start_loc,
-            self._state_indices,
+            # The kernel path clamps the -1 pad in-graph; the reference indexes.
+            self._state_indices.clamp(min=0),
             self._seq_lens,
             layer.num_k_heads,
             layer.head_k_dim,
