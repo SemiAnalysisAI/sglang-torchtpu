@@ -129,7 +129,9 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # carried as 64 zero rope lanes, page=128), bf16 and fp8 KV. SEEDED,
         # not swept: Ling's v7 values above with kv pages doubled for page 128
         # (same tokens per block). The default mixed (1, 16) is ~8x slower.
-        # Mixed mnt <= 64 (spec verify) left on the default until validated.
+        # Mixed mnt <= 128 only comes from spec verify (prefill pads to >= 1k):
+        # each request brings <= 8 query rows, so bq=8 avoids computing 16x the
+        # rows (bq=128: 626 us/call at c16; default (1, 16): 47 us at c1).
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 2): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (32, 1, 2),
@@ -144,7 +146,14 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4096): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8192): (32, 1, 2),
-        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (16, 8),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (16, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (16, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (16, 256),
@@ -163,7 +172,14 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 2048): (32, 1, 2),
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 4096): (32, 1, 2),
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 8192): (32, 1, 2),
-        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 1): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 2): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 4): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 8): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 16): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 32): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 64): (16, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 128): (16, 8),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 256): (16, 256),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 512): (16, 256),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 1024): (16, 256),
