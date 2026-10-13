@@ -32,8 +32,8 @@ CONFIG["server_args"].update(
         "model_path": "/weights/GLM-5.3-Flash",
         "tp_size": 8,
         # Tensor-parallel experts: at small batch EP8 waits on the busiest rank
-        # (~2.6 of a token's 8 experts); EP=1 gives every rank 1/8 of each expert.
-        # Only faster together with SGLANG_TPU_FUSED_MOE_STREAM_BS1 below.
+        # (~2.6 of a token's 8 experts); EP=1 gives every rank 1/8 of each expert,
+        # and enables the streaming one-token MoE kernel.
         "ep_size": 1,
         "language_model_only": True,
         "context_length": CONTEXT_LENGTH,
@@ -63,13 +63,7 @@ CONFIG["runtime_env"].update(
         # Decode speed flags, each measured by interleaved A/B on 8k/1k c=1:
         # route-meta MoE path (single-token SMEM counting sort).
         "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "512",
-        # Single-kernel W8A8 dense linears for <= 16 tokens (bit-exact).
-        "SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL": "1",
         # f32 MoE scales remove a per-step scale relayout.
         "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
-        # Rank-based single-kernel router for up to 16 tokens.
-        "SGLANG_TPU_ROUTER_TOPK_KERNEL": "1",
-        # Streaming one-token MoE (requires ep_size = 1).
-        "SGLANG_TPU_FUSED_MOE_STREAM_BS1": "1",
     }
 )

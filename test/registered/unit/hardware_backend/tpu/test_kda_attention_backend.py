@@ -7,7 +7,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang_tpu.attention_kda import TpuKDAAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -52,7 +51,6 @@ class TestKDAAttentionBackend(unittest.TestCase):
 
     def make_backend(self, use_scan):
         with (
-            envs.SGLANG_TPU_KDA_USE_REFERENCE_SCAN.override(use_scan),
             patch(
                 "sglang_tpu.attention_kda.build_kda_op",
                 return_value=self.op,
@@ -70,7 +68,7 @@ class TestKDAAttentionBackend(unittest.TestCase):
                 return_value=SimpleNamespace(enable_unified_memory=False),
             ),
         ):
-            backend = TpuKDAAttnBackend(self.runner)
+            backend = TpuKDAAttnBackend(self.runner, use_reference_scan=use_scan)
         (kda_builder if use_scan else gdn_builder).assert_called_once_with()
         (gdn_builder if use_scan else kda_builder).assert_not_called()
         return backend

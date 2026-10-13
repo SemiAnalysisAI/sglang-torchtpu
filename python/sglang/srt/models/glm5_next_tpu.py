@@ -31,6 +31,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -339,6 +340,12 @@ class Glm5NextLatentAttention(Glm5NextDenseAttention):
 
     rope_pad = GLM5_NEXT_TPU_MLA_ROPE_PAD
 
+    def __init__(self, config, layer_id, quant_config, prefix):
+        super().__init__(config, layer_id, quant_config, prefix)
+        # forward views kv_b_proj.weight as [heads, q_dim + v_dim, kv_rank]; that
+        # holds only for the unquantized [out, in] layout the checkpoint ships.
+        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+
     def _make_attn(self, layer_id):
         return RadixAttention(
             self.heads,
@@ -456,20 +463,6 @@ class Glm5NextDecoderLayer(nn.Module):
                     nn.Parameter(torch.empty(shape, dtype=torch.float32)),
                 )
 
-    def forward(self, x, forward_batch):
-        residual = x
-        x, post, comb = hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.config
-        )
-        x = self.self_attn(self.input_layernorm(x), forward_batch)
-        x = hc_post(x, residual, post, comb)
-        residual = x
-        x, post, comb = hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.config
-        )
-        x = self.mlp(self.post_attention_layernorm(x), forward_batch)
-        return hc_post(x, residual, post, comb)
-
 
 class Glm5NextModel(nn.Module):
     def __init__(self, config, quant_config):
@@ -488,37 +481,18 @@ class Glm5NextModel(nn.Module):
         self.start_layer, self.end_layer = 0, config.num_hidden_layers
         # Layers whose input residual stream DFlash conditions on.
         self.layers_to_capture: frozenset[int] = frozenset()
-        self.fused_mhc = envs.SGLANG_TPU_GLM_FLASH_FUSED_MHC.get()
-        if envs.SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL.get():
-            from sglang_tpu.fp8_linear import (
-                register_fp8_linear_small_m_op,
-            )
+        from sglang_tpu.router_topk import register_router_topk_op
 
-            register_fp8_linear_small_m_op()
-        if envs.SGLANG_TPU_ROUTER_TOPK_KERNEL.get():
-            from sglang_tpu.router_topk import (
-                register_router_topk_op,
-            )
+        register_router_topk_op()
+        from sglang_tpu.glm_mhc import register_glm_mhc_ops
 
-            register_router_topk_op()
-        if self.fused_mhc:
-            from sglang_tpu.glm_mhc import register_glm_mhc_ops
-
-            register_glm_mhc_ops()
+        register_glm_mhc_ops()
 
     def forward(self, input_ids, forward_batch, input_embeds=None):
         """Final hidden states, plus the captured aux states when DFlash asks."""
         x = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         aux = []
-        if self.fused_mhc:
-            hidden = self._forward_fused_mhc(x, forward_batch, aux)
-        else:
-            x = x.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
-            for i, layer in enumerate(self.layers):
-                if i in self.layers_to_capture:
-                    aux.append(x.mean(-2))
-                x = layer(x, forward_batch)
-            hidden = self.norm(x.mean(-2))
+        hidden = self._forward_fused_mhc(x, forward_batch, aux)
         return (hidden, aux) if self.layers_to_capture else hidden
 
     def prepare_fused_mhc(self):
@@ -776,8 +750,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     attn.local_num_heads,
                     attn.head_k_dim,
                 ).to(attn.dt_bias.device)
-        if self.model.fused_mhc:
-            self.model.prepare_fused_mhc()
+        self.model.prepare_fused_mhc()
 
 
 class Glm5NextMtpModel(nn.Module):

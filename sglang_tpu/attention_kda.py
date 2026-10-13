@@ -4,7 +4,6 @@
 # Keep runtime annotations: custom_jax_kernel inspects jax.Array identity.
 import torch
 
-from sglang.srt.environ import envs
 from sglang_tpu.attention_gdn_pallas import TpuGDNAttnBackend
 
 try:
@@ -97,13 +96,11 @@ def build_kda_op():
 
 
 class TpuKDAAttnBackend(TpuGDNAttnBackend):
-    """GLM-5.3-Flash KDA on the fused Conv1D + GDN v3 Pallas kernel in KDA mode.
+    """GLM-5.3-Flash KDA on the fused Conv1D + GDN v3 Pallas kernel in KDA mode;
+    ``use_reference_scan`` (tests) selects the lax.scan recurrence instead."""
 
-    SGLANG_TPU_KDA_USE_REFERENCE_SCAN selects the lax.scan recurrence instead.
-    """
-
-    def __init__(self, model_runner):
-        self._use_scan = envs.SGLANG_TPU_KDA_USE_REFERENCE_SCAN.get()
+    def __init__(self, model_runner, use_reference_scan: bool = False):
+        self._use_scan = use_reference_scan
         super().__init__(
             model_runner, op_builder=build_kda_op if self._use_scan else None
         )

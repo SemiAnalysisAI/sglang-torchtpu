@@ -1987,26 +1987,12 @@ class Envs:
     # Turn off EP-local expert reads (models that opt in read only their EP
     # rank's routed experts with --weight-loader-disable-mmap).
     SGLANG_TPU_DISABLE_EP_LOCAL_EXPERT_READS = EnvBool(False)
-    # GLM-5.3-Flash KDA: per-token lax.scan reference instead of the chunked
-    # Pallas GDN v3 kernel in KDA mode.
-    SGLANG_TPU_KDA_USE_REFERENCE_SCAN = EnvBool(False)
     # Perf-only GLM-5.3-Flash escape hatch: attend densely up to this context even
     # past index_topk, which no longer matches DSA's top-k selection.
     SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
     # GLM-5.3-Flash: absorbed MLA over the 512-dim latent cache (pallas_tpu_mla)
     # instead of caching per-head K/V for the MHA kernel. Attention stays dense.
     SGLANG_TPU_GLM_FLASH_MLA = EnvBool(False)
-    # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch reference.
-    SGLANG_TPU_GLM_FLASH_FUSED_MHC = EnvBool(True)
-    # GLM-5.3-Flash: dense FP8 linears with <= 16 tokens run as one Pallas W8A8
-    # kernel (row quantize, FP8 dot, rescale) instead of the XLA chain.
-    SGLANG_TPU_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
-    # GLM-5.3-Flash: the one-group sigmoid router (bias, top-k, renormalize) runs
-    # as one rank-based Pallas kernel for a single decode token.
-    SGLANG_TPU_ROUTER_TOPK_KERNEL = EnvBool(False)
-    # One-token fused MoE with every expert local (EP = 1) streams the selected
-    # experts' weights in one Pallas kernel, bit-identical to route-meta + gmm_v2.
-    SGLANG_TPU_FUSED_MOE_STREAM_BS1 = EnvBool(False)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

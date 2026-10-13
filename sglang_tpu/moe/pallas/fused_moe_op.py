@@ -71,7 +71,6 @@ logger = logging.getLogger(__name__)
 _PALLAS_MOE_OP = None
 # Process-static like GMM's arithmetic/buffering flags. Restart to change
 # this setting; a previously cached JAX trace keeps its selected branch.
-_MOE_STREAM_BS1 = envs.SGLANG_TPU_FUSED_MOE_STREAM_BS1.get()
 
 
 def _maybe_moe_stream_bs1(
@@ -579,24 +578,25 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
-    if _MOE_STREAM_BS1:
-        out = _maybe_moe_stream_bs1(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            activation_name=activation_name,
-            no_combine=no_combine,
-            use_group_offset=global_num_experts > num_experts,
-            w_quant_bits=w_quant_bits,
-        )
-        if out is not None:
-            return out
+    # Bit-identical to the routed path; returns None outside its case (EP = 1, one
+    # token, FP8 per-channel experts, clamped SiLU, fits VMEM).
+    out = _maybe_moe_stream_bs1(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation_name=activation_name,
+        no_combine=no_combine,
+        use_group_offset=global_num_experts > num_experts,
+        w_quant_bits=w_quant_bits,
+    )
+    if out is not None:
+        return out
 
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).

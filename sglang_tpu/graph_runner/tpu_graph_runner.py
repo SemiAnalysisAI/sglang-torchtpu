@@ -66,9 +66,14 @@ if TYPE_CHECKING:
 
 def _spec_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses speculative decoding on TPU."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
     algo = model_runner.spec_algorithm
-    # Plain EAGLE also covers NEXTN/MTP draft heads.
-    return algo.is_eagle3() or algo.name == "EAGLE" or algo.is_dflash()
+    # EAGLE covers NEXTN/MTP heads; is_eagle() would also admit FROZEN_KV_MTP.
+    return (
+        algo in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+        or algo.is_dflash()
+    )
 
 
 def _resolve_spec_compile_policy_mixin(
@@ -198,6 +203,13 @@ class TpuGraphRunner:
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
+        # Before any trace: the op cannot be built inside torch.compile. Decode-sized
+        # dense FP8 linears then take one bit-exact W8A8 kernel instead of the XLA chain.
+        from sglang_tpu.fp8_linear import (
+            register_fp8_linear_small_m_op,
+        )
+
+        register_fp8_linear_small_m_op()
 
         # TODO: remove — TPU does not support CP decode-attn-TP; this only
         # keeps the singleton's first-call init out of the dynamo trace.
