@@ -235,9 +235,21 @@ def is_musa() -> bool:
 
 @lru_cache(maxsize=1)
 def is_tpu() -> bool:
-    from sglang.srt.platforms import current_platform
+    if os.environ.get("SGLANG_PLATFORM") == "tpu":
+        return True
+    try:
+        from sglang.srt.platforms import current_platform
 
-    return current_platform.is_tpu()
+        return current_platform.is_tpu()
+    except Exception:
+        pass
+    try:
+        import torch_tpu  # noqa: F401
+
+        return True
+    except Exception:
+        pass
+    return False
 
 
 @lru_cache(maxsize=1)

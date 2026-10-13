@@ -1404,7 +1404,8 @@ class LogitsProcessor(nn.Module):
         # On TPU, in-place copy_ into a static buffer forces an eager TorchTPU JIT
         # dispatch that halts SparseCore; return logits directly without copy_.
         if (
-            not _is_tpu
+            logits.device.type != "tpu"
+            and not is_tpu()
             and logits_buffer is not None
             and tuple(logits_buffer.shape) == tuple(logits.shape)
         ):
