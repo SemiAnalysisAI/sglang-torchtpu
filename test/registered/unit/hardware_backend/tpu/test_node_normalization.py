@@ -129,6 +129,37 @@ class TestNodeNormalization(unittest.TestCase):
                     )
                     normalization._coordinate_worker(0, self.config, 1, 10, Mock())
 
+    def test_coordinate_worker_finds_the_node_rank_without_the_launcher_module(self):
+        # torch_tpu after the 2026.9.22 release has no launchers package; the
+        # same function lives privately in torch_tpu._internal.distributed.
+        distributed = ModuleType("torch_tpu._internal.distributed")
+        distributed.tpu_distributed = SimpleNamespace(
+            local_device_coords=Mock(return_value=[0, 0, 1])
+        )
+        private = ModuleType("torch_tpu._internal.distributed.distributed")
+        private._calculate_topological_node_rank = Mock(return_value=1)
+        writer = Mock()
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    distributed.__name__: distributed,
+                    private.__name__: private,
+                    "torch_tpu._internal.distributed.launchers": None,
+                    "torch_tpu._internal.distributed.launchers.multihost_wrapper": None,
+                },
+            ),
+            patch("torch.distributed.init_process_group"),
+            patch("torch.distributed.barrier"),
+            patch("torch.distributed.destroy_process_group"),
+            patch("sglang.srt.utils.kill_itself_when_parent_died"),
+        ):
+            normalization._coordinate_worker(0, self.config, 1, 10, writer)
+        writer.send.assert_called_once_with(1)
+        private._calculate_topological_node_rank.assert_called_once_with(
+            [0, 0, 1], "2,2,2,2", fallback_index=None, chips_per_host=(2, 2, 1)
+        )
+
     def test_spawn_probe_returns_rank_and_cleans_up_on_failure(self):
         import torch.multiprocessing as mp
 
