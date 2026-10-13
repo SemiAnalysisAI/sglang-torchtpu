@@ -1993,6 +1993,9 @@ class Envs:
     # Perf-only GLM-5.3-Flash escape hatch: attend densely up to this context even
     # past index_topk, which no longer matches DSA's top-k selection.
     SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT = EnvInt(None)
+    # GLM-5.3-Flash: absorbed MLA over the 512-dim latent cache (pallas_tpu_mla)
+    # instead of caching per-head K/V for the MHA kernel. Attention stays dense.
+    SGLANG_TPU_GLM_FLASH_MLA = EnvBool(False)
     # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch reference.
     SGLANG_TPU_GLM_FLASH_FUSED_MHC = EnvBool(True)
     # GLM-5.3-Flash: dense FP8 linears with <= 16 tokens run as one Pallas W8A8

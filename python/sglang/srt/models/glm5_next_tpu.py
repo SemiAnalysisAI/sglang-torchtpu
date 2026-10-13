@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+from sglang.srt.configs.model_config import GLM5_NEXT_TPU_MLA_ROPE_PAD
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -305,7 +306,10 @@ class Glm5NextDenseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.attn = RadixAttention(
+        self.attn = self._make_attn(layer_id)
+
+    def _make_attn(self, layer_id):
+        return RadixAttention(
             self.heads,
             self.q_dim,
             self.q_dim**-0.5,
@@ -327,6 +331,51 @@ class Glm5NextDenseAttention(nn.Module):
         k, v = kv.split([self.q_dim, self.v_dim], dim=-1)
         out = self.attn(q, k.contiguous(), v.contiguous(), forward_batch)
         return self.o_proj(out.reshape(-1, self.heads * self.v_dim))[0]
+
+
+class Glm5NextLatentAttention(Glm5NextDenseAttention):
+    """Absorbed MLA: cache the normed 512-dim latent, fold W_UK into q and W_UV
+    into the output, and attend as MQA over the latent (pallas_tpu_mla)."""
+
+    rope_pad = GLM5_NEXT_TPU_MLA_ROPE_PAD
+
+    def _make_attn(self, layer_id):
+        return RadixAttention(
+            self.heads,
+            self.kv_rank + self.rope_pad,
+            self.q_dim**-0.5,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_rank,
+        )
+
+    def forward(self, hidden_states, forward_batch, **kwargs):
+        q_latent, kv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.q_rank, self.kv_rank], dim=-1
+        )
+        q = self.q_b_proj(self.q_a_layernorm(q_latent))[0].view(
+            -1, self.heads, self.q_dim
+        )
+        # kv_b_proj rows are per head [K (q_dim) | V (v_dim)] over the latent.
+        w_kv = self.kv_b_proj.weight.view(self.heads, self.q_dim + self.v_dim, -1)
+        q_absorbed = torch.einsum("thd,hdc->thc", q, w_kv[:, : self.q_dim])
+        latent = self.kv_a_layernorm(kv_latent).unsqueeze(1)
+        n = hidden_states.shape[0]
+        q_pe = q.new_zeros(n, self.heads, self.rope_pad)
+        k_pe = q.new_zeros(n, 1, self.rope_pad)
+        out = self.attn(
+            q_absorbed, latent, latent, forward_batch, q_rope=q_pe, k_rope=k_pe
+        ).view(n, self.heads, self.kv_rank)
+        out = torch.einsum("thc,hvc->thv", out, w_kv[:, self.q_dim :])
+        return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
+
+
+def _full_attention_cls():
+    return (
+        Glm5NextLatentAttention
+        if envs.SGLANG_TPU_GLM_FLASH_MLA.get()
+        else Glm5NextDenseAttention
+    )
 
 
 def hc_pre(x, fn, scale, base, config):
@@ -371,7 +420,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 reduce_results=True,
             )
         else:
-            self.self_attn = Glm5NextDenseAttention(
+            self.self_attn = _full_attention_cls()(
                 config, layer_id, quant_config, f"{prefix}.self_attn"
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -766,7 +815,7 @@ class Glm5NextMtpLayer(nn.Module):
     def __init__(self, config, quant_config, prefix):
         super().__init__()
         # The draft has its own KV pool, holding this one layer.
-        self.self_attn = Glm5NextDenseAttention(
+        self.self_attn = _full_attention_cls()(
             config, 0, quant_config, f"{prefix}.self_attn"
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

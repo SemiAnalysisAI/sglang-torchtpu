@@ -193,6 +193,9 @@ _TPU_GLM5_NEXT_ARCHS = (
     "Glm5NextForConditionalGeneration",
     "Glm5NextForConditionalGenerationNextN",
 )
+# Zero rope lanes the TPU Flash MLA path appends; 64 is the kernel's tested
+# DeepSeek shape, and the cache pads the rope segment to 128 lanes either way.
+GLM5_NEXT_TPU_MLA_ROPE_PAD = 64
 
 
 def is_deepseek_dsa(config) -> bool:
@@ -1228,10 +1231,13 @@ class ModelConfig:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # The TPU Flash model (glm5_next_tpu) runs its full-attention layers as
-        # unabsorbed MHA, so it needs the MHA KV pool and backend.
-        tpu_glm5_next_mha = (
+        # unabsorbed MHA, so it needs the MHA KV pool and backend, unless it runs
+        # absorbed MLA over the latent cache.
+        tpu_glm5_next = (
             is_tpu() and self.hf_config.architectures[0] in _TPU_GLM5_NEXT_ARCHS
         )
+        tpu_glm5_next_mla = tpu_glm5_next and envs.SGLANG_TPU_GLM_FLASH_MLA.get()
+        tpu_glm5_next_mha = tpu_glm5_next and not tpu_glm5_next_mla
         # FIXME: temporary special judge for MLA architecture
         if tpu_glm5_next_mha:
             self.attention_arch = AttentionArch.MHA
@@ -1281,6 +1287,11 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
+            if tpu_glm5_next_mla:
+                # Flash is NoPE; the Pallas MLA kernel needs a rope segment, so
+                # carry a zero one (q_pe . k_pe = 0, attention is unchanged).
+                self.qk_rope_head_dim = GLM5_NEXT_TPU_MLA_ROPE_PAD
+                self.swa_qk_rope_head_dim = GLM5_NEXT_TPU_MLA_ROPE_PAD
             # In transformers v5, rope_scaling is just rope_parameters.
             rope_scaling = getattr(
                 self.hf_text_config, "rope_parameters", None
