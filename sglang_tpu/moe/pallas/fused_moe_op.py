@@ -89,14 +89,16 @@ def _maybe_moe_stream_bs1(
     use_group_offset,
     w_quant_bits,
 ):
-    """One token with every expert local (EP = 1): stream the selected experts'
-    weights in one kernel, bit-identical to the route-meta + gmm_v2 path.
-    Returns None when the call falls outside that case."""
+    """At most 8 tokens with every expert local (EP = 1): stream each selected
+    expert's weights once in one kernel (bit-identical to the route-meta + gmm_v2
+    path for one token). Returns None when the call falls outside that case."""
     import jax.numpy as jnp
 
     from sglang_tpu.kernels.moe_stream_bs1 import (
         moe_stream_bs1,
+        moe_stream_few_tokens,
         supports,
+        supports_few_tokens,
     )
 
     num_experts, hidden, two_n = w1.shape
@@ -121,10 +123,16 @@ def _maybe_moe_stream_bs1(
         or not per_channel
         or w1.dtype != jnp.float8_e4m3fn
         or w2.dtype != jnp.float8_e4m3fn
-        or not supports(hidden_states.shape[0], hidden, two_n)
     ):
         return None
-    return moe_stream_bs1(
+    tokens = hidden_states.shape[0]
+    if supports(tokens, hidden, two_n):
+        kernel = moe_stream_bs1
+    elif supports_few_tokens(tokens, hidden, two_n):
+        kernel = moe_stream_few_tokens
+    else:
+        return None
+    return kernel(
         hidden_states,
         topk_ids,
         topk_weights,

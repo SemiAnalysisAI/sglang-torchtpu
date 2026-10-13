@@ -102,6 +102,126 @@ def _kernel(
         o_ref[...] = acc_ref[...].astype(dt)
 
 
+def supports_few_tokens(tokens: int, hidden: int, two_n: int) -> bool:
+    # A verify window (DFlash block 8, MTP up to 8). Arbitrary cap: every grid
+    # step computes all rows, so wider batches waste MXU work on routed-off rows.
+    return 1 < tokens <= 8 and supports(1, hidden, two_n)
+
+
+def _few_token_kernel(
+    uniq_ref,
+    count_ref,
+    wv_ref,
+    x_ref,
+    w1_ref,
+    s1_ref,
+    w2_ref,
+    s2_ref,
+    o_ref,
+    acc_ref,
+    *,
+    n,
+    limit,
+    fp8_dtype,
+):
+    s = pl.program_id(0)
+
+    @pl.when(s == 0)
+    def _():
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    # Steps past the distinct-expert count repeat the last expert's blocks, so
+    # the pipeline fetches nothing new; skip their compute.
+    @pl.when(s < count_ref[0])
+    def _():
+        dt = o_ref.dtype
+        dot = functools.partial(_block_quant_dot, fp8_dtype=fp8_dtype)
+        gate_up = dot(x_ref[...], w1_ref[0], s1_ref[0])
+        gate, up = gate_up[:, :n], gate_up[:, n:]
+        if limit is not None:
+            gate = jnp.minimum(gate, limit)
+            up = jnp.clip(up, -limit, limit)
+        h = (jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)).astype(dt)
+        y = dot(h, w2_ref[0], s2_ref[0])
+        # [tokens, 1] routing weight of this expert per token, 0 if not selected.
+        acc_ref[...] += y.astype(jnp.float32) * wv_ref[0]
+
+    @pl.when(s == pl.num_programs(0) - 1)
+    def _():
+        o_ref[...] = acc_ref[...].astype(o_ref.dtype)
+
+
+def _distinct_experts(topk_ids, topk_weights, num_experts):
+    """Distinct selected experts padded with the last one, their count, and the
+    [slots, tokens, 1] f32 weight of each slot's expert per token. Ids outside
+    [0, num_experts) (padding rows) select nothing."""
+    tokens, k = topk_ids.shape
+    slots = tokens * k
+    ids = topk_ids.astype(jnp.int32)
+    valid = (ids >= 0) & (ids < num_experts)
+    srt = jnp.sort(jnp.where(valid, ids, num_experts).reshape(slots))
+    first = jnp.concatenate([jnp.ones((1,), bool), srt[1:] != srt[:-1]])
+    first = first & (srt < num_experts)
+    count = jnp.sum(first.astype(jnp.int32))
+    pos = jnp.where(first, jnp.cumsum(first.astype(jnp.int32)) - 1, slots)
+    uniq = jnp.zeros((slots,), jnp.int32).at[pos].set(srt, mode="drop")
+    last = uniq[jnp.maximum(count - 1, 0)]
+    live = jnp.arange(slots) < count
+    uniq = jnp.where(live, uniq, last)
+    hit = (uniq[:, None, None] == ids[None]) & valid[None] & live[:, None, None]
+    weights = jnp.sum(
+        jnp.where(hit, topk_weights.astype(jnp.float32)[None], 0.0), axis=-1
+    )
+    return uniq, count.reshape(1), weights.reshape(slots, tokens, 1)
+
+
+def moe_stream_few_tokens(
+    x: jax.Array,
+    topk_ids: jax.Array,
+    topk_weights: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array,
+    w2: jax.Array,
+    w2_scale: jax.Array,
+    clamp_limit: float | None,
+) -> jax.Array:
+    """x [T, H] with T <= 8; ids / weights [T, k]; weights as moe_stream_bs1.
+
+    Streams each distinct selected expert's weights once for all T rows. Sums
+    experts in id order rather than each token's top-k order, so the f32
+    combine is not bit-identical to the routed path. Returns [T, H]."""
+    tokens, hidden = x.shape
+    num_experts, _, two_n = w1.shape
+    n = two_n // 2
+    slots = tokens * topk_ids.shape[1]
+    uniq, count, weights = _distinct_experts(topk_ids, topk_weights, num_experts)
+    s1 = w1_scale.reshape(num_experts, 1, two_n).astype(jnp.float32)
+    s2 = w2_scale.reshape(num_experts, 1, hidden).astype(jnp.float32)
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        grid=(slots,),
+        in_specs=[
+            pl.BlockSpec((1, tokens, 1), lambda s, u, c: (s, 0, 0)),
+            pl.BlockSpec((tokens, hidden), lambda s, u, c: (0, 0)),
+            pl.BlockSpec((1, hidden, two_n), lambda s, u, c: (u[s], 0, 0)),
+            pl.BlockSpec((1, 1, two_n), lambda s, u, c: (u[s], 0, 0)),
+            pl.BlockSpec((1, n, hidden), lambda s, u, c: (u[s], 0, 0)),
+            pl.BlockSpec((1, 1, hidden), lambda s, u, c: (u[s], 0, 0)),
+        ],
+        out_specs=pl.BlockSpec((tokens, hidden), lambda s, u, c: (0, 0)),
+        scratch_shapes=[pltpu.VMEM((tokens, hidden), jnp.float32)],
+    )
+    return pl.pallas_call(
+        functools.partial(
+            _few_token_kernel, n=n, limit=clamp_limit, fp8_dtype=w1.dtype
+        ),
+        grid_spec=grid_spec,
+        out_shape=jax.ShapeDtypeStruct((tokens, hidden), x.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name=f"moe_stream_few_{tokens}x{num_experts}x{hidden}x{two_n}",
+    )(uniq, count, weights, x, w1, s1, w2, s2)
+
+
 def moe_stream_bs1(
     x: jax.Array,
     topk_ids: jax.Array,
