@@ -232,6 +232,23 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 @dataclasses.dataclass
+@dataclasses.dataclass
+class HealthCheckWaiter:
+    """What an in-flight /health_generate probe waits on.
+
+    `event` is set exactly once, by the probe's own first output, by the scheduler's
+    HealthCheckOutput for its rid, or by the probe failing. `ok` is the verdict.
+    """
+
+    event: asyncio.Event
+    ok: bool = False
+
+    def resolve(self, ok: bool):
+        if not self.event.is_set():
+            self.ok = ok
+            self.event.set()
+
+
 class ReqState:
     """Store the state a request."""
 
@@ -671,6 +688,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
+        # rid -> waiter of an in-flight /health_generate probe. Resolved only by that
+        # probe's own output or by the scheduler's HealthCheckOutput carrying its rid.
+        self.health_check_waiters: Dict[str, HealthCheckWaiter] = {}
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -843,8 +863,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_update_weights_from_disk_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
-                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
+                # The scheduler answers a probe it deferred while busy by the probe's rid.
+                (HealthCheckOutput, self._handle_health_check_output),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -2366,6 +2386,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    def _handle_health_check_output(self, recv_obj: HealthCheckOutput):
+        # The scheduler was busy when this probe arrived and answered it directly,
+        # which proves the scheduler loop is making progress. Only the probe that
+        # asked is resolved; any other message leaves every waiter untouched.
+        waiter = self.health_check_waiters.get(recv_obj.rid) if recv_obj.rid else None
+        if waiter is not None:
+            waiter.resolve(True)
+
     async def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -2384,7 +2412,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                # A probe that already timed out and dropped its state; its late output is noise.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
                 logger.warning(
