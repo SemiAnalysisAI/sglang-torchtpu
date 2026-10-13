@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
@@ -41,6 +43,7 @@ from sglang_tpu.graph_runner.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
+from sglang_tpu.sampler import TpuSampler
 
 DECODER_POLICY_PRECOMPILE = (
     "sglang_tpu.compilation.decoder_compile_policy.DecoderTpuCompilePolicy.precompile"
@@ -193,7 +196,11 @@ class TestTpuGraphRunner(CustomTestCase):
         server_args.override = _override
         return SimpleNamespace(
             model=model,
-            model_config=SimpleNamespace(context_len=2048),
+            model_config=SimpleNamespace(
+                context_len=2048, is_generation=True, vocab_size=128
+            ),
+            sampler=MagicMock(),
+            device="cpu",
             max_running_requests=1,
             is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -381,6 +388,47 @@ class TestTpuGraphRunner(CustomTestCase):
         model = self._annotate(_model_with(forward=MagicMock()))
         TpuGraphRunner(self._runner_for(model))
         self.mock_compile.assert_called_once()
+
+    def test_sampler_warmup_finishes_before_recompilation_baseline(self):
+        runner = self._runner_for(_model_with(forward=MagicMock()))
+        runner.sampler = MagicMock(spec=TpuSampler)
+        graph_runner = object.__new__(TpuGraphRunner)
+        graph_runner.model_runner = runner
+        graph_runner.model = runner.model
+        order = MagicMock()
+        order.attach_mock(runner.sampler.warmup_small_top_k, "sampler")
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang_tpu.graph_runner.tpu_graph_runner.install_recompilation_checker"
+            ) as checker,
+        ):
+            order.attach_mock(checker, "checker")
+            graph_runner._finish_warmup([])
+        runner.sampler.warmup_small_top_k.assert_called_once_with(
+            max_batch_size=8, vocab_size=128, device=torch.device("cpu")
+        )
+        self.assertEqual([call[0] for call in order.mock_calls], ["sampler", "checker"])
+
+    def test_sampler_warmup_skips_draft_embedding_and_nonfinal_pipeline_stage(self):
+        for field in ("draft", "embedding", "nonfinal", "other_sampler"):
+            with self.subTest(field=field):
+                runner = self._runner_for(_model_with(forward=MagicMock()))
+                runner.sampler = MagicMock(spec=TpuSampler)
+                if field == "draft":
+                    runner.is_draft_worker = True
+                elif field == "embedding":
+                    runner.model_config.is_generation = False
+                elif field == "nonfinal":
+                    runner.pp_group.is_last_rank = False
+                else:
+                    runner.sampler = MagicMock()
+                graph_runner = object.__new__(TpuGraphRunner)
+                graph_runner.model_runner = runner
+                graph_runner.model = runner.model
+                with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False):
+                    graph_runner._finish_warmup([])
+                runner.sampler.warmup_small_top_k.assert_not_called()
 
     def test_no_annotation_uses_direct_tracer(self):
         # Most text decoder models should not need an explicit annotation.
