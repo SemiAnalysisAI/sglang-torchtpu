@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -298,9 +298,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hf_config = self.draft_runner.model_config.hf_config
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
+        # Models that run DSA densely (GLM-5.3-Flash on TPU) have no indexer
+        # top-k to share; relaying one also disables TPU device-accept routing.
         self.index_share_for_mtp_iteration = (
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
+            and is_deepseek_dsa(hf_config)
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
@@ -875,8 +878,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             logits_output = model.forward(input_ids, base_positions + i, forward_batch)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            logits = logits_output.next_token_logits
+            if self.topk == 1:
+                # A top-1 chain reads only the token; skip the full-vocab softmax.
+                topk_index = logits.argmax(dim=-1, keepdim=True)
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
