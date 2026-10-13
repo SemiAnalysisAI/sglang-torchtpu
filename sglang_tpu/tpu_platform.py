@@ -1047,6 +1047,11 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True
 
+    def keeps_swa_index_mapping_on_host(self) -> bool:
+        # SWATokenToKVPoolAllocator keeps the mapping on the host, and the
+        # host-resident req_to_token table hands its segment frees host indices.
+        return True
+
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
         # cross-stream ordering (wait_stream / wait_event) is a no-op and a
