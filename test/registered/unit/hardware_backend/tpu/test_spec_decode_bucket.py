@@ -188,6 +188,34 @@ class TestPrepare(CustomTestCase):
         self.assertIsNone(draft.device_accept_candidate_locs)
 
 
+class TestRegistration(CustomTestCase):
+    def _register(self):
+        from sglang_tpu.compilation import spec_decode_compile_policy_eagle3 as eagle3
+        from sglang_tpu.compilation.bucketer import Bucketer
+
+        policy = object.__new__(eagle3.Eagle3SpecDecodeCompilePolicyMixin)
+        policy.speculative_eagle_topk = 1
+        policy.b_bucketer = Bucketer("b", [1, 2, 4])
+        with (
+            patch.object(spec_decode_bucket, "_decode_batch_bucket", None),
+            patch.object(eagle3, "is_dp_attention_enabled", return_value=False),
+            patch.object(
+                eagle3, "get_parallel", return_value=SimpleNamespace(pp_size=1)
+            ),
+        ):
+            policy._register_decode_batch_bucket()
+            return spec_decode_bucket.decode_batch_bucket(3)
+
+    def test_registers_the_batch_bucket(self):
+        self.assertEqual(self._register(), 4)
+
+    def test_feature_flag_off_keeps_the_real_batch_size(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.override(False):
+            self.assertIsNone(self._register())
+
+
 class TestBucketedStep(CustomTestCase):
     def _prepare(self, fm, batch):
         eagle_utils_tpu.prepare_device_accept_tpu(batch, bs=3, double_alloc=8)

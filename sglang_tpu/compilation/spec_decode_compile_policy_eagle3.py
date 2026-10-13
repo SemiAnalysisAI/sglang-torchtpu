@@ -56,6 +56,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
     _pad_first_dim,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -236,10 +237,12 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def _register_decode_batch_bucket(self) -> None:
         """Let the decode step run at the batch bucket from scheduling on.
 
-        Not with DP attention, whose phases pad to the widest peer, or PP.
+        Not with DP attention, whose phases pad to the widest peer, or PP, or
+        with SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA off.
         """
         if (
-            is_dp_attention_enabled()
+            not tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.get()
+            or is_dp_attention_enabled()
             or get_parallel().pp_size > 1
             or self.speculative_eagle_topk != 1
             or self.b_bucketer is None

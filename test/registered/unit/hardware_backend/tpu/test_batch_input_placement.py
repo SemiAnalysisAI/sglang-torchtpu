@@ -637,6 +637,17 @@ def test_eagle3_prefill_stages_on_host_but_decode_and_multimodal_do_not():
     assert platform.get_batch_input_device(decode) == "meta"
 
 
+def test_eagle3_prefill_staging_follows_the_feature_flag():
+    from sglang_tpu.envs import envs as tpu_envs
+
+    platform = TpuSRTPlatform()
+    batch, _ = make_batch(ForwardMode.EXTEND, [2], [0])
+    batch.spec_algorithm = SpeculativeAlgorithm.EAGLE3
+    with tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.override(False):
+        assert platform.get_batch_input_device(batch) == "meta"
+    assert platform.get_batch_input_device(batch) == "cpu"
+
+
 def test_spec_decode_returns_a_host_staged_prefill_to_the_device():
     batch, _ = make_batch(ForwardMode.EXTEND, [3, 4], [0, 0])
     batch._move_inputs_to_device()

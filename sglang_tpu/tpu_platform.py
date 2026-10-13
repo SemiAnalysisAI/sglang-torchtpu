@@ -1268,9 +1268,11 @@ def _eagle_prefill_can_stage(batch) -> bool:
     the device contract.
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang_tpu.envs import envs as tpu_envs
 
     return (
-        batch.spec_algorithm.is_eagle3()
+        tpu_envs.SGLANG_TPU_ENABLE_SPEC_BUCKETED_METADATA.get()
+        and batch.spec_algorithm.is_eagle3()
         and batch.forward_mode == ForwardMode.EXTEND
         and not getattr(batch.model_config, "is_multimodal", False)
     )
