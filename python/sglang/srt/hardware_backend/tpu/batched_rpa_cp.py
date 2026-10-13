@@ -272,6 +272,11 @@ def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tens
 
     chunks = cp_all_gather_padded(x, local_len, max_len, cp_size, group=group)
     gathered = torch.cat([chunks[r][: per_rank[r]] for r in range(cp_size)], dim=0)
+    reorder_index = getattr(meta, "reorder_index_tensor", None)
+    if reorder_index is not None:
+        if reorder_index.device != gathered.device:
+            reorder_index = reorder_index.to(gathered.device)
+        return gathered.index_select(0, reorder_index)
     parts = torch.split(gathered, meta.reverse_split_len, dim=0)
     return torch.cat([parts[i] for i in meta.cp_reverse_index], dim=0)
 

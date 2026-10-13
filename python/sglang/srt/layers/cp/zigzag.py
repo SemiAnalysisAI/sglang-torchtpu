@@ -63,6 +63,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     zigzag_index: Optional[List[int]] = None
     cp_reverse_index: Optional[List[int]] = None
     reverse_split_len: Optional[List[int]] = None
+    reorder_index_tensor: Optional[Any] = None
 
     # Per-rank aggregate lists have length cp_size.
     per_rank_actual_token: Optional[List[int]] = None
@@ -241,11 +242,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
         assert sum(per_rank_actual_token) == total_seq_lens
 
+        offsets = [0]
+        for l in reverse_split_len:
+            offsets.append(offsets[-1] + l)
+        perm = []
+        for idx in cp_reverse_index:
+            perm.extend(range(offsets[idx], offsets[idx] + reverse_split_len[idx]))
+        reorder_index_tensor = torch.tensor(
+            perm, device=device, dtype=torch.int32
+        )
+
         return ZigzagContextParallelMetadata(
             split_list=split_list,
             zigzag_index=zigzag_index,
             cp_reverse_index=cp_reverse_index,
             reverse_split_len=reverse_split_len,
+            reorder_index_tensor=reorder_index_tensor,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
             kv_len_prev_tensor=torch.tensor(
@@ -320,23 +332,35 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
+        meta = forward_batch.attn_cp_metadata
         gathered = self._all_gather_reorganized(x, forward_batch)
+        reorder_index = getattr(meta, "reorder_index_tensor", None)
+        if reorder_index is not None:
+            if reorder_index.device != gathered.device:
+                reorder_index = reorder_index.to(gathered.device)
+            return gathered.index_select(0, reorder_index)
         chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+            gathered, meta.reverse_split_len, dim=0
         )
         return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
+            [chunks[i] for i in meta.cp_reverse_index], dim=0
         )
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
+        meta = forward_batch.attn_cp_metadata
         gathered = self._all_gather_reorganized(x, forward_batch)
+        reorder_index = getattr(meta, "reorder_index_tensor", None)
+        if reorder_index is not None:
+            if reorder_index.device != gathered.device:
+                reorder_index = reorder_index.to(gathered.device)
+            return gathered.index_select(0, reorder_index)
         chunks = torch.split(
-            gathered, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+            gathered, meta.reverse_split_len, dim=0
         )
         return torch.cat(
-            [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
+            [chunks[i] for i in meta.cp_reverse_index], dim=0
         )
 
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
