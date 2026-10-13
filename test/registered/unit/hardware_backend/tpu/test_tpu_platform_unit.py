@@ -28,6 +28,7 @@ from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.tpu_platform import (
     TpuSRTPlatform,
     _validate_decode_context_parallel,
+    _validate_pipeline_parallel_args,
 )
 
 # CPU suite: mocks torch_tpu, so it runs on the CPU runners -- never a TPU node.
@@ -655,6 +656,41 @@ class TestDsaValidation(CustomTestCase):
                     self._apply_dsa(
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
+
+
+class TestTpuPlatformPipelineContextParallelStages(CustomTestCase):
+    """Pipeline stages made of a prefill context-parallel group."""
+
+    def _validate(self, **overrides):
+        cfg = SimpleNamespace(
+            pp_size=8,
+            tp_size=2,
+            attn_cp_size=2,
+            dcp_size=1,
+            ep_size=1,
+            nnodes=1,
+            enable_dp_attention=False,
+            enable_dynamic_chunking=False,
+            enable_torch_compile=True,
+            kv_cache_dtype="bfloat16",
+            pp_async_batch_depth=1,
+            speculative_algorithm=None,
+        )
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        with (
+            patch("sglang.srt.arg_groups.overrides.resolving_view", return_value=cfg),
+            patch("sglang.srt.arg_groups.overrides.declare_resolution"),
+        ):
+            _validate_pipeline_parallel_args(cfg)
+
+    def test_accepts_stages_spread_over_two_hosts(self):
+        # PP8 x PCP2 over two hosts served gpt-oss-120b in P/D (GSM8K 0.909).
+        self._validate(nnodes=2)
+
+    def test_still_refuses_an_fp8_kv_cache(self):
+        with self.assertRaisesRegex(NotImplementedError, "bf16 KV cache"):
+            self._validate(nnodes=2, kv_cache_dtype="fp8_e4m3")
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):

@@ -315,13 +315,6 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             f"supported with pipeline parallelism on TPU (--pp-size {pp})."
         )
     if cfg.attn_cp_size > 1:
-        if cfg.nnodes > 1:
-            # Only because no multi-host run has validated it with standalone
-            # stage groups; no technical limit is known.
-            raise NotImplementedError(
-                "Pipeline stages made of a context-parallel group run on one host "
-                f"(got --nnodes {cfg.nnodes})."
-            )
         if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
             raise NotImplementedError(
                 "Pipeline stages made of a context-parallel group support only a "
