@@ -277,6 +277,8 @@ class BaseBlockSizeCalculator:
         vmem_limit_bytes: int,
         decode_query_size: int = 1,
     ):
+        self.model_cfgs = model_cfgs
+        self.serve_cfgs = serve_cfgs
         tpu_info = pltpu.get_tpu_info()
         self.tpu_info = tpu_info
         # TPU v7x (and v5p) reserves 64 KiB of hardware VMEM for system/stack
