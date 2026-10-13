@@ -263,6 +263,17 @@ def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tens
     the exported XLA all-gather (see `build_cp_all_gather_op`).
     """
     meta = forward_batch.attn_cp_metadata
+    direct_idx = getattr(meta, "direct_reorder_index", None)
+    if is_tpu() and direct_idx is not None:
+        cp_size = get_parallel().attn_cp_size
+        op = _GLOBAL_AG_OP
+        if op is None:
+            op = build_cp_all_gather_op(cp_size, get_parallel().attn_tp_size)
+        out = op(x.contiguous())
+        if direct_idx.device != out.device:
+            direct_idx = direct_idx.to(out.device)
+        return out.reshape(-1, x.shape[1]).index_select(0, direct_idx)
+
     per_rank = meta.per_rank_logical_token or meta.per_rank_actual_token
     cp_size = len(per_rank)
     cp_rank = get_parallel().attn_cp_rank

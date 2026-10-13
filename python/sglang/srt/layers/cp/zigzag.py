@@ -64,6 +64,9 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     cp_reverse_index: Optional[List[int]] = None
     reverse_split_len: Optional[List[int]] = None
     reorder_index_tensor: Optional[Any] = None
+    perm: Optional[List[int]] = None
+    direct_reorder_index: Optional[Any] = None
+    stride: int = 0
 
     # Per-rank aggregate lists have length cp_size.
     per_rank_actual_token: Optional[List[int]] = None
@@ -252,12 +255,29 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             perm, device=device, dtype=torch.int32
         )
 
+        stride = max(int(num_tokens), max(per_rank_actual_token))
+        gathered_to_rk = []
+        for r, n in enumerate(per_rank_actual_token):
+            for k in range(n):
+                gathered_to_rk.append((r, k))
+        direct_perm = []
+        for p in perm:
+            r, k = gathered_to_rk[p]
+            slot = (cp_rank - r) % self.cp_size
+            direct_perm.append(slot * stride + k)
+        direct_reorder_index = torch.tensor(
+            direct_perm, device=device, dtype=torch.int32
+        )
+
         return ZigzagContextParallelMetadata(
             split_list=split_list,
             zigzag_index=zigzag_index,
             cp_reverse_index=cp_reverse_index,
             reverse_split_len=reverse_split_len,
             reorder_index_tensor=reorder_index_tensor,
+            perm=perm,
+            direct_reorder_index=direct_reorder_index,
+            stride=stride,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
             kv_len_prev_tensor=torch.tensor(
@@ -333,6 +353,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         meta = forward_batch.attn_cp_metadata
+        direct_idx = getattr(meta, "direct_reorder_index", None)
+        if x.device.type == "tpu" and direct_idx is not None:
+            from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                _GLOBAL_AG_OP,
+                build_cp_all_gather_op,
+            )
+            minor = tuple(x.shape[1:])
+            x2 = x.reshape(x.shape[0], -1).contiguous()
+            op = _GLOBAL_AG_OP
+            if op is None:
+                op = build_cp_all_gather_op(self.cp_size, get_parallel().attn_tp_size)
+            out = op(x2)
+            if direct_idx.device != out.device:
+                direct_idx = direct_idx.to(out.device)
+            return out.reshape(-1, x2.shape[1]).index_select(0, direct_idx).reshape(-1, *minor)
+
         gathered = self._all_gather_reorganized(x, forward_batch)
         reorder_index = getattr(meta, "reorder_index_tensor", None)
         if reorder_index is not None:
@@ -350,6 +386,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         meta = forward_batch.attn_cp_metadata
+        direct_idx = getattr(meta, "direct_reorder_index", None)
+        if x.device.type == "tpu" and direct_idx is not None:
+            from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                _GLOBAL_AG_OP,
+                build_cp_all_gather_op,
+            )
+            minor = tuple(x.shape[1:])
+            x2 = x.reshape(x.shape[0], -1).contiguous()
+            op = _GLOBAL_AG_OP
+            if op is None:
+                op = build_cp_all_gather_op(self.cp_size, get_parallel().attn_tp_size)
+            out = op(x2)
+            if direct_idx.device != out.device:
+                direct_idx = direct_idx.to(out.device)
+            return out.reshape(-1, x2.shape[1]).index_select(0, direct_idx).reshape(-1, *minor)
+
         gathered = self._all_gather_reorganized(x, forward_batch)
         reorder_index = getattr(meta, "reorder_index_tensor", None)
         if reorder_index is not None:

@@ -42,6 +42,26 @@ def pad_logical_token_to_physical(metadata: Any) -> None:
     metadata.per_rank_actual_token = [physical_rank_len] * len(logical_tokens)
     metadata.max_rank_len = [physical_rank_len] * len(logical_tokens)
 
+    if hasattr(metadata, "perm") and metadata.perm is not None:
+        stride = max(physical_rank_len, getattr(metadata, "stride", physical_rank_len))
+        metadata.stride = stride
+        parallel = get_parallel()
+        cp_rank = parallel.attn_cp_rank
+        cp_size = parallel.attn_cp_size
+        gathered_to_rk = []
+        for r, n in enumerate(metadata.per_rank_logical_token):
+            for k in range(n):
+                gathered_to_rk.append((r, k))
+        direct_perm = []
+        for p in metadata.perm:
+            r, k = gathered_to_rk[p]
+            slot = (cp_rank - r) % cp_size
+            direct_perm.append(slot * stride + k)
+        device = metadata.reorder_index_tensor.device
+        metadata.direct_reorder_index = torch.tensor(
+            direct_perm, device=device, dtype=torch.int32
+        )
+
 
 def pad_local_rows(x: torch.Tensor, metadata: Any, dim: int) -> torch.Tensor:
     """Pad a local CP tensor from its logical length to its physical length."""
