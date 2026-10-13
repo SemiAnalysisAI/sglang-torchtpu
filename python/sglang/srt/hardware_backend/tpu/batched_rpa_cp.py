@@ -890,33 +890,6 @@ def batched_rpa_pcp_forward(
     from sglang.srt.layers.cp.utils import get_cp_strategy
 
     strategy = get_cp_strategy()
-    meta = (
-        getattr(forward_batch, "attn_cp_metadata", None)
-        if forward_batch is not None
-        else None
-    )
-    if meta is not None and getattr(meta, "actual_seq_q_prev_list", None) is not None:
-        c_heads = list(meta.actual_seq_q_prev_list)
-        c_tails = list(meta.actual_seq_q_next_list)
-    else:
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) if forward_batch is not None else None
-        if extend_lens is None:
-            extend_lens = getattr(forward_batch, "seq_lens_cpu", None) if forward_batch is not None else None
-        if extend_lens is None:
-            try:
-                extend_lens = (
-                    forward_batch.seq_lens
-                    - getattr(
-                        forward_batch,
-                        "prefix_lens",
-                        torch.zeros_like(forward_batch.seq_lens),
-                    )
-                ).cpu().numpy()
-            except Exception:
-                extend_lens = [q.shape[0]]
-        c_sizes = [max(1, int(l) // (2 * cp_size)) for l in extend_lens]
-        c_heads = c_sizes
-        c_tails = c_sizes
 
     q_op = q
     k_logical = k
@@ -953,33 +926,31 @@ def batched_rpa_pcp_forward(
     zeros_2x = torch.zeros_like(cache_lens_2x, dtype=torch.int32)
 
     # 1. Cache Phase (Ring Attention over ICI)
-    context_out = None
-    context_lse = None
-    if pcp_meta.cache_pages > 0:
-        # kv_lens == cached prefix and kv_new_lens == 0, so the kernel's global
-        # cache length is exactly the prefix. No KV is written in this phase.
-        ring_op = _GLOBAL_RING_OP
-        if ring_op is None:
-            ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
-        context_out, context_lse = ring_op(
-            q_op,
-            k_logical,
-            v_logical,
-            kv_cache,
-            cache_lens_2x,
-            curr_page_indices,
-            pcp_meta.pcp_cu_q_lens,
-            curr_distribution,
-            pcp_meta.q_positions,
-            zeros_2x,
-            cp_rank_tensor,
-            zeros_2x,
-            float(layer.scaling),
-            sliding_window,
-            float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
-            k_scale,
-            v_scale,
-        )
+    # Always executed unconditionally to keep the Dynamo graph static across
+    # batches with and without cached prefix tokens. When prefix_lens == 0,
+    # ring_op returns context_lse = -inf and merge_attn_states masks it out cleanly.
+    ring_op = _GLOBAL_RING_OP
+    if ring_op is None:
+        ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
+    context_out, context_lse = ring_op(
+        q_op,
+        k_logical,
+        v_logical,
+        kv_cache,
+        cache_lens_2x,
+        curr_page_indices,
+        pcp_meta.pcp_cu_q_lens,
+        curr_distribution,
+        pcp_meta.q_positions,
+        zeros_2x,
+        cp_rank_tensor,
+        zeros_2x,
+        float(layer.scaling),
+        sliding_window,
+        float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
+        k_scale,
+        v_scale,
+    )
 
     # 2. Current Phase (All-Gather current chunk tokens)
     if (
@@ -1057,11 +1028,7 @@ def batched_rpa_pcp_forward(
         )
 
     # 3. Softmax State Merge
-    if context_out is not None and context_lse is not None:
-        out, lse = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
-    else:
-        out = curr_out
-        lse = curr_lse
+    out, lse = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
 
     # Fold in attention sinks if present (e.g. GPT-OSS-120B)
     if sinks is None:
