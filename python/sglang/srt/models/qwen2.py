@@ -31,6 +31,9 @@ from sglang.srt.layers.cp.utils import (
     cp_shard_model_inputs,
     is_cp_active,
 )
+from sglang.srt.utils.common import is_tpu
+
+_is_tpu = is_tpu()
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -542,7 +545,7 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_cp_active(forward_batch):
+        if not _is_tpu and is_cp_active(forward_batch):
             if input_embeds is None:
                 input_embeds = self.get_input_embeddings()(input_ids)
             with cp_shard_model_inputs(

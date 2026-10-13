@@ -849,7 +849,7 @@ class GptOssForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_cp_active(forward_batch):
+        if not _is_tpu and is_cp_active(forward_batch):
             if input_embeds is None:
                 input_embeds = self.get_input_embeddings()(input_ids)
             with cp_shard_model_inputs(
