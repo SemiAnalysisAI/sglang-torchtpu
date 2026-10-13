@@ -490,10 +490,10 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # Build only TPU metadata. The GPU base constructs variable-length
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
-        slots = self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-        self._state_indices = (
-            self._translate_mamba_indices(slots).to(torch.int32).clamp(min=0)
-        )
+        slots = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        ).clamp(min=0)
+        self._state_indices = slots.to(torch.int32)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
@@ -535,17 +535,21 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             mamba_cache_indices=self._state_indices,
             mamba_track_indices=self._track_indices,
         )
-        self._init_spec_metadata(forward_batch)
+        self._init_spec_metadata(forward_batch, slots)
 
-    def _init_spec_metadata(self, forward_batch: "ForwardBatch") -> None:
+    def _init_spec_metadata(
+        self, forward_batch: "ForwardBatch", slots: torch.Tensor
+    ) -> None:
         self._read_offsets = None
         self._num_spec_tokens = 0
         self._verify_slots = None
         if self._spec_window == 1:
             return
         mode = forward_batch.forward_mode
-        # Clamped slot ids; index_copy_ / index_fill_ take int64.
-        slots = self._state_indices.long()
+        # index_copy_ / index_fill_ take int64; reuse the metadata's own int64
+        # slots so the per-round commit launches no cast.
+        if slots.dtype != torch.int64:
+            slots = slots.long()
         if mode.is_target_verify():
             # Checkpoint rows are laid out per pool window; a different verify
             # width (adaptive spec) would read and commit the wrong rows.
