@@ -384,19 +384,9 @@ def build_dflash_block_tpu(
 
     Each result is a fresh tensor in the shape its consumer reads: torch_tpu
     materializes reshaped views (and buffers written through them) in an extra
-    program per launch, so the flat forms are copies, not views.
-
-    Args:
-      candidates: Slot ids for [base, base + 2 * block_size), [bs, 2 * block_size].
-      seq_lens: Device prefix lengths, [bs].
-      committed_lens: Device mirror of the host base, [bs].
-      bonus_tokens: Each request's verified anchor token, [bs].
-      mask_token: The draft mask token id, [1].
-      block_size: Verify block width.
-
-    Returns:
-      (block_ids [bs, block_size], block_ids flat, positions flat,
-      cache_loc [bs, block_size], cache_loc flat).
+    program per launch, so the flat forms are copies, not views. candidates
+    holds the slot ids for [base, base + 2 * block_size); returns (block_ids,
+    block_ids flat, positions flat, cache_loc, cache_loc flat).
     """
     cache_loc = _select_verify_cache_locs(
         candidates, seq_lens, committed_lens, block_size
@@ -420,15 +410,8 @@ def assemble_dflash_verify_ids_tpu(
     block_ids: torch.Tensor,
     draft_next: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Verify input: each block's anchor followed by its drafted tokens.
-
-    Args:
-      block_ids: Draft block ids, [bs, block_size]; column 0 is the anchor.
-      draft_next: Drafted tokens, [bs, block_size - 1].
-
-    Returns:
-      (tokens [bs, block_size], tokens flat), both fresh tensors.
-    """
+    """Verify input [bs, block_size] and its flat copy: column 0 of block_ids,
+    then the block_size - 1 drafted tokens."""
     tokens = torch.cat([block_ids[:, :1], draft_next.to(block_ids.dtype)], dim=1)
     return tokens, tokens.reshape(-1).clone()
 

@@ -126,12 +126,10 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 2048): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 4096): (8, 256),
         # ===== GLM-5.3-Flash TP8 (64 q heads -> 8/shard, kv_lora=512, NoPE
-        # carried as 64 zero rope lanes, page=128), bf16 and fp8 KV. SEEDED,
-        # not swept: Ling's v7 values above with kv pages doubled for page 128
-        # (same tokens per block). The default mixed (1, 16) is ~8x slower.
-        # Mixed mnt <= 128 only comes from spec verify (prefill pads to >= 1k):
-        # each request brings <= 8 query rows, so bq=8 avoids computing 16x the
-        # rows (bq=128: 626 us/call at c16; default (1, 16): 47 us at c1).
+        # carried as 64 zero rope lanes, page=128), bf16 and fp8 KV. Seeded,
+        # not swept: the v7 values above with kv pages doubled for page 128.
+        # Mixed mnt <= 128 assumes spec verify (<= 8 query rows per request);
+        # prefill pads to >= 1k tokens, so it never lands in the bq=8 rows.
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 2): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (32, 1, 2),

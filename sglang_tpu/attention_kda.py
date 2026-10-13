@@ -122,7 +122,7 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
         conv_weight = layer.conv_weights
         if conv_weight.ndim == 2:
             conv_weight = conv_weight.unsqueeze(1)
-        out = self._op(
+        return self._op(
             mixed_qkv,
             # Raw beta [T, n_v] and forget gate [T, n_v * d_k]; the kernel
             # applies the sigmoid and the gate activation itself.
@@ -148,8 +148,6 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             layer.conv_weights.shape[-1],
             True,
             None if lower_bound is None else float(lower_bound),
-            # Pure decode / verify has no PER_SEQ rows and extend no BATCHED
-            # rows, so each runs one kernel pass.
             batched_only=self._is_decode,
             prefill_only=not self._is_decode,
             packed_weights=layer.kda_packed_weights,
@@ -157,7 +155,6 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             num_spec_tokens=self._num_spec_tokens,
             spec_window=self._spec_window,
         )
-        return out.view(tokens, n_v, d_v)
 
     def _run_scan(self, layer, mixed_qkv, a, b):
         cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)

@@ -169,10 +169,8 @@ class TpuMambaPool(MambaPool):
         # each layer's state owns its storage, so the Pallas bridge's write-back
         # aliases in place instead of lowering to slice + dynamic-update-slice.
         #
-        # conv: kernel-native [size+1, K-1, 1, conv_dim] per layer (GPU stores
-        # [..., conv_dim, K-1]). The kernel reshapes the pool to this rank-4
-        # form, which on TPU re-tiles the whole pool twice per layer call
-        # unless it is stored so. Same bytes as [size+1, K-1, conv_dim].
+        # conv: kernel-native [size+1, K-1, 1, conv_dim]; any other layout makes
+        # the kernel re-tile the whole pool twice per layer call.
         conv_state = [
             [
                 torch.zeros(

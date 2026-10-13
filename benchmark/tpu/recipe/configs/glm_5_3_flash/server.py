@@ -46,7 +46,8 @@ CONFIG["server_args"].update(
         "torch_compile_max_bs": MAX_RUNNING,
         "tpu_compile_bs": COMPILE_BS,
         "max_total_tokens": max(2, MAX_RUNNING) * CONTEXT_LENGTH,
-        # Linear-attention (KDA) state slots; one per running request.
+        # Linear-attention (KDA) state slots: one per running request; the +2
+        # spare is arbitrary headroom.
         "max_mamba_cache_size": MAX_RUNNING + 2,
         # Only the 11 full-attention layers have a KV cache; bf16 matches the
         # dense attention path these numbers were measured on.

@@ -27,13 +27,6 @@ _MAX_BLOCK_TOKENS = 32
 _PREFILL_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
-def pack_hc_vec(hc_scale: jax.Array, hc_base: jax.Array) -> jax.Array:
-    mix = hc_base.shape[0]
-    vec = jnp.zeros((1, VEC_WIDTH), jnp.float32)
-    vec = vec.at[0, :mix].set(hc_base.astype(jnp.float32))
-    return vec.at[0, mix : mix + 3].set(hc_scale.astype(jnp.float32))
-
-
 def _remix(x_ref, res_ref, post_ref, comb_ref, new_res_ref, *, hc, d):
     """hc_post: returns the new streams as f32 values of their bf16 rounding."""
     x = x_ref[...].astype(jnp.float32)

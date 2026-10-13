@@ -699,7 +699,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         return self.model.embed_tokens
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        # Capturing before layer k + 1 gives the completed output of layer k.
+        # Capturing before layer k + 1 gives the completed output of layer k,
+        # so the last layer has no capture point.
+        assert max(layer_ids) + 1 < len(self.model.layers), layer_ids
         self.model.layers_to_capture = frozenset(val + 1 for val in layer_ids)
 
     @classmethod

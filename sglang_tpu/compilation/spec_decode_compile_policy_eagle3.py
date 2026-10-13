@@ -183,7 +183,7 @@ def fold_last_token_embeds(
 
 
 class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
-    """Add EAGLE3 warmup and batch shaping to a decoder compile policy."""
+    """Add EAGLE / EAGLE3 warmup and batch shaping to a decoder compile policy."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

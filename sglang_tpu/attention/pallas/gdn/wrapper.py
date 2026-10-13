@@ -513,12 +513,8 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    # Plain decode only reads activations on the compact path, which upcasts
-    # on load; skipping the f32 copy (for one shared input dtype) and the row
-    # padding is bit-identical. The output zero fill stays: the kernel writes
-    # only the first distribution[0] rows, and padding rows (even the only
-    # row, e.g. an idle DP-attention rank run as a one-row decode) feed
-    # residual / MoE / collectives downstream, so they must be finite.
+    # Plain decode upcasts on load, so skipping the f32 copy is bit-identical.
+    # The output zero fill stays: padding rows feed MoE and collectives downstream.
     decode_only = batched_only and num_spec_tokens == 0 and not pooled
     if not (decode_only and qkv.dtype == b.dtype == a.dtype):
         qkv = qkv.astype(jnp.float32)
