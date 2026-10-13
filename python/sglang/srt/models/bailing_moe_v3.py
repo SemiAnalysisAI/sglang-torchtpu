@@ -1743,6 +1743,27 @@ class BailingMoeV3ForCausalLM(nn.Module):
         # guard); a second model-level pass double-packs the scales and
         # crashes, which is why deepseek_v2 dropped its copy too.
 
+        if _is_tpu:
+            # Post-load, never inside the compiled forward: TPU weight
+            # materialization re-creates these parameters after __init__
+            # bound them onto RadixLinearAttention, and Dynamo/AOT would
+            # lift the stale references as free variables whose storages
+            # then die.
+            for layer in self.model.layers:
+                attention = layer.attention
+                if not isinstance(attention, KimiDeltaAttention):
+                    continue
+                # The kernel contract is the squeezed [dim, K] view
+                # kimi_linear's __init__ binds; Kimi-K3's packed path uses
+                # the raw [dim, 1, K] parameter, not this class's.
+                attention.attn.conv_weights = attention.qkv_conv1d.weight.squeeze(1)
+                # Built bias=False; the kernel reads None as no conv bias.
+                attention.attn.bias = attention.qkv_conv1d.bias
+                # Same name on both sides, but the right-hand side is the
+                # materialized replacement, not the __init__ reference.
+                attention.attn.A_log = attention.A_log
+                attention.attn.dt_bias = attention.dt_bias
+
     def get_decoder_attention_types(self):
         return self.model.decoder_attention_types
 
