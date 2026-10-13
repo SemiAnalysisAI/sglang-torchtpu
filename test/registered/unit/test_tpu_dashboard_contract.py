@@ -272,7 +272,8 @@ class TestJobMapsToOneTest(CustomTestCase):
             model: {g["name"] for g in discover(model)}
             for model in ("day-10am", "day-5pm", "full-set")
         }
-        # Each slot's multihost legs take the 2-host lane its 1-host legs leave idle.
+        # Each slot's multihost legs take the 2-host lane its 1-host legs leave
+        # idle; Kimi-K3 is alone on the 4-host lane.
         self.assertEqual(
             names["day-10am"],
             {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
@@ -282,6 +283,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             {
                 "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
                 "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
+                "test_tpu_kimi_k3_tp32_accuracy",
             },
         )
         # Every multihost accuracy file runs in exactly one scheduled selection.
@@ -300,10 +302,33 @@ class TestJobMapsToOneTest(CustomTestCase):
         )
         self.assertEqual(recipes.count("recipe/configs/kimi_k26/mmmu.py"), 2)
         self.assertNotIn("recipe/configs/qwen3_5_397b/server.py", recipes)
+        nightly_slices = yaml.safe_load((TPU_CI / "topology.yaml").read_text())[
+            "lanes"
+        ]["nightly"]
         for group in groups:
             self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
-            # A hosted runner has six hours, including startup and cleanup.
-            runtime = 3600 + group["timeout_per_file"] + 600
+            # render_jobset.py exits when the lane has no slice of this size.
+            self.assertIn(group["hosts"], nightly_slices, group["name"])
+            # A hosted runner has six hours, including startup and cleanup: the
+            # JobSet deadline (bring-up + timeout) plus _tpu-test.yml's margin.
+            deadline = subprocess.run(
+                [
+                    sys.executable,
+                    str(TPU_CI / "render_jobset.py"),
+                    "--launch-script",
+                    group["launch_script"],
+                    "--files",
+                    group["files"],
+                    "--timeout-per-file",
+                    str(group["timeout_per_file"]),
+                    "--print-wait-seconds",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO),
+                check=True,
+            ).stdout
+            runtime = int(deadline) + 600
             self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
         # The nightly no longer runs accuracy; single-host legs ride the 10 AM slot.
         for job in workflow["jobs"].values():

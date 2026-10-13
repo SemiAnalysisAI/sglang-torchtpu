@@ -17,7 +17,10 @@ as does ${SERVICE_ACCOUNT} (empty -> namespace default KSA).
 Also computes the CI poll budget for a suite (--print-wait-seconds): a static AST scan
 of the registered tree sums est_time over the suite's enabled tests -- no sglang import
 needed (same technique as discover_multihost.py). The workflow uses it so the poll
-timeout scales with the suite instead of a fixed ceiling.
+timeout scales with the suite instead of a fixed ceiling. A multi-host group's budget
+(--print-wait-seconds with --launch-script) is its JobSet deadline: the files' declared
+bring-up (MULTIHOST_LAUNCH["bringup_timeout"], read the same way) plus each file's
+timeout.
 
 A third mode renders jobset-tpu-pd.yaml instead: P/D disaggregation across TWO
 slices (one per role). Every pod of both slices runs the --exec command; the
@@ -28,9 +31,11 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
        render_jobset.py --image <ref> --exec "<cmd>" --pd-prefill-hosts N \
            --pd-decode-hosts N [--weights-pvc <pvc>] [--name <run-name>]
        render_jobset.py --suite <name> --print-wait-seconds
+       render_jobset.py --launch-script <rel> --files "<f>..." --print-wait-seconds
 """
 
 import argparse
+import ast
 import glob
 import os
 import re
@@ -38,6 +43,7 @@ import sys
 
 import yaml
 from ci_register_loader import ci_register as _ci_register
+from discover_multihost import multihost_launch
 
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
@@ -48,6 +54,13 @@ _WAIT_FLOOR_SECONDS = 360
 # over-stating it would cut a slow run short, understating it hands the
 # runtime clock seconds that the admission budget needs more.
 _CHIP_PARALLEL_EFFICIENCY = 0.7
+
+# Launch mode: rank 0 polls /health_generate every 10 s for the group's bring-up
+# budget (weight load + precompile), and the JobSet deadline adds 600 s to it before
+# the files' own timeouts. The default is R1's: 300 polls, a 3600 s allowance.
+_HEALTH_POLL_SECONDS = 10
+_DEFAULT_BRINGUP_SECONDS = 3000
+_BRINGUP_DEADLINE_MARGIN = 600
 
 # P/D mode: two engines to bring up (weight load + compile warmup on both
 # slices) before the probe + accuracy eval even start. Longest seen: 100 min;
@@ -145,6 +158,25 @@ def suite_wait_seconds(
     return max(int(total * _WAIT_MARGIN), _WAIT_FLOOR_SECONDS)
 
 
+def launch_bringup_seconds(files):
+    """The longest bring-up any of the group's files declares, at least the default."""
+    declared = [_DEFAULT_BRINGUP_SECONDS]
+    for path in files.split():
+        with open(path) as f:
+            launch = multihost_launch(ast.parse(f.read())) or {}
+        declared.append(int(launch.get("bringup_timeout", 0)))
+    return max(declared)
+
+
+def launch_deadline_seconds(files, timeout_per_file):
+    """activeDeadlineSeconds of a launch group: bring-up, margin, then each file."""
+    return (
+        launch_bringup_seconds(files)
+        + _BRINGUP_DEADLINE_MARGIN
+        + len(files.split()) * timeout_per_file
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image")
@@ -197,7 +229,8 @@ def main():
     ap.add_argument(
         "--print-wait-seconds",
         action="store_true",
-        help="Print the CI poll budget (s) for --suite and exit (no rendering).",
+        help="Print the CI poll budget (s) for --suite, or the launch group's "
+        "JobSet deadline for --launch-script, and exit (no rendering).",
     )
     a = ap.parse_args()
 
@@ -211,6 +244,11 @@ def main():
         "partition_id": a.partition_id if partitioned else None,
         "partition_size": a.partition_size if partitioned else None,
     }
+    if a.print_wait_seconds and a.launch_script:
+        if not a.files.split():
+            ap.error("--print-wait-seconds with --launch-script needs --files")
+        print(launch_deadline_seconds(a.files, a.timeout_per_file))
+        return
     if a.print_wait_seconds:
         print(
             suite_wait_seconds(
@@ -387,10 +425,15 @@ def main():
     elif a.exec_cmd:
         active_deadline = 7200
     else:
-        # Launch mode: up to ~50m server bring-up (R1 weight load + cold compile;
-        # the health poll in jobset-tpu.yaml allows 300x10s) + each file's
-        # `timeout` budget. _tpu-test's mh wait_s mirrors this formula.
-        active_deadline = 3600 + len(a.files.split()) * a.timeout_per_file
+        # Launch mode: the group's bring-up budget (R1's ~50m weight load + cold
+        # compile by default; a file may declare more) + each file's `timeout`
+        # budget. _tpu-test's mh wait_s must outlast it (--print-wait-seconds).
+        active_deadline = launch_deadline_seconds(a.files, a.timeout_per_file)
+    # Only the launch-mode branch of jobset-tpu.yaml polls; every mode renders it.
+    bringup = (
+        launch_bringup_seconds(a.files) if a.launch_script else _DEFAULT_BRINGUP_SECONDS
+    )
+    health_polls = -(-bringup // _HEALTH_POLL_SECONDS)
 
     pvc = a.weights_pvc
     vals = {
@@ -428,6 +471,7 @@ def main():
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
         "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
         "TIMEOUT_PER_FILE": str(a.timeout_per_file),
+        "HEALTH_POLLS": str(health_polls),
         "SERVICE_ACCOUNT": (
             SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)
             if a.service_account

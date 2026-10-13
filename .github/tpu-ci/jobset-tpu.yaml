@@ -11,6 +11,7 @@
 #   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
 #   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
+#   HEALTH_POLLS  multi-host: rank-0 /health_generate attempts, 10 s apart (the group's bring-up)
 #   PARTITION_FLAGS single-host run_suite partition arguments (empty when unsharded)
 #   TEST_FILE_FLAG single-host exact-file selection (empty when running a whole suite)
 #   CHIP_WORKERS_FLAG single-host --tpu-chip-workers (empty when chip sharing is off)
@@ -195,7 +196,7 @@ ${WEIGHTS_VOLUME}
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0
-                        for i in $(seq 1 300); do
+                        for i in $(seq 1 ${HEALTH_POLLS}); do
                           curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
                           kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
                           sleep 10

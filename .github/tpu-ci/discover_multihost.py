@@ -32,6 +32,17 @@ def _literal(node):
         return None
 
 
+def multihost_launch(tree, launch_var="MULTIHOST_LAUNCH"):
+    """A parsed test file's module-level `launch_var` dict, or None."""
+    launch = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == launch_var for t in node.targets
+        ):
+            launch = _literal(node.value)
+    return launch if isinstance(launch, dict) else None
+
+
 def _scan(root, suite, nightly_only, launch_var="MULTIHOST_LAUNCH"):
     """{path: launch dict} for files registered to `suite` that declare `launch_var`.
 
@@ -43,7 +54,7 @@ def _scan(root, suite, nightly_only, launch_var="MULTIHOST_LAUNCH"):
             tree = ast.parse(open(path).read())
         except SyntaxError:
             continue
-        launch, registered = None, False
+        registered = False
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -61,14 +72,12 @@ def _scan(root, suite, nightly_only, launch_var="MULTIHOST_LAUNCH"):
                         print(f"skip {path}: disabled ({d})", file=sys.stderr)
                         continue
                     registered = True
-            elif isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Name) and t.id == launch_var:
-                        launch = _literal(node.value)
         if registered and launch_var is None:
             found[path] = {}
-        elif registered and isinstance(launch, dict):
-            found[path] = launch
+        elif registered:
+            launch = multihost_launch(tree, launch_var)
+            if launch is not None:
+                found[path] = launch
     return found
 
 

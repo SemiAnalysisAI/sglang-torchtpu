@@ -99,6 +99,12 @@ The shared PVC name is defined in `.github/tpu-ci/weights.yaml`:
 launcher defaults, and workflow inputs. CI discovery reads ordinary literals;
 the JobSet renderer resolves the key for both ordinary and P/D jobs.
 
+Optional keys: `timeout_per_file` (seconds per file, default 3600) and
+`bringup_timeout` (seconds rank 0 polls `/health_generate` before failing the group;
+default and floor 3000). The JobSet deadline is the group's largest `bringup_timeout` +
+600 s + the number of files × `timeout_per_file`; `render_jobset.py --launch-script ...
+--files ... --print-wait-seconds` prints it.
+
 `render_jobset.py --weights-pvc` also accepts a literal PVC name for custom
 claims; an empty value mounts no weights. The container mount remains `/weights`
 (test-side lookup can be overridden with `SGLANG_TPU_WEIGHTS_ROOT`). Provisioning
@@ -144,10 +150,10 @@ The accuracy stage (`accuracy-test-tpu.yml`) runs on its own 10 AM / 5 PM PT sch
 instead: with it the nightly needed about twice the slice time the 6 h runner cap allows.
 Each slot fills the lane its MMMU-Pro legs leave idle:
 
-| Slot | 1-host lane | 2-host lane |
-|---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
+| Slot | 1-host lane | 2-host lane | 4-host lane |
+|---|---|---|---|
+| `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards | — |
+| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy | Kimi-K3 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
@@ -202,7 +208,7 @@ quota entry — no workflow change.
 |-------|--------|--------|
 | admission | the runner's remaining lifetime | suspended in Kueue; no pods exist yet |
 | running | 900s | placed, but binding + image pull |
-| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (single-host shard) | the test itself |
+| runtime | JobSet deadline + 600 (launch, from `render_jobset.py --print-wait-seconds`) / 7800 (exec) / `est_time`×1.5+600 (single-host shard) | the test itself |
 
 One slice runs one multi-host job at a time, so a job's wait is however long everything
 queued ahead of it takes — there is no useful number smaller than "as much of the runner as

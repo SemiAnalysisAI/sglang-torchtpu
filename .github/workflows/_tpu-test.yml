@@ -240,14 +240,17 @@ jobs:
           #     (max(sum(est_time)*1.5, 360s)). run_suite's
           #     --timeout-per-file still bounds each file.
           #   * multi-host: the JobSet caps the run at activeDeadlineSeconds
-          #     (3600s bring-up + files x timeout_per_file, the render_jobset.py
-          #     formula), and this must OUTLAST it so the JobSet -- not this loop --
-          #     decides the outcome.
+          #     (the files' bring-up budget + 600s + files x timeout_per_file, as
+          #     render_jobset.py --print-wait-seconds prints it), and this must
+          #     OUTLAST it so the JobSet -- not this loop -- decides the outcome.
           if [ "$IN_PD_PREFILL_HOSTS" != '0' ]; then
             wait_s=9300          # outlast P/D mode's activeDeadlineSeconds=8700 + margin
           elif [ -n "$IN_LAUNCH_SCRIPT" ]; then
-            nf=$(wc -w <<< "$IN_FILES")
-            wait_s=$(( 3600 + nf * IN_TIMEOUT_PER_FILE + 600 ))  # deadline + margin
+            wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py \
+              --launch-script "$IN_LAUNCH_SCRIPT" \
+              --files "$IN_FILES" \
+              --timeout-per-file "$IN_TIMEOUT_PER_FILE" \
+              --print-wait-seconds) + 600 ))  # deadline + margin
           elif [ -n "$IN_EXEC_CMD" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else

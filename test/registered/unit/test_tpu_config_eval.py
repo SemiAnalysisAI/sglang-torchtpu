@@ -104,11 +104,13 @@ class TestTpuConfigEval(unittest.TestCase):
 
 
 class TestAccuracyRecipes(unittest.TestCase):
-    MULTIHOST = (
-        "recipe/configs/deepseek_r1_0528/accuracy.py",
-        "recipe/configs/deepseek_v3_1/accuracy.py",
-        "recipe/configs/kimi_k26/mmmu.py",
-    )
+    # Multi-host recipe -> the (hosts, tp_size, ep_size) it serves.
+    MULTIHOST = {
+        "recipe/configs/deepseek_r1_0528/accuracy.py": (2, 16, 16),
+        "recipe/configs/deepseek_v3_1/accuracy.py": (2, 16, 16),
+        "recipe/configs/kimi_k26/mmmu.py": (2, 16, 16),
+        "recipe/configs/kimi_k3/accuracy.py": (4, 32, 32),
+    }
     SINGLE_HOST = (
         "recipe/configs/qwen3_5_397b/server.py",
         "recipe/configs/gpt_oss_20b/accuracy.py",
@@ -121,14 +123,17 @@ class TestAccuracyRecipes(unittest.TestCase):
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):
-        topology = {"TPU_WORKER_ID": "1", "TPU_WORKER_HOSTNAMES": "rank0,rank1"}
-        for recipe in self.MULTIHOST:
+        for recipe, (hosts, tp_size, ep_size) in self.MULTIHOST.items():
             with self.subTest(recipe=recipe):
+                topology = {
+                    "TPU_WORKER_ID": "1",
+                    "TPU_WORKER_HOSTNAMES": ",".join(f"rank{i}" for i in range(hosts)),
+                }
                 plan = plan_launch(load_recipe(recipe), inherited=topology)
                 args = plan.config.server_args
-                self.assertEqual((args["nnodes"], args["node_rank"]), (2, 1))
+                self.assertEqual((args["nnodes"], args["node_rank"]), (hosts, 1))
                 self.assertEqual(args["dist_init_addr"], "rank0:10011")
-                self.assertEqual((args["tp_size"], args["ep_size"]), (16, 16))
+                self.assertEqual((args["tp_size"], args["ep_size"]), (tp_size, ep_size))
                 # DP attention is all-or-nothing: --dp-size without
                 # --enable-dp-attention silently serves one attention group.
                 dp_size = args.get("dp_size", 1)
@@ -163,7 +168,7 @@ class TestAccuracyRecipes(unittest.TestCase):
         )
 
     def test_recipes_include_shell_runtime_defaults(self):
-        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+        for recipe in (*self.MULTIHOST, *self.SINGLE_HOST):
             with self.subTest(recipe=recipe):
                 plan = plan_launch(load_recipe(recipe), inherited={})
                 self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
@@ -183,7 +188,7 @@ class TestAccuracyRecipes(unittest.TestCase):
         from sglang.srt.server_args import ServerArgs
 
         topology = {"TPU_WORKER_ID": "0", "TPU_WORKER_HOSTNAMES": "h0,h1"}
-        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+        for recipe in (*self.MULTIHOST, *self.SINGLE_HOST):
             with self.subTest(recipe=recipe):
                 plan = plan_launch(load_recipe(recipe), inherited=topology)
                 argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
