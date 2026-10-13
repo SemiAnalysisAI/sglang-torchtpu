@@ -751,7 +751,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
                 forward_batch
             )
-        self.draft_attn_backend.init_forward_metadata(forward_batch)
+            # The fused loop attends through step 0's backend and derives step
+            # i's KV length in-graph, so the other steps' metadata is never read.
+            self.draft_attn_backend.attn_backends[0].init_forward_metadata(
+                forward_batch
+            )
+        else:
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):
