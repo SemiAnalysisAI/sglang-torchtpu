@@ -121,6 +121,11 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.heartbeat import (
+    ROLE_SCHEDULER,
+    create_heartbeat_writer,
+    scheduler_slot,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -544,6 +549,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self.init_heartbeat(port_args)
         self.init_idle_sleeper()
 
         # Init PD-multiplexing context
@@ -836,6 +842,22 @@ class Scheduler(
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
+
+    def init_heartbeat(self, port_args: PortArgs) -> None:
+        """Liveness heartbeat slot for this rank; /health reads the ages."""
+        parallel = get_parallel()
+        self.heartbeat = create_heartbeat_writer(
+            port_args.instance_id,
+            role=ROLE_SCHEDULER,
+            slot=scheduler_slot(
+                dp_rank=parallel.dp_rank if parallel.dp_rank is not None else 0,
+                pp_rank=parallel.pp_rank,
+                tp_rank=parallel.tp_rank,
+                pp_size=parallel.pp_size,
+                tp_size=parallel.tp_size,
+            ),
+            rank=parallel.tp_rank,
+        )
 
     def init_idle_sleeper(self) -> None:
         if (
@@ -2271,6 +2293,8 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        if self.heartbeat is not None:
+            self.heartbeat.beat()
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
