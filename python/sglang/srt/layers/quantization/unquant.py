@@ -764,6 +764,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # call site can hand layer.w13_weight / layer.w2_weight straight
         # to fused_moe_call with no per-step transpose.
         if _is_tpu:
+            if getattr(layer.w13_weight, "tpu_expert_kn_layout", False):
+                # already (k, n): online updates write into it in place, then come back here
+                return
             # gmm_v2 tiles the intermediate dim in 128 lanes: zero-pad gate, up and w2
             # (e.g. 704 -> 768). Exact without bias: act(0) * 0 = 0 and the w2 pad is 0.
             inter = layer.w2_weight.shape[-1]
