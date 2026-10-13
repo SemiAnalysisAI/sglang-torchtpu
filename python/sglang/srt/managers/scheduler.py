@@ -123,6 +123,7 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.heartbeat import (
     ROLE_SCHEDULER,
+    HeartbeatWriter,
     create_heartbeat_writer,
     scheduler_slot,
 )
@@ -465,6 +466,7 @@ class Scheduler(
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     kv_free_fence: Optional["KVFreeFence"] = None
+    heartbeat: Optional[HeartbeatWriter] = None
 
     def __init__(
         self,
@@ -2293,8 +2295,6 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
-        if self.heartbeat is not None:
-            self.heartbeat.beat()
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2556,6 +2556,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            heartbeat=self.heartbeat,
         )
 
     def init_dp_attn_adapter(self) -> None:
