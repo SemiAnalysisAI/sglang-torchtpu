@@ -84,9 +84,17 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         MAMBA
     }
 
-    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
+    fn incremental_backup_nodes(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Vec<NodeIdx_> {
         let node = tree_core.arena.node(node_id);
-        node.has_device_value(MAMBA) && !node.has_host_value(MAMBA)
+        if node.has_device_value(MAMBA) && !node.has_host_value(MAMBA) {
+            vec![node_id]
+        } else {
+            Vec::new()
+        }
     }
 
     /// A match consumes only the best-match node's mamba state, so MATCH_END

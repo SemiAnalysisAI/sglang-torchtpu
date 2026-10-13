@@ -6752,6 +6752,120 @@ class UnifiedRadixCacheSuite:
             )
         cache.sanity_check()
 
+    def test_hicache_insert_backs_up_swa_recreated_beyond_target_window(self):
+        """An insert that re-creates SWA KV on a backed ancestor more than one
+        window above its last node backs that KV up, so evicting it from device
+        again leaves the ancestor's prefix servable from host."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        ps = self.cfg.page_size
+        window_pages = max(1, -(-self.cfg.sliding_window_size // ps))
+        for write_policy in ("write_through", "write_back"):
+            with self.subTest(write_policy=write_policy):
+                cache, req_to_token_pool, seq_a, _ = self._build_internal_swa_fixture(
+                    write_policy
+                )
+                allocator = cache.token_to_kv_pool_allocator
+                node = cache.tree_core.get_component_device_lru_node_ids(
+                    ComponentType.SWA
+                )[-1]
+                self.assertTrue(_node_children(cache, node))
+                node_len = _node_key_length(cache, node)
+                _write_backup(cache, node, write_back=write_policy == "write_back")
+                cache.writing_check(write_back=True)
+                # Host pressure takes the node's SWA KV from both tiers; Full
+                # stays on host.
+                cache.evict(EvictParams(num_tokens=0, swa_num_tokens=node_len))
+                self.assertEqual(
+                    cache.evict_host(node_len, ComponentType.SWA), node_len
+                )
+                self.assertTrue(cache.tree_core.is_backuped(node))
+                self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+                # A request sharing seq_a re-creates its SWA KV on device; its
+                # own last node is a full window below the ancestor.
+                seq_c = seq_a + self._make_seq(50000, window_pages)
+                self._insert(cache, allocator, req_to_token_pool, seq_c)
+                cache.writing_check(write_back=True)
+                self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+                self.assertIsNotNone(
+                    _host_value(cache, node, ComponentType.SWA),
+                    "re-created SWA KV is backed up at insert",
+                )
+
+                self._evict_device_swa(cache, [node])
+                m = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+                )
+                self.assertEqual(len(m.device_indices) + m.host_hit_length, len(seq_a))
+                cache.sanity_check()
+
+    def test_hicache_insert_backs_up_recreated_swa_beside_target_window(self):
+        """root -> Y -> X -> T: when T's backup window reaches X but not Y and the
+        insert re-creates SWA KV on both backed ancestors, Y's KV also reaches
+        Host instead of being taken as covered through X."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        ps = self.cfg.page_size
+        window_pages = -(-self.cfg.sliding_window_size // ps)
+        if window_pages < 2:
+            self.skipTest("T must be shorter than the window")
+        for write_policy in ("write_through", "write_back"):
+            with self.subTest(write_policy=write_policy):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                self._init_hicache(cache, write_policy=write_policy)
+                cache.write_through_threshold = 1
+                seq_y = self._make_seq(1, 1)
+                seq_x = seq_y + self._make_seq(100, 1)
+                seq_b = seq_x + self._make_seq(1000, window_pages)
+                for tokens in (seq_y, seq_x, seq_b):
+                    self._insert(cache, allocator, req_to_token_pool, tokens)
+                cache.writing_check(write_back=True)
+                x = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq_x)))
+                ).last_device_node
+                y = _node_parent(cache, x)
+                for node in (y, x):
+                    _write_backup(cache, node, write_back=write_policy == "write_back")
+                    cache.writing_check(write_back=True)
+                # Pin seq_b's leaf so eviction takes Y's and X's SWA KV from both
+                # tiers; their Full stays on host.
+                leaf = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq_b)))
+                ).last_device_node
+                leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
+                cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_x)))
+                cache.evict_host(len(seq_x), ComponentType.SWA)
+                cache.dec_lock_ref(leaf, leaf_lock)
+                for node in (y, x):
+                    self.assertTrue(cache.tree_core.is_backuped(node))
+                    self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+                    self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+                seq_t = seq_x + self._make_seq(50000, window_pages - 1)
+                self._insert(cache, allocator, req_to_token_pool, seq_t)
+                cache.writing_check(write_back=True)
+                for node in (y, x):
+                    self.assertIsNotNone(
+                        _host_value(cache, node, ComponentType.SWA),
+                        f"re-created SWA KV of node {node} is backed up",
+                    )
+                cache.sanity_check()
+
+    def _evict_device_swa(self, cache, nodes):
+        """Evict device SWA KV, one page at a time, until none of ``nodes`` holds it."""
+        for _ in range(64):
+            if all(
+                _device_value(cache, node, ComponentType.SWA) is None for node in nodes
+            ):
+                return
+            cache.evict(EvictParams(num_tokens=0, swa_num_tokens=self.cfg.page_size))
+        self.fail("device SWA KV of the nodes was not evicted")
+
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 

@@ -94,13 +94,19 @@ pub trait TreeComponent<K: ChildKeyType> {
         uuid
     }
 
-    /// Whether this component has device data that still needs a host backup.
-    fn needs_incremental_backup(
+    /// Nodes whose device data for this component is missing from Host and
+    /// would be copied by a backup of `node_id`.
+    fn incremental_backup_nodes(
         &self,
         _tree_core: &UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
-    ) -> bool {
-        false
+    ) -> Vec<NodeIdx_> {
+        Vec::new()
+    }
+
+    /// Whether this component has device data that still needs a host backup.
+    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
+        !self.incremental_backup_nodes(tree_core, node_id).is_empty()
     }
 
     /// Refresh this component's LRU position for `node_id` at the given walk phase.

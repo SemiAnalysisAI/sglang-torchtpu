@@ -129,8 +129,8 @@ class SWAComponent(TreeComponent):
             cur = cur.parent
         return unbacked
 
-    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
-        return bool(self._collect_unbacked_swa_nodes(node))
+    def incremental_backup_nodes(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
+        return self._collect_unbacked_swa_nodes(node)
 
     def reset_session_state(self) -> None:
         super().reset_session_state()

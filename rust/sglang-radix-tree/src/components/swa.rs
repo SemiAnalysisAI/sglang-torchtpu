@@ -329,10 +329,12 @@ impl SwaComponent {
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
-    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
-        !self
-            .collect_unbacked_swa_nodes_(tree_core, node_id)
-            .is_empty()
+    fn incremental_backup_nodes(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Vec<NodeIdx_> {
+        self.collect_unbacked_swa_nodes_(tree_core, node_id)
     }
 
     fn component_type(&self) -> ComponentType {

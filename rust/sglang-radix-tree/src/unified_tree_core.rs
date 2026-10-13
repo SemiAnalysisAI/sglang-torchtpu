@@ -1981,16 +1981,42 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.phase = InsertPhase::Tail;
     }
 
-    /// Whether an auxiliary component has new device data missing from Host.
-    fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
-        self.components.iter().any(|component| {
+    /// Components whose missing Host state an insert backs up.
+    fn incremental_backup_components_(
+        &self,
+    ) -> impl Iterator<Item = &Arc<dyn TreeComponent<K> + Send + Sync>> {
+        self.components.iter().filter(|component| {
             let component_type = component.component_type();
             // Write-back defers Full and Mamba to eviction; SWA still publishes
             // its window here because out-of-window frees never reach eviction.
-            component_type != BASE_COMPONENT_TYPE
-                && (!self.is_write_back || component_type == SWA)
-                && component.needs_incremental_backup(self, node_id)
+            component_type != BASE_COMPONENT_TYPE && (!self.is_write_back || component_type == SWA)
         })
+    }
+
+    /// Whether `node_id`'s own component state is on device with no host copy.
+    fn has_unbacked_state_(&self, node_id: NodeIdx_) -> bool {
+        let node = self.arena.node(node_id);
+        self.incremental_backup_components_().any(|component| {
+            let component_type = component.component_type();
+            node.has_device_value(component_type) && !node.has_host_value(component_type)
+        })
+    }
+
+    /// Nodes whose component state a backup of `node_id` copies to Host.
+    fn component_backup_reach_(&self, node_id: NodeIdx_) -> HashSet<NodeIdx_> {
+        self.incremental_backup_components_()
+            .flat_map(|component| component.incremental_backup_nodes(self, node_id))
+            .collect()
+    }
+
+    /// `component_backup_reach_` of a node that has Full KV on host and no
+    /// in-flight write; empty otherwise, as such a node takes no state backup.
+    fn state_backup_reach_(&self, node_id: NodeIdx_) -> HashSet<NodeIdx_> {
+        let node = self.arena.node(node_id);
+        if !(self.enable_hicache && node.backuped() && node.write_through_pending_id.is_none()) {
+            return HashSet::new();
+        }
+        self.component_backup_reach_(node_id)
     }
 
     /// Check whether the insert target needs a Host backup.
@@ -2005,15 +2031,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 && self.inc_hit_count_and_check_(target_node_id);
         }
 
-        let node = self.arena.node(target_node_id);
-        self.enable_hicache
-            && node.backuped()
-            && node.write_through_pending_id.is_none()
-            && self.needs_incremental_component_backup_(target_node_id)
+        !self.state_backup_reach_(target_node_id).is_empty()
     }
 
-    /// Refresh the LRUs and append the insert backup: a new-leaf write-through,
-    /// or an SWA window publish on an existing backed node.
+    /// Refresh the LRUs and append the insert backups: a new-leaf write-through,
+    /// or an SWA window publish on an existing backed node, plus state the walk
+    /// re-created on backed ancestors.
     fn insert_tail_step_(&mut self, state: &mut InsertWalkState<K>) {
         let target_node_id = state
             .target_node_id
@@ -2029,10 +2052,46 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
+        let mut covered = HashSet::new();
         if self.should_backup_after_insert_(state, target_node_id) {
-            let backup =
-                self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
-            state.pending_actions.push(CacheAction::BackupKV(backup));
+            let chain = self.backup_chain_(target_node_id, self.is_write_back);
+            for &node_id in &chain {
+                covered.extend(self.component_backup_reach_(node_id));
+            }
+            let node_ids = chain.iter().map(|&idx| self.arena.node(idx).id).collect();
+            state
+                .pending_actions
+                .push(CacheAction::BackupKV(BackupKV { node_ids }));
+        }
+        self.append_ancestor_state_backups_(state, target_node_id, covered);
+    }
+
+    /// Back up state the walk re-created on a backed ancestor (e.g. SWA KV Host
+    /// had evicted) beyond the reach of the backups already appended; otherwise
+    /// the next device eviction drops it.
+    fn append_ancestor_state_backups_(
+        &self,
+        state: &mut InsertWalkState<K>,
+        target_node_id: NodeIdx_,
+        mut covered: HashSet<NodeIdx_>,
+    ) {
+        let mut ancestor = self.arena.node(target_node_id).try_parent();
+        while let Some(node_id) = ancestor {
+            let node = self.arena.node(node_id);
+            if node.is_root() {
+                break;
+            }
+            // Each ancestor's own state is enough to gate the window walk: unbacked
+            // state higher up is found when the walk reaches its node.
+            if !covered.contains(&node_id) && self.has_unbacked_state_(node_id) {
+                let reach = self.state_backup_reach_(node_id);
+                if !reach.is_subset(&covered) {
+                    covered.extend(reach);
+                    let backup = self.build_backup_kv_action_(node, self.is_write_back);
+                    state.pending_actions.push(CacheAction::BackupKV(backup));
+                }
+            }
+            ancestor = node.try_parent();
         }
     }
 
@@ -4023,9 +4082,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Build the backup action for a node; write-through also chains its
     /// unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
-        let mut chain = vec![node.id];
+        let node_id = self.arena.resolve(node.id).expect("backup of a live node");
+        let chain = self.backup_chain_(node_id, write_back);
+        BackupKV {
+            node_ids: chain.iter().map(|&idx| self.arena.node(idx).id).collect(),
+        }
+    }
+
+    /// The nodes a backup of `node_id` covers; write-through also chains its
+    /// unbacked ancestors.
+    fn backup_chain_(&self, node_id: NodeIdx_, write_back: bool) -> Vec<NodeIdx_> {
+        let mut chain = vec![node_id];
         if !write_back {
-            let mut ancestor = node.try_parent();
+            let mut ancestor = self.arena.node(node_id).try_parent();
             while let Some(ancestor_idx) = ancestor {
                 let ancestor_node = self.arena.node(ancestor_idx);
                 if ancestor_node.is_root()
@@ -4036,13 +4105,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 {
                     break;
                 }
-                chain.push(ancestor_node.id);
+                chain.push(ancestor_idx);
                 ancestor = ancestor_node.try_parent();
             }
             // write_through: Ancestors first to preserve backup invariant
             chain.reverse();
         }
-        BackupKV { node_ids: chain }
+        chain
     }
 
     /// Commit each component's HiCache transfers onto the node.

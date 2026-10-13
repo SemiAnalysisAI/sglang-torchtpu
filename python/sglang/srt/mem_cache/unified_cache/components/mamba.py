@@ -82,9 +82,9 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
-    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+    def incremental_backup_nodes(self, node: UnifiedTreeNode) -> list[UnifiedTreeNode]:
         data = node.component_data[self.component_type]
-        return data.value is not None and data.host_value is None
+        return [node] if data.value is not None and data.host_value is None else []
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         cd = leaf.component_data[self.component_type]

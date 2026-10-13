@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1418,16 +1417,46 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
-    def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
-        components = self.components
+    def _incremental_backup_components(self) -> tuple[TreeComponent, ...]:
+        # Write-back defers Full and Mamba to eviction; SWA still publishes its
+        # window at insert because out-of-window frees never reach eviction.
         if self.is_write_back:
             swa = self.components_by_type.get(ComponentType.SWA)
-            components = () if swa is None else (swa,)
-        return any(
-            component.needs_incremental_backup(node)
-            for component in components
+            return () if swa is None else (swa,)
+        return tuple(
+            component
+            for component in self.components
             if component.component_type != BASE_COMPONENT_TYPE
         )
+
+    def _has_unbacked_state(self, node: UnifiedTreeNode) -> bool:
+        """Whether ``node``'s own component state is on device with no host copy."""
+        return any(
+            cd.value is not None and cd.host_value is None
+            for cd in (
+                node.component_data[component.component_type]
+                for component in self._incremental_backup_components()
+            )
+        )
+
+    def _component_backup_reach(self, node: UnifiedTreeNode) -> set[NodeId]:
+        """Nodes whose component state a backup of ``node`` copies to Host."""
+        return {
+            covered.id
+            for component in self._incremental_backup_components()
+            for covered in component.incremental_backup_nodes(node)
+        }
+
+    def _state_backup_reach(self, node: UnifiedTreeNode) -> set[NodeId]:
+        """``_component_backup_reach`` of a node that has Full KV on host and no
+        in-flight write; empty otherwise, as such a node takes no state backup."""
+        if not (
+            self.enable_hicache
+            and node.backuped
+            and node.write_through_pending_id is None
+        ):
+            return set()
+        return self._component_backup_reach(node)
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
@@ -1437,18 +1466,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 leaf_end > state.params.inserted_len
                 and self._inc_hit_count_and_check(state.target_node)
             )
-
-        node = state.target_node
-        return (
-            self.enable_hicache
-            and node.backuped
-            and node.write_through_pending_id is None
-            and self._needs_incremental_component_backup(node)
-        )
+        return bool(self._state_backup_reach(state.target_node))
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append the insert backup: a new-leaf write-through,
-        or an SWA window publish on an existing backed node."""
+        """Refresh the LRUs and append the insert backups: a new-leaf write-through,
+        or an SWA window publish on an existing backed node, plus state the walk
+        re-created on backed ancestors."""
         # The insert may have put request-owned pages on any node of the path.
         self._stamp_write_horizon(state.target_node)
         if state.target_node is not self.root_node:
@@ -1459,12 +1482,36 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
+        covered: set[NodeId] = set()
         if self._should_backup_after_insert(state):
-            state.pending_actions.append(
-                self._build_backup_kv_action(
-                    state.target_node, write_back=self.is_write_back
-                )
+            backup = self._build_backup_kv_action(
+                state.target_node, write_back=self.is_write_back
             )
+            state.pending_actions.append(backup)
+            for node_id in backup.node_ids:
+                covered |= self._component_backup_reach(self.node_by_id(node_id))
+        self._append_ancestor_state_backups(state, covered=covered)
+
+    def _append_ancestor_state_backups(
+        self, state: _InsertWalkState, *, covered: set[NodeId]
+    ) -> None:
+        """Back up state the walk re-created on a backed ancestor (e.g. SWA KV
+        Host had evicted) beyond the reach of the backups already appended;
+        otherwise the next device eviction drops it."""
+        node = state.target_node.parent
+        while node is not None and node is not self.root_node:
+            # Each ancestor's own state is enough to gate the window walk: unbacked
+            # state higher up is found when the walk reaches its node.
+            if node.id not in covered and self._has_unbacked_state(node):
+                reach = self._state_backup_reach(node)
+                if not reach <= covered:
+                    covered |= reach
+                    state.pending_actions.append(
+                        self._build_backup_kv_action(
+                            node, write_back=self.is_write_back
+                        )
+                    )
+            node = node.parent
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
