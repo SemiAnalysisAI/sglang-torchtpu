@@ -941,6 +941,43 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
+    supports_mamba_extra_buffer = True
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # KDA shares GDN metadata setup, but does not pass snapshot tracking
+        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
+        return hybrid_gdn_config(model_config) is not None
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        # Mixed-batch merging drops the tracking plan while requests retain
+        # checkpoint depths, so the radix tree could cache unwritten states.
+        if view.enable_mixed_chunk and not view.disable_radix_cache:
+            raise ValueError(
+                "TPU GDN prefix caching does not support --enable-mixed-chunk. "
+                "Remove --enable-mixed-chunk or use --disable-radix-cache."
+            )
+        # Lazy slot allocation/release has not been validated with TPU snapshots.
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            raise ValueError(
+                "extra_buffer_lazy is not supported for TPU GDN prefix caching. "
+                "Use --mamba-radix-cache-strategy extra_buffer."
+            )
+        # Host and int8 stores expect stacked GPU-layout states; TPU owns
+        # independent kernel-layout tensors per layer.
+        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
+            if getattr(view, flag):
+                raise ValueError(
+                    f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
+                    "Use device-resident, uncompressed Mamba states."
+                )
+        if hf_config is not None:
+            text_config = getattr(hf_config, "text_config", hf_config)
+            assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
+                "TPU GDN prefix caching requires mamba_chunk_size=64."
+            )
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
