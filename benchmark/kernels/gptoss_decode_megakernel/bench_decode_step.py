@@ -1,6 +1,7 @@
 """TPU microbenchmark: GPT-OSS-120B TP8 decode megakernel step vs baselines (one 2x2x1 host).
 
-Random weights at real dims (bf16 experts), random KV pools, every sequence at context `--ctx`.
+Random weights at real dims (expert format per --w-dtype, default fp8), random KV pools, every
+sequence at context `--ctx`.
 Prints one JSON line per (mode, B). Modes:
 
   mk        one pallas_call per step (in-kernel all-reduce) + the in-place KV scatter kernel
@@ -10,7 +11,7 @@ Prints one JSON line per (mode, B). Modes:
 
 The stock sglang decode forward itself (torch_tpu, RPA v3, gmm_v2 MXFP4 MoE) is not
 reproduced here; compare against the T21 Phase-0 xprof forward-time numbers for that.
-Note the stock path reads MXFP4 experts (~4x fewer expert bytes than this bf16 v0).
+Note the stock path reads MXFP4 experts (0.57x the bytes of the fp8 expert format).
 
   python benchmark/kernels/gptoss_decode_megakernel/bench_decode_step.py \
       --batch 1 8 32 64 --modes mk fallback xla --ctx 1024
@@ -84,7 +85,12 @@ def xla_step_fn(c, mesh, MK, REF):
             ok = (loc >= 0) & (loc < c.EL)
             loc = jnp.clip(loc, 0, c.EL - 1)
             # packed (chunk-tiled) layouts used directly, so XLA does not relayout weights
-            if c.w_dtype == "mxfp4":  # dequantize in XLA (only the gathered experts if small B)
+            if c.w_dtype == "fp8":
+                small = B * c.TOPK < c.EL
+                pick = (lambda a: a[loc]) if small else (lambda a: a)
+                w13 = (pick(W["w13"][l]).astype(F32) * pick(W["c13"][l])).astype(BF16)
+                w2 = (pick(W["w2"][l]).astype(F32) * pick(W["c2"][l])).astype(BF16)
+            elif c.w_dtype == "mxfp4":  # dequantize in XLA (only the gathered experts if small B)
                 def deq(n, idx=None):
                     q, sc = W[n + "q"][l], W[n + "s"][l]
                     if idx is not None:
@@ -162,6 +168,21 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--vmem-mib", type=int, default=60)
     ap.add_argument("--mxfp4", action="store_true", help="MXFP4 expert weights (stock format)")
+    ap.add_argument("--w-dtype", choices=["bf16", "mxfp4", "fp8"], default=None,
+                    help="expert weight format (default fp8 = MXFP4 converted to e4m3)")
+    ap.add_argument("--ar-mode", choices=["auto", "oneshot", "rsag"], default="auto",
+                    help="all-reduce algorithm (auto: rsag for B >= 16)")
+    ap.add_argument("--ablate", nargs="*", default=[],
+                    choices=["ar", "attn", "attn_kv", "moe", "experts"],
+                    help="mk/fallback timing ablations (outputs wrong); see config.ABLATIONS")
+    ap.add_argument("--kv-write", choices=["scatter", "kernel"], default="scatter",
+                    help="kernel: megakernel writes new K/V into aliased pools (no scatter call)")
+    ap.add_argument("--no-scatter", action="store_true",
+                    help="leave out the separate KV scatter call (pools not updated)")
+    ap.add_argument("--steps-per-call", type=int, default=8,
+                    help="also time K steps inside one jit (ms_device); 1 disables")
+    ap.add_argument("--no-ar-fold", action="store_true",
+                    help="all-reduce full [BR, Hp] rows even for B <= 4")
     ap.add_argument("--cpu-smoke", action="store_true",
                     help="tiny dims + Pallas interpret mode on 8 virtual CPU devices (script check)")
     args = ap.parse_args()
@@ -210,7 +231,10 @@ def main():
         extra = {} if args.cpu_smoke else dict(L=args.layers, tne=args.tne,
                                                vmem_mib=args.vmem_mib)
         c = mk_cfg(B, kv_dtype=args.kv, moe_mode=args.moe, npb=args.npb, nb_full=nb,
-                   w_dtype="mxfp4" if args.mxfp4 else "bf16",
+                   w_dtype=args.w_dtype or ("mxfp4" if args.mxfp4 else "fp8"),
+                   ar_mode=args.ar_mode,
+                   ablate=tuple(args.ablate), kv_write=args.kv_write,
+                   ar_fold=not args.no_ar_fold,
                    nb_swa=nb_swa, max_pages=max_pages, kv_bufs=args.kv_bufs, **extra)
         if W is None:  # weights do not depend on B
             keys = jax.random.split(jax.random.PRNGKey(0), 16)
@@ -219,6 +243,13 @@ def main():
                 if s.dtype == jnp.uint32:  # any nibble is a valid e2m1 code
                     W[k] = jax.jit(lambda kk, s=s: jax.random.bits(kk, s.shape, jnp.uint32),
                                    out_shardings=shd)(keys[i])
+                elif s.dtype == jnp.float8_e4m3fn:  # finite e4m3, |w8| < 1
+                    W[k] = jax.jit(lambda kk, s=s: jax.lax.bitcast_convert_type(
+                        jax.random.bits(kk, s.shape, jnp.uint8) & jnp.uint8(0xB7), s.dtype),
+                        out_shardings=shd)(keys[i])
+                elif k in ("c13", "c2"):
+                    W[k] = jax.jit(lambda s=s: jnp.full(s.shape, 2.0**-4, s.dtype),
+                                   out_shardings=shd)()
                 elif k in ("w13s", "w2s"):  # fp4 magnitudes <= 6 -> |w| <= 0.05
                     W[k] = jax.jit(lambda s=s: jnp.full(s.shape, 2.0**-7, s.dtype),
                                    out_shardings=shd)()
@@ -237,14 +268,16 @@ def main():
         pt_s = jax.device_put(jnp.asarray(ptw.astype(np.int32)), rep)
         for mode in args.modes:
             rec = dict(mode=mode, B=B, L=c.L, ctx=args.ctx, kv=c.kv_dtype, moe=c.moe_mode,
-                       w=c.w_dtype,
+                       scatter=not args.no_scatter, kv_write=args.kv_write,
+                       w=c.w_dtype, ablate=list(c.ablate), ar_fold=c.AR_FOLD,
+                       ar="rsag" if c.AR_RSAG else "oneshot",
                        tne=c.tne, npb=c.npb, kv_bufs=c.kv_bufs)
             try:
                 if mode == "xla":
                     fn = xla_step_fn(c, mesh, MK, REF)
                 else:
                     fn = MK.make_step(c, mesh, xla_ar=(mode == "fallback"),
-                                      interpret=args.cpu_smoke)
+                                      interpret=args.cpu_smoke, scatter=not args.no_scatter)
                 step = jax.jit(fn, donate_argnums=(5, 6))
                 t0 = time.perf_counter()
                 out, ps, pf = step(x, pos, pt_s, pt_f, W, *pools)
@@ -259,12 +292,39 @@ def main():
                     out, ps, pf = step(x, pos, pt_s, pt_f, W, ps, pf)
                     out.block_until_ready()
                     ts.append((time.perf_counter() - t1) * 1e3)
-                pools = [ps, pf]
                 ts = np.array(ts)
                 rec.update(ms_median=round(float(np.median(ts)), 3),
                            ms_p10=round(float(np.percentile(ts, 10)), 3),
                            ms_p90=round(float(np.percentile(ts, 90)), 3), iters=len(ts),
                            finite=bool(jnp.all(jnp.isfinite(out.astype(jnp.float32)))))
+                # pipelined: back-to-back dispatch, one block -> hides host dispatch latency
+                t1 = time.perf_counter()
+                for _ in range(args.iters):
+                    out, ps, pf = step(x, pos, pt_s, pt_f, W, ps, pf)
+                out.block_until_ready()
+                rec["ms_pipelined"] = round((time.perf_counter() - t1) * 1e3 / args.iters, 3)
+                if args.steps_per_call > 1:
+                    # device time: K steps inside one jitted call (fori over the step)
+                    K = args.steps_per_call
+
+                    def multi(x, pos, pt_s, pt_f, W, ps, pf):
+                        def body(_, carry):
+                            o, a, b_ = carry
+                            o2, a, b_ = fn(x, pos, pt_s, pt_f, W, a, b_)
+                            return o2, a, b_
+                        return jax.lax.fori_loop(0, K, body, (jnp.zeros_like(x), ps, pf))
+
+                    mstep = jax.jit(multi, donate_argnums=(5, 6))
+                    out, ps, pf = mstep(x, pos, pt_s, pt_f, W, ps, pf)
+                    out.block_until_ready()
+                    tk = []
+                    for _ in range(max(3, args.iters // 4)):
+                        t1 = time.perf_counter()
+                        out, ps, pf = mstep(x, pos, pt_s, pt_f, W, ps, pf)
+                        out.block_until_ready()
+                        tk.append((time.perf_counter() - t1) * 1e3 / K)
+                    rec["ms_device"] = round(float(np.median(tk)), 3)
+                pools = [ps, pf]
             except Exception as e:  # noqa: BLE001
                 rec["error"] = (type(e).__name__ + ": " + str(e))[:2000]
                 pools = new_pools(c)

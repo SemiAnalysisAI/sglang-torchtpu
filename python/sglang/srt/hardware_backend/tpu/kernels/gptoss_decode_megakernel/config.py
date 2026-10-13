@@ -18,6 +18,11 @@ from __future__ import annotations
 import dataclasses
 
 BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# Timing ablations (outputs become wrong): "ar" keeps pack + local reduce but skips the
+# cross-rank exchange (and the start barrier); "attn" skips the whole attention block incl.
+# its all-reduce; "attn_kv" skips only the paged attention core; "moe" skips router, experts
+# and their all-reduce; "experts" skips only the expert matmuls/stream.
+ABLATIONS = ("ar", "attn", "attn_kv", "moe", "experts")
 
 
 def rup(x: int, m: int = 128) -> int:
@@ -66,7 +71,18 @@ class DecodeConfig:
     w_slots: int = 3  # expert weight ring depth (w_slots - 1 items in flight)
     vmem_mib: int = 60
     ar_dtype: str = "bf16"  # all-reduce payload dtype (sum is always f32)
-    w_dtype: str = "bf16"  # expert weights: "bf16" or "mxfp4" (fp4 e2m1 codes + scale per 32 K)
+    # expert weights: "bf16"; "mxfp4" (e2m1 codes + scale per 32 K, dequantized in VMEM);
+    # "fp8" (MXFP4 converted offline to e4m3 x per-column power of two: exact, native MXU)
+    w_dtype: str = "fp8"
+    ar_fold: bool = True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+    # "oneshot": push the full partial to all peers (1 round, 7x payload per rank);
+    # "rsag": reduce-scatter + all-gather of Hp/R column chunks (2 rounds, ~2.5x fewer bytes);
+    # "auto": rsag for B >= 16 (bandwidth-bound), oneshot below (latency-bound)
+    ar_mode: str = "auto"
+    ablate: tuple[str, ...] = ()  # see ABLATIONS
+    # "scatter": new K/V written by a separate non-collective call (safe default);
+    # "kernel": the megakernel writes them into the aliased pools itself (one call per step)
+    kv_write: str = "scatter"
     # KV pools as L/2 SWA + L/2 full per-layer operands (sglang keeps one tensor per layer;
     # stacking them would copy the pools) instead of two stacked [L/2, ...] operands
     split_pools: bool = False
@@ -99,12 +115,12 @@ class DecodeConfig:
     def moe_cols(self, r: int) -> tuple[int, int]:
         """Rank r's slice [start, stop) of the expert intermediate dim.
 
-        "tp" + bf16: even I/R split. "tp" + mxfp4: whole 32-wide scale blocks per rank
+        "tp" + bf16: even I/R split. "tp" + mxfp4/fp8: whole 32-wide scale blocks per rank
         (90 blocks over 8 ranks -> 12,12,11,...), so no block straddles two ranks.
         """
         if self.moe_mode == "ep":
             return 0, self.I
-        if self.w_dtype != "mxfp4":
+        if self.w_dtype == "bf16":
             return r * (self.I // self.R), (r + 1) * (self.I // self.R)
         nb = self.I // 32
         base, extra = divmod(nb, self.R)
@@ -148,6 +164,22 @@ class DecodeConfig:
         return rup(self.tne // 32, 16)
 
     @property
+    def AR_RSAG(self) -> bool:
+        return self.R > 1 and (self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.B >= 16))
+
+    @property
+    def AR_FOLD(self) -> bool:
+        return self.ar_fold and self.B <= 4 and not self.AR_RSAG
+
+    @property
+    def CWA(self) -> int:  # rsag column chunk per rank (lane multiple; last chunks padded)
+        return rup(cdiv(self.Hp, self.R), 128)
+
+    @property
+    def FR(self) -> int:  # folded all-reduce payload rows
+        return rup(self.B * (self.Hp // 128), 8)
+
+    @property
     def VW(self) -> int:
         return max(self.Hp, self.QKVWL, 128)
 
@@ -168,8 +200,11 @@ class DecodeConfig:
         assert self.I % self.R == 0 and self.moe_mode in ("tp", "ep")
         assert self.kv_dtype in ("bf16", "fp8") and self.ar_dtype in ("bf16", "f32")
         assert self.tne % 128 == 0 and self.w_slots >= 2
-        assert self.w_dtype in ("bf16", "mxfp4")
-        if self.w_dtype == "mxfp4":
+        assert self.w_dtype in ("bf16", "mxfp4", "fp8")
+        assert set(self.ablate) <= set(ABLATIONS), self.ablate
+        assert self.kv_write in ("scatter", "kernel")
+        assert self.ar_mode in ("auto", "oneshot", "rsag")
+        if self.w_dtype != "bf16":
             assert self.I % 32 == 0 and self.Hp % 128 == 0
         assert self.page % 8 == 0 and self.kv_bufs >= 2
         assert self.npb_swa >= self.NWP, "sliding layers: one work item per sequence"

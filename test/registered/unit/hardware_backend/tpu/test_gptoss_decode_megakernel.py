@@ -42,7 +42,7 @@ def _setup(c, seed=0):
     rng = np.random.default_rng(seed)
     keys = jax.random.split(jax.random.PRNGKey(seed), c.L + 3)
     layers = [REF.random_layer(c, k) for k in keys[:c.L]]
-    if c.w_dtype == "mxfp4":  # the reference sees exactly the representable weights
+    if c.w_dtype != "bf16":  # the reference sees exactly the MXFP4-representable weights
         layers = [REF.mxfp4_roundtrip(c, w) for w in layers]
     x = jax.random.normal(keys[c.L], (c.B, c.H), jnp.float32).astype(jnp.bfloat16)
     pos = _positions(c)
@@ -72,16 +72,24 @@ def _run(c, d, xla_ar):
 class TestGptOssDecodeMegakernel(unittest.TestCase):
     def _check(self, c, also_fallback=False):
         d = _setup(c)
+        margins = []
         ref, kn_ref, vn_ref = REF.step(c, d["x"], jnp.asarray(d["pos"]), d["k_hist"],
-                                       d["v_hist"], d["layers"])
+                                       d["v_hist"], d["layers"], margins)
         out, kv_s, kv_f = _run(c, d, xla_ar=False)
+        # Rows whose top-k routing is a near-tie in some layer can legitimately pick a
+        # different expert under f32 summation-order noise; compare the other rows.
+        tie = np.min(np.stack([np.asarray(m) for m in margins]), axis=0) < 3e-3
+        self.assertLessEqual(int(tie.sum()), max(1, c.B // 4), "too many near-tie rows")
+        keep = ~tie
+        out, ref = out[keep], ref[keep]
         rel = _rel(out, ref)
         print(f"{c.moe_mode} w={c.w_dtype} kv={c.kv_dtype} L={c.L} B={c.B}: "
-              f"megakernel vs reference rel {rel:.2e}")
+              f"megakernel vs reference rel {rel:.2e} (near-tie rows skipped: {int(tie.sum())})")
         self.assertLess(rel, 2e-2)
         self._check_pools(c, d, kv_s, kv_f, kn_ref, vn_ref)
         if also_fallback:
             out_fb, kv_s_fb, kv_f_fb = _run(c, d, xla_ar=True)
+            out_fb = out_fb[keep]
             rel_fb = _rel(out_fb, ref)
             rel_mf = _rel(out, out_fb)
             print(f"  fallback vs reference {rel_fb:.2e}, megakernel vs fallback {rel_mf:.2e}")
@@ -116,13 +124,13 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
             self.assertTrue(np.all(changed <= exp_changed), "pool rows written outside new tokens")
 
     def test_tp_moe_bf16_kv_with_fallback(self):
-        self._check(C.tiny(B=4), also_fallback=True)
+        self._check(C.tiny(B=4, w_dtype="bf16"), also_fallback=True)
 
     def test_ep_moe_fp8_kv(self):
         self._check(C.tiny(B=4, moe_mode="ep", kv_dtype="fp8"))
 
     def test_four_layers_b1(self):
-        self._check(C.tiny(B=1, L=4))
+        self._check(C.tiny(B=1, L=4, w_dtype="bf16"))
 
     def test_long_context_deep_prefetch(self):
         # several full-layer items per sequence, prefetch crossing sequence boundaries
@@ -136,8 +144,38 @@ class TestGptOssDecodeMegakernel(unittest.TestCase):
     def test_mxfp4_ep_moe_fp8_kv(self):
         self._check(C.tiny(B=4, w_dtype="mxfp4", moe_mode="ep", kv_dtype="fp8"))
 
+    def test_rsag_allreduce_b4(self):
+        self._check(C.tiny(B=4, ar_mode="rsag", kv_dtype="fp8"), also_fallback=True)
+
+    def test_ar_unfolded_b4(self):
+        self._check(C.tiny(B=4, ar_fold=False))
+
+    def test_ablations_run(self):
+        # timing-only switches: they must compile/run and stay finite (outputs are wrong)
+        c0 = C.tiny(B=2)
+        d = _setup(c0)
+        full, _, _ = _run(c0, d, xla_ar=False)
+        for ab in C.ABLATIONS:
+            out, _, _ = _run(dataclasses.replace(c0, ablate=(ab,)), d, xla_ar=False)
+            out = np.asarray(out.astype(jnp.float32))
+            self.assertTrue(np.all(np.isfinite(out)), ab)
+            self.assertGreater(_rel(out, full), 1e-3, ab)
+
+    def test_fp8_experts_tp(self):
+        self._check(C.tiny(B=4, w_dtype="fp8"), also_fallback=True)
+
+    def test_fp8_experts_ep_b16(self):
+        self._check(dataclasses.replace(C.tiny(B=16, w_dtype="fp8", moe_mode="ep"),
+                                        nb_swa=72, nb_full=72))
+
+    def test_in_kernel_kv_write(self):
+        # the megakernel writes new K/V into its aliased pools (no separate scatter call)
+        self._check(C.tiny(B=4, kv_write="kernel", kv_dtype="fp8"))
+
     def test_b16_npb1(self):
-        self._check(dataclasses.replace(C.tiny(B=16, npb=1), nb_swa=72, nb_full=72))
+        # B=16 -> ar_mode "auto" picks reduce-scatter + all-gather
+        self._check(dataclasses.replace(C.tiny(B=16, npb=1, w_dtype="bf16"), nb_swa=72,
+                                        nb_full=72))
 
 
 if __name__ == "__main__":
