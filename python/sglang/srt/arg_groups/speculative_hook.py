@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.model_config import _TPU_GLM5_NEXT_ARCHS
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -91,7 +92,11 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
         )
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
-    if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
+    # GLM-5.3-Flash on TPU runs dense attention with no indexer, so nothing is shared.
+    if (
+        getattr(model_config.hf_config, "index_share_for_mtp_iteration", False)
+        and model_config.hf_config.architectures[0] not in _TPU_GLM5_NEXT_ARCHS
+    ):
         raise ValueError("TPU speculative decoding does not support DSA index sharing.")
 
 

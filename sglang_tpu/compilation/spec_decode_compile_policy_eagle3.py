@@ -196,9 +196,14 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._draft_eager_model_forward: Callable[..., Any] | None = None
         self._draft_eager_logits_forward: Callable[..., Any] | None = None
 
-        if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
+        # EAGLE also drives NEXTN/MTP heads: the same draft loop, but the draft
+        # reads the target's final hidden state instead of EAGLE3's aux layers.
+        if self.speculative_algorithm and self.speculative_algorithm not in (
+            "EAGLE3",
+            "EAGLE",
+        ):
             raise ValueError(
-                f"TPU torch.compile precompilation only supports EAGLE3, "
+                f"TPU torch.compile precompilation only supports EAGLE3 and EAGLE, "
                 f"got {self.speculative_algorithm!r}."
             )
 

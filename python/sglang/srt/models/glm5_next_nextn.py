@@ -17,6 +17,7 @@ import logging
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.utils.common import is_tpu
 
 logger = logging.getLogger(__name__)
 
@@ -85,4 +86,5 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         )
 
 
-EntryClass = [Glm5NextForConditionalGenerationNextN]
+# glm5_next_tpu registers the TPU draft under the same architecture name.
+EntryClass = [] if is_tpu() else [Glm5NextForConditionalGenerationNextN]

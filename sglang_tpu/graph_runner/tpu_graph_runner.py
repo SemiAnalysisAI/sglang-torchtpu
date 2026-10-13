@@ -66,10 +66,9 @@ if TYPE_CHECKING:
 
 def _spec_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses speculative decoding on TPU."""
-    return (
-        model_runner.spec_algorithm.is_eagle3()
-        or model_runner.spec_algorithm.is_dflash()
-    )
+    algo = model_runner.spec_algorithm
+    # Plain EAGLE also covers NEXTN/MTP draft heads.
+    return algo.is_eagle3() or algo.name == "EAGLE" or algo.is_dflash()
 
 
 def _resolve_spec_compile_policy_mixin(

@@ -545,6 +545,64 @@ class Glm5NextModel(nn.Module):
         return self.norm(res.view(-1, h, c.hidden_size).mean(-2))
 
 
+def _load_flash_weights(params, weights, n_routed_experts):
+    """Place checkpoint tensors (already renamed to parameter names) into params:
+    routed experts, stacked projections, and q_a + kv_a fused into
+    fused_qkv_a_proj_with_mqa. Returns the loaded parameter names."""
+    stacked = [
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+        ("qkv_conv1d", "q_conv1d", 0),
+        ("qkv_conv1d", "k_conv1d", 1),
+        ("qkv_conv1d", "v_conv1d", 2),
+    ]
+    expert_mapping = FusedMoE.make_expert_params_mapping(
+        "gate_proj", "down_proj", "up_proj", n_routed_experts
+    )
+    cached = {}
+    loaded = set()
+    for name, weight in weights:
+        if ".experts." in name:
+            for target, source, expert_id, shard_id in expert_mapping:
+                if source in name:
+                    name = name.replace(source, target)
+                    param = params[name]
+                    param.weight_loader(
+                        param, weight, name, shard_id=shard_id, expert_id=expert_id
+                    )
+                    loaded.add(name)
+                    break
+            else:
+                raise KeyError(f"Unrecognized expert weight: {name}")
+            continue
+        for target, source, shard_id in stacked:
+            candidate = name.replace(source, target)
+            if source in name and candidate in params:
+                params[candidate].weight_loader(params[candidate], weight, shard_id)
+                loaded.add(candidate)
+                break
+        else:
+            if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:
+                cached[name] = weight
+                qname = name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                kvname = name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                if qname not in cached or kvname not in cached:
+                    continue
+                name = qname.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+                weight = torch.cat([cached.pop(qname), cached.pop(kvname)], dim=0)
+            if name.endswith(".A_log"):
+                weight = weight.view(1, 1, -1, 1)
+            param = params[name]
+            getattr(param, "weight_loader", default_weight_loader)(param, weight)
+            loaded.add(name)
+    if cached:
+        raise ValueError(f"Unpaired attention projections: {list(cached)}")
+    return loaded
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -585,9 +643,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise ValueError(
                 "GLM-5.3-Flash TPU currently requires --disable-radix-cache"
             )
-        if args.speculative_algorithm not in (None, "DFLASH"):
+        if args.speculative_algorithm not in (None, "DFLASH", "EAGLE", "NEXTN"):
             raise ValueError(
-                "GLM-5.3-Flash TPU supports only DFLASH speculative decoding"
+                "GLM-5.3-Flash TPU supports DFLASH and NEXTN (MTP) speculative decoding"
             )
         if args.enable_dp_attention or args.pp_size != 1:
             raise ValueError(
@@ -629,68 +687,29 @@ class Glm5NextForConditionalGeneration(nn.Module):
             num_logical_experts=config.n_routed_experts,
         )
 
+    def get_embed_and_head(self):
+        """Shared with the MTP draft head, which has no embedding or lm_head of its own."""
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def load_weights(self, weights):
         """Load the language checkpoint, explicitly excluding vision, MTP and the inactive indexer."""
         params = dict(self.named_parameters())
-        stacked = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("qkv_conv1d", "q_conv1d", 0),
-            ("qkv_conv1d", "k_conv1d", 1),
-            ("qkv_conv1d", "v_conv1d", 2),
-        ]
-        expert_mapping = FusedMoE.make_expert_params_mapping(
-            "gate_proj", "down_proj", "up_proj", self.config.n_routed_experts
+
+        def language_layers():
+            for name, weight in weights:
+                name = name.replace("model.language_model.", "model.")
+                if name.startswith("model.visual.") or ".indexer." in name:
+                    continue
+                if (
+                    name.startswith("model.layers.")
+                    and int(name.split(".")[2]) >= self.config.num_hidden_layers
+                ):
+                    continue
+                yield name, weight
+
+        loaded = _load_flash_weights(
+            params, language_layers(), self.config.n_routed_experts
         )
-        cached = {}
-        loaded = set()
-        for name, weight in weights:
-            name = name.replace("model.language_model.", "model.")
-            if name.startswith("model.visual.") or ".indexer." in name:
-                continue
-            if (
-                name.startswith("model.layers.")
-                and int(name.split(".")[2]) >= self.config.num_hidden_layers
-            ):
-                continue
-            if ".experts." in name:
-                for target, source, expert_id, shard_id in expert_mapping:
-                    if source in name:
-                        name = name.replace(source, target)
-                        param = params[name]
-                        param.weight_loader(
-                            param, weight, name, shard_id=shard_id, expert_id=expert_id
-                        )
-                        loaded.add(name)
-                        break
-                else:
-                    raise KeyError(f"Unrecognized expert weight: {name}")
-                continue
-            for target, source, shard_id in stacked:
-                candidate = name.replace(source, target)
-                if source in name and candidate in params:
-                    params[candidate].weight_loader(params[candidate], weight, shard_id)
-                    loaded.add(candidate)
-                    break
-            else:
-                if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:
-                    cached[name] = weight
-                    qname = name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                    kvname = name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                    if qname not in cached or kvname not in cached:
-                        continue
-                    name = qname.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                    weight = torch.cat([cached.pop(qname), cached.pop(kvname)], dim=0)
-                if name.endswith(".A_log"):
-                    weight = weight.view(1, 1, -1, 1)
-                param = params[name]
-                getattr(param, "weight_loader", default_weight_loader)(param, weight)
-                loaded.add(name)
-        if cached:
-            raise ValueError(f"Unpaired attention projections: {list(cached)}")
         missing = set(params) - loaded
         if missing:
             raise ValueError(f"Missing GLM-5.3-Flash weights: {sorted(missing)}")
@@ -712,5 +731,130 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.model.prepare_fused_mhc()
 
 
-# Replaces the upstream glm5_next implementation on TPU.
-EntryClass = [Glm5NextForConditionalGeneration] if current_platform.is_tpu() else []
+class Glm5NextMtpModel(nn.Module):
+    """The checkpoint's MTP head (layer num_hidden_layers): one full-attention +
+    MoE block with a plain residual stream (no mHC, no KDA), fed with
+    eh_proj([enorm(embed(token)), hnorm(target hidden)])."""
+
+    def __init__(self, config, quant_config):
+        super().__init__()
+        h = config.hidden_size
+        # Replaced by the target's tensors (set_embed_and_head) before serving.
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, h)
+        self.enorm = RMSNorm(h, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(h, eps=config.rms_norm_eps)
+        # The checkpoint keeps eh_proj unquantized.
+        self.eh_proj = ReplicatedLinear(2 * h, h, bias=False, quant_config=None)
+        # The checkpoint prefix, so the quant ignore list (bf16 kv_b_proj) matches.
+        self.decoder = Glm5NextMtpLayer(
+            config, quant_config, f"model.layers.{config.num_hidden_layers}"
+        )
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(h, eps=config.rms_norm_eps)
+
+    # (input_ids, positions, forward_batch) is the signature the TPU draft
+    # compile policy calls the backbone with; positions are unused (NoPE).
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        x = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        target_hidden = forward_batch.spec_info.hidden_states
+        x = self.eh_proj(torch.cat([self.enorm(x), self.hnorm(target_hidden)], -1))[0]
+        x = self.decoder(x, forward_batch)
+        return self.shared_head.norm(x)
+
+
+class Glm5NextMtpLayer(nn.Module):
+    def __init__(self, config, quant_config, prefix):
+        super().__init__()
+        # The draft has its own KV pool, holding this one layer.
+        self.self_attn = Glm5NextDenseAttention(
+            config, 0, quant_config, f"{prefix}.self_attn"
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = DeepseekV2MoE(
+            config=config, quant_config=quant_config, prefix=f"{prefix}.mlp", layer_id=0
+        )
+
+    def forward(self, x, forward_batch):
+        x = x + self.self_attn(self.input_layernorm(x), forward_batch)
+        return x + self.mlp(self.post_attention_layernorm(x), forward_batch)
+
+
+class Glm5NextForConditionalGenerationNextN(nn.Module):
+    """TPU MTP draft for NEXTN/EAGLE speculative decoding. The draft config
+    arrives renamed to this architecture with linear_attn_config cleared."""
+
+    def __init__(self, config, quant_config=None, prefix=""):
+        super().__init__()
+        self.config = config.get_text_config()
+        c = self.config
+        self.quant_config = quant_config
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(
+                Glm5NextForConditionalGeneration.packed_modules_mapping
+            )
+        self.model = Glm5NextMtpModel(c, quant_config)
+        self.lm_head = ParallelLMHead(
+            c.vocab_size, c.hidden_size, quant_config=quant_config, prefix="lm_head"
+        )
+        self.logits_processor = LogitsProcessor(c)
+
+    @torch.no_grad()
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+        hidden = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        config = config.get_text_config()
+        return ModelConfigForExpertLocation(
+            num_layers=1, num_logical_experts=config.n_routed_experts
+        )
+
+    def load_weights(self, weights):
+        """Load only the MTP layer; the embedding and lm_head come from the target."""
+        mtp = f"model.layers.{self.config.num_hidden_layers}."
+        params = dict(self.named_parameters())
+        shared = ("embed_tokens", "shared_head.head")
+        own = ("eh_proj", "enorm", "hnorm", "shared_head.norm")
+
+        def mtp_layer():
+            for name, weight in weights:
+                name = name.replace("model.language_model.", "model.")
+                if not name.startswith(mtp) or ".indexer." in name:
+                    continue
+                rest = name[len(mtp) :]
+                if rest.startswith(shared) or rest.startswith("hc_"):
+                    continue
+                if rest.startswith(own):
+                    yield "model." + rest, weight
+                else:
+                    yield "model.decoder." + rest, weight
+
+        loaded = _load_flash_weights(params, mtp_layer(), self.config.n_routed_experts)
+        missing = {
+            n
+            for n in set(params) - loaded
+            if not n.startswith(("model.embed_tokens.", "lm_head."))
+        }
+        if missing:
+            raise ValueError(f"Missing GLM-5.3-Flash MTP weights: {sorted(missing)}")
+
+
+# Replaces the upstream glm5_next implementation (and its MTP draft) on TPU.
+EntryClass = (
+    [Glm5NextForConditionalGeneration, Glm5NextForConditionalGenerationNextN]
+    if current_platform.is_tpu()
+    else []
+)

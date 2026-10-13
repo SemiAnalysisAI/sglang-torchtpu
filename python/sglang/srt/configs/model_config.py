@@ -187,6 +187,14 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+# The TPU Flash target and its MTP draft (renamed for draft configs) share the
+# dense-DSA, unabsorbed-MHA attention path.
+_TPU_GLM5_NEXT_ARCHS = (
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
+)
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -213,7 +221,7 @@ def is_deepseek_dsa(config) -> bool:
             and _hf_attr(config, "tpu_dense_dsa_max_context") is not None
         )
         # The TPU Flash model (glm5_next_tpu) evaluates DSA densely.
-        and not (_hf_arch(config) == "Glm5NextForConditionalGeneration" and is_tpu())
+        and not (_hf_arch(config) in _TPU_GLM5_NEXT_ARCHS and is_tpu())
     )
 
 
@@ -1191,10 +1199,7 @@ class ModelConfig:
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
-        if (
-            is_tpu()
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
-        ):
+        if is_tpu() and self.hf_config.architectures[0] in _TPU_GLM5_NEXT_ARCHS:
             # The TPU reference path expands MLA to ordinary per-head K/V.
             self.head_dim = self.hf_text_config.qk_nope_head_dim
             self.hf_text_config.head_dim = self.head_dim
@@ -1225,8 +1230,7 @@ class ModelConfig:
         # The TPU Flash model (glm5_next_tpu) runs its full-attention layers as
         # unabsorbed MHA, so it needs the MHA KV pool and backend.
         tpu_glm5_next_mha = (
-            is_tpu()
-            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+            is_tpu() and self.hf_config.architectures[0] in _TPU_GLM5_NEXT_ARCHS
         )
         # FIXME: temporary special judge for MLA architecture
         if tpu_glm5_next_mha:
