@@ -64,6 +64,7 @@ def compiled_op(
     warmup: WarmupArgsFactory | None = None,
     model: torch.nn.Module | None = None,
     uses_rng: bool = False,
+    direct: bool = False,
 ):
     """Compile a tensor helper with the selected TPU tracer.
 
@@ -80,6 +81,12 @@ def compiled_op(
     Direct helper warmups compile without executing; the queue joins compilation
     futures without retaining example inputs. Dynamo warmups still execute to
     trigger tracing and compilation.
+
+    ``direct=True`` uses direct compilation even under the Dynamo tracer: a call
+    then costs a key lookup instead of Dynamo's frame evaluation and runtime
+    wrappers (~0.3 ms per call on the host-bound speculative round). Only for
+    pure helpers: direct compilation requires that ``fn`` mutates none of its
+    inputs and captures no tensors.
     """
 
     def decorator(fn):
@@ -120,7 +127,9 @@ def compiled_op(
                     _canonical_tensor, (bound.args, bound.kwargs)
                 )
             if compiled_fn is None:
-                use_direct = get_exec().graph.tpu_compile_tracer == "direct"
+                use_direct = (
+                    direct and model is None
+                ) or get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
                     from sglang_tpu.compilation.direct_compile import (
                         direct_compile,
