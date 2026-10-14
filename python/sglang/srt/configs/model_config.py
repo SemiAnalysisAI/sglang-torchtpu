@@ -200,9 +200,18 @@ GLM5_NEXT_TPU_MLA_ROPE_PAD = 64
 
 def runs_dsa_densely(config) -> bool:
     """DSA model served with dense attention: no indexer runs, so there is no
-    top-k to compute, relay or share."""
-    # TODO(Bob-Chen222): drop once GLM-5.3-Flash's kpool DSA runs on TPU.
-    return _hf_arch(config) in _TPU_GLM5_NEXT_ARCHS and is_tpu()
+    top-k to compute, relay or share. On TPU, GLM-5.3-Flash's MTP draft head
+    always runs dense, and the target only under the perf-only
+    SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT escape hatch."""
+    if not is_tpu():
+        return False
+    arch = _hf_arch(config)
+    if arch == "Glm5NextForConditionalGenerationNextN":
+        return True
+    return (
+        arch == "Glm5NextForConditionalGeneration"
+        and envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is not None
+    )
 
 
 def is_deepseek_dsa(config) -> bool:
@@ -1238,7 +1247,10 @@ class ModelConfig:
         tpu_glm5_next = (
             is_tpu() and self.hf_config.architectures[0] in _TPU_GLM5_NEXT_ARCHS
         )
-        tpu_glm5_next_mla = tpu_glm5_next and envs.SGLANG_TPU_GLM_FLASH_MLA.get()
+        # Sparse attention (DSA) runs absorbed MLA over the latent cache too.
+        tpu_glm5_next_mla = tpu_glm5_next and (
+            envs.SGLANG_TPU_GLM_FLASH_MLA.get() or not runs_dsa_densely(self.hf_config)
+        )
         tpu_glm5_next_mha = tpu_glm5_next and not tpu_glm5_next_mla
         # FIXME: temporary special judge for MLA architecture
         if tpu_glm5_next_mha:

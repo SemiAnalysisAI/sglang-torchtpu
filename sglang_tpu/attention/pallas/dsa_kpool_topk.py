@@ -125,7 +125,7 @@ def compress_pools(keys: jax.Array, gates: jax.Array, ape: jax.Array) -> jax.Arr
 
 
 def kpool_indexer_step(
-    query: jax.Array,  # bf16[num_tokens, n_heads, d]; Hadamard-rotated
+    query: jax.Array,  # bf16[num_tokens, n_heads, d]; wq_b(q_lora), not rotated
     key: jax.Array,  # bf16[num_tokens, d]; k_norm(wk(x)), not rotated
     gate: jax.Array,  # bf16[num_tokens, d]; compress_gate(x)
     head_weights: jax.Array,  # f32[num_tokens, n_heads]; weights_proj(x)
@@ -140,10 +140,11 @@ def kpool_indexer_step(
     weight_scale: float,
     topk: int,
     kpool: int,
+    out_width: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Returns (topk_indices i32[num_tokens, topk + kpool - 1], raw_cache,
-    pooled_cache). Rows list sequence-relative token positions: the selected
-    pools' tokens, then the tail, then -1."""
+    """Returns (topk_indices i32[num_tokens, max(out_width, topk + kpool - 1)],
+    raw_cache, pooled_cache). Rows list sequence-relative token positions: the
+    selected pools' tokens, then the tail, then -1."""
     num_tokens, n_heads, d = query.shape
     num_pages, page_size, _ = raw_cache.shape
     rows_per_page, tokens_per_row, record_bytes = pooled_cache.shape[1:]
@@ -206,6 +207,8 @@ def kpool_indexer_step(
     k_scale = jnp.exp2(rec[..., d].astype(jnp.float32) - 127.0)  # [S, P]
     k_f32 = k_fp8.astype(jnp.float32).reshape(num_seqs * max_pools, d)
 
+    # Upstream rotates the bf16 query (rotate_activation) before quantizing.
+    query = hadamard_rotate(query).astype(jnp.bfloat16)
     q_fp8, q_scale, _ = quantize_ue8m0(query)
     q_f32 = q_fp8.astype(jnp.float32)
     w = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale  # [T, H]
@@ -235,7 +238,7 @@ def kpool_indexer_step(
     # Tail: the open pool's tokens, right after the selected history.
     hist_len = jnp.minimum(pool_len, n_pick) * kpool
     tail_count = (pos + 1) % kpool
-    width = topk + kpool - 1
+    width = max(out_width, topk + kpool - 1)
     col = jnp.arange(width, dtype=jnp.int32)[None, :]
     tail_off = col - hist_len[:, None]
     tail = jnp.where(
@@ -243,7 +246,7 @@ def kpool_indexer_step(
         pool_len[:, None] * kpool + tail_off,
         -1,
     )
-    hist = jnp.pad(tokens, ((0, 0), (0, kpool - 1)), constant_values=-1)
+    hist = jnp.pad(tokens, ((0, 0), (0, width - topk)), constant_values=-1)
     out = jnp.where(col < hist_len[:, None], hist, tail)
     out = jnp.where(valid[:, None], out, -1).astype(jnp.int32)
     return out, raw_cache, pooled_cache

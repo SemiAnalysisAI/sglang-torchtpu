@@ -377,7 +377,74 @@ class Glm5NextLatentAttention(Glm5NextDenseAttention):
         return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
 
 
-def _full_attention_cls():
+class Glm5NextSparseAttention(Glm5NextLatentAttention):
+    """DeepSeek Sparse Attention: the pooled (kpool) indexer picks each query's
+    keys, and absorbed MLA attends over only those (pallas_tpu_mla_sparse)."""
+
+    def __init__(self, config, layer_id, quant_config, prefix):
+        super().__init__(config, layer_id, quant_config, prefix)
+        from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+
+        self.layer_id = layer_id
+        self.indexer = IndexerKPool(
+            hidden_size=config.hidden_size,
+            index_n_heads=config.index_n_heads,
+            index_head_dim=config.index_head_dim,
+            rope_head_dim=0,
+            index_topk=config.index_topk,
+            q_lora_rank=self.q_rank,
+            max_position_embeddings=config.max_position_embeddings,
+            rope_theta=getattr(config, "rope_theta", 10000.0),
+            scale_fmt="ue8m0",
+            layer_id=layer_id,
+            prefix=f"{prefix}.indexer",
+            quant_config=quant_config,
+            skip_rope=True,
+            config=config,
+        )
+
+    def forward(self, hidden_states, forward_batch, **kwargs):
+        q_latent, kv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            [self.q_rank, self.kv_rank], dim=-1
+        )
+        q_lora = self.q_a_layernorm(q_latent)
+        topk_indices = self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=forward_batch.positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+        )
+        q = self.q_b_proj(q_lora)[0].view(-1, self.heads, self.q_dim)
+        # kv_b_proj rows are per head [K (q_dim) | V (v_dim)] over the latent.
+        w_kv = self.kv_b_proj.weight.view(self.heads, self.q_dim + self.v_dim, -1)
+        q_absorbed = torch.einsum("thd,hdc->thc", q, w_kv[:, : self.q_dim])
+        latent = self.kv_a_layernorm(kv_latent).unsqueeze(1)
+        n = hidden_states.shape[0]
+        q_pe = q.new_zeros(n, self.heads, self.rope_pad)
+        k_pe = q.new_zeros(n, 1, self.rope_pad)
+        out = self.attn(
+            q_absorbed,
+            latent,
+            latent,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            topk_indices=topk_indices,
+        ).view(n, self.heads, self.kv_rank)
+        out = torch.einsum("thc,hvc->thv", out, w_kv[:, self.q_dim :])
+        return self.o_proj(out.reshape(n, self.heads * self.v_dim))[0]
+
+
+def _runs_dsa() -> bool:
+    # The target runs sparse attention unless the dense escape hatch is set
+    # (model_config.runs_dsa_densely); the MTP draft head always runs dense.
+    return envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
+
+
+def _full_attention_cls(*, draft: bool = False):
+    if not draft and _runs_dsa():
+        return Glm5NextSparseAttention
     return (
         Glm5NextLatentAttention
         if envs.SGLANG_TPU_GLM_FLASH_MLA.get()
@@ -656,11 +723,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             c, "index_kpool_always_select_tail", False
         ):
             raise ValueError(
-                "Dense DSA requires the checkpoint's always-select-tail setting"
+                "GLM-5.3-Flash TPU requires the checkpoint's always-select-tail setting"
             )
-        if args.context_length is None or args.context_length > dense_limit:
+        if not _runs_dsa() and (
+            args.context_length is None or args.context_length > dense_limit
+        ):
             raise ValueError(
-                f"GLM-5.3-Flash TPU requires --context-length <= {dense_limit}; sparse top-k is not implemented"
+                f"Dense GLM-5.3-Flash requires --context-length <= {dense_limit}"
             )
         if not args.disable_radix_cache:
             raise ValueError(
@@ -723,7 +792,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         def language_layers():
             for name, weight in weights:
                 name = name.replace("model.language_model.", "model.")
-                if name.startswith("model.visual.") or ".indexer." in name:
+                if name.startswith("model.visual."):
+                    continue
+                if ".indexer." in name and not _runs_dsa():
                     continue
                 if (
                     name.startswith("model.layers.")
@@ -790,7 +861,7 @@ class Glm5NextMtpLayer(nn.Module):
     def __init__(self, config, quant_config, prefix):
         super().__init__()
         # The draft has its own KV pool, holding this one layer.
-        self.self_attn = _full_attention_cls()(
+        self.self_attn = _full_attention_cls(draft=True)(
             config, 0, quant_config, f"{prefix}.self_attn"
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

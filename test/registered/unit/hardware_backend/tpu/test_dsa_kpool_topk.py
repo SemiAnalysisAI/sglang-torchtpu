@@ -39,7 +39,8 @@ def _ref_select(keys, gates, ape, q, w, pos, weight_scale):
         c = kp.compress_pools(jnp.asarray(keys[sl]), jnp.asarray(gates[sl]), ape)
         k8, ks, _ = kp.quantize_ue8m0(c[None])
         pooled.append((np.asarray(k8[0].astype(jnp.float32)), float(ks[0, 0])))
-    q8, qs, _ = kp.quantize_ue8m0(jnp.asarray(q))
+    q_rot = kp.hadamard_rotate(jnp.asarray(q, jnp.bfloat16)).astype(jnp.bfloat16)
+    q8, qs, _ = kp.quantize_ue8m0(q_rot)
     q8 = np.asarray(q8.astype(jnp.float32))
     ww = np.asarray(w) * np.asarray(qs)[:, 0] * weight_scale
     scores = np.array(

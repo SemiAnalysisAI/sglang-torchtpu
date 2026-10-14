@@ -92,9 +92,13 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
         )
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
-    if getattr(
-        model_config.hf_config, "index_share_for_mtp_iteration", False
-    ) and not runs_dsa_densely(model_config.hf_config):
+    # Index sharing seeds the MTP draft head's DSA top-k; DFlash's separate
+    # draft model shares nothing.
+    if (
+        cfg.speculative_algorithm in ("EAGLE", "NEXTN")
+        and getattr(model_config.hf_config, "index_share_for_mtp_iteration", False)
+        and not runs_dsa_densely(model_config.hf_config)
+    ):
         raise ValueError("TPU speculative decoding does not support DSA index sharing.")
 
 
