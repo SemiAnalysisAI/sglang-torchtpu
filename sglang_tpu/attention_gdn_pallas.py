@@ -52,6 +52,28 @@ logger = logging.getLogger(__name__)
 _PALLAS_GDN_OP = None
 
 
+def _kernel_source_fingerprint() -> str:
+    """Digest of the sources that define the op's JAX body.
+
+    custom_jax_kernel keys the exported kernel by op name and shapes, and the
+    persistent TPU compile cache keys compiled graphs by their FX graph, which
+    names the op but not its body. Without the digest in the name, an edited
+    kernel is silently served from a cached graph.
+    """
+    import hashlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+    files = sorted((root / "attention" / "pallas" / "gdn").glob("*.py"))
+    # The KDA packed-weight layout is read at trace time.
+    files.append(root / "kda_layout.py")
+    files.append(Path(__file__).resolve())
+    digest = hashlib.blake2b(digest_size=6)
+    for path in files:
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def build_gdn_pallas_op():
     """Lazily register the fused Conv1D+GDN kernel as a torch custom op.
 
@@ -98,7 +120,7 @@ def build_gdn_pallas_op():
     # skipped on the hot path. Per-op (this builder runs once).
     _exported_shapes: set = set()
 
-    op_name = "sglang_tpu_pallas::gdn_attention"
+    op_name = f"sglang_tpu_pallas::gdn_attention_{_kernel_source_fingerprint()}"
 
     def _wrapped(
         qkv: jax.Array,
