@@ -28,6 +28,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -929,8 +930,10 @@ class GptOssForCausalLM(nn.Module):
         # TPU decode megakernel (opt-in, SGLANG_TPU_GPTOSS_DECODE_MK=1): copy this
         # rank's kernel weights out of the checkpoint stream; stock loading is unchanged.
         mk_tap = None
-        if _is_tpu and not is_nextn:
-            from sglang_tpu.gptoss_decode_mk.runtime import maybe_make_weight_tap
+        if not is_nextn and envs.SGLANG_TPU_GPTOSS_DECODE_MK.get():
+            from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (
+                maybe_make_weight_tap,
+            )
 
             mk_tap = maybe_make_weight_tap(self)
             if mk_tap is not None:

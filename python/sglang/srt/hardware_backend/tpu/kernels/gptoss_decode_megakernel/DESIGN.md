@@ -1,8 +1,8 @@
-# GPT-OSS-120B TP8 decode megakernel (T21 Phase 1 groundwork, v0)
+# GPT-OSS-120B TP8 decode megakernel
 
-Status: **CPU-validated prototype**. It has never run on a TPU. Correctness was checked in
-Pallas TPU interpret mode on 8 virtual CPU devices. Compilability was checked by
-ahead-of-time compilation for `tpu7x:2x2x1` on a CPU host. Performance is **unmeasured**.
+Correctness is validated in Pallas TPU interpret mode on 8 virtual CPU devices and on TPU v7x
+(`tpu7x:2x2x1`). Compilation is checked by ahead-of-time compilation for `tpu7x:2x2x1` on a CPU
+host and end-to-end serving benchmarks on TPU v7x.
 
 ## What one call does
 

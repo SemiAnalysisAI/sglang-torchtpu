@@ -50,7 +50,9 @@ class DecodeConfig:
     E: int = 128
     TOPK: int = 4
     I: int = 2880
-    window: int = 128  # attended tokens including the current one (sglang window_left 127)
+    window: int = (
+        128  # attended tokens including the current one (sglang window_left 127)
+    )
     eps: float = 1e-5
     alpha: float = 1.702
     limit: float = 7.0
@@ -58,10 +60,16 @@ class DecodeConfig:
     rope_factor: float = 32.0
     rope_orig: int = 4096
     R: int = 8  # TP ranks
-    moe_mode: str = "tp"  # "tp": every rank holds I/R of every expert; "ep": E/R whole experts
-    kv_dtype: str = "bf16"  # "bf16" or "fp8" (float8_e4m3fn), sglang TPU fused-KV layout
+    moe_mode: str = (
+        "tp"  # "tp": every rank holds I/R of every expert; "ep": E/R whole experts
+    )
+    kv_dtype: str = (
+        "bf16"  # "bf16" or "fp8" (float8_e4m3fn), sglang TPU fused-KV layout
+    )
     page: int = 64
-    max_pages: int = 128  # page-table columns per sequence (context <= page * max_pages)
+    max_pages: int = (
+        128  # page-table columns per sequence (context <= page * max_pages)
+    )
     nb_full: int = 1024  # pages in the full-attention pool (per rank, per layer)
     nb_swa: int = 1024  # pages in the SWA pool
     npb: int = 8  # KV pages per attention work item, full layers (one DMA per page)
@@ -74,7 +82,9 @@ class DecodeConfig:
     # expert weights: "bf16"; "mxfp4" (e2m1 codes + scale per 32 K, dequantized in VMEM);
     # "fp8" (MXFP4 converted offline to e4m3 x per-column power of two: exact, native MXU)
     w_dtype: str = "fp8"
-    ar_fold: bool = True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+    ar_fold: bool = (
+        True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+    )
     # "oneshot": push the full partial to all peers (1 round, 7x payload per rank);
     # "rsag": reduce-scatter + all-gather of Hp/R column chunks (2 rounds, ~2.5x fewer bytes);
     # "auto": rsag for B >= 16 (bandwidth-bound), oneshot below (latency-bound)
@@ -156,7 +166,9 @@ class DecodeConfig:
         return self.B * max(cdiv(self.max_pages, self.npb), 1) + self.B
 
     @property
-    def SR13(self) -> int:  # MXFP4 scale rows of a w13 chunk (Hp/32, padded to the bf16 tile)
+    def SR13(
+        self,
+    ) -> int:  # MXFP4 scale rows of a w13 chunk (Hp/32, padded to the bf16 tile)
         return rup(self.Hp // 32, 16)
 
     @property
@@ -165,14 +177,18 @@ class DecodeConfig:
 
     @property
     def AR_RSAG(self) -> bool:
-        return self.R > 1 and (self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.B >= 16))
+        return self.R > 1 and (
+            self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.B >= 16)
+        )
 
     @property
     def AR_FOLD(self) -> bool:
         return self.ar_fold and self.B <= 4 and not self.AR_RSAG
 
     @property
-    def CWA(self) -> int:  # rsag column chunk per rank (lane multiple; last chunks padded)
+    def CWA(
+        self,
+    ) -> int:  # rsag column chunk per rank (lane multiple; last chunks padded)
         return rup(cdiv(self.Hp, self.R), 128)
 
     @property
@@ -224,9 +240,20 @@ def tiny(B: int = 4, **kw) -> DecodeConfig:
     attention code path is exactly the real one; E=16 < 128 exercises the router padding.
     """
     base = dict(
-        L=2, H=240, E=16, TOPK=4, I=8 * 48, max_pages=4, nb_full=24, nb_swa=24, npb=2,
-        npb_swa=3, kv_bufs=3,
-        tne=128, w_slots=3, vmem_mib=32,
+        L=2,
+        H=240,
+        E=16,
+        TOPK=4,
+        I=8 * 48,
+        max_pages=4,
+        nb_full=24,
+        nb_swa=24,
+        npb=2,
+        npb_swa=3,
+        kv_bufs=3,
+        tne=128,
+        w_slots=3,
+        vmem_mib=32,
     )
     base.update(kw)
     return DecodeConfig(B=B, **base)

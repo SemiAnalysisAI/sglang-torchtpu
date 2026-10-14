@@ -18,33 +18,42 @@ Run (8 virtual CPU devices, jax + torch CPU):
 """
 
 import dataclasses
+import importlib.util
 import os
 import unittest
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
-    os.environ["XLA_FLAGS"] = (
-        os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+import numpy as np
+import torch
+
+from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import config as C
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.gptoss_decode_mk import weights as W
+
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
+register_tpu_ci(est_time=25, suite="stage-a-test-tpu-unit")
+
+_HAS_JAX = importlib.util.find_spec("jax") is not None
+if _HAS_JAX:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+        os.environ["XLA_FLAGS"] = (
+            os.environ.get("XLA_FLAGS", "")
+            + " --xla_force_host_platform_device_count=8"
+        )
+
+    import jax  # noqa: E402
+    import jax.numpy as jnp  # noqa: E402
+    from jax.sharding import Mesh  # noqa: E402
+    from jax.sharding import PartitionSpec as P  # noqa: E402
+
+    from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (  # noqa: E402
+        megakernel as MK,
     )
-
-import jax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from jax.sharding import Mesh  # noqa: E402
-from jax.sharding import PartitionSpec as P  # noqa: E402
-
-from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (  # noqa: E402
-    config as C,
-)
-from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (
-    megakernel as MK,
-)
-from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (
-    reference as REF,
-)
-from sglang_tpu.gptoss_decode_mk import adapter as A  # noqa: E402
-from sglang_tpu.gptoss_decode_mk import weights as W  # noqa: E402
+    from sglang.srt.hardware_backend.tpu.kernels.gptoss_decode_megakernel import (
+        reference as REF,
+    )
+    from sglang_tpu.gptoss_decode_mk import adapter as A  # noqa: E402
 
 LUT = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
 
@@ -197,7 +206,7 @@ def _unpack(words, scales):
     return np.asarray(MK.mxfp4_unpack_xla(words, jnp.asarray(scales)))
 
 
-class TestWeightRepack(unittest.TestCase):
+class TestWeightRepack(CustomTestCase):
     def test_e8m0_to_bf16_exact(self):
         e = torch.arange(0, 256, dtype=torch.int32).to(torch.uint8)
         got = W.e8m0_to_bf16(e).float().numpy().astype(np.float64)
@@ -228,12 +237,15 @@ class TestWeightRepack(unittest.TestCase):
                     tuple(mine[k].shape), tuple(MK.packed_specs(c)[k].shape[1:])
                 )
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_tp_matches_pack_weights(self):
         self._check_mode("tp")
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_ep_matches_pack_weights(self):
         self._check_mode("ep")
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_fp8_matches_pack_weights(self):
         # MXFP4 stream -> fp8 experts == the kernel's own fp8 pack_weights, bit for bit
         for moe_mode in ("tp", "ep"):
@@ -265,6 +277,7 @@ class TestWeightRepack(unittest.TestCase):
         _, _, bad = W.fp8_pack_kn(w)
         self.assertEqual(bad, 1)
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_quantizer_matches_reference(self):
         rng = np.random.default_rng(2)
         w = (
@@ -278,6 +291,7 @@ class TestWeightRepack(unittest.TestCase):
             _unpack(_to_jax(words), _to_jax(scales)), REF.mxfp4_dequantize(code, scale)
         )
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_bf16_checkpoint_packs_identically(self):
         # a bf16 (HF dequantized) checkpoint of the same weights -> the same kernel weights
         for moe_mode in ("tp", "ep"):
@@ -341,7 +355,8 @@ def _alloc(rng, n_pages_total, used):
     return free
 
 
-class TestDecodeMapping(unittest.TestCase):
+@unittest.skipUnless(_HAS_JAX, "requires JAX")
+class TestDecodeMapping(CustomTestCase):
     """sglang decode metadata -> kernel operands, against out_cache_loc semantics."""
 
     def test_page_tables_positions_and_write_slots(self):
@@ -499,7 +514,7 @@ class TestDecodeMapping(unittest.TestCase):
             nb_full=24,
             page=64,
         )
-        mesh = Mesh(np.array(jax.devices()[:8]), ("tp",))
+        mesh = Mesh(np.array(jax.devices("cpu")[:8]), ("tp",))
         sds = jax.ShapeDtypeStruct
         tmap = {
             torch.bfloat16: jnp.bfloat16,
@@ -559,7 +574,7 @@ class TestDecodeMapping(unittest.TestCase):
             nb_full=24,
             page=64,
         )
-        mesh = Mesh(np.array(jax.devices()[:8]), ("tp",))
+        mesh = Mesh(np.array(jax.devices("cpu")[:8]), ("tp",))
         sds = jax.ShapeDtypeStruct
         specs = W.per_rank_specs(c)
         tmap = {torch.bfloat16: jnp.bfloat16, torch.float32: jnp.float32}
@@ -693,7 +708,8 @@ def _rel(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-6))
 
 
-class TestEndToEndTinyStep(unittest.TestCase):
+@unittest.skipUnless(_HAS_JAX, "requires JAX")
+class TestEndToEndTinyStep(CustomTestCase):
     """Repacked weights + split pools + adapter glue through the megakernel (interpret)."""
 
     def _run(self, moe_mode, kv_dtype, w_dtype="mxfp4"):
@@ -756,7 +772,7 @@ class TestEndToEndTinyStep(unittest.TestCase):
             nb_full=c0.nb_full,
             page=c0.page,
         )
-        mesh = Mesh(np.array(jax.devices()[: c.R]), ("tp",))
+        mesh = Mesh(np.array(jax.devices("cpu")[: c.R]), ("tp",))
         nw, npl = len(names), len(pools)
 
         def body(rank, x, kvl, pi, spi, cs, *rest):
@@ -834,7 +850,7 @@ class TestEndToEndTinyStep(unittest.TestCase):
         self._run("ep", "bf16")
 
 
-class TestRuntimeGating(unittest.TestCase):
+class TestRuntimeGating(CustomTestCase):
     """The torch-side choices that do not need torch_tpu."""
 
     def setUp(self):
@@ -918,6 +934,7 @@ class TestRuntimeGating(unittest.TestCase):
         self.assertIn("Tensor newpg, Tensor off, Tensor kvn, Tensor(a3!) kv_0", schema)
         self.assertIn("Tensor(a38!) kv_35) -> ()", schema)
 
+    @unittest.skipUnless(_HAS_JAX, "requires JAX")
     def test_generated_op_signature(self):
         import inspect
 
@@ -985,7 +1002,7 @@ def _fake_kv_write_layers(newpg, off, kvn, *pools):
     _fake_kv_write_layers_impl(newpg, off, kvn, list(pools))
 
 
-class TestRunUnderTorchCompile(unittest.TestCase):
+class TestRunUnderTorchCompile(CustomTestCase):
     """``GptOssDecodeMK.run`` (the code inside the decode graph) traces under
     ``torch.compile(fullgraph=True)`` for every diagnostics / ablation / KV-write setting,
     with CPU stand-ins for the torch_tpu ops (catches e.g. context managers, locks or host

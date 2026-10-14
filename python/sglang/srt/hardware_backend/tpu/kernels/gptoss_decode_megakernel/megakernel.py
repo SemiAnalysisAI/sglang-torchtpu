@@ -41,7 +41,6 @@ in-kernel all-reduce and to compare against.
 
 from __future__ import annotations
 
-import functools
 import math
 
 import jax
@@ -72,7 +71,11 @@ F4 = jnp.float4_e2m1fn
 
 
 def w_names(c: DecodeConfig) -> tuple[str, ...]:
-    return AW_NAMES + {"mxfp4": EW_NAMES_FP4, "fp8": EW_NAMES_FP8}.get(c.w_dtype, EW_NAMES)
+    return AW_NAMES + {"mxfp4": EW_NAMES_FP4, "fp8": EW_NAMES_FP8}.get(
+        c.w_dtype, EW_NAMES
+    )
+
+
 # rows of the per-layer `vec` [8, VW] f32 operand
 V_LN1, V_LN2, V_BO, V_BQKV, V_BR = range(5)
 
@@ -94,33 +97,39 @@ def packed_specs(c: DecodeConfig) -> dict[str, jax.ShapeDtypeStruct]:
     if c.w_dtype == "mxfp4":
         # 8 e2m1 codes per uint32 along K (row k of a group of 8 at bits 4k, the
         # `pltpu.bitcast` packing); bf16 power-of-two scale per 32 K rows and column
-        out.update({
-            "w13q": s((R, L, EL, NJ, Hp // 8, 2 * T), jnp.uint32),
-            # scale rows padded to the bf16 sublane tile: unpadded rows made XLA relayout-
-            # copy the scale arrays every step (seen in the AOT HLO)
-            "w13s": s((R, L, EL, NJ, c.SR13, 2 * T), BF16),
-            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
-            "w2q": s((R, L, EL, NJ, T // 8, Hp), jnp.uint32),
-            "w2s": s((R, L, EL, NJ, c.SR2, Hp), BF16),
-            "b2": s((R, L, EL, 1, Hp), F32),
-        })
+        out.update(
+            {
+                "w13q": s((R, L, EL, NJ, Hp // 8, 2 * T), jnp.uint32),
+                # scale rows padded to the bf16 sublane tile: unpadded rows made XLA relayout-
+                # copy the scale arrays every step (seen in the AOT HLO)
+                "w13s": s((R, L, EL, NJ, c.SR13, 2 * T), BF16),
+                "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+                "w2q": s((R, L, EL, NJ, T // 8, Hp), jnp.uint32),
+                "w2s": s((R, L, EL, NJ, c.SR2, Hp), BF16),
+                "b2": s((R, L, EL, 1, Hp), F32),
+            }
+        )
     elif c.w_dtype == "fp8":
         # e4m3 weights; column c of a chunk is w8[:, c] * c13[c] (power of two)
-        out.update({
-            "w13": s((R, L, EL, NJ, Hp, 2 * T), jnp.float8_e4m3fn),
-            "c13": s((R, L, EL, NJ, 1, 2 * T), F32),
-            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
-            "w2": s((R, L, EL, NJ, T, Hp), jnp.float8_e4m3fn),
-            "c2": s((R, L, EL, NJ, 1, Hp), F32),
-            "b2": s((R, L, EL, 1, Hp), F32),
-        })
+        out.update(
+            {
+                "w13": s((R, L, EL, NJ, Hp, 2 * T), jnp.float8_e4m3fn),
+                "c13": s((R, L, EL, NJ, 1, 2 * T), F32),
+                "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+                "w2": s((R, L, EL, NJ, T, Hp), jnp.float8_e4m3fn),
+                "c2": s((R, L, EL, NJ, 1, Hp), F32),
+                "b2": s((R, L, EL, 1, Hp), F32),
+            }
+        )
     else:
-        out.update({
-            "w13": s((R, L, EL, NJ, Hp, 2 * T), BF16),
-            "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
-            "w2": s((R, L, EL, NJ, T, Hp), BF16),
-            "b2": s((R, L, EL, 1, Hp), F32),
-        })
+        out.update(
+            {
+                "w13": s((R, L, EL, NJ, Hp, 2 * T), BF16),
+                "b13": s((R, L, EL, NJ, 1, 2 * T), F32),
+                "w2": s((R, L, EL, NJ, T, Hp), BF16),
+                "b2": s((R, L, EL, 1, Hp), F32),
+            }
+        )
     return {k: out[k] for k in w_names(c)}
 
 
@@ -128,6 +137,7 @@ def mxfp4_pack(w, scale_rows=None):
     """[..., K, N] MXFP4-representable weights -> (uint32 codes [..., K/8, N], bf16 scales
     [..., scale_rows, N] (rows past K/32 are padding)). K must be a multiple of 32."""
     from .reference import mxfp4_quantize
+
     code, scale = mxfp4_quantize(w)
     code = code.astype(np.uint32)
     words = np.zeros(code.shape[:-2] + (code.shape[-2] // 8, code.shape[-1]), np.uint32)
@@ -151,6 +161,7 @@ def fp8_pack(w):
     bad = int(np.sum(np.asarray(w8.astype(F32)) * f != w))
     if bad:
         import warnings
+
         warnings.warn(f"fp8_pack: {bad} expert weights not exactly representable")
     return w8, jnp.asarray(f)
 
@@ -160,7 +171,7 @@ def mxfp4_unpack_xla(words, scale):
     f = lax.bitcast_convert_type(words, F4)  # [..., K/8, N, 8], element k = bits 4k
     f = jnp.swapaxes(f, -1, -2)
     f = f.reshape(f.shape[:-3] + (f.shape[-3] * 8, f.shape[-1])).astype(F32)
-    scale = scale[..., :f.shape[-2] // 32, :]
+    scale = scale[..., : f.shape[-2] // 32, :]
     return f * jnp.repeat(scale.astype(F32), 32, axis=-2)
 
 
@@ -174,7 +185,9 @@ def pool_specs(c: DecodeConfig) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStr
     way the stock RPA v3 kernel does (bitcast the VMEM page to uint32, shift, bitcast back).
     """
     dt = kv_jdtype(c)
-    sh = lambda nb: jax.ShapeDtypeStruct((c.R, c.L // 2, nb, c.page, 1, c.kv_packing, 128), dt)
+    sh = lambda nb: jax.ShapeDtypeStruct(
+        (c.R, c.L // 2, nb, c.page, 1, c.kv_packing, 128), dt
+    )
     return sh(c.nb_swa), sh(c.nb_full)
 
 
@@ -185,29 +198,37 @@ def pack_weights(c: DecodeConfig, layers: list[LayerWeights]) -> dict[str, jax.A
     E, I, EL, ILR, IL, NJ, T = c.E, c.I, c.EL, c.IL_RAW, c.IL, c.NJ, c.tne
 
     def pad_to(x, shape, value=0.0):
-        return jnp.pad(x, [(0, s - d) for s, d in zip(shape, x.shape)], constant_values=value)
+        return jnp.pad(
+            x, [(0, s - d) for s, d in zip(shape, x.shape)], constant_values=value
+        )
 
     out = {k: [] for k in W_NAMES}
     for r in range(R):
         per = {k: [] for k in W_NAMES}
         for w in layers:
-            q = w.wqkv[:, r * QWL:(r + 1) * QWL]
-            k = pad_to(w.wqkv[:, QW + r * D:QW + (r + 1) * D], (H, 128))
-            v = pad_to(w.wqkv[:, QW + KW + r * D:QW + KW + (r + 1) * D], (H, 128))
-            per["wqkv"].append(pad_to(jnp.concatenate([q, k, v], -1).astype(BF16), (Hp, c.QKVWL)))
-            bq = w.bqkv[r * QWL:(r + 1) * QWL]
-            bk = pad_to(w.bqkv[QW + r * D:QW + (r + 1) * D], (128,))
-            bv = pad_to(w.bqkv[QW + KW + r * D:QW + KW + (r + 1) * D], (128,))
+            q = w.wqkv[:, r * QWL : (r + 1) * QWL]
+            k = pad_to(w.wqkv[:, QW + r * D : QW + (r + 1) * D], (H, 128))
+            v = pad_to(w.wqkv[:, QW + KW + r * D : QW + KW + (r + 1) * D], (H, 128))
+            per["wqkv"].append(
+                pad_to(jnp.concatenate([q, k, v], -1).astype(BF16), (Hp, c.QKVWL))
+            )
+            bq = w.bqkv[r * QWL : (r + 1) * QWL]
+            bk = pad_to(w.bqkv[QW + r * D : QW + (r + 1) * D], (128,))
+            bv = pad_to(w.bqkv[QW + KW + r * D : QW + KW + (r + 1) * D], (128,))
             vec = jnp.zeros((8, c.VW), F32)
             vec = vec.at[V_LN1, :H].set(w.ln1.astype(F32))
             vec = vec.at[V_LN2, :H].set(w.ln2.astype(F32))
             vec = vec.at[V_BO, :H].set(w.bo.astype(F32))
-            vec = vec.at[V_BQKV, :c.QKVWL].set(jnp.concatenate([bq, bk, bv]).astype(F32))
+            vec = vec.at[V_BQKV, : c.QKVWL].set(
+                jnp.concatenate([bq, bk, bv]).astype(F32)
+            )
             vec = vec.at[V_BR, :128].set(pad_to(w.br.astype(F32), (128,), NEG))
             per["vec"].append(vec)
-            per["wo"].append(pad_to(w.wo[r * QWL:(r + 1) * QWL].astype(BF16), (QWL, Hp)))
+            per["wo"].append(
+                pad_to(w.wo[r * QWL : (r + 1) * QWL].astype(BF16), (QWL, Hp))
+            )
             per["wr"].append(pad_to(w.wr.astype(BF16), (Hp, 128)))
-            sk = w.sinks[r * NQL:(r + 1) * NQL].astype(F32)
+            sk = w.sinks[r * NQL : (r + 1) * NQL].astype(F32)
             per["sinks"].append(jnp.broadcast_to(sk[:, None], (NQL, 128)))
             if c.moe_mode == "tp":
                 ex, cols = np.arange(E), np.arange(*c.moe_cols(r))
@@ -215,10 +236,12 @@ def pack_weights(c: DecodeConfig, layers: list[LayerWeights]) -> dict[str, jax.A
                 ex, cols = np.arange(r * EL, (r + 1) * EL), np.arange(I)
             g = pad_to(w.w13[ex][:, :, cols], (EL, Hp, IL)).reshape(EL, Hp, NJ, T)
             u = pad_to(w.w13[ex][:, :, I + cols], (EL, Hp, IL)).reshape(EL, Hp, NJ, T)
-            per["w13"].append(jnp.concatenate([g, u], -1).transpose(0, 2, 1, 3).astype(BF16))
-            bg = pad_to(w.b13[ex][:, cols], (EL, IL)).reshape(EL, NJ, 1, T)
-            bu = pad_to(w.b13[ex][:, I + cols], (EL, IL)).reshape(EL, NJ, 1, T)
-            per["b13"].append(jnp.concatenate([bg, bu], -1).astype(F32))
+            per["w13"].append(
+                jnp.concatenate([g, u], -1).transpose(0, 2, 1, 3).astype(BF16)
+            )
+            b_g = pad_to(w.b13[ex][:, cols], (EL, IL)).reshape(EL, NJ, 1, T)
+            b_u = pad_to(w.b13[ex][:, I + cols], (EL, IL)).reshape(EL, NJ, 1, T)
+            per["b13"].append(jnp.concatenate([b_g, b_u], -1).astype(F32))
             w2 = pad_to(w.w2[ex][:, cols], (EL, IL, Hp)).reshape(EL, NJ, T, Hp)
             per["w2"].append(w2.astype(BF16))
             per["b2"].append(pad_to(w.b2[ex].astype(F32), (EL, Hp))[:, None])
@@ -253,8 +276,8 @@ def build_pools(c: DecodeConfig, k_hist, v_hist, pos, pt_swa, pt_full, base=None
             for t in range(int(pos[b])):
                 pg = int(pt[b, t // c.page])
                 pool[:, l // 2, pg, t % c.page, 0, :2, :] = 0.0
-                pool[:, l // 2, pg, t % c.page, 0, 0, :c.D] = kh[l, b, t]
-                pool[:, l // 2, pg, t % c.page, 0, 1, :c.D] = vh[l, b, t]
+                pool[:, l // 2, pg, t % c.page, 0, 0, : c.D] = kh[l, b, t]
+                pool[:, l // 2, pg, t % c.page, 0, 1, : c.D] = vh[l, b, t]
     return tuple(jnp.asarray(p).astype(dt) for p in pools)
 
 
@@ -283,77 +306,106 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
         "sem_m": pltpu.SemaphoreType.DMA((4,)),
     }
     if mode in ("mega", "attn"):
-        s.update({
-            # per-sequence [NQL, 128] tiles (row b*NQL + h) so phase B only does aligned
-            # dynamic loads/stores; phase A/C move between layouts with strided accesses
-            "qh": V((BR * c.NQL, 128), F32),  # head h's q in lanes 0..63 (pre-scaled)
-            "kr8": V((BR * c.NQL, 128), F32),  # new K of seq b replicated over NQL rows
-            "vr8": V((BR * c.NQL, 128), F32),
-            "oh": V((BR * c.NQL, 128), F32),  # head h's output in its pair-block half
-            "kvn": V((BR, 1, c.kv_packing, 128), kvdt),
-            "awqkv": V((2, Hp, c.QKVWL), BF16),
-            "awo": V((2, QWL, Hp), BF16),
-            "awsink": V((2, c.NQL, 128), F32),
-            "kvb": V((c.kv_bufs, c.TKMAX, 1, c.kv_packing, 128), kvdt),
-            "sem_kv": pltpu.SemaphoreType.DMA((c.kv_bufs,)),
-            "it_b": pltpu.SMEM((c.NIMAX,), I32),
-            "it_j": pltpu.SMEM((c.NIMAX,), I32),
-            "nit": pltpu.SMEM((1,), I32),  # items listed by the last attention prepare
-        })
+        s.update(
+            {
+                # per-sequence [NQL, 128] tiles (row b*NQL + h) so phase B only does aligned
+                # dynamic loads/stores; phase A/C move between layouts with strided accesses
+                "qh": V(
+                    (BR * c.NQL, 128), F32
+                ),  # head h's q in lanes 0..63 (pre-scaled)
+                "kr8": V(
+                    (BR * c.NQL, 128), F32
+                ),  # new K of seq b replicated over NQL rows
+                "vr8": V((BR * c.NQL, 128), F32),
+                "oh": V(
+                    (BR * c.NQL, 128), F32
+                ),  # head h's output in its pair-block half
+                "kvn": V((BR, 1, c.kv_packing, 128), kvdt),
+                "awqkv": V((2, Hp, c.QKVWL), BF16),
+                "awo": V((2, QWL, Hp), BF16),
+                "awsink": V((2, c.NQL, 128), F32),
+                "kvb": V((c.kv_bufs, c.TKMAX, 1, c.kv_packing, 128), kvdt),
+                "sem_kv": pltpu.SemaphoreType.DMA((c.kv_bufs,)),
+                "it_b": pltpu.SMEM((c.NIMAX,), I32),
+                "it_j": pltpu.SMEM((c.NIMAX,), I32),
+                "nit": pltpu.SMEM(
+                    (1,), I32
+                ),  # items listed by the last attention prepare
+            }
+        )
     if mode in ("mega", "moe"):
-        s.update({
-            "awr": V((2, Hp, 128), BF16),
-            "wf": V((BR, 128), F32),
-            "actv": V((8, 128), I32),
-            "acts": pltpu.SMEM((8, 128), I32),
-            "ite": pltpu.SMEM((c.EL + 1,), I32),
-            "macc": V((BR, Hp), F32),
-            "b13r": V((NS, 1, 2 * T), F32),
-            "b2r": V((NS, 1, Hp), F32),
-            "sem_e": pltpu.SemaphoreType.DMA((NS, 6)),
-        })
+        s.update(
+            {
+                "awr": V((2, Hp, 128), BF16),
+                "wf": V((BR, 128), F32),
+                "actv": V((8, 128), I32),
+                "acts": pltpu.SMEM((8, 128), I32),
+                "ite": pltpu.SMEM((c.EL + 1,), I32),
+                "macc": V((BR, Hp), F32),
+                "b13r": V((NS, 1, 2 * T), F32),
+                "b2r": V((NS, 1, Hp), F32),
+                "sem_e": pltpu.SemaphoreType.DMA((NS, 6)),
+            }
+        )
         if c.w_dtype == "mxfp4":
-            s.update({
-                "w13qr": V((NS, Hp // 8, 2 * T), jnp.uint32),
-                "w13sr": V((NS, c.SR13, 2 * T), BF16),
-                "w2qr": V((NS, T // 8, Hp), jnp.uint32),
-                "w2sr": V((NS, c.SR2, Hp), BF16),
-                "w13r": V((1, Hp, 2 * T), BF16),  # dequantized chunk (one, reused)
-                "w2r": V((1, T, Hp), BF16),
-            })
+            s.update(
+                {
+                    "w13qr": V((NS, Hp // 8, 2 * T), jnp.uint32),
+                    "w13sr": V((NS, c.SR13, 2 * T), BF16),
+                    "w2qr": V((NS, T // 8, Hp), jnp.uint32),
+                    "w2sr": V((NS, c.SR2, Hp), BF16),
+                    "w13r": V((1, Hp, 2 * T), BF16),  # dequantized chunk (one, reused)
+                    "w2r": V((1, T, Hp), BF16),
+                }
+            )
         elif c.w_dtype == "fp8":
-            s.update({
-                "w13r": V((NS, Hp, 2 * T), jnp.float8_e4m3fn),
-                "w2r": V((NS, T, Hp), jnp.float8_e4m3fn),
-                "c13r": V((NS, 1, 2 * T), F32),
-                "c2r": V((NS, 1, Hp), F32),
-            })
+            s.update(
+                {
+                    "w13r": V((NS, Hp, 2 * T), jnp.float8_e4m3fn),
+                    "w2r": V((NS, T, Hp), jnp.float8_e4m3fn),
+                    "c13r": V((NS, 1, 2 * T), F32),
+                    "c2r": V((NS, 1, Hp), F32),
+                }
+            )
         else:
-            s.update({
-                "w13r": V((NS, Hp, 2 * T), BF16),
-                "w2r": V((NS, T, Hp), BF16),
-            })
+            s.update(
+                {
+                    "w13r": V((NS, Hp, 2 * T), BF16),
+                    "w2r": V((NS, T, Hp), BF16),
+                }
+            )
     if comm and c.AR_RSAG:  # reduce-scatter chunks (AR dtype) + all-gather of f32 sums
         CW = c.CWA
-        s.update({
-            "send": V((2, R, BR, CW), ardt), "recv": V((2, R, BR, CW), ardt),
-            "ag_send": V((2, BR, CW), F32), "ag_recv": V((2, R, BR, CW), F32),
-            "arout": V((BR, Hp), F32),
-            "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
-            "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
-            "agssem": pltpu.SemaphoreType.DMA((2, R - 1)),
-            "agrsem": pltpu.SemaphoreType.DMA((2, R - 1)),
-        })
+        s.update(
+            {
+                "send": V((2, R, BR, CW), ardt),
+                "recv": V((2, R, BR, CW), ardt),
+                "ag_send": V((2, BR, CW), F32),
+                "ag_recv": V((2, R, BR, CW), F32),
+                "arout": V((BR, Hp), F32),
+                "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
+                "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
+                "agssem": pltpu.SemaphoreType.DMA((2, R - 1)),
+                "agrsem": pltpu.SemaphoreType.DMA((2, R - 1)),
+            }
+        )
     elif comm:
         if c.AR_FOLD:  # live rows only, 128-lane chunks stacked as rows, f32
-            s.update({"send": V((2, c.FR, 128), F32), "recv": V((2, R, c.FR, 128), F32),
-                      "arout": V((BR, Hp), F32)})
+            s.update(
+                {
+                    "send": V((2, c.FR, 128), F32),
+                    "recv": V((2, R, c.FR, 128), F32),
+                    "arout": V((BR, Hp), F32),
+                }
+            )
         else:
             s.update({"send": V((2, BR, Hp), ardt), "recv": V((2, R, BR, Hp), ardt)})
-        s.update({
-            "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
-            "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
-        })
+        s.update(
+            {
+                "ssem": pltpu.SemaphoreType.DMA((2, R - 1)),
+                "rsem": pltpu.SemaphoreType.DMA((2, R - 1)),
+            }
+        )
     return s
 
 
@@ -377,12 +429,16 @@ def vmem_bytes(c: DecodeConfig, mode: str = "mega") -> dict[str, int]:
         if "VMEM" in str(getattr(v, "memory_space", "")).upper():
             out[k] = _tile_bytes(v.shape, v.dtype)
     # VMEM-resident operands / outputs
-    out["x+cos+sin+out"] = 3 * _tile_bytes((c.BR, c.Hp), F32) + 2 * _tile_bytes((c.BR, 128), F32)
+    out["x+cos+sin+out"] = 3 * _tile_bytes((c.BR, c.Hp), F32) + 2 * _tile_bytes(
+        (c.BR, 128), F32
+    )
     out["total"] = sum(out.values())
     return out
 
 
-def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, interpret=False):
+def build(
+    c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, interpret=False
+):
     """Return a per-rank callable (to be used under shard_map over axis "tp").
 
     mode="mega": f(rank, pos, pt_win [B*NWP], pt_full [B*MP], newpg [2B], x, cos, sin, *W,
@@ -406,25 +462,37 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
     scale = float(c.sm_scale)
     scratch = _scratch(c, mode, comm)
     s_names = list(scratch)
-    aw_need = {"mega": AW_NAMES, "attn": ("wqkv", "wo", "vec", "sinks"), "moe": ("wr", "vec")}[mode]
-    aw_dst = {"wqkv": "awqkv", "wo": "awo", "wr": "awr", "vec": "awvec", "sinks": "awsink"}
+    aw_need = {
+        "mega": AW_NAMES,
+        "attn": ("wqkv", "wo", "vec", "sinks"),
+        "moe": ("wr", "vec"),
+    }[mode]
+    aw_dst = {
+        "wqkv": "awqkv",
+        "wo": "awo",
+        "wr": "awr",
+        "vec": "awvec",
+        "sinks": "awsink",
+    }
     WN = w_names(c)
-    KW = mode == "mega" and c.kv_write == "kernel"  # in-kernel new-K/V write (aliased pools)
+    KW = (
+        mode == "mega" and c.kv_write == "kernel"
+    )  # in-kernel new-K/V write (aliased pools)
     assert not (KW and c.split_pools), "split_pools needs kv_write='scatter'"
     n_pool = L if c.split_pools else 2
     n_in = 8 + len(WN) + n_pool
 
     def kernel(*refs):
         rank_s, pos_s, ptw_s, ptf_s, newpg_s, x_ref, cos_ref, sin_ref = refs[:8]
-        Wr = dict(zip(WN, refs[8:8 + len(WN)]))
-        pool_refs = refs[8 + len(WN):n_in]
+        Wr = dict(zip(WN, refs[8 : 8 + len(WN)]))
+        pool_refs = refs[8 + len(WN) : n_in]
         if c.split_pools:  # per-layer refs, indexed by layer pair
-            kv_swa, kv_full = pool_refs[:L // 2], pool_refs[L // 2:]
+            kv_swa, kv_full = pool_refs[: L // 2], pool_refs[L // 2 :]
         else:
             kv_swa, kv_full = pool_refs
         n_out = 1 if mode == "moe" else (4 if KW else 2)
-        outs = refs[n_in:n_in + n_out]
-        S = dict(zip(s_names, refs[n_in + n_out:]))
+        outs = refs[n_in : n_in + n_out]
+        S = dict(zip(s_names, refs[n_in + n_out :]))
         rank = rank_s[0]
 
         def cp(src, dst, sem):
@@ -465,14 +533,17 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             if interpret:
                 v = S["kvb"][slot, pl.ds(0, rows)]
                 return pltpu.bitcast(v.reshape(rows * c.kv_packing, 128), U32)
-            return S["kvb"].bitcast(U32).at[slot, pl.ds(0, rows)].reshape(rows, 128)[...]
+            return (
+                S["kvb"].bitcast(U32).at[slot, pl.ds(0, rows)].reshape(rows, 128)[...]
+            )
 
         def zero_kvb():  # stale-but-finite is all masking needs; VMEM starts arbitrary
             if interpret:
                 S["kvb"][...] = jnp.zeros(S["kvb"].shape, kvdt)
             else:
                 S["kvb"].bitcast(U32).reshape(NBUF * c.TKMAX, 128)[...] = jnp.zeros(
-                    (NBUF * c.TKMAX, 128), U32)
+                    (NBUF * c.TKMAX, 128), U32
+                )
 
         def store_words(ref, w):
             rows = w.shape[0]
@@ -483,39 +554,60 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
         # ---------------------------------------------------------- attention-weight buffer
         def aw_copies(l, slot):
-            return [cp(Wr[n].at[l], S[aw_dst[n]].at[slot], S["sem_aw"].at[slot, i])
-                    for i, n in enumerate(AW_NAMES) if n in aw_need]
+            return [
+                cp(Wr[n].at[l], S[aw_dst[n]].at[slot], S["sem_aw"].at[slot, i])
+                for i, n in enumerate(AW_NAMES)
+                if n in aw_need
+            ]
 
         def vrow(slot, row, width):
-            return S["awvec"][slot, row:row + 1, 0:width]
+            return S["awvec"][slot, row : row + 1, 0:width]
 
         # ---------------------------------------------------------- all-reduce
         # One-shot all-to-all all-reduce, ported from vllm-torchtpu's generic megakernel
         # (`kernels/megakernel/comm.py`, non-RSAG path): every rank DMAs its partial into
         # slot `me` of every peer's receive buffer, then sums all R slots in rank order.
         def oneshot_copies(slot, me):
-            return [pltpu.make_async_remote_copy(
-                src_ref=S["send"].at[slot], dst_ref=S["recv"].at[slot, me],
-                send_sem=S["ssem"].at[slot, off - 1], recv_sem=S["rsem"].at[slot, off - 1],
-                device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
-                for off in range(1, R)]
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=S["send"].at[slot],
+                    dst_ref=S["recv"].at[slot, me],
+                    send_sem=S["ssem"].at[slot, off - 1],
+                    recv_sem=S["rsem"].at[slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, R)
+            ]
 
         # RSAG (vllm-torchtpu comm.py RSAG path): rank r owns column chunk r. Round 1 sends
         # chunk (me^off) of the partial to peer me^off; round 2 sends the f32 sum of my
         # chunk to every peer. f32 in round 2 keeps the result identical to the one-shot sum.
         def rs_copies(slot, me):
-            return [pltpu.make_async_remote_copy(
-                src_ref=S["send"].at[slot, me ^ off], dst_ref=S["recv"].at[slot, me],
-                send_sem=S["ssem"].at[slot, off - 1], recv_sem=S["rsem"].at[slot, off - 1],
-                device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
-                for off in range(1, R)]
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=S["send"].at[slot, me ^ off],
+                    dst_ref=S["recv"].at[slot, me],
+                    send_sem=S["ssem"].at[slot, off - 1],
+                    recv_sem=S["rsem"].at[slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, R)
+            ]
 
         def ag_copies(slot, me):
-            return [pltpu.make_async_remote_copy(
-                src_ref=S["ag_send"].at[slot], dst_ref=S["ag_recv"].at[slot, me],
-                send_sem=S["agssem"].at[slot, off - 1], recv_sem=S["agrsem"].at[slot, off - 1],
-                device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH)
-                for off in range(1, R)]
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=S["ag_send"].at[slot],
+                    dst_ref=S["ag_recv"].at[slot, me],
+                    send_sem=S["agssem"].at[slot, off - 1],
+                    recv_sem=S["agrsem"].at[slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, R)
+            ]
 
         def ar_copies(slot, me):  # every descriptor of one AR (for send waits)
             if c.AR_RSAG:
@@ -538,6 +630,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 return lambda: val.astype(ardt).astype(F32)
             me = lax.axis_index("tp").astype(I32)
             if exchange and used_before:
+
                 @pl.when(l > 0)  # this slot's sends from the previous layer have left
                 def _():
                     for d in ar_copies(slot, me):
@@ -549,11 +642,11 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 for j in range(R):
                     w = max(0, min(Hp - j * CW, CW))
                     if w == CW:
-                        S["send"][slot, j] = v[:, j * CW:(j + 1) * CW]
+                        S["send"][slot, j] = v[:, j * CW : (j + 1) * CW]
                     else:
                         S["send"][slot, j] = jnp.zeros((BR, CW), ardt)
                         if w:
-                            S["send"][slot, j, :, 0:w] = v[:, j * CW:j * CW + w]
+                            S["send"][slot, j, :, 0:w] = v[:, j * CW : j * CW + w]
                 S["recv"][slot, me] = S["send"][slot, me]
                 descs = rs_copies(slot, me) if exchange else []
                 for d in descs:
@@ -567,15 +660,17 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                         red = red + S["recv"][slot, r].astype(F32)
                     S["ag_send"][slot] = red
                     S["ag_recv"][slot, me] = red
-                    ags = ag_copies(slot, me) if exchange else []
-                    for d in ags:
+                    ag_descs = ag_copies(slot, me) if exchange else []
+                    for d in ag_descs:
                         d.start()
-                    for d in ags:
+                    for d in ag_descs:
                         d.wait_recv()
                     for j in range(R):
                         w = max(0, min(Hp - j * CW, CW))
                         if w:
-                            S["arout"][:, j * CW:j * CW + w] = S["ag_recv"][slot, j, :, 0:w]
+                            S["arout"][:, j * CW : j * CW + w] = S["ag_recv"][
+                                slot, j, :, 0:w
+                            ]
                     return S["arout"][...]
 
                 return finish_rsag
@@ -583,7 +678,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             if c.AR_FOLD:
                 v = val.astype(ardt).astype(F32)
                 for j in range(NHB):
-                    S["send"][slot, j * B:(j + 1) * B, :] = v[0:B, j * 128:(j + 1) * 128]
+                    S["send"][slot, j * B : (j + 1) * B, :] = v[
+                        0:B, j * 128 : (j + 1) * 128
+                    ]
             else:
                 S["send"][slot] = val.astype(ardt)
             S["recv"][slot, me] = S["send"][slot]
@@ -600,7 +697,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 if not c.AR_FOLD:
                     return tot
                 for j in range(NHB):
-                    S["arout"][0:B, j * 128:(j + 1) * 128] = tot[j * B:(j + 1) * B]
+                    S["arout"][0:B, j * 128 : (j + 1) * 128] = tot[j * B : (j + 1) * B]
                 return S["arout"][...]
 
             return finish
@@ -622,13 +719,15 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
             low = lane < 64
             for j in range(QWL // 128):
-                blk = rp(qkv[:, j * 128:(j + 1) * 128]) * scale  # heads 2j | 2j+1
+                blk = rp(qkv[:, j * 128 : (j + 1) * 128]) * scale  # heads 2j | 2j+1
                 for h in (2 * j, 2 * j + 1):
                     qv = pltpu.roll(blk, 64, 1) if h % 2 else blk
                     S["qh"][pl.ds(h, BR, stride=NQL)] = jnp.where(low, qv, 0.0)
-            k = rp(qkv[:, QWL:QWL + 128])
-            v = qkv[:, QWL + 128:QWL + 256]
-            if c.kv_dtype == "fp8":  # saturate like the stock path's fp8 KV quantization
+            k = rp(qkv[:, QWL : QWL + 128])
+            v = qkv[:, QWL + 128 : QWL + 256]
+            if (
+                c.kv_dtype == "fp8"
+            ):  # saturate like the stock path's fp8 KV quantization
                 k, v = jnp.clip(k, -448.0, 448.0), jnp.clip(v, -448.0, 448.0)
             kq, vq = k.astype(kvdt), v.astype(kvdt)
             kf, vf = kq.astype(F32), vq.astype(F32)
@@ -644,9 +743,11 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             pool_out = outs[2] if s == 0 else outs[3]
 
             def tok_cp(b):
-                return cp(S["kvn"].at[pl.ds(b, 1)],
-                          pool_out.at[pi, newpg_s[s * B + b], pl.ds(pos_s[b] % PAGE, 1)],
-                          S["sem_m"].at[1])
+                return cp(
+                    S["kvn"].at[pl.ds(b, 1)],
+                    pool_out.at[pi, newpg_s[s * B + b], pl.ds(pos_s[b] % PAGE, 1)],
+                    S["sem_m"].at[1],
+                )
 
             def start(b, _):
                 tok_cp(b).start()
@@ -660,6 +761,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                     def w(b, _):
                         tok_cp(0).wait()
                         return 0
+
                     lax.fori_loop(0, B, w, 0)
 
             return (d, _WaitAll)
@@ -681,12 +783,15 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             def page_cp(slot, i, page, lp=None):
                 lp = pi if lp is None else lp
                 src = pool[lp].at[page] if c.split_pools else pool.at[lp, page]
-                return cp(src, S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)], S["sem_kv"].at[slot])
+                return cp(
+                    src, S["kvb"].at[slot, pl.ds(i * PAGE, PAGE)], S["sem_kv"].at[slot]
+                )
 
             def page_start(slot, i, page):
                 if c.split_pools and not isinstance(pi, int):
                     # per-layer refs cannot be indexed by the traced pair index
                     for lp in range(L // 2):
+
                         @pl.when(pi == lp)
                         def _():
                             page_cp(slot, i, page, lp).start()
@@ -711,6 +816,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 b, j = S["it_b"][k], S["it_j"][k]
                 npg = rng(b)[3]
                 for i in range(NPBL):
+
                     @pl.when(j * NPBL + i < npg)
                     def _():
                         # a wait only uses the destination/semaphore: any layer's ref works
@@ -737,6 +843,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             n_items = lax.fori_loop(0, B, collect, jnp.int32(0))
             S["nit"][0] = n_items
             for k in range(NBUF - 1):
+
                 @pl.when(k < n_items)
                 def _():
                     kv_start(k, k)
@@ -776,7 +883,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 first = j == 0
                 m = jnp.where(first, m0, m)
                 l_ = jnp.where(first, jnp.exp(sink - m0) + pnew, l_)
-                acc = jnp.where(first, pnew.astype(BF16).astype(F32) * S["vr8"][rows], acc)
+                acc = jnp.where(
+                    first, pnew.astype(BF16).astype(F32) * S["vr8"][rows], acc
+                )
 
                 kt, vt = kv_decode(load_words(slot, TKL))
                 sc = lax.dot_general(qbf, kt, NT_DIMS, preferred_element_type=F32)
@@ -787,7 +896,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 alpha = jnp.exp(m - m_new)
                 p = jnp.exp(sc - m_new[:, :1])
                 l_ = alpha * l_ + jnp.sum(p, axis=1, keepdims=True)
-                acc = alpha * acc + jnp.dot(p.astype(BF16), vt, preferred_element_type=F32)
+                acc = alpha * acc + jnp.dot(
+                    p.astype(BF16), vt, preferred_element_type=F32
+                )
 
                 @pl.when(j == n - 1)
                 def _():
@@ -800,8 +911,11 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
 
         def phase_c(s):
             # head pair (2j, 2j+1) occupy the two halves of o_proj input block j
-            blocks = [S["oh"][pl.ds(2 * j, BR, stride=NQL)] + S["oh"][pl.ds(2 * j + 1, BR, stride=NQL)]
-                      for j in range(NQL // 2)]
+            blocks = [
+                S["oh"][pl.ds(2 * j, BR, stride=NQL)]
+                + S["oh"][pl.ds(2 * j + 1, BR, stride=NQL)]
+                for j in range(NQL // 2)
+            ]
             o = jnp.concatenate(blocks, axis=1) if len(blocks) > 1 else blocks[0]
             return jnp.dot(o.astype(BF16), S["awo"][s], preferred_element_type=F32)
 
@@ -811,7 +925,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             var = jnp.sum(res * res, axis=-1, keepdims=True) * (1.0 / H)
             xn = (res * lax.rsqrt(var + c.eps) * vrow(s, V_LN2, Hp)).astype(BF16)
             S["xn"][...] = xn
-            lg = jnp.dot(xn, S["awr"][s], preferred_element_type=F32) + vrow(s, V_BR, 128)
+            lg = jnp.dot(xn, S["awr"][s], preferred_element_type=F32) + vrow(
+                s, V_BR, 128
+            )
             lane = lax.broadcasted_iota(I32, (BR, 128), 1)
             live = lax.broadcasted_iota(I32, (BR, 128), 0) < B
             ids, vals = [], []
@@ -854,15 +970,22 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 e = S["ite"][i // NJ]
                 j = i % NJ
                 sem = S["sem_e"]
-                ds = [cp(Wr["b13"].at[l, e, j], S["b13r"].at[slot], sem.at[slot, 0]),
-                      cp(Wr["b2"].at[l, e], S["b2r"].at[slot], sem.at[slot, 1])]
-                names = {"mxfp4": ("w13q", "w13s", "w2q", "w2s"),
-                         "fp8": ("w13", "c13", "w2", "c2")}.get(c.w_dtype, ("w13", "w2"))
+                ds = [
+                    cp(Wr["b13"].at[l, e, j], S["b13r"].at[slot], sem.at[slot, 0]),
+                    cp(Wr["b2"].at[l, e], S["b2r"].at[slot], sem.at[slot, 1]),
+                ]
+                names = {
+                    "mxfp4": ("w13q", "w13s", "w2q", "w2s"),
+                    "fp8": ("w13", "c13", "w2", "c2"),
+                }.get(c.w_dtype, ("w13", "w2"))
                 for i, n in enumerate(names):
-                    ds.append(cp(Wr[n].at[l, e, j], S[n + "r"].at[slot], sem.at[slot, 2 + i]))
+                    ds.append(
+                        cp(Wr[n].at[l, e, j], S[n + "r"].at[slot], sem.at[slot, 2 + i])
+                    )
                 return ds
 
             for k in range(NS - 1):
+
                 @pl.when(k < NI)
                 def _():
                     for d in e_cps(k, k):
@@ -900,8 +1023,11 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 if c.w_dtype == "fp8":
                     y = y * S["c2r"][slot]
                 y = y + jnp.where(j == 0, b2flag, 0.0) * S["b2r"][slot]
-                wcol = jnp.sum(jnp.where(lane == base + e, S["wf"][...], 0.0), axis=1,
-                               keepdims=True)
+                wcol = jnp.sum(
+                    jnp.where(lane == base + e, S["wf"][...], 0.0),
+                    axis=1,
+                    keepdims=True,
+                )
                 S["macc"][...] += wcol * y
                 return 0
 
@@ -916,15 +1042,19 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
             e2m1 -> bf16 unpack is `pltpu.bitcast` + convert, as in gmm_v2's fp4 path.
             """
             for ch in range(K // 128):
-                w = pltpu.bitcast(q_ref[slot, ch * 16:(ch + 1) * 16, :], F4).astype(BF16)
+                w = pltpu.bitcast(q_ref[slot, ch * 16 : (ch + 1) * 16, :], F4).astype(
+                    BF16
+                )
                 for g in range(4):
                     r0 = ch * 128 + g * 32
-                    sc = s_ref[slot, ch * 4 + g:ch * 4 + g + 1, :]
-                    out_ref[0, r0:r0 + 32, :] = w[g * 32:(g + 1) * 32] * sc
+                    sc = s_ref[slot, ch * 4 + g : ch * 4 + g + 1, :]
+                    out_ref[0, r0 : r0 + 32, :] = w[g * 32 : (g + 1) * 32] * sc
 
         # ---------------------------------------------------------- composition
         if mode == "mega":
-            if comm and not exchange:  # "ar" ablation: peers' slots must hold finite data
+            if (
+                comm and not exchange
+            ):  # "ar" ablation: peers' slots must hold finite data
                 for k in ("recv", "send", "ag_recv"):
                     if k in S:
                         S[k][...] = jnp.zeros(S[k].shape, S[k].dtype)
@@ -934,8 +1064,12 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                 me = lax.axis_index("tp").astype(I32)
                 barrier = pltpu.get_barrier_semaphore()
                 for off in range(1, R):
-                    pl.semaphore_signal(barrier, 1, device_id=(me ^ off,),
-                                        device_id_type=pl.DeviceIdType.MESH)
+                    pl.semaphore_signal(
+                        barrier,
+                        1,
+                        device_id=(me ^ off,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
                 pl.semaphore_wait(barrier, R - 1)
             for d in aw_copies(0, 0):
                 d.start()
@@ -964,7 +1098,9 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                         for d in kn_descs:
                             d.wait()
                         finish = ar_start(0, phase_c(s), l, True)
-                        S["res"][...] = rnd(S["res"][...] + finish() + vrow(s, V_BO, Hp))
+                        S["res"][...] = rnd(
+                            S["res"][...] + finish() + vrow(s, V_BO, Hp)
+                        )
 
                     def prepare_next():
                         if "attn" in AB or "attn_kv" in AB:
@@ -972,6 +1108,7 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
                         if s == 0:
                             phase_b_prepare(p, sliding=False)
                         else:
+
                             @pl.when(p + 1 < L // 2)
                             def _():
                                 phase_b_prepare(p + 1, sliding=True)
@@ -1029,8 +1166,10 @@ def build(c: DecodeConfig, mode: str = "mega", layer: int | None = None, *, inte
         out_specs = (vmem, hbm)
         if KW:
             sw, fu = pool_specs(c)
-            out_shape += (jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
-                          jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype))
+            out_shape += (
+                jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
+                jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype),
+            )
             out_specs += (hbm, hbm)
             aliases = {n_in - 2: 2, n_in - 1: 3}
     elif mode == "attn":
@@ -1075,9 +1214,11 @@ def build_kv_scatter(c: DecodeConfig, *, interpret=False):
 
                 def cp(b):
                     pos = pos_s[b]
-                    return pltpu.make_async_copy(kvn.at[l, pl.ds(b, 1)],
-                                                 pool.at[p, newpg_s[s * B + b], pl.ds(pos % PAGE, 1)],
-                                                 sem.at[0])
+                    return pltpu.make_async_copy(
+                        kvn.at[l, pl.ds(b, 1)],
+                        pool.at[p, newpg_s[s * B + b], pl.ds(pos % PAGE, 1)],
+                        sem.at[0],
+                    )
 
                 def start(b, _):
                     cp(b).start()
@@ -1098,8 +1239,10 @@ def build_kv_scatter(c: DecodeConfig, *, interpret=False):
     sw, fu = pool_specs(c)
     return pl.pallas_call(
         kernel,
-        out_shape=(jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
-                   jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype)),
+        out_shape=(
+            jax.ShapeDtypeStruct(sw.shape[1:], sw.dtype),
+            jax.ShapeDtypeStruct(fu.shape[1:], fu.dtype),
+        ),
         in_specs=[smem] * 2 + [hbm] * 3,
         out_specs=(hbm, hbm),
         scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
@@ -1118,16 +1261,30 @@ def page_args(c: DecodeConfig, pos, pt_swa, pt_full):
     widx = jnp.minimum(plo[:, None] + jnp.arange(NWP)[None, :], MP - 1)
     ptw = jnp.take_along_axis(pt_swa, widx, axis=1)
     cur = (pos // c.page)[:, None]
-    newpg = jnp.concatenate([jnp.take_along_axis(pt_swa, cur, 1)[:, 0],
-                             jnp.take_along_axis(pt_full, cur, 1)[:, 0]])
-    return ptw.reshape(-1).astype(I32), pt_full.reshape(-1).astype(I32), newpg.astype(I32)
+    newpg = jnp.concatenate(
+        [
+            jnp.take_along_axis(pt_swa, cur, 1)[:, 0],
+            jnp.take_along_axis(pt_full, cur, 1)[:, 0],
+        ]
+    )
+    return (
+        ptw.reshape(-1).astype(I32),
+        pt_full.reshape(-1).astype(I32),
+        newpg.astype(I32),
+    )
 
 
 # ----------------------------------------------------------------------------- step
 
 
-def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = False,
-              scatter: bool = True):
+def make_step(
+    c: DecodeConfig,
+    mesh,
+    *,
+    xla_ar: bool = False,
+    interpret: bool = False,
+    scatter: bool = True,
+):
     """Jittable decode step over `mesh` (1-D axis "tp" of size R).
 
     step(x [B, H] bf16, pos [B] i32, pt_swa [B, MP] i32, pt_full [B, MP] i32, W, kv_swa, kv_full)
@@ -1137,10 +1294,22 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
     """
     R = c.R
     mega = None if xla_ar else build(c, "mega", interpret=interpret)
-    attn = [build(c, "attn", l, interpret=interpret) for l in range(c.L)] if xla_ar else None
-    moe = [build(c, "moe", l, interpret=interpret) for l in range(c.L)] if xla_ar else None
+    attn = (
+        [build(c, "attn", l, interpret=interpret) for l in range(c.L)]
+        if xla_ar
+        else None
+    )
+    moe = (
+        [build(c, "moe", l, interpret=interpret) for l in range(c.L)]
+        if xla_ar
+        else None
+    )
     in_kernel_kv = (not xla_ar) and c.kv_write == "kernel"
-    sc = build_kv_scatter(c, interpret=interpret) if scatter and not in_kernel_kv else None
+    sc = (
+        build_kv_scatter(c, interpret=interpret)
+        if scatter and not in_kernel_kv
+        else None
+    )
     ardt = ar_jdtype(c)
 
     def per_rank(rank, x, pos, pt_s, pt_f, W, kv_s, kv_f):
@@ -1161,23 +1330,27 @@ def make_step(c: DecodeConfig, mesh, *, xla_ar: bool = False, interpret: bool = 
             res = xp.astype(F32)
             kvns = []
             for l in range(c.L):
-                part, kvn_l = attn[l](rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s,
-                                      kv_f)
+                part, kvn_l = attn[l](
+                    rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s, kv_f
+                )
                 tot = lax.psum(part.astype(ardt).astype(F32), "tp")
-                bo = W["vec"][l, V_BO:V_BO + 1, :c.Hp]
+                bo = W["vec"][l, V_BO : V_BO + 1, : c.Hp]
                 res = (res + tot + bo).astype(BF16).astype(F32)
-                part = moe[l](rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s, kv_f)
+                part = moe[l](
+                    rank, pos, pt_s, pt_f, newpg, res, cos, sin, *wl, kv_s, kv_f
+                )
                 tot = lax.psum(part.astype(ardt).astype(F32), "tp")
                 res = (res + tot).astype(BF16).astype(F32)
                 kvns.append(kvn_l)
             out, kvn = res.astype(BF16), jnp.concatenate(kvns)
         if sc is not None:
             kv_s, kv_f = sc(newpg, pos, kvn, kv_s, kv_f)
-        return out[:c.B, :c.H], kv_s[None], kv_f[None]
+        return out[: c.B, : c.H], kv_s[None], kv_f[None]
 
     w_spec = {k: P("tp") for k in w_names(c)}
     smap = jax.shard_map(
-        per_rank, mesh=mesh,
+        per_rank,
+        mesh=mesh,
         in_specs=(P("tp"), P(), P(), P(), P(), w_spec, P("tp"), P("tp")),
         out_specs=(P(), P("tp"), P("tp")),
         check_vma=False,

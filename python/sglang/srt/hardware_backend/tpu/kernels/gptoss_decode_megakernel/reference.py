@@ -54,8 +54,21 @@ def ar_jdtype(c: DecodeConfig):
 
 @functools.partial(
     jax.tree_util.register_dataclass,
-    data_fields=["ln1", "wqkv", "bqkv", "sinks", "wo", "bo", "ln2", "wr", "br", "w13", "b13",
-                 "w2", "b2"],
+    data_fields=[
+        "ln1",
+        "wqkv",
+        "bqkv",
+        "sinks",
+        "wo",
+        "bo",
+        "ln2",
+        "wr",
+        "br",
+        "w13",
+        "b13",
+        "w2",
+        "b2",
+    ],
     meta_fields=[],
 )
 @dataclasses.dataclass
@@ -131,7 +144,7 @@ def rmsnorm(x, w, eps):
 
 def rope(x, cos, sin):  # x [B, nh, D] f32
     D = x.shape[-1]
-    x1, x2 = x[..., : D // 2], x[..., D // 2:]
+    x1, x2 = x[..., : D // 2], x[..., D // 2 :]
     rot = jnp.concatenate([-x2, x1], -1)
     return x * cos[:, None, :] + rot * sin[:, None, :]
 
@@ -184,7 +197,7 @@ def moe_partials(c: DecodeConfig, x2, ids, wts, w: LayerWeights):
     R, I, E = c.R, c.I, c.E
     wfull = jnp.zeros((x2.shape[0], E), F32)
     for k in range(c.TOPK):
-        wfull = wfull + jax.nn.one_hot(ids[:, k], E, dtype=F32) * wts[:, k:k + 1]
+        wfull = wfull + jax.nn.one_hot(ids[:, k], E, dtype=F32) * wts[:, k : k + 1]
     parts = []
     for r in range(R):
         if c.moe_mode == "tp":
@@ -202,13 +215,15 @@ def moe_partials(c: DecodeConfig, x2, ids, wts, w: LayerWeights):
             h_u = mm(x2, u_w) + w.b13[e][I + cols].astype(F32)
             a = swigluoai(c, h_g, h_u).astype(BF16)
             y = mm(a, w.w2[e][rows]) + b2flag * w.b2[e].astype(F32)
-            acc = acc + wfull[:, e:e + 1] * y
+            acc = acc + wfull[:, e : e + 1] * y
         parts.append(acc)
     return parts
 
 
 # ----------------------------------------------------------------------------- MXFP4
-FP4_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)  # e2m1 codes 0..7
+FP4_VALUES = np.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32
+)  # e2m1 codes 0..7
 
 
 def mxfp4_quantize(w):
@@ -243,8 +258,9 @@ def mxfp4_roundtrip(c: DecodeConfig, w: LayerWeights) -> LayerWeights:
     """Expert weights snapped to MXFP4-representable values (blocks along each K dim)."""
     w13 = mxfp4_dequantize(*mxfp4_quantize(w.w13), K=c.H)
     w2 = mxfp4_dequantize(*mxfp4_quantize(w.w2), K=c.I)
-    return dataclasses.replace(w, w13=jnp.asarray(w13).astype(BF16),
-                               w2=jnp.asarray(w2).astype(BF16))
+    return dataclasses.replace(
+        w, w13=jnp.asarray(w13).astype(BF16), w2=jnp.asarray(w2).astype(BF16)
+    )
 
 
 def route(c: DecodeConfig, x2, w: LayerWeights, margins=None):
@@ -257,8 +273,18 @@ def route(c: DecodeConfig, x2, w: LayerWeights, margins=None):
     return ids.astype(jnp.int32), ex / jnp.sum(ex, -1, keepdims=True)
 
 
-def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding: bool,
-          margins=None):
+def layer(
+    c: DecodeConfig,
+    res,
+    cos,
+    sin,
+    pos,
+    kh,
+    vh,
+    w: LayerWeights,
+    sliding: bool,
+    margins=None,
+):
     """res [B, H] bf16; kh/vh [B, T, NKV, D] in the KV dtype. Returns res, (k_new, v_new)."""
     B = res.shape[0]
     NQ, NKV, D, R = c.NQ, c.NKV, c.D, c.R
@@ -266,14 +292,25 @@ def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding:
     a = rmsnorm(res, w.ln1, c.eps)
     qkv = mm(a, w.wqkv) + w.bqkv.astype(F32)
     q = rope(qkv[:, :qw].reshape(B, NQ, D), cos, sin)
-    k = rope(qkv[:, qw:qw + kw].reshape(B, NKV, D), cos, sin)
-    v = qkv[:, qw + kw:].reshape(B, NKV, D)
+    k = rope(qkv[:, qw : qw + kw].reshape(B, NKV, D), cos, sin)
+    v = qkv[:, qw + kw :].reshape(B, NKV, D)
     kq, vq = k.astype(kv_jdtype(c)), v.astype(kv_jdtype(c))
-    o = attention(c, q, kq.astype(F32), vq.astype(F32), kh.astype(F32), vh.astype(F32), pos,
-                  w.sinks, sliding)
+    o = attention(
+        c,
+        q,
+        kq.astype(F32),
+        vq.astype(F32),
+        kh.astype(F32),
+        vh.astype(F32),
+        pos,
+        w.sinks,
+        sliding,
+    )
     o = o.reshape(B, qw).astype(BF16)
     ql = qw // R
-    parts = [mm(o[:, r * ql:(r + 1) * ql], w.wo[r * ql:(r + 1) * ql]) for r in range(R)]
+    parts = [
+        mm(o[:, r * ql : (r + 1) * ql], w.wo[r * ql : (r + 1) * ql]) for r in range(R)
+    ]
     res = (res.astype(F32) + tp_sum(c, parts) + w.bo.astype(F32)).astype(BF16)
     x2 = rmsnorm(res, w.ln2, c.eps)
     ids, wts = route(c, x2, w, margins)
@@ -281,7 +318,9 @@ def layer(c: DecodeConfig, res, cos, sin, pos, kh, vh, w: LayerWeights, sliding:
     return res, (kq, vq)
 
 
-def step(c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights], margins=None):
+def step(
+    c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights], margins=None
+):
     """x [B, H] bf16 (embedded token); pos [B]; k_hist/v_hist [L, B, T, NKV, D] (KV dtype).
 
     Returns hidden [B, H] bf16 before the final norm, and per-layer new K/V [L, B, NKV, D].
@@ -291,8 +330,9 @@ def step(c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights], m
     res = x
     kn, vn = [], []
     for li, w in enumerate(weights):
-        res, (k, v) = layer(c, res, cos, sin, pos, k_hist[li], v_hist[li], w, c.sliding[li],
-                            margins)
+        res, (k, v) = layer(
+            c, res, cos, sin, pos, k_hist[li], v_hist[li], w, c.sliding[li], margins
+        )
         kn.append(k)
         vn.append(v)
     return res, jnp.stack(kn), jnp.stack(vn)

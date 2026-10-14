@@ -24,11 +24,12 @@ is an explicit opt-in, so a silent fallback would only hide a broken experiment)
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 import torch
 from torch import nn
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +59,35 @@ ENV_U32 = "SGLANG_TPU_GPTOSS_DECODE_MK_U32"
 def kernel_knobs_from_env() -> dict:
     """Kernel A/B knobs (unset = kernel defaults): w_dtype fp8|mxfp4, ar_mode
     auto|oneshot|rsag, ar_fold 0|1, npb, npb_swa, kv_bufs, kernel ablations (comma list)."""
-    e = os.environ.get
-    kw: dict = {"w_dtype": e(ENV_PREFIX + "W_DTYPE", "fp8").strip().lower()}
-    if e(ENV_PREFIX + "AR_MODE"):
-        kw["ar_mode"] = e(ENV_PREFIX + "AR_MODE").strip().lower()
-    if e(ENV_PREFIX + "AR_FOLD"):
-        kw["ar_fold"] = e(ENV_PREFIX + "AR_FOLD").strip() not in ("0", "false")
-    for k in ("NPB", "NPB_SWA", "KV_BUFS", "W_SLOTS", "VMEM_MIB"):
-        if e(ENV_PREFIX + k):
-            kw[k.lower()] = int(e(ENV_PREFIX + k))
-    if e(ENV_PREFIX + "KERNEL_ABLATE"):
-        kw["ablate"] = tuple(a for a in e(ENV_PREFIX + "KERNEL_ABLATE").split(",") if a)
+    kw: dict = {
+        "w_dtype": (envs.SGLANG_TPU_GPTOSS_DECODE_MK_W_DTYPE.get() or "fp8")
+        .strip()
+        .lower()
+    }
+    ar_mode = envs.SGLANG_TPU_GPTOSS_DECODE_MK_AR_MODE.get().strip().lower()
+    if ar_mode:
+        kw["ar_mode"] = ar_mode
+    ar_fold = envs.SGLANG_TPU_GPTOSS_DECODE_MK_AR_FOLD.get().strip().lower()
+    if ar_fold:
+        kw["ar_fold"] = ar_fold not in ("0", "false")
+    for k, env_field in (
+        ("npb", envs.SGLANG_TPU_GPTOSS_DECODE_MK_NPB),
+        ("npb_swa", envs.SGLANG_TPU_GPTOSS_DECODE_MK_NPB_SWA),
+        ("kv_bufs", envs.SGLANG_TPU_GPTOSS_DECODE_MK_KV_BUFS),
+        ("w_slots", envs.SGLANG_TPU_GPTOSS_DECODE_MK_W_SLOTS),
+        ("vmem_mib", envs.SGLANG_TPU_GPTOSS_DECODE_MK_VMEM_MIB),
+    ):
+        val = env_field.get()
+        if val is not None:
+            kw[k] = int(val)
+    kablate = envs.SGLANG_TPU_GPTOSS_DECODE_MK_KERNEL_ABLATE.get().strip()
+    if kablate:
+        kw["ablate"] = tuple(a for a in kablate.split(",") if a)
     return kw
 
 
 def enabled_by_env() -> bool:
-    return os.environ.get(ENV_ENABLE, "0").strip().lower() in ("1", "true", "yes", "on")
+    return bool(envs.SGLANG_TPU_GPTOSS_DECODE_MK.get())
 
 
 def static_disable_reason(hf_config, parallel, spec_algorithm) -> Optional[str]:
@@ -220,7 +234,7 @@ def maybe_make_weight_tap(causal_lm: nn.Module) -> Optional[WeightTap]:
         return None
     from sglang_tpu.gptoss_decode_mk.weights import config_from_hf
 
-    moe_mode = os.environ.get(ENV_MOE_MODE, "tp").strip().lower()
+    moe_mode = (envs.SGLANG_TPU_GPTOSS_DECODE_MK_MOE.get() or "tp").strip().lower()
     c = config_from_hf(
         causal_lm.config,
         tp_size=parallel.attn_tp_size,
@@ -431,14 +445,18 @@ class GptOssDecodeMK(nn.Module):
             torch.tensor([rank], dtype=torch.int32, device=device),
             persistent=False,
         )
-        self.ablate = os.environ.get(ENV_ABLATE, "").strip().lower()
+        self.ablate = envs.SGLANG_TPU_GPTOSS_DECODE_MK_ABLATE.get().strip().lower()
         if self.ablate not in ABLATIONS:
             raise ValueError(
                 f"{ENV_ABLATE}={self.ablate!r}; expected one of {ABLATIONS}"
             )
         # register the ops eagerly, outside any torch.compile trace
         self._step_op = get_step_op(c, tp_size, noop=self.ablate == "noop_kernel")
-        self.kv_write_mode = os.environ.get(ENV_KV_WRITE, "layers").strip().lower()
+        self.kv_write_mode = (
+            (envs.SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE.get() or "layers")
+            .strip()
+            .lower()
+        )
         if self.kv_write_mode == "per_layer":
             self._kv_write_op = get_kv_write_op()
         else:
@@ -571,7 +589,7 @@ def _to_device(t: torch.Tensor, device) -> torch.Tensor:
     """Upload; MXFP4 code words become genuine uint32 device tensors when torch_tpu can
     hold them (a base tensor of the kernel's dtype: no bitcast in the graph, and no dtype
     view, which torch_tpu would materialize as a copy), else stay int32."""
-    if t.dtype == torch.int32 and os.environ.get(ENV_U32, "1") != "0":
+    if t.dtype == torch.int32 and envs.SGLANG_TPU_GPTOSS_DECODE_MK_U32.get():
         try:
             u = t.view(torch.uint32).to(device)
             assert u._base is None and u.dtype == torch.uint32
@@ -609,7 +627,7 @@ class _Diagnostics:
 
     @classmethod
     def maybe_start(cls, rank: int):
-        if os.environ.get(ENV_TIMING, "0") in ("", "0"):
+        if not envs.SGLANG_TPU_GPTOSS_DECODE_MK_TIMING.get():
             return None
         return cls(rank)
 
