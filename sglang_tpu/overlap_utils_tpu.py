@@ -69,7 +69,6 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     )
 
     hidden_buf = future_map.hidden_states_buf if future_map.need_hidden_states else None
-    width = (candidate_locs.shape[1] + 1) // 2
     from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 
     probs, topk, bonus, hidden = gather_spec_extras_func(
@@ -79,13 +78,14 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
         future_map.output_tokens_buf,
         hidden_buf,
     )
-    selected = _select_device_accept_cache_locs(candidate_locs, accept_lens, width)
+    from sglang_tpu.eagle_utils_tpu import select_device_accept_tpu
+
+    select_device_accept_tpu(draft_input, candidate_locs, accept_lens)
     draft_input.topk_p = probs
     draft_input.topk_index = topk
     draft_input.bonus_tokens = bonus
     if hidden is not None:
         draft_input.hidden_states = hidden
-    draft_input.device_accept_selected_cache_locs = selected
     draft_input.dsa_topk_indices = None
 
     from sglang.srt.managers.overlap_utils import (
@@ -191,9 +191,9 @@ def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
         return False
     candidates = draft.device_accept_candidate_locs
     assert candidates.shape[1] >= 3 and candidates.shape[1] % 2 == 1
-    draft.device_accept_selected_cache_locs = _select_device_accept_cache_locs(
-        candidates, draft.accept_lens_device, (candidates.shape[1] + 1) // 2
-    )
+    from sglang_tpu.eagle_utils_tpu import select_device_accept_tpu
+
+    select_device_accept_tpu(draft, candidates, draft.accept_lens_device)
     draft.bonus_tokens = pending.payload.bonus_tokens.to(
         future_map.output_tokens_buf.dtype
     )
