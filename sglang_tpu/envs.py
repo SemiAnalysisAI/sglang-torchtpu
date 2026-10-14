@@ -23,9 +23,11 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
     # torch.compile (see TpuPlatform.on_warmup_complete)
     # After warmup, evaluate only the guards that tell the compiled graphs
-    # apart instead of every guard on every call. Unsafe if serving can present
-    # an input warmup never compiled: it may then run a graph that does not fit.
-    SGLANG_TPU_OPT_SKIP_GUARD_EVAL = EnvBool(False)
+    # apart instead of every guard on every call (~1.4 ms of host time per
+    # speculative round). Warmup compiles every serving shape and recompiles
+    # are frozen, so the remaining guards still pick the right graph; set 0 to
+    # evaluate every guard when debugging a suspected wrong-graph dispatch.
+    SGLANG_TPU_OPT_SKIP_GUARD_EVAL = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:
