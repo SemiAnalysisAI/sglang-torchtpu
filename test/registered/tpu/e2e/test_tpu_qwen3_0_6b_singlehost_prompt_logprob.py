@@ -26,11 +26,16 @@ from sglang.test.test_utils import (
 )
 
 register_tpu_ci(
-    est_time=300,
+    est_time=110,
     suite="stage-b-test-tpu-4-v7",
     labels=["singlehost", "qwen3-0.6b", "logprob"],
 )
-register_tpu_ci(est_time=300, suite="external-nightly-1host", nightly=True)
+register_tpu_ci(
+    est_time=300,
+    suite="external-nightly-1host",
+    nightly=True,
+    labels=["singlehost", "qwen3-0.6b", "logprob"],
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is Paris, and the capital of Italy is"

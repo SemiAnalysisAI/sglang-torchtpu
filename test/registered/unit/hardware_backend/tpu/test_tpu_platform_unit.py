@@ -144,6 +144,21 @@ class TestTpuPlatformInitialization(CustomTestCase):
         )
 
 
+class TestTpuCompileCache(CustomTestCase):
+    def test_reports_tier1_cache_misses(self):
+        with patch.object(
+            torch,
+            "tpu",
+            SimpleNamespace(_get_cache_misses=lambda: 37),
+            create=True,
+        ):
+            self.assertEqual(TpuSRTPlatform().get_compilation_cache_misses(), 37)
+
+    def test_omits_cache_misses_when_runtime_has_no_counter(self):
+        with patch.object(torch, "tpu", SimpleNamespace(), create=True):
+            self.assertIsNone(TpuSRTPlatform().get_compilation_cache_misses())
+
+
 class TestTpuPlatformMemory(CustomTestCase):
     """Device memory methods delegate to torch.accelerator.get_memory_info.
 
@@ -592,9 +607,12 @@ class TestDsaValidation(CustomTestCase):
     _args = TestTpuPlatformServerDefaults._args
     _apply = TestTpuPlatformServerDefaults._apply
 
-    def _apply_dsa(self, *, attention_backend, **config_fields):
+    def _apply_dsa(
+        self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
+    ):
         args = self._args(
             attention_backend=attention_backend,
+            tpu_compile_tracer=tpu_compile_tracer,
             model_path="model",
             trust_remote_code=False,
             revision=None,
@@ -621,6 +639,16 @@ class TestDsaValidation(CustomTestCase):
                     self._apply_dsa(
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
+
+    def test_dsa_needs_the_dynamo_tracer(self):
+        """The direct tracer reads the KV cache through the pool's get_state,
+        which the split MLA pool does not implement. The launch must say so
+        instead of failing at the first compile."""
+        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
+            self._apply_dsa(
+                attention_backend="pallas_tpu_mla_sparse",
+                tpu_compile_tracer="direct",
+            )
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
@@ -872,9 +900,9 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+    def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
-        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
+        self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
