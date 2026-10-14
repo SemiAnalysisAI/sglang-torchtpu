@@ -513,9 +513,11 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    # Plain decode upcasts on load, so skipping the f32 copy is bit-identical.
-    # The output zero fill stays: padding rows feed MoE and collectives downstream.
-    decode_only = batched_only and num_spec_tokens == 0 and not pooled
+    # Batched rows (decode and the speculative verify window) take the recurrent
+    # scan, which upcasts on load, so skipping the f32 copy is bit-identical, and
+    # it inverts no blocks, so rows need no padding to INVERT_BLOCK. The output
+    # zero fill stays: padding rows feed MoE and collectives downstream.
+    decode_only = batched_only and not pooled
     if not (decode_only and qkv.dtype == b.dtype == a.dtype):
         qkv = qkv.astype(jnp.float32)
         b = b.astype(jnp.float32)
