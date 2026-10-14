@@ -79,7 +79,18 @@ def _polled(sent=(), received=(), failed=(), completed_ns=None):
     """Fake poll_stats_with_details() result for the given req ids."""
 
     def settled(ids):
-        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+        return [
+            SimpleNamespace(
+                req_id=r,
+                completed_ns=completed_ns,
+                elapsed_ns=None,
+                peer=None,
+                code=None,
+                reason=None,
+                phase=None,
+            )
+            for r in ids
+        ]
 
     return SimpleNamespace(
         sent=settled(sent), received=settled(received), failed=settled(failed)
@@ -2236,6 +2247,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._failed)
+        self.assertNotIn(self.ROOM, mgr.failure_records)
 
     def test_room_is_not_complete_while_closing_registration_is_pending(self):
         mgr, _ = self._decode_with_chunk_plan()

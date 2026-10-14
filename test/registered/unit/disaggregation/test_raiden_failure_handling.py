@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVManager,
     RaidenKVReceiver,
@@ -35,13 +36,26 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 ROOM = 7
 OTHER_ROOM = 8
+# SettledTransfer's failure fields, unset.
+_UNREPORTED = dict(elapsed_ns=None, peer=None, code=None, reason=None, phase=None)
 
 
-def _polled(sent=(), received=(), failed=(), completed_ns=None):
-    """Fake poll_stats_with_details() result for the given req ids."""
+def _polled(sent=(), received=(), failed=(), completed_ns=None, details=None):
+    """Fake poll_stats_with_details() result for the given req ids; ``details``
+    maps a req id to the failure fields raiden reports for it."""
 
     def settled(ids):
-        return [SimpleNamespace(req_id=r, completed_ns=completed_ns) for r in ids]
+        return [
+            SimpleNamespace(
+                req_id=r,
+                **{
+                    "completed_ns": completed_ns,
+                    **_UNREPORTED,
+                    **(details or {}).get(r, {}),
+                },
+            )
+            for r in ids
+        ]
 
     return SimpleNamespace(
         sent=settled(sent), received=settled(received), failed=settled(failed)
@@ -946,7 +960,7 @@ class TestPrefillTellsDecodeRoomFailed(unittest.TestCase):
         self.assertEqual(sender.poll(), KVPoll.Failed)
         [(endpoint, note)] = self._notices(mgr)
         self.assertEqual((endpoint, note.room), (self.DECODE, ROOM))
-        self.assertIn(f"failed room {ROOM}", note.reason)
+        self.assertEqual(note.reason, f"Raiden send failed: req_id={ROOM}")
         self.assertEqual(other.poll(), KVPoll.WaitingForInput)
         self.assertEqual(len(_sent_frames(mgr)), 1)
 
@@ -958,7 +972,7 @@ class TestPrefillTellsDecodeRoomFailed(unittest.TestCase):
         decode._dispatch(_sent_frames(mgr)[0][1])
         with patch.object(RaidenKVReceiver, "_send_abort_notification"):
             self.assertEqual(recv.poll(), KVPoll.Failed)
-        with self.assertRaisesRegex(Exception, f"failed room {ROOM}"):
+        with self.assertRaisesRegex(Exception, f"Raiden send failed: req_id={ROOM}"):
             recv.failure_exception()
         self.assertEqual(decode.request_status[OTHER_ROOM], KVPoll.Transferring)
 
@@ -1735,6 +1749,101 @@ class TestAbortKeepsTheFailureReason(unittest.TestCase):
                     end.failure_exception()
                 self.assertEqual(cm.exception.bootstrap_room, ROOM)
                 self.assertEqual(cm.exception.failure_reason, "Aborted by AbortReq.")
+
+
+class TestNativeFailureReason(CustomTestCase):
+    def test_prefill_reports_why_raiden_failed_its_read(self):
+        """A read raiden failed must name raiden's cause in the room's failure,
+        on the rank that failed; the drain gate quiesces that rank too."""
+        for rid in (f"{ROOM}#2", f"swa:{ROOM}"):
+            with self.subTest(rid=rid):
+                mgr = _prefill_manager()
+                _populate_send_state(mgr, ROOM)
+                mgr.is_dummy_cp_rank = False
+                mgr._send_reads[ROOM] = {rid}
+                mgr._engine = Mock()
+                mgr._engine.poll_stats_with_details.return_value = _polled(
+                    failed=[rid],
+                    details={
+                        rid: dict(
+                            code="DEADLINE_EXCEEDED",
+                            phase="await_pull",
+                            elapsed_ns=120_000_000_000,
+                            reason="Send session timed out",
+                        )
+                    },
+                )
+                sender = _prefill_sender(mgr)
+                cause = (
+                    f"Raiden send failed: req_id={rid} code=DEADLINE_EXCEEDED "
+                    "phase=await_pull elapsed_ms=120000.0 "
+                    "reason=Send session timed out"
+                )
+
+                with self.assertLogs(
+                    "sglang_tpu.disaggregation.raiden.conn", "ERROR"
+                ) as logs:
+                    self.assertEqual(sender.poll(), KVPoll.Failed)
+                sender.quiesce_group_failure()
+
+                self.assertEqual(
+                    [r.getMessage() for r in logs.records],
+                    [f"RaidenKVManager rank0 {cause}"],
+                )
+                with self.assertRaises(KVTransferError) as cm:
+                    sender.failure_exception()
+                self.assertEqual(cm.exception.failure_reason, cause)
+
+    def test_the_earliest_failure_is_the_rooms_reason(self):
+        """A room's chunk and closing reads can fail in the same poll, the
+        closing one as a symptom of the chunk's failure. The room's reason and
+        its one ERROR line must be the failure raiden settled first, not the
+        lowest request id; another room's failure gets its own ERROR line."""
+        chunk, closing, other = f"{ROOM}#2", f"{ROOM}", f"{OTHER_ROOM}#0"
+        mgr = _prefill_manager()
+        _populate_send_state(mgr, ROOM)
+        _populate_send_state(mgr, OTHER_ROOM)
+        mgr.is_dummy_cp_rank = False
+        mgr._send_reads[ROOM] = {chunk, closing}
+        mgr._send_reads[OTHER_ROOM] = {other}
+        mgr._engine = Mock()
+        mgr._engine.poll_stats_with_details.return_value = _polled(
+            failed=[closing, other, chunk],
+            details={
+                chunk: dict(completed_ns=1, code="UNAVAILABLE", phase="push"),
+                closing: dict(completed_ns=2, code="CANCELLED", phase="await_pull"),
+                other: dict(completed_ns=3, code="UNAVAILABLE", phase="push"),
+            },
+        )
+        sender = _prefill_sender(mgr)
+        cause = f"Raiden send failed: req_id={chunk} code=UNAVAILABLE phase=push"
+
+        with self.assertLogs("sglang_tpu.disaggregation.raiden.conn", "DEBUG") as logs:
+            sender.poll()
+
+        self.assertEqual(
+            [
+                (r.levelname, r.getMessage())
+                for r in logs.records
+                if r.getMessage().startswith("RaidenKVManager rank0 Raiden ")
+            ],
+            [
+                ("ERROR", f"RaidenKVManager rank0 {cause}"),
+                (
+                    "ERROR",
+                    f"RaidenKVManager rank0 Raiden send failed: req_id={other} "
+                    "code=UNAVAILABLE phase=push",
+                ),
+                (
+                    "DEBUG",
+                    f"RaidenKVManager rank0 Raiden send failed: req_id={closing} "
+                    "code=CANCELLED phase=await_pull",
+                ),
+            ],
+        )
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+        self.assertEqual(cm.exception.failure_reason, cause)
 
 
 class TestSendRevalidatesTheSocket(unittest.TestCase):
