@@ -164,6 +164,14 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _contiguous_strides(shape) -> tuple:
+    strides, step = [], 1
+    for size in reversed(shape):
+        strides.append(step)
+        step *= max(size, 1)
+    return tuple(reversed(strides))
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -799,6 +807,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.topk,
                 self.speculative_num_steps,
             )
+        # Dynamo guards on strides, size-1 dims included, so a [steps, 1] view
+        # with stride (1, steps) and a dense one are different graphs. Present
+        # one layout whichever path built the rows.
+        if out_cache_loc.stride() != _contiguous_strides(out_cache_loc.shape):
+            out_cache_loc = out_cache_loc.clone(memory_format=torch.contiguous_format)
 
         steps_fn = self._compiled_fused_steps
         if steps_fn is None:
@@ -821,6 +834,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # loop to decode while preserving the scheduler-owned value afterward.
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
+        # A top-1 draft's positions are its seq_lens. Whether they arrive as
+        # the same tensor depends on upstream padding and input resolution, and
+        # Dynamo compiles aliased and distinct inputs as separate graphs: warmup
+        # covered one, batched serving produced the other, and the frozen
+        # compiler raised. Alias them whenever they agree so every call matches.
+        orig_positions = forward_batch.positions
+        if (
+            self.topk == 1
+            and orig_positions is not None
+            and orig_positions.shape == forward_batch.seq_lens.shape
+            and orig_positions.dtype == forward_batch.seq_lens.dtype
+        ):
+            forward_batch.positions = forward_batch.seq_lens
         try:
             with forward_context(ForwardContext(attn_backend=attn_backends[0])):
                 tree_outputs = steps_fn(
@@ -835,6 +861,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
+            forward_batch.positions = orig_positions
         spec_info.rpa_draft_kv_lens = None
 
         return tree_outputs
