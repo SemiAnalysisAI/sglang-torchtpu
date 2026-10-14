@@ -1629,6 +1629,30 @@ class USPAttention(nn.Module):
         if attn_mask is None and attn_mask_meta is None:
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
+        use_varlen_fa = (
+            _VARLEN_FA_ENABLED
+            and self.backend == AttentionBackendEnum.FA
+            and q.device.type == "cuda"
+            and q.dtype in (torch.float16, torch.bfloat16)
+        )
+        if (
+            attn_mask is None
+            and not use_varlen_fa
+            and not (num_replicated_prefix or num_replicated_suffix)
+        ):
+            pad_start = attn_mask_meta.get("pad_start", attn_mask_meta.get("gap_start"))
+            pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
+            if pad_start is not None and pad_end == k.shape[1]:
+                # Tail padding only: mask the keys past the global real length,
+                # a span every rank holds, so every rank runs the same program
+                # (spmd-safe compiled regions need that) and no mask is
+                # gathered. Pad query rows keep their values; the caller trims
+                # them after the final gather.
+                key_mask = torch.arange(k.shape[1], device=q.device) < pad_start
+                return self._kv_gather_masked_sdpa(
+                    q, k, v, key_mask.expand(q.shape[0], -1)
+                )
+
         explicit_mask = attn_mask is not None
         if attn_mask is None:
             local_pad = int(attn_mask_meta.get("local_pad", 0))
@@ -1676,12 +1700,7 @@ class USPAttention(nn.Module):
         else:
             key_mask = cached["key_mask"]
 
-        if (
-            _VARLEN_FA_ENABLED
-            and self.backend == AttentionBackendEnum.FA
-            and q.device.type == "cuda"
-            and q.dtype in (torch.float16, torch.bfloat16)
-        ):
+        if use_varlen_fa:
             if (
                 explicit_mask
                 and attn_mask_meta is not None
@@ -1729,6 +1748,16 @@ class USPAttention(nn.Module):
                 query_len,
             )
 
+        out = self._kv_gather_masked_sdpa(q, k, v, key_mask)
+        return out * attn_mask[:, :, None, None]
+
+    def _kv_gather_masked_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_mask: torch.Tensor,
+    ) -> torch.Tensor:
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
@@ -1748,7 +1777,7 @@ class USPAttention(nn.Module):
             else nullcontext()
         )
         with sdpa_context:
-            out = torch.nn.functional.scaled_dot_product_attention(
+            return torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
                 v_,
@@ -1757,7 +1786,6 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
-        return out * attn_mask[:, :, None, None]
 
     def _forward_with_replicated_prefix(
         self,

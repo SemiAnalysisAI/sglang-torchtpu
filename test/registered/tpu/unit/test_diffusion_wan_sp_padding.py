@@ -10,6 +10,9 @@ register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import unittest
 
+from sglang.multimodal_gen.test.unit.test_usp_attention_kv_gather import (  # noqa: F401
+    TestUSPAttentionKVGather,
+)
 from sglang.multimodal_gen.test.unit.test_usp_tail_pad_key_prefix import (  # noqa: F401
     TestTailPadKeyPrefix,
 )
