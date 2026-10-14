@@ -706,7 +706,11 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             self.assertTrue(suite, f"{path.name} registers no suite")
             # Multi-host discovery creates one job per file, even when files
             # share a suite. Single-host discovery creates one job per suite.
-            if not hasattr(mod, "MULTIHOST_LAUNCH"):
+            # External self-launch suites bundle files by design and place them
+            # per host by est_time.
+            if not hasattr(mod, "MULTIHOST_LAUNCH") and not suite.startswith(
+                "external-nightly-"
+            ):
                 self.assertNotIn(suite, suites, f"{path.name} shares a suite")
                 suites.add(suite)
 
