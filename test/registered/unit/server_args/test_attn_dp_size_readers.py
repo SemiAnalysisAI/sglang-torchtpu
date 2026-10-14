@@ -24,6 +24,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from parameterized import parameterized
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -47,10 +49,10 @@ _MINI_CONFIG = {
 }
 
 # Both spellings of attention-DP 2. Every case runs on each.
-_SPELLINGS = {
-    "deprecated": dict(dp_size=2, enable_dp_attention=True),
-    "attn_dp_size": dict(attn_dp_size=2),
-}
+_SPELLINGS = [
+    ("deprecated", dict(dp_size=2, enable_dp_attention=True)),
+    ("attn_dp_size", dict(attn_dp_size=2)),
+]
 
 
 class _ResolveCase(CustomTestCase):
@@ -77,30 +79,23 @@ class _ResolveCase(CustomTestCase):
 
 
 class TestTpuBatchLimitsUseAttentionDp(_ResolveCase):
-    def test_compile_buckets_stop_at_per_worker_concurrency(self):
+    @parameterized.expand(_SPELLINGS)
+    def test_compile_buckets_stop_at_per_worker_concurrency(self, _name, spelling):
         # 32 requests over 2 attention-DP workers is 16 per worker, which the
         # configured [1, 8, 16] ladder already covers. Reading one DP group
         # made it 32 per worker: a 32 bucket the scheduler never fills, whose
         # page table overflows SMEM at long context.
-        for name, spelling in _SPELLINGS.items():
-            with self.subTest(spelling=name):
-                server_args = self.resolve(
-                    tp_size=8,
-                    max_running_requests=32,
-                    torch_compile_max_bs=16,
-                    tpu_compile_bs=[1, 8, 16],
-                    **spelling,
-                )
-                self.assertEqual(resolution_result(server_args, "attn_dp_size"), 2)
-                self.assertEqual(
-                    resolution_result(server_args, "tpu_compile_bs"), [1, 8, 16]
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "torch_compile_max_bs"), 16
-                )
-                self.assertEqual(
-                    resolution_result(server_args, "max_running_requests"), 32
-                )
+        server_args = self.resolve(
+            tp_size=8,
+            max_running_requests=32,
+            torch_compile_max_bs=16,
+            tpu_compile_bs=[1, 8, 16],
+            **spelling,
+        )
+        self.assertEqual(resolution_result(server_args, "attn_dp_size"), 2)
+        self.assertEqual(resolution_result(server_args, "tpu_compile_bs"), [1, 8, 16])
+        self.assertEqual(resolution_result(server_args, "torch_compile_max_bs"), 16)
+        self.assertEqual(resolution_result(server_args, "max_running_requests"), 32)
 
 
 class TestTpuPlatformRefusesAttentionDp(_ResolveCase):
@@ -114,17 +109,17 @@ class TestTpuPlatformRefusesAttentionDp(_ResolveCase):
         with patch("sglang_tpu.patches._prepare_tpu_env"):
             TpuSRTPlatform().apply_server_args_defaults(server_args)
 
-    def test_pipeline_tensor_parallel_pair_refuses_attention_dp(self):
-        fields = dict(tp_size=2, pp_size=2, enable_torch_compile=True)
-        # Control: a plain tensor-parallel pair is admitted.
-        self.apply_tpu_defaults(self.resolve(**fields))
-        for name, spelling in _SPELLINGS.items():
-            with self.subTest(spelling=name):
-                server_args = self.resolve(**fields, **spelling)
-                with self.assertRaisesRegex(
-                    NotImplementedError, "tensor-parallel pair"
-                ):
-                    self.apply_tpu_defaults(server_args)
+    PIPELINE_PAIR = dict(tp_size=2, pp_size=2, enable_torch_compile=True)
+
+    def test_pipeline_tensor_parallel_pair_is_admitted(self):
+        # Control for the refusal below: the same stage without attention DP.
+        self.apply_tpu_defaults(self.resolve(**self.PIPELINE_PAIR))
+
+    @parameterized.expand(_SPELLINGS)
+    def test_pipeline_tensor_parallel_pair_refuses_attention_dp(self, _name, spelling):
+        server_args = self.resolve(**self.PIPELINE_PAIR, **spelling)
+        with self.assertRaisesRegex(NotImplementedError, "tensor-parallel pair"):
+            self.apply_tpu_defaults(server_args)
 
 
 class TestDpSchedulerCount(CustomTestCase):
@@ -138,15 +133,19 @@ class TestDpSchedulerCount(CustomTestCase):
         cls.bench = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.bench)
 
-    def test_counts_attention_dp_groups_and_replicas(self):
-        count = self.bench._dp_scheduler_count
-        # A server from before --attn-dp-size counted attention-DP in dp_size.
-        self.assertEqual(count({"dp_size": 2}), 2)
-        # A current server reports dp_size=1 under attention DP.
-        self.assertEqual(count({"dp_size": 1, "attn_dp_size": 2}), 2)
-        self.assertEqual(count({"dp_size": 2, "attn_dp_size": 1}), 2)
-        self.assertEqual(count({"dp_size": 1, "attn_dp_size": 1}), 1)
-        self.assertIsNone(count({}))
+    @parameterized.expand(
+        [
+            # A server from before --attn-dp-size counted attention DP in dp_size.
+            ("pre_attn_dp_size_server", {"dp_size": 2}, 2),
+            # A current server reports dp_size=1 under attention DP.
+            ("attention_dp", {"dp_size": 1, "attn_dp_size": 2}, 2),
+            ("replicas", {"dp_size": 2, "attn_dp_size": 1}, 2),
+            ("single_scheduler", {"dp_size": 1, "attn_dp_size": 1}, 1),
+            ("no_dp_layout", {}, None),
+        ]
+    )
+    def test_counts_attention_dp_groups_and_replicas(self, _name, info, expected):
+        self.assertEqual(self.bench._dp_scheduler_count(info), expected)
 
 
 def _deprecated_flag_reads(path):
