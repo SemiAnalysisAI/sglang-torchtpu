@@ -1066,6 +1066,10 @@ def kernel_main(
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
 
 
+# Row count from which 8-bit GMMs use 256-row tiles (see calculate_tiling).
+_LARGE_M_ROWS = 16384
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1094,6 +1098,11 @@ def calculate_tiling(
     lhs_mod = min(pl.cdiv(16, lhs_bits), 2)
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
+    if lhs_bits <= 8 and rhs_bits <= 8 and dims.size_m >= _LARGE_M_ROWS:
+        # Prefill-sized 8-bit GMMs: with ~200+ rows per expert, 128-row tiles
+        # stream each expert's weights twice. 256 measured 21-25% faster on
+        # GLM-5.3-Flash's 288-expert shapes (bit-identical); 512 is slower.
+        tile_m = 256
     tile_m = min(tile_m, dims.size_m)
 
     # Per-buffer VMEM target for triple-buffered RHS.
