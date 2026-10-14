@@ -9,6 +9,7 @@ All patches are idempotent.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 from collections.abc import Sequence
@@ -932,6 +933,62 @@ def _patch_scheduler_reject_prompt_logprob() -> None:
 
     _add_request_to_queue._tpu_prompt_logprob_gate = True
     Scheduler._add_request_to_queue = _add_request_to_queue
+
+
+_tokenizer_manager_pd_health_patched = False
+
+
+def _patch_tokenizer_manager_pd_health_generate() -> None:
+    """P/D /health_generate judged in the HTTP process (health_generate_http)."""
+    global _tokenizer_manager_pd_health_patched
+    if _tokenizer_manager_pd_health_patched:
+        return
+    _tokenizer_manager_pd_health_patched = True
+
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+    _wrap_tokenizer_manager_for_pd_health(TokenizerManager)
+
+
+def _wrap_tokenizer_manager_for_pd_health(cls) -> None:
+    from sglang_tpu.disaggregation import health_generate_http
+
+    orig_init_disaggregation = cls.init_disaggregation
+    orig_mark_state_dispatched = cls._mark_state_dispatched
+    orig_handle_batch_output = cls._handle_batch_output
+    orig_abort_request = cls.abort_request
+
+    @functools.wraps(orig_init_disaggregation)
+    def init_disaggregation(self, *args, **kwargs):
+        result = orig_init_disaggregation(self, *args, **kwargs)
+        health_generate_http.attach_tracker(self)
+        return result
+
+    @functools.wraps(orig_mark_state_dispatched)
+    def _mark_state_dispatched(self, rid):
+        health_generate_http.track_dispatched(self, rid)
+        return orig_mark_state_dispatched(self, rid)
+
+    @functools.wraps(orig_handle_batch_output)
+    async def _handle_batch_output(self, recv_obj):
+        health_generate_http.track_outputs(self, recv_obj)
+        return await orig_handle_batch_output(self, recv_obj)
+
+    @functools.wraps(orig_abort_request)
+    def abort_request(self, rid="", abort_all=False):
+        health_generate_http.track_cancelled(self, rid=rid, abort_all=abort_all)
+        return orig_abort_request(self, rid, abort_all)
+
+    cls.init_disaggregation = init_disaggregation
+    cls._mark_state_dispatched = _mark_state_dispatched
+    cls._handle_batch_output = _handle_batch_output
+    cls.abort_request = abort_request
+
+
+def apply_tpu_http_patches(*, disaggregation_mode: str) -> None:
+    """Patches for the HTTP process, which never runs apply_tpu_patches."""
+    if disaggregation_mode != "null":
+        _patch_tokenizer_manager_pd_health_generate()
 
 
 def apply_tpu_patches() -> None:
