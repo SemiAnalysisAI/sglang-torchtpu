@@ -17,6 +17,7 @@ from collections import defaultdict
 CHIPS_PER_HOST = 4  # tpu7x-standard-4t
 NODEPOOL = "cloud.google.com/gke-nodepool"
 TOPOLOGY = "cloud.google.com/gke-tpu-topology"
+CI_NAMESPACES = ("tpu-ci", "default")
 
 
 def kubectl_json(context: str, *args: str) -> dict:
@@ -29,10 +30,10 @@ def kubectl_json(context: str, *args: str) -> dict:
     return json.loads(out)
 
 
-def busy_nodes(context: str) -> set[str]:
+def busy_nodes(context: str, ns_args: list[str]) -> set[str]:
     """Nodes holding a pod that requests TPU chips and has not finished."""
     busy = set()
-    for pod in kubectl_json(context, "get", "pods", "-A")["items"]:
+    for pod in kubectl_json(context, "get", "pods", *ns_args)["items"]:
         node = pod["spec"].get("nodeName")
         if not node or pod["status"].get("phase") in ("Succeeded", "Failed"):
             continue
@@ -47,12 +48,13 @@ def inventory(name: str, context: str) -> list[str]:
         context, "get", "nodes", "-l", "cloud.google.com/gke-tpu-accelerator"
     )["items"]
     try:
-        busy = busy_nodes(context)
-    except subprocess.CalledProcessError as e:
-        print(
-            f"[{name}] cannot list pods cluster-wide ({e.stderr.strip()}); busy column unknown"
-        )
-        busy = None
+        busy = busy_nodes(context, ["-A"])
+    except subprocess.CalledProcessError:
+        # The CI SA may only list pods in the CI namespaces; dev pods elsewhere go uncounted.
+        print(f"[{name}] busy hosts count CI pods only ({', '.join(CI_NAMESPACES)})")
+        busy = set()
+        for ns in CI_NAMESPACES:
+            busy |= busy_nodes(context, ["-n", ns])
     pools: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
     for n in nodes:
         lb = n["metadata"]["labels"]
@@ -74,7 +76,7 @@ def inventory(name: str, context: str) -> list[str]:
         dims = [int(d) for d in topo.split("x")] if topo != "?" else [CHIPS_PER_HOST]
         hosts_per_slice = max(1, math.prod(dims) // CHIPS_PER_HOST)
         slices = len(names) / hosts_per_slice
-        nbusy = "?" if busy is None else str(sum(x in busy for x in names))
+        nbusy = sum(x in busy for x in names)
         rows.append(
             f"| {pool} | {topo} | {ci_pool} | {lane} | {len(names)} | {slices:g} "
             f"| {len(names) * CHIPS_PER_HOST} | {nbusy} |"

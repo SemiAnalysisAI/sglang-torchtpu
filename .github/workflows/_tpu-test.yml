@@ -229,7 +229,7 @@ jobs:
             ${{ inputs.nightly && '--nightly' || '' }} "$@"
           }
           # Targets: id -> kube context, namespace, manifest, and whether Kueue admits it.
-          declare -A T_CTX T_NS T_FILE T_KUEUE T_NAME
+          declare -A T_CTX=() T_NS=() T_FILE=() T_KUEUE=() T_NAME=()  # =(): set -u rejects a never-assigned array
           targets=()
           add_target() {  # id ctx ns kueue(1|"") render-args...
             local id="$1" ctx="$2" ns="$3" kueue="$4"; shift 4
