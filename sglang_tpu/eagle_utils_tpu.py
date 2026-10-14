@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -225,6 +226,12 @@ def draft_extend_positions_tpu(
     return (seq_lens.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
 
 
+@functools.cache
+def uniform_extend_start_loc_tpu(bs: int, width: int, device) -> torch.Tensor:
+    """Start row of each request in a uniform-width extend: i * width, int32."""
+    return (torch.arange(bs, dtype=torch.int32) * width).to(device)
+
+
 class DeviceAcceptLayouts(NamedTuple):
     """Contiguous layouts of the selected device-accept window."""
 
@@ -236,7 +243,7 @@ class DeviceAcceptLayouts(NamedTuple):
     verify_kv_lens: Optional[torch.Tensor] = None
 
 
-@compiled_op(warmup=make_device_accept_select_args)
+@compiled_op(warmup=make_device_accept_select_args, direct=True)
 def select_device_accept_windows_tpu(
     candidate_locs: torch.Tensor,  # [bs, 2 * width - 1]
     accept_lens: torch.Tensor,  # [bs]
@@ -261,7 +268,7 @@ def select_device_accept_windows_tpu(
     )
 
 
-@compiled_op(warmup=make_verify_kv_lens_args)
+@compiled_op(warmup=make_verify_kv_lens_args, direct=True)
 def verify_kv_lens_tpu(seq_lens: torch.Tensor, width: int) -> torch.Tensor:
     return (seq_lens + width).to(torch.int32)
 
@@ -399,7 +406,7 @@ def last_accepted_row_indices(
     return row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
 
 
-@compiled_op(warmup=make_draft_extend_select_args)
+@compiled_op(warmup=make_draft_extend_select_args, direct=True)
 def fused_draft_extend_select_argmax_func(
     next_token_logits: torch.Tensor,
     hidden_states: Optional[torch.Tensor],

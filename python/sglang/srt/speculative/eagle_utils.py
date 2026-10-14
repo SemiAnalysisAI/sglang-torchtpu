@@ -449,7 +449,7 @@ def _make_greedy_verify_chain_args(context):
 SIM_OFF, SIM_FIXED, SIM_REAL = 0, 1, 2
 
 
-@compiled_op(warmup=_make_greedy_verify_chain_args)
+@compiled_op(warmup=_make_greedy_verify_chain_args, direct=True)
 def _greedy_verify_chain_tpu(
     next_token_logits: torch.Tensor,
     draft_token: torch.Tensor,
