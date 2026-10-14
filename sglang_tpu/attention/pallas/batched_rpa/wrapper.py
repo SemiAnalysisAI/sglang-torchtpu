@@ -438,7 +438,49 @@ def calculate_block_sizes(
     # cell's worth.
     prefill_batch_size = 1
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    def cover_whole_pages(block_sizes: configs.BlockSizes) -> configs.BlockSizes:
+        # The schedule fetches block k's cached pages from k * cdiv(bkv_sz, page),
+        # while the kernel labels its keys from k * bkv_sz; they agree on whole pages.
+        page = serve_cfgs.page_size
+        if block_sizes.bkv_sz % page == 0:
+            return block_sizes
+        if block_sizes.bkv_sz > page:
+            # The q block stays as searched; the kernel does not need bq_sz <= bkv_sz.
+            return dataclasses.replace(
+                block_sizes, bkv_sz=block_sizes.bkv_sz // page * page
+            )
+        # Growing the k block to one page needs VMEM the search did not budget.
+        # Like the search, keep the buffers and halve the q block first; a mixed
+        # q block stops at 2 tokens, since the kernel reads bq_sz == 1 as decode.
+        min_bq_sz = min(block_sizes.bq_sz, 2)
+        bq_sz = block_sizes.bq_sz
+        while (
+            bq_sz > min_bq_sz
+            and calculate_vmem_usage(1, block_sizes.n_buffer, bq_sz, page)
+            > capped_vmem_limit_bytes
+        ):
+            bq_sz = max(min_bq_sz, bq_sz // 2)
+        try:
+            batch_size, n_buffer = fit_lanes_and_buffers(
+                block_sizes.batch_size, block_sizes.n_buffer, bq_sz, page
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"A one-page k block ({page=}) does not fit within VMEM limit;"
+                " a smaller page size may."
+            ) from e
+        return dataclasses.replace(
+            block_sizes,
+            bq_sz=bq_sz,
+            bq_c_sz=math.gcd(block_sizes.bq_c_sz, bq_sz),
+            bkv_sz=page,
+            batch_size=batch_size,
+            n_buffer=n_buffer,
+        )
+
+    decode_block_sizes = cover_whole_pages(
+        find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     # Operator escape hatch. The search above works from a VMEM estimate that
@@ -451,6 +493,8 @@ def calculate_block_sizes(
         page = serve_cfgs.page_size
         aligned = max(page, -(-int(forced_bkv) // page) * page)
         prefill_block_sizes = dataclasses.replace(prefill_block_sizes, bkv_sz=aligned)
+    else:
+        prefill_block_sizes = cover_whole_pages(prefill_block_sizes)
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -655,9 +699,13 @@ def ragged_paged_attention(
         else prepare_attention_sink(attention_sink, num_kv_heads, queries.dtype)
     )
 
-    default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes
-    )
+    # Explicit block sizes for both modes are used as given, even where the
+    # search would refuse.
+    default_decode = default_prefill = None
+    if decode_block_sizes is None or prefill_block_sizes is None:
+        default_decode, default_prefill = calculate_block_sizes(
+            model_cfgs, serve_cfgs, vmem_limit_bytes
+        )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     lse_hbm = None
