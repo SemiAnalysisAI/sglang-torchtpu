@@ -55,6 +55,8 @@ PREFILL_CONFIG["server_args"].update(
     tp_size=1, ep_size=1, pp_size=8, disable_overlap_schedule=True
 )
 
+# The perf test reads the decode's sglang:spec_accept_length gauge; the mini router has no /metrics.
+DECODE_CONFIG["server_args"]["enable_metrics"] = True
 # A non-PP decode must name its layer pools to pull from a PP producer.
 DECODE_CONFIG["runtime_envs"]["SGLANG_RAIDEN_PIPELINE_TRANSFER"] = "1"
 # Spec uses CPU-tensor retraction; host-pool I/O is tested separately.

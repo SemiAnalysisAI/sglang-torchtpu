@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.test_utils import dump_metric
 from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
@@ -65,6 +66,8 @@ ISL, OSL, CONCUR = 8192, 1024, 64
 # Random-ids prompts give a drafter nothing to predict; pin acceptance near the
 # GSM8K measurement, as the single-host EAGLE3 perf test does.
 SIMULATE_ACC_LEN = 2.5
+# The simulated acceptance is random per verify; a 640-request mean sits well inside this.
+ACCEPT_LENGTH_TOLERANCE = 0.3
 
 
 def resolve_model_path(env: Mapping[str, str] | None = None) -> str:
@@ -110,6 +113,16 @@ def engine_configuration_failures(
                     f"{role} reports {name}={info.get(name)!r}, expected {value}"
                 )
     return failures
+
+
+def read_spec_accept_length(metrics_text: str) -> float:
+    """Max sglang:spec_accept_length across ranks; 0.0 when spec never ran."""
+    values = [
+        float(line.rsplit(" ", 1)[1])
+        for line in metrics_text.splitlines()
+        if line.startswith("sglang:spec_accept_length") and " " in line
+    ]
+    return max(values, default=0.0)
 
 
 def build_model_config() -> dict[str, Any]:
@@ -175,6 +188,30 @@ class TestPdSingleHostPpSpecGptOss120bPerf(PDSingleHostTestCase):
 
     def test_throughput(self) -> None:
         self.run_evaluations()
+        if self.role != PREFILL_ROLE:
+            return
+        url = f"http://{self.decode_hostname()}:{DECODE_PORT}/metrics"
+        with urllib.request.urlopen(url, timeout=60) as response:
+            accept_length = read_spec_accept_length(response.read().decode("utf-8"))
+        config = build_model_config()
+        dump_metric(
+            "spec_accept_length",
+            accept_length,
+            labels={
+                "kind": "info",
+                "id": config["id"],
+                "display_name": config["display_name"],
+                "model": config["model"],
+                "workload": WORKLOAD,
+            },
+        )
+        self.assertAlmostEqual(
+            accept_length,
+            SIMULATE_ACC_LEN,
+            delta=ACCEPT_LENGTH_TOLERANCE,
+            msg=f"decode accept length {accept_length} on {url}: EAGLE3 or the "
+            "simulated acceptance did not take effect",
+        )
 
 
 class TestPdSingleHostPpSpecGptOss120bConfiguration(unittest.TestCase):
@@ -230,6 +267,19 @@ class TestPdSingleHostPpSpecGptOss120bConfiguration(unittest.TestCase):
         from sglang.test.tpu.evals import model_config
 
         self.assertTrue(model_config.build_gates(build_model_config()))
+
+    def test_accept_length_reads_the_max_over_ranks(self) -> None:
+        text = (
+            "# TYPE sglang:spec_accept_length gauge\n"
+            'sglang:spec_accept_length{tp_rank="0"} 2.4\n'
+            'sglang:spec_accept_length{tp_rank="1"} 2.6\n'
+            "sglang:spec_accept_rate 0.5\n"
+        )
+        self.assertEqual(read_spec_accept_length(text), 2.6)
+        self.assertEqual(read_spec_accept_length("sglang:num_running_reqs 1\n"), 0.0)
+
+    def test_decode_exports_metrics(self) -> None:
+        self.assertTrue(self.plans[DECODE_ROLE]["server_args"]["enable_metrics"])
 
     def test_engine_configuration_check(self) -> None:
         prefill = {
