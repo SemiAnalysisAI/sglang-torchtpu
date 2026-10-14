@@ -22,7 +22,6 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.model_runner import ModelRunner, SamplingPrewarmResult
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -357,17 +356,13 @@ class TestTpuGraphRunner(CustomTestCase):
                             "sglang_tpu.tpu_platform.snapshot_recompilation_baseline",
                             side_effect=lambda: events.append("baseline"),
                         ),
-                        patch(
-                            "sglang.srt.model_executor.model_runner.current_platform",
-                            TpuSRTPlatform(),
-                        ),
                     ):
                         with scope:
                             TpuGraphRunner(runner)
                             runner.sampler.warmup_small_top_k.assert_not_called()
                             self.assertNotIn("done", events)
                         self.assertEqual(events, ["execute"])
-                        ModelRunner.prewarm_sampling(runner)
+                        TpuSRTPlatform().prewarm_sampling(runner)
                     self.assertEqual(events, ["execute", "sampler", "baseline", "done"])
 
     def test_prepare_forward_batch_composes_model_and_policy_hooks(self):
@@ -862,6 +857,7 @@ class TestDraftPrecompileOrdering(CustomTestCase):
 
 class TestTpuSamplingPrewarm(unittest.TestCase):
     def setUp(self):
+        self.platform = TpuSRTPlatform()
         self.runner = SimpleNamespace(
             sampler=MagicMock(spec=TpuSampler),
             model=SimpleNamespace(_can_torch_compile=True),
@@ -869,15 +865,8 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_last_rank=True),
             device="cpu",
-            sampling_prewarm_result=SamplingPrewarmResult(),
         )
         self.enterContext(get_context().override_server_args(torch_compile_max_bs=8))
-        self.enterContext(
-            patch(
-                "sglang.srt.model_executor.model_runner.current_platform",
-                TpuSRTPlatform(),
-            )
-        )
         self.baseline = self.enterContext(
             patch("sglang_tpu.tpu_platform.snapshot_recompilation_baseline")
         )
@@ -893,12 +882,10 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
             ):
                 self.runner.model._can_torch_compile = can_compile
                 self.runner.sampler.warmup_small_top_k.reset_mock()
-                result = ModelRunner.prewarm_sampling(self.runner)
+                self.platform.prewarm_sampling(self.runner)
                 self.runner.sampler.warmup_small_top_k.assert_called_once_with(
                     max_batch_size=8, vocab_size=128, device=torch.device("cpu")
                 )
-                self.assertEqual(result, SamplingPrewarmResult())
-                self.assertIs(result, self.runner.sampling_prewarm_result)
 
     def test_skips_draft_embedding_nonfinal_and_other_sampler(self):
         for role in ("draft", "embedding", "nonfinal", "other_sampler"):
@@ -913,7 +900,7 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
                 )
                 self.baseline.reset_mock()
                 self.log.reset_mock()
-                ModelRunner.prewarm_sampling(self.runner)
+                self.platform.prewarm_sampling(self.runner)
                 self.runner.sampler.warmup_small_top_k.assert_not_called()
                 if role == "draft":
                     self.baseline.assert_not_called()
@@ -927,16 +914,12 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
             "warmup failed"
         )
         with self.assertRaisesRegex(RuntimeError, "warmup failed"):
-            ModelRunner.prewarm_sampling(self.runner)
+            self.platform.prewarm_sampling(self.runner)
         self.baseline.assert_not_called()
         self.log.assert_not_called()
 
     def test_default_platform_preserves_noop(self):
-        with patch(
-            "sglang.srt.model_executor.model_runner.current_platform", SRTPlatform()
-        ):
-            result = ModelRunner.prewarm_sampling(self.runner)
-        self.assertEqual(result, SamplingPrewarmResult())
+        SRTPlatform().prewarm_sampling(self.runner)
         self.runner.sampler.warmup_small_top_k.assert_not_called()
         self.baseline.assert_not_called()
         self.log.assert_not_called()
