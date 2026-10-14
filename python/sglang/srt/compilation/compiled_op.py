@@ -86,6 +86,11 @@ def compiled_op(
         compiled_fn = None
         use_direct = False
         signature = inspect.signature(fn)
+        num_params = len(signature.parameters)
+        positional_only_ok = all(
+            p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            for p in signature.parameters.values()
+        )
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -96,14 +101,24 @@ def compiled_op(
                 or not envs.SGLANG_ENABLE_TORCH_COMPILE.get()
             ):
                 return fn(*args, **kwargs)
-            from jax import tree_util
+            if (
+                not kwargs
+                and positional_only_ok
+                and len(args) == num_params
+                and all(not isinstance(a, (list, tuple, dict)) for a in args)
+            ):
+                # Hot path: a full flat positional call already matches what
+                # bind() would produce, so canonicalize the leaves directly.
+                args = tuple(_canonical_tensor(a) for a in args)
+            else:
+                from jax import tree_util
 
-            # Bind to fn's signature: positional warmups and keyword callers share a key.
-            bound = signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            args, kwargs = tree_util.tree_map(
-                _canonical_tensor, (bound.args, bound.kwargs)
-            )
+                # Bind to fn's signature: positional warmups and keyword callers share a key.
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                args, kwargs = tree_util.tree_map(
+                    _canonical_tensor, (bound.args, bound.kwargs)
+                )
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
