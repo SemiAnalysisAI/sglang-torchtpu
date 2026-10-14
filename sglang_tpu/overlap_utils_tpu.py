@@ -193,7 +193,9 @@ def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
     assert candidates.shape[1] >= 3 and candidates.shape[1] % 2 == 1
     from sglang_tpu.eagle_utils_tpu import select_device_accept_tpu
 
-    select_device_accept_tpu(draft, candidates, draft.accept_lens_device)
+    select_device_accept_tpu(
+        draft, candidates, draft.accept_lens_device, pending.seq_lens
+    )
     draft.bonus_tokens = pending.payload.bonus_tokens.to(
         future_map.output_tokens_buf.dtype
     )

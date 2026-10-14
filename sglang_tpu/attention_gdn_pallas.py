@@ -463,7 +463,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     def _slot_indices(
         self, req_pool_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """(slot ids, int32 slot ids) of the batch's requests.
+        """(int64 slot ids, int32 slot ids) of the batch's requests.
 
         An unchanged batch reuses the last result: the gather and the cast are
         two launches per round otherwise. The request-to-slot table is written
@@ -481,6 +481,9 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             return memo[3], memo[4]
         slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
         slots_i32 = slots.to(torch.int32)
+        # int64 for the verify commit's index_copy_ (the table itself is int32).
+        if slots.dtype != torch.int64:
+            slots = slots.long()
         if pool.mamba_v2p_table is None:
             self._slot_memo = (
                 weakref.ref(req_pool_indices),

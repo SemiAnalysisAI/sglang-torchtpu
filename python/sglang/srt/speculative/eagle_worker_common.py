@@ -367,6 +367,8 @@ def prepare_for_draft(
     draft_input.positions = (
         prepared_positions
         if prepared_positions is not None
+        else batch.seq_lens
+        if topk == 1
         else batch.seq_lens.repeat_interleave(topk, dim=0)
     )
     forward_batch = ForwardBatch.init_new(
@@ -520,6 +522,12 @@ def build_eagle_verify_input(
             bs=batch.seq_lens.shape[0],
             num_verify_tokens=num_draft_tokens,
         )
+        layouts = draft_input.device_accept_layouts
+        if (
+            layouts is not None
+            and verify_input.device_accept_cache_locs is layouts.verify
+        ):
+            verify_input.verify_kv_lens = layouts.verify_kv_lens
     return verify_input
 
 

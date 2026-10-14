@@ -10,6 +10,7 @@ from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang_tpu.spec_op_warmup import (
     make_device_accept_select_args,
+    make_verify_kv_lens_args,
     make_draft_extend_select_args,
 )
 
@@ -230,6 +231,9 @@ class DeviceAcceptLayouts(NamedTuple):
     draft: torch.Tensor  # [bs * num_steps], the draft steps' write slots
     draft_per_step: torch.Tensor  # [num_steps, bs], one row per draft step
     verify: torch.Tensor  # [bs * width], the verify window's slots
+    # int32 [bs] RPA kv_lens of the verify forward (committed prefix + width),
+    # or None when the prefix was not known at selection.
+    verify_kv_lens: Optional[torch.Tensor] = None
 
 
 @compiled_op(warmup=make_device_accept_select_args)
@@ -257,14 +261,27 @@ def select_device_accept_windows_tpu(
     )
 
 
-def select_device_accept_tpu(draft_input, candidate_locs, accept_lens) -> None:
-    """Store the selected window and its layouts on the draft input."""
-    num_steps = (candidate_locs.shape[1] + 1) // 2 - 1
+@compiled_op(warmup=make_verify_kv_lens_args)
+def verify_kv_lens_tpu(seq_lens: torch.Tensor, width: int) -> torch.Tensor:
+    return (seq_lens + width).to(torch.int32)
+
+
+def select_device_accept_tpu(
+    draft_input, candidate_locs, accept_lens, seq_lens=None
+) -> None:
+    """Store the selected window and its layouts on the draft input. With the
+    committed prefix lengths known, also the verify forward's RPA kv_lens."""
+    width = (candidate_locs.shape[1] + 1) // 2
     selected, draft, per_step, verify = select_device_accept_windows_tpu(
-        candidate_locs, accept_lens, num_steps
+        candidate_locs, accept_lens, width - 1
     )
     draft_input.device_accept_selected_cache_locs = selected
-    draft_input.device_accept_layouts = DeviceAcceptLayouts(draft, per_step, verify)
+    draft_input.device_accept_layouts = DeviceAcceptLayouts(
+        draft,
+        per_step,
+        verify,
+        None if seq_lens is None else verify_kv_lens_tpu(seq_lens, width),
+    )
 
 
 def prepare_draft_cache_locs_tpu(
