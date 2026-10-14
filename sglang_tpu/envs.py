@@ -21,6 +21,11 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # torch.compile (see TpuPlatform.on_warmup_complete)
+    # After warmup, evaluate only the guards that tell the compiled graphs
+    # apart instead of every guard on every call. Unsafe if serving can present
+    # an input warmup never compiled: it may then run a graph that does not fit.
+    SGLANG_TPU_OPT_SKIP_GUARD_EVAL = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

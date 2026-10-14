@@ -1206,10 +1206,16 @@ class TpuSRTPlatform(SRTPlatform):
                 "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
             )
             return
-        torch.compiler.set_stance("fail_on_recompile")
+        from sglang_tpu.envs import envs as tpu_envs
+
+        skip_guards = tpu_envs.SGLANG_TPU_OPT_SKIP_GUARD_EVAL.get()
+        torch.compiler.set_stance(
+            "fail_on_recompile", skip_guard_eval_unsafe=skip_guards
+        )
         logger.info(
             "[tpu] Warmup complete; froze torch.compile via "
-            "set_stance('fail_on_recompile')."
+            "set_stance('fail_on_recompile', skip_guard_eval_unsafe=%s).",
+            skip_guards,
         )
 
     def get_compilation_cache_misses(self) -> Optional[int]:
