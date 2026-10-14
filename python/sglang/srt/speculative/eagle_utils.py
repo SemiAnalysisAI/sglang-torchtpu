@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from enum import IntEnum
@@ -436,6 +437,56 @@ def _make_verify_bookkeeping_args(context):
     from sglang_tpu.spec_op_warmup import make_verify_bookkeeping_args
 
     return make_verify_bookkeeping_args(context)
+
+
+def _make_greedy_verify_chain_args(context):
+    from sglang_tpu.spec_op_warmup import make_greedy_verify_chain_args
+
+    return make_greedy_verify_chain_args(context)
+
+
+# simulate_mode of _greedy_verify_chain_tpu: off, fixed tokens, real draft tokens.
+SIM_OFF, SIM_FIXED, SIM_REAL = 0, 1, 2
+
+
+@compiled_op(warmup=_make_greedy_verify_chain_args)
+def _greedy_verify_chain_tpu(
+    next_token_logits: torch.Tensor,
+    draft_token: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    sim_accept_len: torch.Tensor,
+    simulate_mode: int,
+):
+    """Greedy verify of a top-1 draft chain, simulated acceptance included.
+
+    Returns (predicts int32 [bs * W], accept_lens int32 [bs] counting the bonus
+    token, accept_index int32 [bs, W]). One dispatch replaces the eager buffer
+    preallocation, slice copies and simulated-index ops of eagle_sample.
+    sim_accept_len is a device int32 [1] (the host-sampled length) so a
+    different length per round does not recompile.
+    """
+    bs, w = retrieve_index.shape
+    candidates = draft_token.reshape(bs, w)
+    predicts, accept_index, accept_len = _verify_tree_greedy_torch.__wrapped__(
+        next_token_logits, candidates, retrieve_index
+    )
+    if simulate_mode == SIM_OFF:
+        return predicts, accept_len, accept_index
+    k = sim_accept_len.to(torch.int32)
+    cols = torch.arange(w, device=draft_token.device, dtype=torch.int32)[None, :]
+    first = retrieve_index[:, :1].to(torch.int32)
+    accept_index = torch.where(cols < k, first + cols, -1).to(torch.int32)
+    accept_len = k.expand(bs).to(torch.int32)
+    if simulate_mode == SIM_FIXED:
+        predicts = torch.full_like(predicts, 100)
+    else:
+        target = torch.argmax(next_token_logits, dim=-1).reshape(bs, w)
+        drafts = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1)
+        grid = predicts.reshape(bs, w)
+        grid = torch.where(cols < k - 1, drafts.to(grid.dtype), grid)
+        grid = torch.where(cols == k - 1, target.to(grid.dtype), grid)
+        predicts = grid.reshape(-1).clone()
+    return predicts, accept_len, accept_index
 
 
 @compiled_op(warmup=_make_verify_tree_greedy_args)
@@ -1020,6 +1071,22 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    if (
+        _is_tpu
+        and verify_input.tree_topk == 1
+        and _verify_uses_greedy(
+            is_all_greedy=sampling_info.is_all_greedy,
+            is_cpu=_is_cpu,
+            is_hip=_is_hip,
+            is_xpu=_is_xpu,
+            use_rejection_sampling=use_rejection_sampling,
+        )
+    ):
+        return _eagle_sample_greedy_chain_tpu(
+            verify_input, next_token_logits, device, simulate=SIMULATE_ACC_LEN > 0
+        )
+
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
@@ -1030,7 +1097,6 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
@@ -1281,6 +1347,46 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     return predict, num_correct_drafts + 1, accept_index
+
+
+def _eagle_sample_greedy_chain_tpu(
+    verify_input, next_token_logits, device, *, simulate
+):
+    """TPU greedy verify of a top-1 chain (and simulated acceptance) in one op."""
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_METHOD,
+        SIMULATE_ACC_TOKEN_MODE,
+        sample_simulated_acc_len,
+    )
+
+    if simulate:
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or 'real-draft-token'."
+            )
+        k = sample_simulated_acc_len(
+            SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, verify_input.max_tree_depth
+        )
+        mode = SIM_FIXED if SIMULATE_ACC_TOKEN_MODE == "fixed" else SIM_REAL
+        # Host value uploaded as data, so each round's length reuses one graph.
+        sim_k = torch.tensor([k], dtype=torch.int32).to(device, non_blocking=True)
+    else:
+        mode = SIM_OFF
+        sim_k = _sim_len_placeholder(device)
+    return _greedy_verify_chain_tpu(
+        next_token_logits,
+        verify_input.draft_token,
+        verify_input.retrieve_index,
+        sim_k,
+        mode,
+    )
+
+
+@functools.cache
+def _sim_len_placeholder(device) -> torch.Tensor:
+    return torch.ones((1,), dtype=torch.int32).to(device)
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
