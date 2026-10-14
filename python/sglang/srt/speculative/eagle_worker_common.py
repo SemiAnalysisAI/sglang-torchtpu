@@ -53,6 +53,7 @@ if _is_tpu:
         device_accept_verify_cache_locs_tpu,
         draft_extend_positions_tpu,
         prepare_draft_cache_locs_tpu,
+        uniform_extend_start_loc_tpu,
     )
 
 if _is_cpu:
@@ -179,6 +180,21 @@ def prepare_for_draft_extend(
     # The fused CUDA layout kernels keep the length arithmetic on the device too.
     fused_lengths = device_lens_only and batch.seq_lens.is_cuda
     extend_position_info = None
+    if (
+        _is_tpu
+        and not widen
+        and draft_extend_input.positions is not None
+        and not batch.forward_mode.is_idle()
+    ):
+        # Uniform window with known positions: hand init_new the layout so it
+        # skips compute_position's length readbacks and uploads.
+        extend_position_info = (
+            draft_extend_input.positions,
+            uniform_extend_start_loc_tpu(
+                bs, num_window_tokens, draft_extend_input.positions.device
+            ),
+            None,
+        )
     if fused_lengths and not widen and draft_extend_input.positions is None:
         batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
             prepare_draft_extend_layout(
