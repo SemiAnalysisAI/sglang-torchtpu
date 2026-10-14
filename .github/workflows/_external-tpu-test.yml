@@ -173,7 +173,7 @@ jobs:
           # A cancel signals the step; exit through the EXIT trap rather than dying first.
           trap 'exit 130' INT TERM
 
-          # tpu-external PR jobs borrow single hosts here (_tpu-test.yml external) and stop
+          # PR-gate jobs borrow single hosts here (_tpu-test.yml external_slots) and stop
           # submitting once this run is live. Delete their unstarted pods, wait out the ones
           # on this row's slices, and preempt any still there after PR_DRAIN_MAX.
           PR_DRAIN_MAX=5400
