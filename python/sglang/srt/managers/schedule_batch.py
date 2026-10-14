@@ -2049,6 +2049,13 @@ class Req(ReqDllmMixin):
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
+            draft_cpu=(
+                token_to_kv_pool_allocator.full_draft_kv_pool.get_cpu_copy(
+                    token_indices, req_pool_index=self.kv.req_pool_idx
+                )
+                if token_to_kv_pool_allocator.full_draft_kv_pool is not None
+                else None
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -2068,6 +2075,11 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
+        draft_cpu = self.kv.retraction_backup.draft_cpu
+        if draft_cpu is not None:
+            token_to_kv_pool_allocator.full_draft_kv_pool.load_cpu_copy(
+                draft_cpu, token_indices, req_pool_index=self.kv.req_pool_idx
+            )
         self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
