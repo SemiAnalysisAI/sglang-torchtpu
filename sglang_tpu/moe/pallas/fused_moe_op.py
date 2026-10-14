@@ -754,9 +754,10 @@ def _fused_moe_jax(
         # argsort is stable enough on TPU for our usage; the gmm kernel
         # only cares about contiguous expert runs.
         argsort_idx = jnp.argsort(topk_ids_flat)
-        # Row-of-original-token for each sorted slot.
-        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-        sorted_token_ids = token_indices[argsort_idx]
+        # Row-of-original-token for each sorted slot: slot i belongs to token
+        # i // topk. A divide, not a gather of a repeat(arange) table: XLA
+        # gathers are slow on TPU (~0.6 ms per layer at 8k prefill tokens).
+        sorted_token_ids = (argsort_idx // topk).astype(jnp.int32)
 
         # gmm_v2 only reads and writes the rows of expert groups at or after
         # ``group_offset``, so this rank's routed-row window is all the permute
