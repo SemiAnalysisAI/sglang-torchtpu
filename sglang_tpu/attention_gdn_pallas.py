@@ -60,10 +60,15 @@ _MEGA_KDA_PREFILL = tpu_envs.SGLANG_TPU_OPT_MEGA_KDA_PREFILL.get()
 def _kda_prefill_with_fallback(
     qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
     dt_bias, query_start_loc, state_indices, distribution, seq_lens,
-    read_offsets, *, n_kq, n_v, d_k, d_v, kernel_size, gate_lower_bound,
+    read_offsets, packed_weights, *, n_kq, n_v, d_k, d_v, kernel_size,
+    gate_lower_bound,
 ):
     """KDA prefill through the Mega kernel, or the fused kernel when the batch
-    has leading decode rows or a tile spans more than two sequences."""
+    has leading decode rows or a tile spans more than two sequences.
+
+    With packed_weights (kda_layout: conv [K, dim] in rows [0, K), dt_bias in
+    rows [K, K + n_v), A_log in row K + n_v) the Mega path unpacks them and the
+    fused path reads the packed array as before."""
     import jax
 
     from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
@@ -74,7 +79,16 @@ def _kda_prefill_with_fallback(
     kw = dict(n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=kernel_size)
 
     def mega(ops):
-        return kda_prefill_mega(*ops, gate_lower_bound=gate_lower_bound, **kw)
+        (qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx, sl, ro) = ops
+        if packed_weights is not None:
+            dim = qkv_.shape[1]
+            w = packed_weights[:kernel_size, :dim].T.reshape(dim, 1, kernel_size)
+            dtb = packed_weights[kernel_size : kernel_size + n_v, :d_k]
+            alog = packed_weights[kernel_size + n_v, :n_v]
+        return kda_prefill_mega(
+            qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx, sl, ro,
+            gate_lower_bound=gate_lower_bound, **kw,
+        )
 
     def fused(ops):
         (qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx, sl, ro) = ops
@@ -82,7 +96,8 @@ def _kda_prefill_with_fallback(
             (new_conv, new_rec), out = fused_conv1d_gdn(
                 qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx,
                 distribution, sl, ro, attention_mode=AttentionMode.KDA,
-                gate_lower_bound=gate_lower_bound, prefill_only=True, **kw,
+                gate_lower_bound=gate_lower_bound, prefill_only=True,
+                packed_weights=packed_weights, **kw,
             )
         return new_conv, new_rec, out.reshape(-1, n_v, d_v)
 
@@ -209,14 +224,15 @@ def build_gdn_pallas_op():
             and gate_lower_bound is not None
             and num_spec_tokens == 0
             and track_indices is None
-            and packed_weights is None
+            and conv_bias is None
             and n_kq == n_v
         ):
             return _kda_prefill_with_fallback(
                 qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias,
                 a_log, dt_bias, query_start_loc, state_indices, distribution,
-                seq_lens, read_offsets, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
-                kernel_size=kernel_size, gate_lower_bound=gate_lower_bound,
+                seq_lens, read_offsets, packed_weights, n_kq=n_kq, n_v=n_v,
+                d_k=d_k, d_v=d_v, kernel_size=kernel_size,
+                gate_lower_bound=gate_lower_bound,
             )
         with tpu_info_for_cpu_export():
             (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
