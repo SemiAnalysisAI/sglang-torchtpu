@@ -254,6 +254,9 @@ NIGHTLY_SUITES = {
         "nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
         "nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro",
         "nightly-tpu-accuracy-qwen3-5-397b-mmmupro",
+        # External tpu7x cluster: single-host tests that launch their own server,
+        # run per host by jobset-external-tpu.yaml's self-launch groups.
+        "external-nightly-1host",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
