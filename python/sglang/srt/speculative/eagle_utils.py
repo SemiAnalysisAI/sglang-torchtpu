@@ -455,13 +455,16 @@ def _greedy_verify_chain_tpu(
     draft_token: torch.Tensor,
     retrieve_index: torch.Tensor,
     sim_accept_len: torch.Tensor,
+    seq_lens: torch.Tensor,
     simulate_mode: int,
 ):
     """Greedy verify of a top-1 draft chain, simulated acceptance included.
 
     Returns (predicts int32 [bs * W], accept_lens int32 [bs] counting the bonus
-    token, accept_index int32 [bs, W]). One dispatch replaces the eager buffer
-    preallocation, slice copies and simulated-index ops of eagle_sample.
+    token, accept_index int32 [bs, W]) followed by the commit outputs (see
+    _chain_commit_outputs). One dispatch replaces the eager buffer
+    preallocation, slice copies and simulated-index ops of eagle_sample, plus
+    the bookkeeping and draft-extend input ops that used to follow it.
     sim_accept_len is a device int32 [1] (the host-sampled length) so a
     different length per round does not recompile.
     """
@@ -471,7 +474,12 @@ def _greedy_verify_chain_tpu(
         next_token_logits, candidates, retrieve_index
     )
     if simulate_mode == SIM_OFF:
-        return predicts, accept_len, accept_index
+        return (
+            predicts,
+            accept_len,
+            accept_index,
+            *_chain_commit_outputs(predicts, accept_len, seq_lens, w),
+        )
     k = sim_accept_len.to(torch.int32)
     cols = torch.arange(w, device=draft_token.device, dtype=torch.int32)[None, :]
     first = retrieve_index[:, :1].to(torch.int32)
@@ -486,7 +494,34 @@ def _greedy_verify_chain_tpu(
         grid = torch.where(cols < k - 1, drafts.to(grid.dtype), grid)
         grid = torch.where(cols == k - 1, target.to(grid.dtype), grid)
         predicts = grid.reshape(-1).clone()
-    return predicts, accept_len, accept_index
+    return (
+        predicts,
+        accept_len,
+        accept_index,
+        *_chain_commit_outputs(predicts, accept_len, seq_lens, w),
+    )
+
+
+def _chain_commit_outputs(predicts, accept_len, seq_lens, w):
+    """Post-verify values of a top-1 chain, traced inside the verify op.
+
+    (new_seq_lens, bonus_tokens int64, last_step int32 [the state-commit step
+    and the draft extend's correct-draft count], select_index int64 [each
+    request's last accepted row], predicts int64 [draft extend input ids]).
+    A chain accepts a prefix, so row i * W + accept_len - 1 holds the bonus.
+    """
+    bs = accept_len.shape[0]
+    last_step = (accept_len - 1).to(torch.int32)
+    rows = torch.arange(bs, device=predicts.device, dtype=torch.int64) * w
+    select_index = rows + last_step.to(torch.int64)
+    predicts64 = predicts.to(torch.int64)
+    return (
+        seq_lens + accept_len.to(seq_lens.dtype),
+        predicts64[select_index],
+        last_step,
+        select_index,
+        predicts64,
+    )
 
 
 @compiled_op(warmup=_make_verify_tree_greedy_args)
@@ -1010,10 +1045,14 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    with_commit_outputs: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
+
+    with_commit_outputs appends a fourth value: the TPU top-1 chain's commit
+    outputs (see _chain_commit_outputs), or None when another path sampled.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -1034,6 +1073,8 @@ def eagle_sample(
         predict = torch.empty(0, dtype=torch.int32, device=device)
         num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
         accept_index = torch.empty(0, dtype=torch.int32, device=device)
+        if with_commit_outputs:
+            return predict, num_correct_drafts, accept_index, None
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
@@ -1083,9 +1124,16 @@ def eagle_sample(
             use_rejection_sampling=use_rejection_sampling,
         )
     ):
-        return _eagle_sample_greedy_chain_tpu(
-            verify_input, next_token_logits, device, simulate=SIMULATE_ACC_LEN > 0
+        predict, accept_lens, accept_index, *commit = _eagle_sample_greedy_chain_tpu(
+            verify_input,
+            next_token_logits,
+            batch.seq_lens,
+            device,
+            simulate=SIMULATE_ACC_LEN > 0,
         )
+        if with_commit_outputs:
+            return predict, accept_lens, accept_index, tuple(commit)
+        return predict, accept_lens, accept_index
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -1346,13 +1394,18 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
+    if with_commit_outputs:
+        return predict, num_correct_drafts + 1, accept_index, None
     return predict, num_correct_drafts + 1, accept_index
 
 
 def _eagle_sample_greedy_chain_tpu(
-    verify_input, next_token_logits, device, *, simulate
+    verify_input, next_token_logits, seq_lens, device, *, simulate
 ):
-    """TPU greedy verify of a top-1 chain (and simulated acceptance) in one op."""
+    """TPU greedy verify of a top-1 chain (and simulated acceptance) in one op.
+
+    Returns the three eagle_sample outputs and the chain commit outputs.
+    """
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_METHOD,
@@ -1380,6 +1433,7 @@ def _eagle_sample_greedy_chain_tpu(
         verify_input.draft_token,
         verify_input.retrieve_index,
         sim_k,
+        seq_lens,
         mode,
     )
 
