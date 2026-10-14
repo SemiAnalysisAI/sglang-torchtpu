@@ -570,10 +570,14 @@ class Glm5NextModel(nn.Module):
             for site in ("attn", "ffn"):
                 base = getattr(layer, f"hc_{site}_base").detach().float()
                 scale = getattr(layer, f"hc_{site}_scale").detach().float()
-                vec = torch.zeros(1, VEC_WIDTH, dtype=torch.float32, device=base.device)
-                vec[0, : base.numel()] = base
-                vec[0, base.numel() : base.numel() + 3] = scale
-                layer.register_buffer(f"hc_{site}_vec", vec, persistent=False)
+                # Built on the host and uploaded whole: a device buffer written
+                # through slices is re-materialized each time a graph reads it,
+                # one extra program per verify for all 90 sites.
+                pad = torch.zeros(VEC_WIDTH - base.numel() - scale.numel())
+                vec = torch.cat([base.cpu(), scale.cpu(), pad]).reshape(1, VEC_WIDTH)
+                layer.register_buffer(
+                    f"hc_{site}_vec", vec.to(base.device), persistent=False
+                )
             # The kernel applies each sublayer's input RMSNorm; f32 weights once.
             for site, norm in (
                 ("attn", layer.input_layernorm),
