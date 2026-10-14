@@ -745,6 +745,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    cp_last_rows: Optional[torch.Tensor] = None
+    cp_last_owner_mask: Optional[torch.Tensor] = None
+    gather_reorder_index: Optional[torch.Tensor] = None
+    direct_reorder_index: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

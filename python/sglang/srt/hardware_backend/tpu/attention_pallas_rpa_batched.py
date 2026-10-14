@@ -146,9 +146,13 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
         from sglang.srt.runtime_context import get_parallel
 
+        from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+            PcpBatchedMetadata,
+        )
+
         self._pp_schedule_runner = model_runner if get_parallel().pp_size > 1 else None
         self._cp_op = None
-        self.pcp_forward_metadata = None
+        self.pcp_forward_metadata = PcpBatchedMetadata.create_empty(self.device)
         self._cp_reqs: set[int] = set()
         if get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1:
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
@@ -221,9 +225,14 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 except Exception:
                     pass
         else:
-            self.pcp_forward_metadata = None
+            from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                PcpBatchedMetadata,
+            )
+
+            empty_pcp_meta = PcpBatchedMetadata.create_empty(self.device)
+            self.pcp_forward_metadata = empty_pcp_meta
             if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
-                self.forward_metadata.pcp_metadata = None
+                self.forward_metadata.pcp_metadata = empty_pcp_meta
             forward_mode = getattr(forward_batch, "forward_mode", None)
             if forward_mode is not None and forward_mode.is_extend():
                 req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
@@ -247,7 +256,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         from sglang.srt.runtime_context import get_parallel
 
         pcp_meta = self.pcp_forward_metadata or getattr(self.forward_metadata, "pcp_metadata", None)
-        if get_parallel().attn_cp_size > 1 and pcp_meta is not None:
+        if (
+            get_parallel().attn_cp_size > 1
+            and pcp_meta is not None
+            and getattr(pcp_meta, "is_active", False)
+        ):
             return self._forward_cp_extend(q, k, v, layer, forward_batch, pcp_meta=pcp_meta, **kwargs)
         return super().forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs

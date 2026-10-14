@@ -1162,6 +1162,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    alias_kv_cache: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -1198,11 +1199,18 @@ def rpa_kernel(
         logits from `wrapper.prepare_attention_sink`.
       lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
       cfgs: Configuration of the kernel.
+      alias_kv_cache: When True (default) the kv cache is returned as an output
+        aliased to the input, so an in-place update is visible to the caller.
+        A read-only call (the PCP cache phase, which never writes new KV) passes
+        False: the kernel then has no kv output and no alias, so a non-donating
+        caller (an exported SPMD program) does not force XLA to copy the whole
+        pool into a fresh output buffer.
 
     Returns:
       out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
       new_kv_cache: [num_pages, page_size, num_kv_heads // kv_packing, kv_packing,
-        head_dim]. Result of new kv cache.
+        head_dim]. Result of new kv cache (the unchanged input when
+        ``alias_kv_cache`` is False).
       lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
     """
     return_lse = cfgs.serve.return_lse
@@ -1225,13 +1233,8 @@ def rpa_kernel(
         lse_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
-        o_kv_cache_hbm_ref: jax.Ref,
-        o_lse_hbm_ref: jax.Ref | None = None,
+        *o_trailing_refs: jax.Ref,
     ):
-
-        del o_kv_cache_hbm_ref
-        if o_lse_hbm_ref is not None:
-            del o_lse_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
             kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
@@ -1443,9 +1446,30 @@ def rpa_kernel(
         input_output_aliases[num_active_scalers + schedule_leaves + 3 + sink_leaves] = (
             2  # lse_hbm -> out[2]
         )
+    out_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
+        pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
+        pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+    ]
+    kernel_body = ragged_paged_attention_pipeline
 
-    return pl.pallas_call(
-        ragged_paged_attention_pipeline,
+    if not alias_kv_cache:
+        # Read-only kv cache: drop the kv output and its alias. The pipeline
+        # keeps its signature; the output ref it never used is passed as None.
+        out_shape = [q_hbm, lse_hbm if return_lse else None]
+        out_specs = [
+            pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
+            pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
+        ]
+        input_output_aliases = {num_active_scalers + schedule_leaves: 0}
+        if return_lse:
+            input_output_aliases[
+                num_active_scalers + schedule_leaves + 3 + sink_leaves
+            ] = 1  # lse_hbm -> out[1]
+
+
+    result = pl.pallas_call(
+        kernel_body,
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
@@ -1461,11 +1485,7 @@ def rpa_kernel(
                 ),  # sink_ref
                 pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
             ],
-            out_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
-                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
-                pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,
-            ],
+            out_specs=out_specs,
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=min(
@@ -1495,3 +1515,12 @@ def rpa_kernel(
         attention_sink,
         lse_hbm if return_lse else None,
     )
+    if alias_kv_cache:
+        return result
+    # Re-insert the (unchanged) kv cache so callers see one result layout.
+    if return_lse:
+        o_out, lse_out = result
+    else:
+        o_out = result
+        lse_out = None
+    return o_out, kv_cache_hbm, lse_out

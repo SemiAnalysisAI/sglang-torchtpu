@@ -15,7 +15,7 @@ Supports:
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -260,11 +260,29 @@ def cp_all_gather_padded(
 def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tensor:
     """All-gather a rank-local 2-D row block into global zigzag token order.
 
-    Same semantics as `ZigzagCPStrategy.gather_kv_cache`, but the collective is
-    the exported XLA all-gather (see `build_cp_all_gather_op`).
+    Every rank holds the same number of (padded) local rows, so the gather is
+    one in-graph ``all_gather_into_tensor`` over the attention-CP group
+    (rank-major result, ``[cp * rows, cols]``) followed by one row gather with
+    the host-built ``gather_reorder_index``. ``SGLANG_PCP_GATHER_IMPL=ppermute``
+    keeps the older exported ``cp_size - 1`` collective-permute program (slot
+    order + ``direct_reorder_index``) for A/B comparison.
     """
-    meta = forward_batch.attn_cp_metadata
-    direct_idx = getattr(meta, "direct_reorder_index", None)
+    gather_idx = getattr(forward_batch, "gather_reorder_index", None)
+    if gather_idx is None and getattr(forward_batch, "attn_cp_metadata", None) is not None:
+        gather_idx = getattr(forward_batch.attn_cp_metadata, "gather_reorder_index", None)
+    if gather_idx is not None and _PCP_GATHER_IMPL != "ppermute":
+        cp_size = get_parallel().attn_cp_size
+        group = group or get_parallel().attn_cp_group
+        x = x.contiguous()
+        out = x.new_empty((cp_size * x.shape[0], x.shape[1]))
+        group.all_gather_into_tensor(out, x)
+        if gather_idx.device != out.device:
+            gather_idx = gather_idx.to(out.device)
+        return out.index_select(0, gather_idx)
+
+    direct_idx = getattr(forward_batch, "direct_reorder_index", None)
+    if direct_idx is None and getattr(forward_batch, "attn_cp_metadata", None) is not None:
+        direct_idx = getattr(forward_batch.attn_cp_metadata, "direct_reorder_index", None)
     if direct_idx is not None:
         cp_size = get_parallel().attn_cp_size
         op = _GLOBAL_AG_OP
@@ -291,6 +309,32 @@ def cp_all_gather_rows(x: torch.Tensor, forward_batch, group=None) -> torch.Tens
         return gathered.index_select(0, reorder_index)
     parts = torch.split(gathered, meta.reverse_split_len, dim=0)
     return torch.cat([parts[i] for i in meta.cp_reverse_index], dim=0)
+
+
+def cp_last_token_rows(
+    hidden_states: torch.Tensor,
+    *,
+    last_rows: torch.Tensor,
+    last_owner_mask: torch.Tensor,
+    group: Any = None,
+) -> torch.Tensor:
+    """[pad_b, H] last-token hidden states, identical on every rank.
+
+    Each rank contributes the rows it owns (the owner of each request's last
+    non-empty block) and zeros elsewhere; a sum all-reduce over the group
+    broadcasts them.
+    """
+    if group is None:
+        group = get_parallel().attn_cp_group
+    if last_rows.device != hidden_states.device:
+        last_rows = last_rows.to(hidden_states.device)
+    if last_owner_mask.device != hidden_states.device:
+        last_owner_mask = last_owner_mask.to(hidden_states.device)
+    rows = hidden_states.index_select(0, last_rows)
+    zero = torch.zeros((), dtype=rows.dtype, device=rows.device)
+    rows = torch.where(last_owner_mask.to(torch.bool)[:, None], rows, zero)
+    res = group.all_reduce(rows)
+    return res if res is not None else rows
 
 
 def _pcp_debug_dump(
@@ -356,6 +400,26 @@ class PcpBatchedMetadata:
     num_reqs: int
     pcp_cache_lens: torch.Tensor
     c_per_req: int = 1
+    is_active: bool = True
+
+    @classmethod
+    def create_empty(cls, device=None) -> "PcpBatchedMetadata":
+        if device is None:
+            device = torch.device("cpu")
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        return cls(
+            pcp_cu_q_lens=empty_i32,
+            q_positions=empty_i32,
+            new_kv_page_indices=None,
+            update_kv_cache=empty_i32,
+            kv_new_lens=empty_i32,
+            striped_page_indices=empty_i32,
+            cache_pages=0,
+            num_reqs=0,
+            pcp_cache_lens=empty_i32,
+            c_per_req=1,
+            is_active=False,
+        )
 
 
 _RING_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_batched_pcp_ring"
@@ -436,6 +500,10 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
             update_kv_cache=update_kv_cache,
             return_lse=True,
             kv_layout=kv_layout(),
+            # The cache phase only reads the pool. Without this the kernel's
+            # kv in/out alias makes the (non-donating) exported program copy
+            # the whole layer pool into a fresh output buffer on every call.
+            alias_kv_cache=False,
         )
         return out, lse
 

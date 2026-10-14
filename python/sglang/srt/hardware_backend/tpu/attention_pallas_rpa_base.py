@@ -110,6 +110,19 @@ class PallasForwardMetadata:
     # Prefill Context Parallelism (PCP) metadata when CP is active
     pcp_metadata: Any | None = None
 
+    def __post_init__(self):
+        if self.pcp_metadata is None:
+            from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                PcpBatchedMetadata,
+            )
+
+            device = (
+                self.kv_lens.device
+                if hasattr(self, "kv_lens") and self.kv_lens is not None
+                else torch.device("cpu")
+            )
+            self.pcp_metadata = PcpBatchedMetadata.create_empty(device)
+
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
     """Return an owned scalar whose compiled input layout is batch-independent."""

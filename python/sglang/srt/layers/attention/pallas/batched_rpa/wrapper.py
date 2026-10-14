@@ -706,6 +706,7 @@ def calculate_block_sizes(
         "return_lse",
         "pcp_ring_axis_name",
         "pcp_ring_mesh_axis_names",
+        "alias_kv_cache",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -754,6 +755,7 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
+    alias_kv_cache: bool = True,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -823,6 +825,9 @@ def ragged_paged_attention(
       pcp_ring_axis_name: not implemented yet; see `kernel.RingAttentionHooks`.
       pcp_ring_mesh_axis_names: not implemented yet.
       return_lse: If True, return log-sum-exp (lse) values along with the output.
+      alias_kv_cache: If False, the kernel does not alias/return the kv cache
+        (read-only call, e.g. the PCP cache phase); the returned kv_cache is the
+        unchanged input. See ``kernel.rpa_kernel``.
         Defaults to False.
 
     Returns:
@@ -1080,6 +1085,7 @@ def ragged_paged_attention(
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            alias_kv_cache=alias_kv_cache,
         )
         if return_lse:
             o_out, kv_out, lse_out = result

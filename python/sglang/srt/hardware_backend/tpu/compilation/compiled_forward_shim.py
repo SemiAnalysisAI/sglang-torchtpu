@@ -28,6 +28,7 @@ from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -91,6 +92,8 @@ _BS_FIELDS = (
     "extend_prefix_lens",
     "extend_start_loc",
     "encoder_lens",
+    "cp_last_rows",
+    "cp_last_owner_mask",
 )
 
 # Python-list batch metadata can become Dynamo guards; pad to bucket length.
@@ -554,6 +557,19 @@ def _pad_forward_batch_inputs(
         )
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
+    elif is_cp_active(forward_batch):
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU extend batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Set --prefill-max-requests to at least the largest extend batch."
+            )
+        if forward_batch.attn_cp_metadata is None:
+            prepare_cp_forward(forward_batch)
+        meta = forward_batch.attn_cp_metadata
+        local_q = max(meta.per_rank_actual_token)
+        pad_t = t_bucketer.next_bucket(max(local_q, pad_b))
+        real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
@@ -565,6 +581,57 @@ def _pad_forward_batch_inputs(
             )
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
+
+    if is_cp_active(forward_batch):
+        meta = forward_batch.attn_cp_metadata
+        forward_batch.cp_last_rows = getattr(meta, "cp_last_rows", None)
+        forward_batch.cp_last_owner_mask = getattr(meta, "cp_last_owner_mask", None)
+        if forward_batch.cp_last_rows is not None and forward_batch.cp_last_rows.shape[0] < pad_b:
+            forward_batch.cp_last_rows = _zero_pad_dim0(forward_batch.cp_last_rows, pad_b)
+        if forward_batch.cp_last_owner_mask is not None and forward_batch.cp_last_owner_mask.shape[0] < pad_b:
+            forward_batch.cp_last_owner_mask = _zero_pad_dim0(forward_batch.cp_last_owner_mask, pad_b)
+        forward_batch.gather_reorder_index = getattr(meta, "gather_reorder_index", None)
+        if forward_batch.gather_reorder_index is not None:
+            from sglang.srt.runtime_context import get_parallel
+
+            cp_size = get_parallel().attn_cp_size
+            target_gather_len = pad_t * cp_size
+            curr_len = forward_batch.gather_reorder_index.shape[0]
+            if curr_len < target_gather_len:
+                forward_batch.gather_reorder_index = F.pad(
+                    forward_batch.gather_reorder_index,
+                    (0, target_gather_len - curr_len),
+                    value=0,
+                )
+            elif curr_len > target_gather_len:
+                forward_batch.gather_reorder_index = forward_batch.gather_reorder_index[
+                    :target_gather_len
+                ]
+        forward_batch.direct_reorder_index = getattr(meta, "direct_reorder_index", None)
+        local_rows = getattr(meta, "local_rows", None)
+        if local_rows is not None:
+            if local_rows.shape[0] < pad_t:
+                local_rows = F.pad(local_rows, (0, pad_t - local_rows.shape[0]), value=0)
+            elif local_rows.shape[0] > pad_t:
+                local_rows = local_rows[:pad_t]
+            meta.local_rows = local_rows
+
+            device = forward_batch.input_ids.device
+            if local_rows.device != device:
+                local_rows = local_rows.to(device)
+
+            forward_batch.input_ids = forward_batch.input_ids.index_select(0, local_rows)
+            forward_batch.positions = forward_batch.positions.index_select(0, local_rows)
+            if getattr(forward_batch, "out_cache_loc", None) is not None and isinstance(forward_batch.out_cache_loc, torch.Tensor):
+                loc_len = forward_batch.out_cache_loc.shape[0]
+                if loc_len > 0:
+                    clamped_rows = torch.clamp(local_rows, 0, loc_len - 1)
+                    forward_batch.out_cache_loc = forward_batch.out_cache_loc.index_select(0, clamped_rows)
+            if getattr(forward_batch, "input_embeds", None) is not None and isinstance(forward_batch.input_embeds, torch.Tensor):
+                emb_len = forward_batch.input_embeds.shape[0]
+                if emb_len > 0:
+                    clamped_rows = torch.clamp(local_rows, 0, emb_len - 1)
+                    forward_batch.input_embeds = forward_batch.input_embeds.index_select(0, clamped_rows)
 
     # Opt-in host padding applies only to prefill with arbitrary token counts.
     # Decode and target verify have a small, fixed set of token counts. The
@@ -641,10 +708,7 @@ def _pad_forward_batch_inputs(
 
     forward_batch.batch_size = pad_b
 
-    from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
-
-    if is_cp_active(forward_batch):
-        forward_batch.attn_cp_metadata = None
+    if is_cp_active(forward_batch) and forward_batch.attn_cp_metadata is None:
         prepare_cp_forward(forward_batch)
 
     return real_q_out, real_b_out

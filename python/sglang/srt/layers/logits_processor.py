@@ -286,6 +286,10 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Context Parallelism
+    cp_last_rows: Optional[torch.Tensor] = None
+    cp_last_owner_mask: Optional[torch.Tensor] = None
+
     def __post_init__(self) -> None:
         has_global_top_k_logits = self.next_token_global_top_k_logits is not None
         has_global_top_k_token_ids = self.next_token_global_top_k_token_ids is not None
@@ -623,6 +627,18 @@ class LogitsProcessor(nn.Module):
         distributed_top_k = None
         token_indices_to_pool = None
         if isinstance(logits_metadata, ForwardBatch):
+            last_rows = getattr(logits_metadata, "cp_last_rows", None)
+            if last_rows is not None and _is_tpu:
+                from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                    cp_last_token_rows,
+                )
+
+                hidden_states = cp_last_token_rows(
+                    hidden_states,
+                    last_rows=last_rows,
+                    last_owner_mask=getattr(logits_metadata, "cp_last_owner_mask", None),
+                    group=get_parallel().attn_cp_group,
+                )
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_output_mode = logits_metadata.logits_output_mode
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
@@ -638,6 +654,10 @@ class LogitsProcessor(nn.Module):
                 logits_metadata,
                 compute_input_logprobs=self.compute_input_logprobs,
             )
+            if last_rows is not None and _is_tpu:
+                logits_metadata.extend_seq_lens = torch.ones_like(
+                    last_rows, dtype=torch.int32
+                )
 
         # Autotune dummy run discards this output. `is False` not `not`: None
         # means no autotune pass, which must not skip. Placed before the MIS /

@@ -53,14 +53,27 @@ def pad_logical_token_to_physical(metadata: Any) -> None:
             for k in range(n):
                 gathered_to_rk.append((r, k))
         direct_perm = []
+        gather_perm = []
         for p in metadata.perm:
             r, k = gathered_to_rk[p]
             slot = (cp_rank - r) % cp_size
             direct_perm.append(slot * stride + k)
+            gather_perm.append(r * stride + k)
         device = metadata.reorder_index_tensor.device
         metadata.direct_reorder_index = torch.tensor(
             direct_perm, device=device, dtype=torch.int32
         )
+        metadata.gather_reorder_index = torch.tensor(
+            gather_perm, device=device, dtype=torch.int32
+        )
+
+        if hasattr(metadata, "local_rows") and metadata.local_rows is not None:
+            cur_rows = metadata.local_rows
+            if cur_rows.shape[0] < stride:
+                pad_size = stride - cur_rows.shape[0]
+                metadata.local_rows = torch.nn.functional.pad(
+                    cur_rows, (0, pad_size), value=0
+                )
 
 
 def pad_local_rows(x: torch.Tensor, metadata: Any, dim: int) -> torch.Tensor:

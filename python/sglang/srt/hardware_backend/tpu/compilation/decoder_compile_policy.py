@@ -666,8 +666,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             previous_pcp_metadata = getattr(backend, "pcp_forward_metadata", None)
             # Attention reads metadata through the backend during tracing.
             backend.forward_metadata = attention_metadata
-            if hasattr(attention_metadata, "pcp_metadata"):
+            if getattr(attention_metadata, "pcp_metadata", None) is not None:
                 backend.pcp_forward_metadata = attention_metadata.pcp_metadata
+            elif hasattr(backend, "device"):
+                from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                    PcpBatchedMetadata,
+                )
+
+                backend.pcp_forward_metadata = PcpBatchedMetadata.create_empty(backend.device)
             try:
                 with use_attention_rank_tensors(attention_rank_tensors):
                     return fn(input_ids, positions, forward_batch, *args, **kwargs)
@@ -1206,6 +1212,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self._set_cp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
         forward_batch.logits_output_mode = logits_output_mode
+        if "forward_batch" in kwargs:
+            kwargs["forward_batch"] = forward_batch
+        args = (forward_batch.input_ids, forward_batch.positions, forward_batch, *args[3:])
 
         forward_attn_backend = attn_backend or self.model_runner.attn_backend
         forward_attn_backend.init_forward_metadata(forward_batch)
@@ -1301,12 +1310,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if strategy is None:
             return
 
-        min_tokens = getattr(strategy, "cp_size", 1) * 2
+        cp_size = getattr(strategy, "cp_size", 1)
+        min_tokens = cp_size * 2
         if num_tokens < min_tokens:
             return
 
         device = self.model_runner.device
-        lens = [num_tokens] + [0] * (bs - 1)
+        global_tokens = num_tokens * cp_size
+
+        # Distribute tokens across bs requests so that per-request length does not
+        # exceed the per-request page table capacity (context_len) for large buckets.
+        base = global_tokens // bs
+        rem = global_tokens % bs
+        lens = [base + (1 if i < rem else 0) for i in range(bs)]
+        start_loc = [0]
+        for l in lens[:-1]:
+            start_loc.append(start_loc[-1] + l)
+
         forward_batch.extend_seq_lens_cpu = list(lens)
         forward_batch.seq_lens_cpu = torch.tensor(lens, dtype=torch.int64)
         forward_batch.extend_seq_lens = torch.tensor(
@@ -1316,9 +1336,40 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             lens, dtype=torch.int64, device=device
         )
         forward_batch.orig_seq_lens = forward_batch.seq_lens
+        forward_batch.extend_prefix_lens_cpu = [0] * bs
+        forward_batch.extend_prefix_lens = torch.zeros(
+            (bs,), dtype=torch.int32, device=device
+        )
+        forward_batch.extend_start_loc = torch.tensor(
+            start_loc, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_num_tokens = global_tokens
+        forward_batch.seq_lens_sum = global_tokens
+
+        if forward_batch.input_ids.shape[0] < global_tokens:
+            forward_batch.input_ids = torch.zeros(
+                global_tokens, dtype=forward_batch.input_ids.dtype, device=device
+            )
+            forward_batch.positions = torch.zeros(
+                global_tokens, dtype=forward_batch.positions.dtype, device=device
+            )
+        if (
+            getattr(forward_batch, "out_cache_loc", None) is not None
+            and forward_batch.out_cache_loc.shape[0] < global_tokens
+        ):
+            forward_batch.out_cache_loc = torch.zeros(
+                global_tokens,
+                dtype=forward_batch.out_cache_loc.dtype,
+                device=device,
+            )
 
         forward_batch.attn_cp_metadata = None
         prepare_cp_forward(forward_batch)
+        if forward_batch.attn_cp_metadata is not None:
+            forward_batch.cp_last_rows = getattr(forward_batch.attn_cp_metadata, "cp_last_rows", None)
+            forward_batch.cp_last_owner_mask = getattr(forward_batch.attn_cp_metadata, "cp_last_owner_mask", None)
+            forward_batch.gather_reorder_index = getattr(forward_batch.attn_cp_metadata, "gather_reorder_index", None)
+            forward_batch.direct_reorder_index = getattr(forward_batch.attn_cp_metadata, "direct_reorder_index", None)
 
     def _dummy_kv_slot(self) -> int:
         """KV-pool slot for dummy ``req_pool_indices``/``out_cache_loc``."""

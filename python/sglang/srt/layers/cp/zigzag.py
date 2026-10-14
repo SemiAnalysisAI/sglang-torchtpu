@@ -66,6 +66,10 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     reorder_index_tensor: Optional[Any] = None
     perm: Optional[List[int]] = None
     direct_reorder_index: Optional[Any] = None
+    gather_reorder_index: Optional[Any] = None
+    local_rows: Optional[Any] = None
+    cp_last_rows: Optional[Any] = None
+    cp_last_owner_mask: Optional[Any] = None
     stride: int = 0
 
     # Per-rank aggregate lists have length cp_size.
@@ -261,13 +265,57 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             for k in range(n):
                 gathered_to_rk.append((r, k))
         direct_perm = []
+        gather_perm = []
         for p in perm:
             r, k = gathered_to_rk[p]
             slot = (cp_rank - r) % self.cp_size
             direct_perm.append(slot * stride + k)
+            gather_perm.append(r * stride + k)
         direct_reorder_index = torch.tensor(
             direct_perm, device=device, dtype=torch.int32
         )
+        gather_reorder_index = torch.tensor(
+            gather_perm, device=device, dtype=torch.int32
+        )
+
+        chunk_offsets = [0]
+        for l in split_list:
+            chunk_offsets.append(chunk_offsets[-1] + l)
+
+        local_indices = []
+        for idx in zigzag_index:
+            local_indices.extend(
+                range(chunk_offsets[idx], chunk_offsets[idx] + split_list[idx])
+            )
+
+        local_indices_padded = list(local_indices)
+        if len(local_indices_padded) < stride:
+            local_indices_padded.extend([0] * (stride - len(local_indices_padded)))
+        local_rows = torch.tensor(
+            local_indices_padded, device=device, dtype=torch.int32
+        )
+
+        local_indices_map = {tok_id: loc_idx for loc_idx, tok_id in enumerate(local_indices)}
+        last_rows_list = []
+        last_owner_mask_list = []
+        cum_len = 0
+        for b in range(bs):
+            req_len = extend_seqs_len[b] if extend_seqs_len is not None else 0
+            if req_len > 0:
+                last_tok = cum_len + req_len - 1
+                if last_tok in local_indices_map:
+                    last_rows_list.append(local_indices_map[last_tok])
+                    last_owner_mask_list.append(True)
+                else:
+                    last_rows_list.append(0)
+                    last_owner_mask_list.append(False)
+                cum_len += req_len
+            else:
+                last_rows_list.append(0)
+                last_owner_mask_list.append(False)
+
+        cp_last_rows = torch.tensor(last_rows_list, device=device, dtype=torch.int32)
+        cp_last_owner_mask = torch.tensor(last_owner_mask_list, device=device, dtype=torch.bool)
 
         return ZigzagContextParallelMetadata(
             split_list=split_list,
@@ -277,6 +325,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             reorder_index_tensor=reorder_index_tensor,
             perm=perm,
             direct_reorder_index=direct_reorder_index,
+            gather_reorder_index=gather_reorder_index,
+            local_rows=local_rows,
+            cp_last_rows=cp_last_rows,
+            cp_last_owner_mask=cp_last_owner_mask,
             stride=stride,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
@@ -353,21 +405,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         meta = forward_batch.attn_cp_metadata
-        direct_idx = getattr(meta, "direct_reorder_index", None)
-        if x.device.type == "tpu" and direct_idx is not None:
+        if x.device.type == "tpu" and (
+            getattr(meta, "gather_reorder_index", None) is not None
+            or getattr(meta, "direct_reorder_index", None) is not None
+        ):
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
-                _GLOBAL_AG_OP,
-                build_cp_all_gather_op,
+                cp_all_gather_rows,
             )
             minor = tuple(x.shape[1:])
             x2 = x.reshape(x.shape[0], -1).contiguous()
-            op = _GLOBAL_AG_OP
-            if op is None:
-                op = build_cp_all_gather_op(self.cp_size, get_parallel().attn_tp_size)
-            out = op(x2)
-            if direct_idx.device != out.device:
-                direct_idx = direct_idx.to(out.device)
-            return out.reshape(-1, x2.shape[1]).index_select(0, direct_idx).reshape(-1, *minor)
+            out = cp_all_gather_rows(x2, forward_batch)
+            return out.reshape(-1, *minor)
 
         gathered = self._all_gather_reorganized(x, forward_batch)
         reorder_index = getattr(meta, "reorder_index_tensor", None)
@@ -386,21 +434,17 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         meta = forward_batch.attn_cp_metadata
-        direct_idx = getattr(meta, "direct_reorder_index", None)
-        if x.device.type == "tpu" and direct_idx is not None:
+        if x.device.type == "tpu" and (
+            getattr(meta, "gather_reorder_index", None) is not None
+            or getattr(meta, "direct_reorder_index", None) is not None
+        ):
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
-                _GLOBAL_AG_OP,
-                build_cp_all_gather_op,
+                cp_all_gather_rows,
             )
             minor = tuple(x.shape[1:])
             x2 = x.reshape(x.shape[0], -1).contiguous()
-            op = _GLOBAL_AG_OP
-            if op is None:
-                op = build_cp_all_gather_op(self.cp_size, get_parallel().attn_tp_size)
-            out = op(x2)
-            if direct_idx.device != out.device:
-                direct_idx = direct_idx.to(out.device)
-            return out.reshape(-1, x2.shape[1]).index_select(0, direct_idx).reshape(-1, *minor)
+            out = cp_all_gather_rows(x2, forward_batch)
+            return out.reshape(-1, *minor)
 
         gathered = self._all_gather_reorganized(x, forward_batch)
         reorder_index = getattr(meta, "reorder_index_tensor", None)
