@@ -300,8 +300,9 @@ class SamplingBatchInfo:
         pass
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: SamplingBatchInfo):
-        pass
+    def adjusted_merge_batch(self, other: SamplingBatchInfo) -> bool:
+        """Return whether a platform hook handled basic sampling tensor merging."""
+        return False
 
     # placeholder for override
     def adjusted_filter_batch(
@@ -568,17 +569,18 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+        if not self.adjusted_merge_batch(other):
+            for item in [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+            ]:
+                self_val = getattr(self, item, None)
+                other_val = getattr(other, item, None)
+                if self_val is not None and other_val is not None:
+                    setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
@@ -588,8 +590,6 @@ class SamplingBatchInfo:
         if self.uniform_top_k != other.uniform_top_k:
             self.uniform_top_k = None
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
-
-        self.adjusted_merge_batch(other)
 
     def _merge_processor_entries(
         self, other: SamplingBatchInfo

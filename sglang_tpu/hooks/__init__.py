@@ -15,6 +15,12 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
+from sglang_tpu.hooks.sampling_batch_info import (
+    copy_basic_sampling_params,
+    filter_basic_sampling_params,
+    initialize_basic_sampling_params,
+    merge_basic_sampling_params,
+)
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
 logger = logging.getLogger(__name__)
@@ -22,6 +28,26 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_from_schedule_batch",
+        initialize_basic_sampling_params,
+        HookType.REPLACE,
+    ),
+    (
+        "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_filter_batch",
+        filter_basic_sampling_params,
+        HookType.REPLACE,
+    ),
+    (
+        "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_merge_batch",
+        merge_basic_sampling_params,
+        HookType.REPLACE,
+    ),
+    (
+        "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.copy_for_forward",
+        copy_basic_sampling_params,
+        HookType.AFTER,
+    ),
     (
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,

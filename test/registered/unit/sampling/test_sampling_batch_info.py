@@ -571,6 +571,22 @@ class TestFilterBatch(CustomTestCase):
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
+    def test_platform_hook_can_replace_basic_tensor_merge(self):
+        info1 = _make_info(batch_size=2)
+        info2 = _make_info(batch_size=1)
+        merged_temperatures = torch.tensor([[1.0], [2.0], [3.0]])
+
+        def merge_on_platform(_other):
+            info1.temperatures = merged_temperatures
+            return True
+
+        info1.adjusted_merge_batch = merge_on_platform
+        with patch("torch.cat") as cat:
+            info1.merge_batch(info2)
+
+        cat.assert_not_called()
+        self.assertIs(info1.temperatures, merged_temperatures)
+
     def test_merge_concatenates_tensors(self):
         """Test that merge concatenates temperature tensors from both batches."""
         info1 = _make_info(batch_size=2)

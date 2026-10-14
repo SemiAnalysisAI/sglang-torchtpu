@@ -325,18 +325,44 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             content = f.read()
         self.assertIn('tpu = "sglang.srt.hardware_backend.tpu:activate"', content)
 
-    def test_scheduler_initialization_hook_is_declared(self):
+    def test_tpu_hooks_are_declared(self):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
             skip_spec_op_precompile_without_draft,
         )
+        from sglang_tpu.hooks.sampling_batch_info import (
+            copy_basic_sampling_params,
+            filter_basic_sampling_params,
+            initialize_basic_sampling_params,
+            merge_basic_sampling_params,
+        )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 
         self.assertEqual(
             HOOKS,
             [
+                (
+                    "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_from_schedule_batch",
+                    initialize_basic_sampling_params,
+                    HookType.REPLACE,
+                ),
+                (
+                    "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_filter_batch",
+                    filter_basic_sampling_params,
+                    HookType.REPLACE,
+                ),
+                (
+                    "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.adjusted_merge_batch",
+                    merge_basic_sampling_params,
+                    HookType.REPLACE,
+                ),
+                (
+                    "sglang.srt.sampling.sampling_batch_info.SamplingBatchInfo.copy_for_forward",
+                    copy_basic_sampling_params,
+                    HookType.AFTER,
+                ),
                 (
                     "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
                     initialize_dense_moe_config,
