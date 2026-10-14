@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.configs.model_config import runs_dsa_densely
+from sglang.srt.configs.model_config import mtp_draft_runs_dsa_densely
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -92,12 +92,12 @@ def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> Non
         )
     if cfg.kv_canary != "none":
         raise ValueError("TPU speculative decoding does not support KV canary.")
-    # Index sharing seeds the MTP draft head's DSA top-k; DFlash's separate
-    # draft model shares nothing.
+    # Index sharing seeds the MTP draft head's DSA top-k; a dense draft head
+    # takes none, and DFlash's separate draft model shares nothing.
     if (
         cfg.speculative_algorithm in ("EAGLE", "NEXTN")
         and getattr(model_config.hf_config, "index_share_for_mtp_iteration", False)
-        and not runs_dsa_densely(model_config.hf_config)
+        and not mtp_draft_runs_dsa_densely(model_config.hf_config)
     ):
         raise ValueError("TPU speculative decoding does not support DSA index sharing.")
 

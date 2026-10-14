@@ -214,6 +214,15 @@ def runs_dsa_densely(config) -> bool:
     )
 
 
+
+def mtp_draft_runs_dsa_densely(target_config) -> bool:
+    """Whether this target's MTP draft head attends densely, so it takes no
+    shared DSA top-k. On TPU, GLM-5.3-Flash's draft config is renamed to the
+    NextN arch, which always runs dense, even while the target runs DSA."""
+    if is_tpu() and _hf_arch(target_config) in _TPU_GLM5_NEXT_ARCHS:
+        return True
+    return runs_dsa_densely(target_config)
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
