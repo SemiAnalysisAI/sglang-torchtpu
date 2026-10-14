@@ -10,6 +10,24 @@ _PALLAS_DEVICE_KIND_BY_TORCHTPU = {
 }
 
 
+def source_fingerprint(*paths) -> str:
+    """Short digest of source files, for custom_jax_kernel op names.
+
+    custom_jax_kernel keys an exported kernel by op name and shapes, and the
+    persistent TPU compile cache keys compiled graphs by the FX graph, which
+    names the op but not its JAX body. An op whose body (or a table it reads
+    at trace time) can change must carry a digest of those sources in its
+    name, or an edited kernel is silently served from a cached graph.
+    """
+    import hashlib
+    from pathlib import Path
+
+    digest = hashlib.blake2b(digest_size=6)
+    for path in sorted(Path(p).resolve() for p in paths):
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def argnums(function: Callable, *names: str) -> tuple[int, ...]:
     """Return the positions of the named parameters of ``function``.
 

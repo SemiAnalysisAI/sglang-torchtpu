@@ -84,7 +84,22 @@ def _build_pallas_mla_kernel_op():
         mla_ragged_paged_attention as _jax_mla,
     )
 
-    op_name = "sglang_tpu_pallas::mla_ragged_paged_attention"
+    from pathlib import Path
+
+    from sglang_tpu.pallas_export import source_fingerprint
+
+    # The kernel reads its block sizes from the tuned tables at trace time, so
+    # the tables are part of the body (see source_fingerprint).
+    pallas_dir = Path(__file__).resolve().parent / "attention" / "pallas"
+    fingerprint = source_fingerprint(
+        pallas_dir / "mla_ragged_paged_attention_v2.py",
+        pallas_dir / "mla_kv_utils.py",
+        pallas_dir / "tuned_block_sizes_mla.py",
+        pallas_dir / "tuned_block_sizes.py",
+        pallas_dir / "util.py",
+        __file__,
+    )
+    op_name = f"sglang_tpu_pallas::mla_ragged_paged_attention_{fingerprint}"
 
     def _wrapped(
         ql_nope: jax.Array,

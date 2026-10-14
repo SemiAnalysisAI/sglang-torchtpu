@@ -112,24 +112,18 @@ def _kda_prefill_with_fallback(
 
 
 def _kernel_source_fingerprint() -> str:
-    """Digest of the sources that define the op's JAX body.
-
-    custom_jax_kernel keys the exported kernel by op name and shapes, and the
-    persistent TPU compile cache keys compiled graphs by their FX graph, which
-    names the op but not its body. Without the digest in the name, an edited
-    kernel is silently served from a cached graph.
-    """
-    import hashlib
+    """Digest of the sources that define the op's JAX body (see
+    pallas_export.source_fingerprint)."""
     from pathlib import Path
 
+    from sglang_tpu.pallas_export import source_fingerprint
+
     root = Path(__file__).resolve().parent
-    files = sorted((root / "attention" / "pallas" / "gdn").glob("*.py"))
-    files += sorted((root / "kernels").glob("mega_kda*.py"))
-    files.append(Path(__file__).resolve())
-    digest = hashlib.blake2b(digest_size=6)
-    for path in files:
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return source_fingerprint(
+        *(root / "attention" / "pallas" / "gdn").glob("*.py"),
+        *(root / "kernels").glob("mega_kda*.py"),
+        __file__,
+    )
 
 
 def build_gdn_pallas_op():
