@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang_tpu.spec_op_warmup import (
+    make_device_accept_select_args,
     make_draft_extend_select_args,
 )
 
@@ -159,6 +160,7 @@ def prepare_device_accept_tpu(
     if draft_input is not None:
         draft_input.device_accept_candidate_locs = None
         draft_input.device_accept_selected_cache_locs = None
+        draft_input.device_accept_layouts = None
 
     accept_lens = draft_input.accept_lens_device if draft_input is not None else None
     if accept_lens is not None:
@@ -222,6 +224,49 @@ def draft_extend_positions_tpu(
     return (seq_lens.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
 
 
+class DeviceAcceptLayouts(NamedTuple):
+    """Contiguous layouts of the selected device-accept window."""
+
+    draft: torch.Tensor  # [bs * num_steps], the draft steps' write slots
+    draft_per_step: torch.Tensor  # [num_steps, bs], one row per draft step
+    verify: torch.Tensor  # [bs * width], the verify window's slots
+
+
+@compiled_op(warmup=make_device_accept_select_args)
+def select_device_accept_windows_tpu(
+    candidate_locs: torch.Tensor,  # [bs, 2 * width - 1]
+    accept_lens: torch.Tensor,  # [bs]
+    num_steps: int,
+) -> tuple[torch.Tensor, ...]:
+    """Select each row's next window and emit every layout its readers take.
+
+    Readers consumed slices, reshapes and a transpose of the window, each
+    materialized by its own launch; returning dense tensors removes them.
+    Returns (selected [bs, width], draft flat, draft per step, verify flat).
+    """
+    width = (candidate_locs.shape[1] + 1) // 2
+    offsets = torch.arange(width, device=candidate_locs.device, dtype=torch.int64)
+    cols = accept_lens.to(torch.int64)[:, None] - 1 + offsets[None, :]
+    selected = torch.gather(candidate_locs, 1, cols)
+    draft = selected[:, :num_steps]
+    return (
+        selected,
+        draft.reshape(-1).clone(),
+        draft.t().contiguous(),
+        selected.reshape(-1).clone(),
+    )
+
+
+def select_device_accept_tpu(draft_input, candidate_locs, accept_lens) -> None:
+    """Store the selected window and its layouts on the draft input."""
+    num_steps = (candidate_locs.shape[1] + 1) // 2 - 1
+    selected, draft, per_step, verify = select_device_accept_windows_tpu(
+        candidate_locs, accept_lens, num_steps
+    )
+    draft_input.device_accept_selected_cache_locs = selected
+    draft_input.device_accept_layouts = DeviceAcceptLayouts(draft, per_step, verify)
+
+
 def prepare_draft_cache_locs_tpu(
     batch: ScheduleBatch,
     draft_input: EagleDraftInput,
@@ -242,7 +287,11 @@ def prepare_draft_cache_locs_tpu(
     assert selected.shape[1] >= max(draft_width, num_verify_tokens), (
         "selected cache window must cover draft and verify tokens"
     )
-    batch.out_cache_loc = selected[:, :draft_width].reshape(-1)
+    layouts = draft_input.device_accept_layouts
+    if layouts is not None and layouts.draft.shape[0] == bs * draft_width:
+        batch.out_cache_loc = layouts.draft
+    else:
+        batch.out_cache_loc = selected[:, :draft_width].reshape(-1)
     return True
 
 
@@ -258,6 +307,9 @@ def device_accept_verify_cache_locs_tpu(
     assert selected.shape[1] >= num_verify_tokens, (
         "selected cache window must cover verify tokens"
     )
+    layouts = draft_input.device_accept_layouts
+    if layouts is not None and layouts.verify.shape[0] == bs * num_verify_tokens:
+        return layouts.verify
     return selected[:, :num_verify_tokens].reshape(-1)
 
 
@@ -270,6 +322,8 @@ def filter_device_accept_tpu(
         draft_input.device_accept_candidate_locs = (
             draft_input.device_accept_candidate_locs[new_indices]
         )
+    # Layouts are for the whole selected batch; readers re-slice after a filter.
+    draft_input.device_accept_layouts = None
     if draft_input.device_accept_selected_cache_locs is not None:
         draft_input.device_accept_selected_cache_locs = (
             draft_input.device_accept_selected_cache_locs[new_indices]
@@ -298,6 +352,7 @@ def merge_device_accept_tpu(
         draft_input.accept_lens_device = None
         draft_input.device_accept_candidate_locs = None
     draft_input.device_accept_selected_cache_locs = None
+    draft_input.device_accept_layouts = None
 
 
 def last_accepted_row_indices(
