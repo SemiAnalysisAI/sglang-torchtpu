@@ -657,6 +657,14 @@ class TpuSRTPlatform(SRTPlatform):
             disaggregation_mode=cfg.disaggregation_mode,
             max_queued_requests=cfg.max_queued_requests,
         )
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_K3_MEGAKERNEL.get():
+            from sglang_tpu.kimi_k3_megakernel.config import (
+                validate_megakernel_server_args,
+            )
+
+            validate_megakernel_server_args(server_args)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray

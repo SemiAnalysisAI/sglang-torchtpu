@@ -3661,14 +3661,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 "KDA kernel reads conv weight / dt_bias / A_log copies built at "
                 "load time. Restart the server to change weights."
             )
+            # TODO(plugin seam): attach through a platform post-load hook once
+            # core has one. The runner must exist before KV-pool sizing because
+            # it stacks the MoE experts in place and allocates decode state.
             from sglang_tpu.kimi_k3_megakernel.runner import (
-                KimiK3MegakernelRunner,
-                is_megakernel_enabled,
+                maybe_attach_decode_megakernel,
             )
 
-            if is_megakernel_enabled():
-                self._megakernel_runner = KimiK3MegakernelRunner.from_model(self)
-                self.logits_processor.use_tpu_distributed_top_k = False
+            maybe_attach_decode_megakernel(self)
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

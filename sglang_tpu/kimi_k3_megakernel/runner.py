@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from collections.abc import Callable, Sequence
 from threading import Lock
 from types import SimpleNamespace
@@ -13,6 +12,7 @@ from typing import Any
 
 import torch
 
+from .config import is_megakernel_enabled, megakernel_context, megakernel_max_rows
 from .handoff import (
     apply_row_move,
     build_padded_token_locs_and_mask,
@@ -30,6 +30,14 @@ from .weights import (
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "KimiK3MegakernelRunner",
+    "allocate_decode_states",
+    "is_megakernel_enabled",
+    "maybe_attach_decode_megakernel",
+    "register_megakernel_decode_op",
+]
+
 _STATE_DTYPES = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
@@ -37,11 +45,6 @@ _STATE_DTYPES = {
 
 _DECODE_OPS: dict[tuple[int, int, str, int, tuple[str, ...]], Callable] = {}
 _DECODE_OPS_LOCK = Lock()
-
-
-def is_megakernel_enabled() -> bool:
-    """Return True when the Kimi-K3 TPU decode megakernel is enabled."""
-    return os.environ.get("SGLANG_TPU_K3_MEGAKERNEL") == "1"
 
 
 def allocate_decode_states(
@@ -285,34 +288,33 @@ class KimiK3MegakernelRunner:
             )
         tp_rank = parallel.tp_rank
 
-        checkpoint_path = os.environ.get("SGLANG_TPU_K3_MEGAKERNEL_CHECKPOINT")
+        from sglang_tpu.envs import envs
+
+        checkpoint_path = envs.SGLANG_TPU_K3_MEGAKERNEL_CHECKPOINT.get()
         if not checkpoint_path:
             checkpoint_path = getattr(language_model.config, "_name_or_path", None)
         if not checkpoint_path:
-            try:
-                checkpoint_path = get_model().model_path
-            except Exception:
-                checkpoint_path = None
+            checkpoint_path = get_model().model_path
         if not checkpoint_path:
             raise ValueError(
                 "Could not determine checkpoint path for Kimi-K3 megakernel; "
                 "set SGLANG_TPU_K3_MEGAKERNEL_CHECKPOINT."
             )
 
-        raw_context = os.environ.get("SGLANG_TPU_K3_MEGAKERNEL_CONTEXT")
-        if raw_context is not None:
-            context = int(raw_context)
-        else:
-            model_ctx = None
-            try:
-                model_ctx = get_model().context_length
-            except Exception:
-                pass
-            context = int(model_ctx) if model_ctx else 4096
-        context = max(384, ((context + 127) // 128) * 128)
+        # validate_megakernel_server_args resolved --context-length to fit the
+        # megakernel context before the model loaded.
+        context_length = envs.SGLANG_TPU_K3_MEGAKERNEL_CONTEXT.get()
+        if context_length is None:
+            context_length = get_model().context_length
+        if not context_length:
+            raise ValueError(
+                "Kimi-K3 megakernel needs --context-length or "
+                "SGLANG_TPU_K3_MEGAKERNEL_CONTEXT to size its decode state."
+            )
+        context = megakernel_context(context_length)
 
-        max_rows = int(os.environ.get("SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS", "8"))
-        recipe = os.environ.get("SGLANG_TPU_K3_MEGAKERNEL_RECIPE", "tuned")
+        max_rows = megakernel_max_rows()
+        recipe = envs.SGLANG_TPU_K3_MEGAKERNEL_RECIPE.get()
         layers = int(language_model.config.num_hidden_layers)
         vocab_size = int(language_model.config.vocab_size)
         device = next(language_model.parameters()).device
@@ -419,11 +421,17 @@ class KimiK3MegakernelRunner:
             if req_to_token_pool is not None
             else None
         )
+        if gen_tensor is None:
+            gens = [0] * len(req_indices)
+        else:
+            # ReqToTokenPool keeps req_generation on host; reading it per step
+            # must never turn into a device-to-host sync.
+            assert gen_tensor.device.type == "cpu", (
+                f"req_generation must be host-resident, got {gen_tensor.device}"
+            )
+            gens = gen_tensor[req_indices].tolist()
         rids: list[str] = []
-        gens: list[int] = []
-        for i, pool_idx in enumerate(req_indices):
-            gen = int(gen_tensor[pool_idx].item()) if gen_tensor is not None else 0
-            gens.append(gen)
+        for i, (pool_idx, gen) in enumerate(zip(req_indices, gens)):
             if (
                 reqs is not None
                 and i < len(reqs)
@@ -501,10 +509,9 @@ class KimiK3MegakernelRunner:
         else:
             real_b = int(real_b)
 
-        if real_b <= 0 or real_b > self.max_rows:
+        if real_b <= 0:
             return
 
-        pad_b = self._resolve_pad_b(real_b)
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = forward_batch.seq_lens.cpu()
@@ -514,8 +521,29 @@ class KimiK3MegakernelRunner:
 
         req_indices = [int(x) for x in req_indices_cpu[:real_b].tolist()]
         seq_lens = [int(x) for x in seq_lens_cpu[:real_b].tolist()]
+        is_dummy = self._is_dummy_warmup_batch(forward_batch, req_indices)
 
-        if self._is_dummy_warmup_batch(forward_batch, req_indices):
+        if real_b > self.max_rows:
+            # Warmup may precompile decode buckets above the megakernel rows;
+            # those dummy batches run SGLang's decode. A real one would read
+            # KV/Mamba caches the megakernel never updated, so refuse it.
+            if is_dummy:
+                return
+            raise RuntimeError(
+                f"Kimi-K3 megakernel got a decode batch of {real_b} requests but "
+                f"holds {self.max_rows} rows; --max-running-requests must not "
+                "exceed SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS."
+            )
+        if not is_dummy and max(seq_lens) > self.context:
+            raise RuntimeError(
+                f"Kimi-K3 megakernel decode position {max(seq_lens) - 1} is past "
+                f"its {self.context}-token state; --context-length must fit "
+                "SGLANG_TPU_K3_MEGAKERNEL_CONTEXT."
+            )
+
+        pad_b = self._resolve_pad_b(real_b)
+
+        if is_dummy:
             if not self._handoff_warmed:
                 req_pool, kv_pool = self._resolve_pools(forward_batch)
                 if req_pool is not None and kv_pool is not None:
@@ -617,3 +645,19 @@ class KimiK3MegakernelRunner:
         )
         logits = mk_logits.index_select(0, self._row_to_output[b])
         return self._logits_output_cls(next_token_logits=logits)
+
+
+def maybe_attach_decode_megakernel(language_model: Any) -> None:
+    """Attach a ``KimiK3MegakernelRunner`` to a loaded Kimi-K3 language model.
+
+    No-op unless ``SGLANG_TPU_K3_MEGAKERNEL`` is set. The server-arg contract was
+    already enforced by ``validate_megakernel_server_args`` before load.
+    """
+    if not is_megakernel_enabled():
+        return
+    language_model._megakernel_runner = KimiK3MegakernelRunner.from_model(
+        language_model
+    )
+    # The megakernel all-gathers full-vocab logits, so the sampler must not run
+    # the vocab-sharded distributed top-k over them.
+    language_model.logits_processor.use_tpu_distributed_top_k = False

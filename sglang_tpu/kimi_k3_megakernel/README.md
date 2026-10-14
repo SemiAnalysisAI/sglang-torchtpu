@@ -116,23 +116,57 @@ SGLang baseline (real 2.7T weights, `2x2x4` tpu7x slice, fused `o_norm`, attenti
 | `sglang_tpu/kimi_k3_megakernel/slots.py` | Dense row table: request → megakernel row, compaction moves on release, `row_bucket()` |
 | `sglang_tpu/kimi_k3_megakernel/weights.py` | In-place 92-layer 5D MXFP4 expert stacker (`stack_sglang_moe_experts_in_place`), dense-family checkpoint loader (`load_dense_families`), exact `f32 -> E8M0` scale conversion |
 | `sglang_tpu/kimi_k3_megakernel/handoff.py` | On-device KDA + MLA prefill-to-decode state handoff (`handoff_request_to_row`) and row compaction (`apply_row_move`) |
-| `sglang_tpu/kimi_k3_megakernel/runner.py` | Custom op registration (`register_megakernel_decode_op`) and `KimiK3MegakernelRunner` managing slot lifecycle, state buffers, per-rank vocab offset, and `forward_decode` |
+| `sglang_tpu/kimi_k3_megakernel/config.py` | Launch contract (`validate_megakernel_server_args`, run from `TpuSRTPlatform.apply_server_args_defaults`), `megakernel_context`, `megakernel_max_rows` |
+| `sglang_tpu/kimi_k3_megakernel/runner.py` | Custom op registration (`register_megakernel_decode_op`), `KimiK3MegakernelRunner` (slot lifecycle, state buffers, per-rank vocab offset, `forward_decode`, oversize/over-context decode guards), and `maybe_attach_decode_megakernel` (the single call core makes after weight load) |
 | `test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_slots.py` | Slot table tests incl. a 5,000-step churn simulation |
-| `test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py` | Unit tests for 5D expert stacking, E8M0 scale roundtrip, KDA/MLA handoff, row compaction, runner lifecycle, and non-zero `tp_rank` vocabulary offset |
+| `test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py` | Unit tests for 5D expert stacking, E8M0 scale roundtrip, KDA/MLA handoff, row compaction, runner lifecycle, non-zero `tp_rank` vocabulary offset, and `return_state_updates=True` parity |
+| `test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_config.py` | Launch contract and its platform wiring, runtime decode guards, host-only generation read, env registry, compile-cache key |
 | `benchmark/tpu/kimi_k3_megakernel/` | Bridge spike, CPU dry runs, 4-host GKE JobSet harness (`run_variants_v5.sh`, `client_v5.sh`), and xprof breakdown tools |
 
-## 6. How to run the CPU checks
+## 6. Launch contract and configuration
+
+Decode state lives only in the megakernel's buffers: SGLang's paged MLA/Mamba
+pools are read once at the prefill->decode handoff and never updated again. The
+server therefore refuses, at argument resolution and before the model loads,
+anything that would read those pools after the handoff:
+
+| Requirement | Enforced as |
+|---|---|
+| `--tp-size 32 --ep-size 8` | error |
+| `--max-running-requests <= SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS` | error if larger, declared if unset |
+| Radix cache off | declared (`disable_radix_cache=True`) with a warning |
+| `--context-length` fits the megakernel context | error if larger; declared from `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` if unset; error if neither is set |
+| No speculative decoding, PP, DP / DP attention, P/D disaggregation, hierarchical cache | error |
+
+At runtime a real decode batch above the row count, or a position past the
+state context, raises instead of falling back to SGLang's decode.
+
+Environment variables (declared in `sglang_tpu/envs.py`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SGLANG_TPU_K3_MEGAKERNEL` | `false` | Run decode through the megakernel |
+| `SGLANG_TPU_K3_MEGAKERNEL_CHECKPOINT` | served model path | Where the dense families load from |
+| `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` | `--context-length` | Decode-state tokens per row (rounded up to 128, min 384) |
+| `SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS` | `8` | Decode rows (1-8); caps `--max-running-requests` |
+| `SGLANG_TPU_K3_MEGAKERNEL_RECIPE` | `tuned` | Kernel tuning recipe |
+
+The megakernel sources are part of the torch.compile cache key
+(`sglang_tpu/compile_cache.py`), so editing them invalidates cached executables.
+
+## 7. How to run the CPU checks
 
 ```bash
 # Vendored export (no TPU): one tpu_custom_call, 43 in / 5 out
 python -B benchmark/tpu/kimi_k3_megakernel/dryrun/export_flat_cpu.py 1 1152
 
-# Unit tests (slots, 5D weight stacking, handoff, runner lifecycle)
+# Unit tests (slots, 5D weight stacking, handoff, runner lifecycle, launch contract)
 PYTHONPATH=python:. pytest test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_slots.py \
-  test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py
+  test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py \
+  test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_config.py
 ```
 
-## 7. Sharp bits learned
+## 8. Sharp bits learned
 
 - **No `stablehlo.partition_id` outside `pallas_call`**: `torch_tpu`'s `InjectCustomKernel` runs
   `PartitionGlobalToLocal`, unwrapping `sdy.manual_computation` into the main TorchTPU module,

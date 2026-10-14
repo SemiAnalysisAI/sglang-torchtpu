@@ -72,6 +72,7 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "attention_pallas_rpa_v3.py",
         "distributed_topk_pallas.py",
         "kernels",
+        "kimi_k3_megakernel",
         "pallas_export.py",
         "pallas_jax_op.py",
         "quantized_matmul.py",
