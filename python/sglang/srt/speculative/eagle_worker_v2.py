@@ -1303,6 +1303,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
+        verify_input = batch.spec_info
+        if (
+            _is_tpu
+            and self.topk == 1
+            and isinstance(verify_input, EagleVerifyInput)
+            and verify_input.positions is not None
+            and verify_input.positions.shape[0]
+            == len(batch.seq_lens) * self.speculative_num_draft_tokens
+        ):
+            # The draft extend rewrites the top-1 verify window: same positions
+            # and kv lengths, so reuse them instead of recomputing.
+            draft_extend_input.positions = verify_input.positions
+            draft_extend_input.verify_kv_lens = verify_input.verify_kv_lens
         # Prepare for draft extend in a separate stream
         if self.plan_stream:
             self.plan_stream.wait_stream(

@@ -69,6 +69,7 @@ def make_greedy_verify_chain_args(
             context.physical_bs, context.num_verify_tokens
         ),
         torch.ones((1,), dtype=torch.int32, device=context.device),
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
         simulate_mode,
     )
 
