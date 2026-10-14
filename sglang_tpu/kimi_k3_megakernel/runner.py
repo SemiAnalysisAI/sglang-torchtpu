@@ -97,18 +97,14 @@ def register_megakernel_decode_op(
                     recipe=recipe,
                 )
             )
-            output_shardings = tuple(
-                NamedSharding(mesh, spec) for spec in output_specs
-            )
+            output_shardings = tuple(NamedSharding(mesh, spec) for spec in output_specs)
             jit_fn = jax.jit(
                 decode_step,
                 donate_argnums=state_operands,
                 keep_unused=True,
                 out_shardings=output_shardings,
             )
-            op_name = (
-                f"sglang_tpu_pallas::kimi_k3_megakernel_decode_b{batch_size}_l{layers}_{recipe}"
-            )
+            op_name = f"sglang_tpu_pallas::kimi_k3_megakernel_decode_b{batch_size}_l{layers}_{recipe}"
             trace_key = pallas_impl._get_kernel_invocation_key(
                 op_name,
                 [],
@@ -199,9 +195,7 @@ class KimiK3MegakernelRunner:
         if weight_names is None:
             from ._vendor.kimi.load import selected_local_shapes
 
-            expected = tuple(
-                selected_local_shapes(layers, vocab=vocab_size).keys()
-            )
+            expected = tuple(selected_local_shapes(layers, vocab=vocab_size).keys())
             if set(expected).issubset(weights.keys()):
                 weight_names = expected
             else:
@@ -350,9 +344,7 @@ class KimiK3MegakernelRunner:
 
         from ._vendor.kimi.load import selected_local_shapes
 
-        weight_names = tuple(
-            selected_local_shapes(layers, vocab=vocab_size).keys()
-        )
+        weight_names = tuple(selected_local_shapes(layers, vocab=vocab_size).keys())
         weights = {**dense_weights, **expert_weights}
         runner = cls(
             weights=weights,
@@ -403,9 +395,7 @@ class KimiK3MegakernelRunner:
             policy = getattr(shim, "policy", None)
             model_runner = getattr(policy, "model_runner", None)
             if model_runner is not None:
-                req_pool = req_pool or getattr(
-                    model_runner, "req_to_token_pool", None
-                )
+                req_pool = req_pool or getattr(model_runner, "req_to_token_pool", None)
                 kv_pool = kv_pool or getattr(model_runner, "token_to_kv_pool", None)
         return req_pool, kv_pool
 
@@ -444,10 +434,10 @@ class KimiK3MegakernelRunner:
                 rids.append(f"__pool_{pool_idx}_gen_{gen}")
         return rids, gens
 
-    def _mamba_slot_dev(self, req_to_token_pool: Any, req_pool_idx: int) -> torch.Tensor:
-        mapping = getattr(
-            req_to_token_pool, "req_index_to_mamba_index_mapping", None
-        )
+    def _mamba_slot_dev(
+        self, req_to_token_pool: Any, req_pool_idx: int
+    ) -> torch.Tensor:
+        mapping = getattr(req_to_token_pool, "req_index_to_mamba_index_mapping", None)
         if mapping is None:
             return torch.tensor([req_pool_idx], dtype=torch.long, device=self.device)
         if mapping.device.type == "cpu":
@@ -611,9 +601,7 @@ class KimiK3MegakernelRunner:
         self._mk_positions[pad_b].copy_(positions_cpu)
         self._row_to_output[pad_b].copy_(row_to_output_cpu)
 
-    def forward_decode(
-        self, input_ids: torch.Tensor, forward_batch: Any
-    ) -> Any:
+    def forward_decode(self, input_ids: torch.Tensor, forward_batch: Any) -> Any:
         """Execute one compiled megakernel decode step for padded batch ``input_ids``."""
         del forward_batch
         b = int(input_ids.shape[0])

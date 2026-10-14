@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -194,8 +194,8 @@ class TestStackSglangMoeExpertsInPlace(CustomTestCase):
                 ),
                 moe_runner_config=SimpleNamespace(activation="silu"),
                 quant_method=SimpleNamespace(
-                    process_weights_after_loading=lambda l: prepare_tpu_mxfp4_moe_weights(
-                        l, with_bias=False
+                    process_weights_after_loading=lambda l: (
+                        prepare_tpu_mxfp4_moe_weights(l, with_bias=False)
                     )
                 ),
             )
@@ -224,7 +224,9 @@ class TestHandoffAndRowMove(CustomTestCase):
     def test_handoff_populates_target_row_and_masks_past_cached_len(self):
         context = 384
         layers = 4  # 3 KDA + 1 MLA
-        states = allocate_decode_states(rows=4, context=context, layers=layers, device="cpu")
+        states = allocate_decode_states(
+            rows=4, context=context, layers=layers, device="cpu"
+        )
         req_pool, kv_pool = _make_fake_pools(
             num_reqs=4, max_ctx=context, kda_layers=3, mla_layers=1, num_tokens=64
         )
@@ -273,7 +275,9 @@ class TestHandoffAndRowMove(CustomTestCase):
             self.assertTrue(torch.equal(rec_state[1, l_idx], expected_rec))
 
         # Row 1 MLA valid positions [0, 5) populated; [5, context) zeroed; trailing 64 of key_cache zeroed
-        self.assertGreater(float(key_cache[1, 0, :, :cached_len, :192].abs().sum()), 0.0)
+        self.assertGreater(
+            float(key_cache[1, 0, :, :cached_len, :192].abs().sum()), 0.0
+        )
         self.assertEqual(float(key_cache[1, 0, :, :cached_len, 192:].abs().sum()), 0.0)
         self.assertEqual(float(key_cache[1, 0, :, cached_len:, :].abs().sum()), 0.0)
         self.assertGreater(float(value_cache[1, 0, :, :cached_len, :].abs().sum()), 0.0)
@@ -415,13 +419,178 @@ class TestKimiK3MegakernelRunner(CustomTestCase):
             device="cpu",
         )
         self.assertIsNone(runner_rank3._vocab_offset_dev._base)
-        self.assertEqual(runner_rank3._vocab_offset_dev.tolist(), [3 * (vocab_size // 32)])
-        runner_rank3.prepare_batch(batch2)
-        runner_rank3.forward_decode(
-            torch.tensor([202, 203], dtype=torch.int64), batch2
+        self.assertEqual(
+            runner_rank3._vocab_offset_dev.tolist(), [3 * (vocab_size // 32)]
         )
+        runner_rank3.prepare_batch(batch2)
+        runner_rank3.forward_decode(torch.tensor([202, 203], dtype=torch.int64), batch2)
         # Rank 3 shifts tokens by -6 (3 * (64 // 32)); row 0 has rB (202 - 6 = 196), row 1 has rC (203 - 6 = 197)
         self.assertEqual(recorded_calls[-1], (2, [196, 197], [7, 9]))
+
+
+class TestDecodeLocalStateUpdates(CustomTestCase):
+    def test_return_state_updates_matches_full_state_return_and_keeps_subslice_dus(
+        self,
+    ):
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError:
+            self.skipTest("jax not installed")
+        from unittest.mock import patch
+
+        from sglang_tpu.kimi_k3_megakernel._vendor.kimi import decode_megakernel
+
+        cpu_device = jax.devices("cpu")[0]
+        with jax.default_device(cpu_device):
+            layers = 4  # 3 KDA + 1 MLA
+            context = 384
+            vocab_shard = 16
+            hidden = 7168
+            weights = {
+                "embedding": jnp.ones((vocab_shard, hidden), dtype=jnp.bfloat16),
+                "output_res": jnp.ones((1, 2, hidden), dtype=jnp.float32),
+                "final_norm": jnp.ones((hidden,), dtype=jnp.float32),
+                "lm_head": jnp.ones((hidden, vocab_shard), dtype=jnp.bfloat16),
+            }
+
+            def fake_stack(
+                prefix,
+                embedding,
+                w,
+                states,
+                positions,
+                *,
+                batch_size,
+                return_state_updates=False,
+                **kwargs,
+            ):
+                conv, rec, key_c, val_c = states
+                row_iota = jnp.arange(batch_size, dtype=jnp.float32) + 1.0
+                conv_upd = conv[:batch_size] + row_iota[
+                    :, None, None, None, None, None
+                ].astype(jnp.bfloat16)
+                rec_upd = rec[:batch_size] + row_iota[:, None, None, None, None]
+
+                key_tiles = []
+                val_tiles = []
+                full_key = key_c
+                full_val = val_c
+                for r in range(batch_size):
+                    pos = positions[r]
+                    active = pos >= 0
+                    block_offset = (jnp.maximum(pos, 0) // 128) * 128
+                    orig_k_tile = jax.lax.dynamic_slice(
+                        key_c, (r, 0, 0, block_offset, 0), (1, 1, 3, 128, 256)
+                    )
+                    orig_v_tile = jax.lax.dynamic_slice(
+                        val_c, (r, 0, 0, block_offset, 0), (1, 1, 3, 128, 128)
+                    )
+                    k_delta = jnp.where(active, jnp.bfloat16(r + 1), jnp.bfloat16(0))
+                    v_delta = jnp.where(
+                        active, jnp.bfloat16((r + 1) * 2), jnp.bfloat16(0)
+                    )
+                    new_k_tile = orig_k_tile + k_delta
+                    new_v_tile = orig_v_tile + v_delta
+                    key_tiles.append(new_k_tile)
+                    val_tiles.append(new_v_tile)
+                    full_key = jax.lax.dynamic_update_slice(
+                        full_key, new_k_tile, (r, 0, 0, block_offset, 0)
+                    )
+                    full_val = jax.lax.dynamic_update_slice(
+                        full_val, new_v_tile, (r, 0, 0, block_offset, 0)
+                    )
+
+                blocks = jnp.zeros((batch_size, 8, hidden), dtype=jnp.bfloat16)
+                if return_state_updates:
+                    return (
+                        prefix,
+                        blocks,
+                        conv_upd,
+                        rec_upd,
+                        jnp.concatenate(key_tiles, axis=0),
+                        jnp.concatenate(val_tiles, axis=0),
+                        (),
+                    )
+                full_conv = conv.at[:batch_size].set(conv_upd)
+                full_rec = rec.at[:batch_size].set(rec_upd)
+                return (
+                    prefix,
+                    blocks,
+                    full_conv,
+                    full_rec,
+                    full_key,
+                    full_val,
+                    (),
+                )
+
+            cases = [
+                (1, 8, [5]),
+                (4, 8, [5, 135, 383, -1]),
+                (8, 8, [0, 127, 128, 255, 256, 383, 10, -1]),
+                (1, 1, [140]),
+            ]
+            with (
+                patch.object(decode_megakernel, "stack", side_effect=fake_stack),
+                patch.object(decode_megakernel.kimi, "tp_sum", side_effect=lambda x: x),
+            ):
+                for batch_size, max_rows, pos_list in cases:
+                    key = jax.random.PRNGKey(batch_size * 10 + max_rows)
+                    k1, k2, k3, k4 = jax.random.split(key, 4)
+                    states = (
+                        jax.random.normal(
+                            k1, (max_rows, 3, 3, 3, 3, 128), dtype=jnp.bfloat16
+                        ),
+                        jax.random.normal(
+                            k2, (max_rows, 3, 3, 128, 128), dtype=jnp.float32
+                        ),
+                        jax.random.normal(
+                            k3, (max_rows, 1, 3, context, 256), dtype=jnp.bfloat16
+                        ),
+                        jax.random.normal(
+                            k4, (max_rows, 1, 3, context, 128), dtype=jnp.bfloat16
+                        ),
+                    )
+                    tokens = jnp.arange(batch_size, dtype=jnp.int32)
+                    positions = jnp.array(pos_list, dtype=jnp.int32)
+
+                    logits_ref, states_ref = decode_megakernel.decode_local(
+                        weights,
+                        states,
+                        tokens,
+                        positions,
+                        batch_size=batch_size,
+                        layers=layers,
+                        rank=0,
+                        return_state_updates=False,
+                    )
+                    logits_upd, states_upd = decode_megakernel.decode_local(
+                        weights,
+                        states,
+                        tokens,
+                        positions,
+                        batch_size=batch_size,
+                        layers=layers,
+                        rank=0,
+                    )
+                    self.assertTrue(bool(jnp.array_equal(logits_ref, logits_upd)))
+                    for s_ref, s_upd in zip(states_ref, states_upd):
+                        self.assertTrue(bool(jnp.array_equal(s_ref, s_upd)))
+
+                    if batch_size == max_rows:
+                        lowered = jax.jit(
+                            lambda s, t, p: decode_megakernel.decode_local(
+                                weights,
+                                s,
+                                t,
+                                p,
+                                batch_size=batch_size,
+                                layers=layers,
+                                rank=0,
+                            )
+                        ).lower(states, tokens, positions)
+                        ir_text = str(lowered.compiler_ir())
+                        self.assertIn("stablehlo.dynamic_update_slice", ir_text)
 
 
 if __name__ == "__main__":

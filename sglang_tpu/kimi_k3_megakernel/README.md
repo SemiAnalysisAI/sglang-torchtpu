@@ -41,36 +41,39 @@ context 1,152): 249 / 392 / 515 / 865 tok/s at batch 1 / 2 / 4 / 8, i.e.
 
 ## 2. Measured TPU v7x Results (2.7T Kimi-K3 on `2x2x4`, 16 chips / 32 cores)
 
-### SGLang + Megakernel Decode (`SGLANG_TPU_K3_MEGAKERNEL=1`, `--tp-size 32 --ep-size 8`, context `9344`, 2026-10-13, job `j-3f0a1768-52bc-43ec-95e8`)
+### SGLang + Megakernel Decode (`SGLANG_TPU_K3_MEGAKERNEL=1`, `--tp-size 32 --ep-size 8`, context `9344`, 2026-10-14, job `j-994d97ca-c299-4613-946f`)
 
 | Benchmark / Check | Result | Notes |
 |---|---|---|
 | **HBM weight memory** | **76.32 GB / rank** (`18.42 GB` free after load) | Zero-copy shared 5D MXFP4 expert weights (`26.43 GiB` `w13` + `13.21 GiB` `w2`) |
-| **Decode precompile (`bs=1, 2, 4, 8`)** | **10.1s / 10.8s / 12.7s / 16.4s** | Zero graph breaks (`graph_break=0`), zero Dynamo recompiles at serving time |
+| **Decode precompile (`bs=1, 2, 4, 8`)** | **13.5s / 13.5s / 17.5s / 24.4s** | Zero graph breaks (`graph_break=0`), zero Dynamo recompiles at serving time |
 | **Validation checks (`capital`, `arith`, `explain`, `code`)** | **4/4 passed** | Coherent reasoning + exact arithmetic (`17 × 23 = 391`) |
-| **Greedy generation (`8` prompts)** | **8/8 passed** | Code, math, translation, primes, long context |
-| **GSM8K (`64` 5-shot questions)** | **100.0% accuracy** (`64/64`, `0.0%` invalid) | `121.30 tok/s` output throughput over `53.75s` |
-| **TPOT: `bs=1`, `isl=1024`, `osl=128`** | **9.47 ms** mean / **9.47 ms** median (`~105.6 tok/s`) | TTFT: `342.98 ms` |
-| **TPOT: `bs=1`, `isl=8192`, `osl=128`** | **10.44 ms** mean / **10.44 ms** median (`~95.8 tok/s`) | TTFT: `1868.79 ms` (**34.4% faster TPOT** vs 15.92 ms baseline) |
-| **TPOT: `bs=4`, `isl=1024`, `osl=128`** | **13.85 ms** mean / **13.98 ms** median (`296.0 tok/s` peak) | TTFT: `1309.16 ms` (**34.2% faster TPOT** vs 21.05 ms baseline) |
+| **Greedy generation (`8` prompts)** | **8/8 passed** (`5s` wall time) | Code, math, translation, primes, long context |
+| **GSM8K (`64` 5-shot questions)** | **100.0% accuracy** (`64/64`, `0.0%` invalid) | **`147.49 tok/s`** output throughput over `44.22s` (up from `121.30 tok/s`) |
+| **Decode: `bs=1`, `isl=1024`, `osl=128`** | **`4.27 ms` mean TPOT / `4.25 ms` median ITL (`234.2 tok/s`)** | TTFT: `344.25 ms`; `p90_itl_ms = 4.30 ms` (down from `9.47 ms` before copy fix) |
+| **Decode: `bs=1`, `isl=8192`, `osl=128`** | **`5.29 ms` mean TPOT / `4.98 ms` median ITL (`189.0 tok/s`)** | TTFT: `1876.98 ms`; `p90_itl_ms = 5.10 ms` (**3.01× faster** vs `15.92 ms` baseline) |
+| **Decode: `bs=4`, `isl=1024`, `osl=128`** | **`7.95 ms` median ITL / `7.93 ms` steady-state TPOT (`503.1 tok/s`)** | `p90_itl_ms = 8.07 ms`, `495.5 tok/s` last-gen throughput (**2.65× faster** vs `21.05 ms` baseline) |
+| **`xprof` decode step (`bs=4`, `isl=1024`)** | **`7.67 ms` total XLA op time (`8.03 ms` launch period)** | `%kimi_decoder_stack`: `7.04 ms` (`91.9%`), `copy`: `46.5 µs` (`0.6%`), state updates: `72.7 µs` (`0.9%`) |
 
-### Previous SGLang Baselines (without megakernel, 2026-10-12)
+### Comparison Against SGLang Baselines & Pre-Fix Megakernel
 
-SGLang main + the open Kimi-K3 PRs, real 2.7T weights, one 2x2x4 tpu7x slice, all three
-opt-in flags on (fused o_norm, attention-residual kernel, guard skip):
+SGLang baseline (real 2.7T weights, `2x2x4` tpu7x slice, fused `o_norm`, attention-residual kernel, guard skip enabled):
 
-| Workload | Baseline TPOT | Megakernel TPOT | Speedup |
-|---|---|---|---|
-| batch 1, 8,192-token prompt | **15.92 ms** | **10.44 ms** | **1.52x (34.4% TPOT reduction)** |
-| batch 4, 1,024-token prompts | **21.05 ms** (median) | **13.85 ms** (mean) / **13.98 ms** (median) | **1.52x (34.2% TPOT reduction)** |
-
-Flags off on the baseline stack: 16.84–16.86 ms (8k/1k batch 1), 21.8–21.9 ms (1k/1k batch 4).
+| Workload | Baseline SGLang | Megakernel (pre-copy fix, `mk_e2e5`) | Megakernel (`return_state_updates=True`, `mk_e2e6`) | Speedup vs Baseline |
+|---|---|---|---|---|
+| `bs=1`, `1,024`-token prompt (`osl=128`) | `16.84 ms` | `9.47 ms` (`105.6 tok/s`) | **`4.27 ms` TPOT / `4.25 ms` ITL (`234.2 tok/s`)** | **3.94× (`-74.6%` TPOT)** |
+| `bs=1`, `8,192`-token prompt (`osl=128`) | `15.92 ms` | `10.44 ms` (`95.8 tok/s`) | **`5.29 ms` TPOT / `4.98 ms` ITL (`189.0 tok/s`)** | **3.01× (`-66.8%` TPOT)** |
+| `bs=4`, `1,024`-token prompts (`osl=128`) | `21.05 ms` (median) | `13.98 ms` median ITL (`286.1 tok/s`) | **`7.95 ms` median ITL (`503.1 tok/s`)** | **2.65× (`-62.2%` ITL)** |
 
 ## 3. Verified Design & Architecture
 
-1. **The whole decode step exports to one TPU custom call under SGLang's JAX 0.10.2**
-   (43 inputs: the weight dict + 4 states + token + position; 5 outputs: logits + 4 states;
-   `has_communication`, `collective_id 21`, 64 MiB scoped VMEM, `disable_bounds_checks`).
+1. **The whole decode step exports to one TPU custom call + in-place tile updates under SGLang's JAX 0.10.2**
+   (`stack(..., return_state_updates=True)` takes 43 inputs with `input_output_aliases={}` and
+   returns 6 compact outputs: final hidden state `[B, 7168]`, attention-residual state `[B, 8, 7168]`,
+   updated KDA conv `[B, 69, 3, 3, 3, 128]`, updated KDA recurrent `[B, 69, 3, 128, 128]`,
+   and updated 128-token MLA K/V tiles `[B, 24, 3, 128, 256/128]`; outside `stack()`,
+   `decode_local` applies in-place `jax.lax.dynamic_update_slice` into the donated `[8, ...]`
+   state buffers so `TpuCopyInsertion::AddSpecialCaseCopies` inserts zero full-buffer HBM copies).
 2. **It registers and shape-propagates through SGLang's bridge** (`sglang_tpu/pallas_jax_op.py`
    `cpu_export_jax_op`) for `ROW_BUCKETS = (1, 2, 4, 8)` and context up to `9,344`.
 3. **Zero-copy 5D routed expert weight sharing**:
@@ -98,11 +101,11 @@ Flags off on the baseline stack: 16.84–16.86 ms (8k/1k batch 1), 21.8–21.9 m
 
 ## 4. Design Summary
 
-| Design | Decode TPOT bs1 8k / bs4 1k | Verdict |
+| Design | Decode Latency (`bs=1 1k` / `bs=1 8k` / `bs=4 1k`) | Verdict |
 |---|---|---|
-| A. Megakernel-only engine | ~5.2 / ~8.3 ms (est.) | Rejected for serving: 8k TTFT ~9–12 s, ≤8 concurrent requests, no fallback, no multimodal |
-| B. SGLang prefill + full megakernel decode **over SGLang's paged caches** | ~4.7 / ~9.0 ms (est.) | Rejected: ~10 weeks of kernel surgery verifiable only on TPU |
-| **Hybrid A+B (Implemented)** | **10.44 / 13.85 ms (measured)** | **SGLang chunked/multimodal prefill + zero-copy shared 5D experts + one-time state handoff + full-step megakernel decode** |
+| A. Megakernel-only engine | ~4.0 / ~5.0 / ~7.8 ms (standalone demo) | Rejected for serving: 8k TTFT ~9–12 s, ≤8 concurrent requests, no fallback, no multimodal |
+| B. SGLang prefill + full megakernel decode **over SGLang's paged caches** | ~4.7 / ~5.5 / ~9.0 ms (est.) | Rejected: ~10 weeks of kernel surgery verifiable only on TPU |
+| **Hybrid A+B (Implemented)** | **`4.27` / `5.29` / `7.95` ms (measured in SGLang!)** | **Matches standalone megakernel decode speed while keeping SGLang chunked/multimodal prefill + zero-copy shared 5D experts** |
 
 ## 5. Code in this branch
 
@@ -154,4 +157,15 @@ PYTHONPATH=python:. pytest test/registered/unit/hardware_backend/tpu/test_kimi_k
 - **Zero views into compiled graphs**: Views passed into a compiled graph are re-materialized
   per call on `torch_tpu`; every kernel operand must be a storage-owning base tensor
   (`t._base is None`).
-
+- **Avoiding `TpuCopyInsertion::AddSpecialCaseCopies` on communicating custom-calls (`return_state_updates=True`)**:
+  In `libtpu.so`, `OutputHasToBeConstant` returns `true` for every output of any `tpu_custom_call`
+  with `has_communication=true` (`collective_id=21`). If `stack()` aliases its `[8, ...]` state
+  inputs to its `[8, ...]` state outputs and returns them directly in `ROOT %tuple`,
+  `CollectParamCopiesForRecv` and `CollectRootCopyForRecv` insert `2 × 3.85 GiB = 7.70 GiB`
+  (`5.22 ms/step`) of full-buffer HBM copies before and after `%kimi_decoder_stack`. Returning
+  only the compact updated `[B, ...]` KDA state rows and `[B, 24, 3, 128, 256/128]` MLA cache
+  tiles from `stack(..., return_state_updates=True)` with `input_output_aliases={}` and applying
+  in-place `jax.lax.dynamic_update_slice` on the donated state buffers outside the custom-call
+  (split into two halves when `B == max_rows` so `HloAlgebraicSimplifier` does not fold
+  `dynamic_update_slice` back into `update`) keeps the live-out `HloBuffer`s owned by
+  `kDynamicUpdateSlice` and eliminates all `7.70 GiB` of full-buffer state copies.

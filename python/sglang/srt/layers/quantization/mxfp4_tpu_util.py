@@ -98,7 +98,6 @@ def _e8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
     return out.to(scale_u8.device) if scale_u8.device.type != "cpu" else out
 
 
-
 def _flatten_block_bytes(packed_blocks: torch.Tensor) -> torch.Tensor:
     """``(..., num_blocks, 16)`` uint8 → ``(..., num_blocks * 16)`` uint8.
 

@@ -3598,6 +3598,7 @@ def stack(
     include_layer_zero: bool = False,
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    return_state_updates: bool = False,
 ):
     """Fuse the decoder layers while keeping a native batch tile in VMEM.
 
@@ -3611,6 +3612,8 @@ def stack(
     """
     if not 1 <= batch_size <= 8:
         raise ValueError("The fused decoder stack supports batch sizes from 1 to 8")
+    if return_state_updates and sequence_rows != 1:
+        raise ValueError("return_state_updates requires sequence_rows == 1")
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -3706,8 +3709,7 @@ def stack(
         return jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
 
     local_weights = {
-        name: _local_weight(name, value)
-        for name, value in weights.items()
+        name: _local_weight(name, value) for name, value in weights.items()
     }
     mla_scoped_scratch = _mla_scoped_scratch(
         local_weights,
@@ -4418,28 +4420,38 @@ def stack(
                             for row_index in range(mla_cache_batch_tile_size):
                                 batch_index = batch_offset + row_index
                                 position = jnp.maximum(position_ref[batch_index], 0)
+                                key_dest = (
+                                    key_output_ref.at[batch_index, state_index]
+                                    if return_state_updates
+                                    else key_output_ref.at[
+                                        batch_index,
+                                        state_index,
+                                        :,
+                                        pl.ds(position // 128 * 128, 128),
+                                        :,
+                                    ]
+                                )
+                                value_dest = (
+                                    value_output_ref.at[batch_index, state_index]
+                                    if return_state_updates
+                                    else value_output_ref.at[
+                                        batch_index,
+                                        state_index,
+                                        :,
+                                        pl.ds(position // 128 * 128, 128),
+                                        :,
+                                    ]
+                                )
                                 cache_writes.extend(
                                     (
                                         tpu.make_async_copy(
                                             key_tile_vmem.at[row_index],
-                                            key_output_ref.at[
-                                                batch_index,
-                                                state_index,
-                                                :,
-                                                pl.ds(position // 128 * 128, 128),
-                                                :,
-                                            ],
+                                            key_dest,
                                             cache_semaphores.at[0, row_index],
                                         ),
                                         tpu.make_async_copy(
                                             value_tile_vmem.at[row_index],
-                                            value_output_ref.at[
-                                                batch_index,
-                                                state_index,
-                                                :,
-                                                pl.ds(position // 128 * 128, 128),
-                                                :,
-                                            ],
+                                            value_dest,
                                             cache_semaphores.at[1, row_index],
                                         ),
                                     )
@@ -4774,9 +4786,7 @@ def stack(
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
                     active_rows=(
-                        jnp.stack(
-                            tuple(position_ref[row] for row in range(batch_size))
-                        )
+                        jnp.stack(tuple(position_ref[row] for row in range(batch_size)))
                         >= 0
                     ),
                 )
@@ -5032,6 +5042,20 @@ def stack(
         if select_state_row
         else jnp.zeros((1,), jnp.int32)
     )
+    state_output_shapes = (
+        (
+            jax.ShapeDtypeStruct((batch_size, *states[0].shape[1:]), states[0].dtype),
+            jax.ShapeDtypeStruct((batch_size, *states[1].shape[1:]), states[1].dtype),
+            jax.ShapeDtypeStruct(
+                (batch_size, states[2].shape[1], 3, 128, 256), states[2].dtype
+            ),
+            jax.ShapeDtypeStruct(
+                (batch_size, states[3].shape[1], 3, 128, 128), states[3].dtype
+            ),
+        )
+        if return_state_updates
+        else tuple(shape(state) for state in states)
+    )
     output_shapes = (
         shape(prefix),
         (
@@ -5039,7 +5063,7 @@ def stack(
             if sequence_parallel_pre_attention
             else jax.ShapeDtypeStruct((batch_size, 8, hidden_size), jnp.bfloat16)
         ),
-        *(shape(state) for state in states),
+        *state_output_shapes,
         jax.ShapeDtypeStruct(
             (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
         ),
@@ -5117,7 +5141,11 @@ def stack(
         body,
         name="kimi_decoder_stack",
         out_shape=output_shapes,
-        input_output_aliases={state_offset + index: index + 2 for index in range(4)},
+        input_output_aliases=(
+            {}
+            if return_state_updates
+            else {state_offset + index: index + 2 for index in range(4)}
+        ),
         grid_spec=tpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
@@ -5164,6 +5192,7 @@ def decode_local(
     state_row=None,
     kernel_options: frozenset = frozenset(),
     rank=None,
+    return_state_updates: bool | None = None,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5231,6 +5260,8 @@ def decode_local(
         _, embedding = jax.lax.scan(prepare_first_layer_row, (), tokens)
     if state_row is not None and sequence_rows != batch_size:
         raise ValueError("state_row needs one sequence per tile")
+    if return_state_updates is None:
+        return_state_updates = sequence_rows == 1
     # Layer zero runs inside the fused stack and starts from the embedding.
     prefix = embedding
     convolution_states, recurrent_states = states[:2]
@@ -5271,7 +5302,71 @@ def decode_local(
         include_layer_zero=True,
         state_row=state_row,
         kernel_options=kernel_options,
+        return_state_updates=return_state_updates,
     )
+    if return_state_updates:
+        # SGLANG-PATCH: TPU XLA's TpuCopyInsertion::AddSpecialCaseCopies forces
+        # full-buffer copies before and after any custom-call with
+        # has_communication=true whose output aliases an ENTRY parameter or
+        # ENTRY root output. Returning only the active [B, ...] KDA state rows
+        # and [B, mla_layers, 3, 128, D] MLA cache tiles from stack() without
+        # custom-call aliasing, then applying in-place dynamic_update_slice on
+        # the donated state buffers outside the custom-call, keeps the live-out
+        # HloBuffers owned by kDynamicUpdateSlice and eliminates the 2x 3.85 GiB
+        # HBM-to-HBM copies.
+        conv_updates, rec_updates, key_updates, value_updates = (
+            convolution_states,
+            recurrent_states,
+            key_caches,
+            value_caches,
+        )
+        convolution_states, recurrent_states, key_caches, value_caches = states
+        if batch_size < convolution_states.shape[0]:
+            convolution_states = jax.lax.dynamic_update_slice(
+                convolution_states, conv_updates, (0, 0, 0, 0, 0, 0)
+            )
+            recurrent_states = jax.lax.dynamic_update_slice(
+                recurrent_states, rec_updates, (0, 0, 0, 0, 0)
+            )
+        elif batch_size >= 2:
+            half = batch_size // 2
+            convolution_states = jax.lax.dynamic_update_slice(
+                convolution_states, conv_updates[:half], (0, 0, 0, 0, 0, 0)
+            )
+            convolution_states = jax.lax.dynamic_update_slice(
+                convolution_states, conv_updates[half:], (half, 0, 0, 0, 0, 0)
+            )
+            recurrent_states = jax.lax.dynamic_update_slice(
+                recurrent_states, rec_updates[:half], (0, 0, 0, 0, 0)
+            )
+            recurrent_states = jax.lax.dynamic_update_slice(
+                recurrent_states, rec_updates[half:], (half, 0, 0, 0, 0)
+            )
+        else:
+            convolution_states = jax.lax.dynamic_update_slice(
+                convolution_states, conv_updates[:, :, :2], (0, 0, 0, 0, 0, 0)
+            )
+            convolution_states = jax.lax.dynamic_update_slice(
+                convolution_states, conv_updates[:, :, 2:], (0, 0, 2, 0, 0, 0)
+            )
+            recurrent_states = jax.lax.dynamic_update_slice(
+                recurrent_states, rec_updates[:, :, :2], (0, 0, 0, 0, 0)
+            )
+            recurrent_states = jax.lax.dynamic_update_slice(
+                recurrent_states, rec_updates[:, :, 2:], (0, 0, 2, 0, 0)
+            )
+        for row_index in range(batch_size):
+            block_offset = (jnp.maximum(positions[row_index], 0) // 128) * 128
+            key_caches = jax.lax.dynamic_update_slice(
+                key_caches,
+                key_updates[row_index : row_index + 1],
+                (row_index, 0, 0, block_offset, 0),
+            )
+            value_caches = jax.lax.dynamic_update_slice(
+                value_caches,
+                value_updates[row_index : row_index + 1],
+                (row_index, 0, 0, block_offset, 0),
+            )
 
     if sequence_parallel_pre_attention and batched_decoder_boundaries:
         logits = jnp.dot(prefix, weights["lm_head"], preferred_element_type=jnp.float32)

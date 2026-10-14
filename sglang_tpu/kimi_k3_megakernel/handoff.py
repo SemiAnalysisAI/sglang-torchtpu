@@ -171,12 +171,8 @@ def handoff_request_to_megakernel_row(
     )
     k_all = torch.cat((k_nope, k_rope, k_zeros), dim=-1)  # [24, 3, context, 256]
 
-    k_masked = torch.where(
-        valid_mask_dev, k_all, torch.zeros_like(k_all)
-    ).unsqueeze(0)
-    v_masked = torch.where(
-        valid_mask_dev, v_all, torch.zeros_like(v_all)
-    ).unsqueeze(0)
+    k_masked = torch.where(valid_mask_dev, k_all, torch.zeros_like(k_all)).unsqueeze(0)
+    v_masked = torch.where(valid_mask_dev, v_all, torch.zeros_like(v_all)).unsqueeze(0)
 
     key_cache.index_copy_(0, row_dev, k_masked)
     value_cache.index_copy_(0, row_dev, v_masked)
