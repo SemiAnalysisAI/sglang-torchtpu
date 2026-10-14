@@ -42,6 +42,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang_tpu.attention_pallas_rpa_base import PallasForwardMetadata
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -53,6 +54,46 @@ logger = logging.getLogger(__name__)
 # One custom op per process. The kernel specialises on shapes internally, so no
 # shape-dependent op specialisation is needed at the torch.library boundary.
 _PALLAS_GDN_OP = None
+_MEGA_KDA_PREFILL = tpu_envs.SGLANG_TPU_OPT_MEGA_KDA_PREFILL.get()
+
+
+def _kda_prefill_with_fallback(
+    qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
+    dt_bias, query_start_loc, state_indices, distribution, seq_lens,
+    read_offsets, *, n_kq, n_v, d_k, d_v, kernel_size, gate_lower_bound,
+):
+    """KDA prefill through the Mega kernel, or the fused kernel when the batch
+    has leading decode rows or a tile spans more than two sequences."""
+    import jax
+
+    from sglang_tpu.attention.pallas.gdn import fused_conv1d_gdn
+    from sglang_tpu.attention.pallas.gdn.config import AttentionMode
+    from sglang_tpu.kernels.mega_kda import kda_prefill_mega, mega_layout_supported
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    kw = dict(n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=kernel_size)
+
+    def mega(ops):
+        return kda_prefill_mega(*ops, gate_lower_bound=gate_lower_bound, **kw)
+
+    def fused(ops):
+        (qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx, sl, ro) = ops
+        with tpu_info_for_cpu_export():
+            (new_conv, new_rec), out = fused_conv1d_gdn(
+                qkv_, b_, a_, conv, rec, w, bias, alog, dtb, qsl, idx,
+                distribution, sl, ro, attention_mode=AttentionMode.KDA,
+                gate_lower_bound=gate_lower_bound, prefill_only=True, **kw,
+            )
+        return new_conv, new_rec, out.reshape(-1, n_v, d_v)
+
+    ops = (
+        qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
+        dt_bias, query_start_loc, state_indices, seq_lens, read_offsets,
+    )
+    use_mega = (distribution[0] == 0) & mega_layout_supported(
+        query_start_loc, qkv.shape[0]
+    )
+    return jax.lax.cond(use_mega, mega, fused, ops)
 
 
 def build_gdn_pallas_op():
@@ -161,6 +202,22 @@ def build_gdn_pallas_op():
         # trace, as RPA does (attention_pallas_rpa_base.py). The generic bridge
         # in pallas_jax_op.py does this automatically; this op registers through
         # torch_tpu's pallas helper directly and has to opt in.
+        if (
+            _MEGA_KDA_PREFILL
+            and kda
+            and prefill_only
+            and gate_lower_bound is not None
+            and num_spec_tokens == 0
+            and track_indices is None
+            and packed_weights is None
+            and n_kq == n_v
+        ):
+            return _kda_prefill_with_fallback(
+                qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias,
+                a_log, dt_bias, query_start_loc, state_indices, distribution,
+                seq_lens, read_offsets, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+                kernel_size=kernel_size, gate_lower_bound=gate_lower_bound,
+            )
         with tpu_info_for_cpu_export():
             (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
                 qkv,
