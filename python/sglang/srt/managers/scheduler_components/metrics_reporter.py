@@ -822,13 +822,14 @@ class SchedulerMetricsReporter:
                 host_hit_tokens=prefill_stats.log_host_hit_tokens,
                 storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
             )
-            self.metrics_collector.increment_swa_prefix(
-                full_kv_device_hit_tokens=prefill_stats.log_full_kv_device_hit_tokens,
-                full_kv_host_hit_tokens=prefill_stats.log_full_kv_host_hit_tokens,
-                swa_miss_tokens=prefill_stats.log_swa_miss_tokens,
-                swa_miss_reqs=prefill_stats.log_swa_miss_reqs,
-                swa_restored_tokens=prefill_stats.log_swa_restored_tokens,
-            )
+            if self.scheduler.tree_cache.swa_is_only_match_cut():
+                self.metrics_collector.increment_swa_prefix(
+                    full_kv_device_hit_tokens=prefill_stats.log_full_kv_device_hit_tokens,
+                    full_kv_host_hit_tokens=prefill_stats.log_full_kv_host_hit_tokens,
+                    swa_miss_tokens=prefill_stats.log_swa_miss_tokens,
+                    swa_miss_reqs=prefill_stats.log_swa_miss_reqs,
+                    swa_restored_tokens=prefill_stats.log_swa_restored_tokens,
+                )
 
             # Basics
             if (

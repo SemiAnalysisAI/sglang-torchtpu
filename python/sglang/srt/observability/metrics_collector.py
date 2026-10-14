@@ -970,8 +970,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
         # Kept out of prefill_effective_tokens_total: its modes sum to the
-        # hit-rate denominator. Not pre-seeded, so caches other than full KV + SWA
-        # never export these series. Each request is counted once, at admission.
+        # hit-rate denominator. Exported only by caches whose components are exactly
+        # full KV + SWA. Each request is counted once, at admission.
         self.prefill_full_kv_hit_tokens_total = Counter(
             name="sglang:prefill_full_kv_hit_tokens_total",
             documentation=(
@@ -1436,23 +1436,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         swa_miss_reqs: int,
         swa_restored_tokens: int,
     ) -> None:
+        # Zeros are incremented too, so every series exists once a cache that counts
+        # SWA prefixes has run a prefill batch; ratio panels rely on that.
         for location, tokens in (
             ("device", full_kv_device_hit_tokens),
             ("host", full_kv_host_hit_tokens),
         ):
-            if tokens > 0:
-                self.prefill_full_kv_hit_tokens_total.labels(
-                    **self.labels, location=location
-                ).inc(tokens)
-        if swa_miss_tokens > 0:
-            self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(
-                swa_miss_tokens
-            )
-            self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(swa_miss_reqs)
-        if swa_restored_tokens > 0:
-            self.prefill_swa_restored_tokens_total.labels(**self.labels).inc(
-                swa_restored_tokens
-            )
+            self.prefill_full_kv_hit_tokens_total.labels(
+                **self.labels, location=location
+            ).inc(tokens)
+        self.prefill_swa_miss_tokens_total.labels(**self.labels).inc(swa_miss_tokens)
+        self.prefill_swa_miss_reqs_total.labels(**self.labels).inc(swa_miss_reqs)
+        self.prefill_swa_restored_tokens_total.labels(**self.labels).inc(
+            swa_restored_tokens
+        )
 
     def increment_forward_execution_seconds(
         self,

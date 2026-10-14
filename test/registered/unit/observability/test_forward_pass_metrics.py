@@ -475,6 +475,43 @@ class TestIdleMetrics(CustomTestCase):
         self.assertEqual(self.published_occupancies, [])
 
 
+class TestSwaPrefixMetrics(CustomTestCase):
+    def test_zero_counts_still_export_every_series(self):
+        """Dashboard ratios mask replicas by series presence and pool clusters by
+        weight, so a zero batch must still create every SWA prefix series."""
+        registry = prometheus_client.CollectorRegistry()
+        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
+        sample_labels = {key: str(value) for key, value in labels.items()}
+        with patch.multiple(
+            prometheus_client,
+            **{
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
+                for kind in ("Counter", "Gauge", "Histogram", "Summary")
+            },
+        ):
+            collector = SchedulerMetricsCollector(
+                labels=labels, server_args=_publish_server_args(self)
+            )
+        collector.increment_swa_prefix(
+            full_kv_device_hit_tokens=0,
+            full_kv_host_hit_tokens=0,
+            swa_miss_tokens=0,
+            swa_miss_reqs=0,
+            swa_restored_tokens=0,
+        )
+        for name, extra in (
+            ("sglang:prefill_full_kv_hit_tokens_total", {"location": "device"}),
+            ("sglang:prefill_full_kv_hit_tokens_total", {"location": "host"}),
+            ("sglang:prefill_swa_miss_tokens_total", {}),
+            ("sglang:prefill_swa_miss_reqs_total", {}),
+            ("sglang:prefill_swa_restored_tokens_total", {}),
+        ):
+            with self.subTest(name=name, **extra):
+                self.assertEqual(
+                    registry.get_sample_value(name, {**sample_labels, **extra}), 0
+                )
+
+
 class TestSchedulerTimeAccounting(CustomTestCase):
     def setUp(self):
         enter_scope(
