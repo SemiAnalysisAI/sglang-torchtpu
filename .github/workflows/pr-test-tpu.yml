@@ -6,6 +6,8 @@
 #   * the PR touches a TPU-explicit path (auto), OR
 #   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
 #     maintainer judges need TPU coverage but that don't match those paths).
+# The `tpu-external` label also opts in, and moves the unit suite onto the external
+# cluster (e2e stays in-project: no model-weights PVC there).
 #
 # Why path-OR-label instead of the label alone: a label added by the labeler bot's
 # GITHUB_TOKEN does NOT trigger a new workflow run, so relying on the label alone
@@ -23,11 +25,12 @@ concurrency:
 
 jobs:
   decide:
-    # Only the `tpu` label can make a PR TPU-relevant. Labels are fetched live
-    # below so label-then-rerun is not tied to the original event payload.
+    # Only the `tpu` / `tpu-external` labels can make a PR TPU-relevant. Labels are
+    # fetched live below so label-then-rerun is not tied to the original event payload.
     if: >-
       github.event.action != 'labeled' ||
-      github.event.label.name == 'tpu'
+      github.event.label.name == 'tpu' ||
+      github.event.label.name == 'tpu-external'
     runs-on: ubuntu-latest
     # dorny/paths-filter lists the PR's changed files via the GitHub API (read);
     # write lets the gate post its on-demand notice on the PR.
@@ -36,6 +39,7 @@ jobs:
       pull-requests: write
     outputs:
       run: ${{ steps.gate.outputs.run }}
+      external: ${{ contains(fromJson(steps.pr.outputs.labels), 'tpu-external') }}
     steps:
       - name: Fetch latest PR state
         id: pr
@@ -101,7 +105,8 @@ jobs:
         id: gate
         run: |
           if [[ "${{ steps.paths.outputs.tpu }}" != "true" && \
-                "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" ]]; then
+                "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" != "true" && \
+                "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu-external') }}" != "true" ]]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.run_attempt }}" == "1" ]]; then
             echo "run=needs-trigger" >> "$GITHUB_OUTPUT"
@@ -151,11 +156,11 @@ jobs:
       contents: read
       id-token: write
 
-  # Per-commit TPU suite on any single host: a 2x2x1 slice, one host of the pr-gate 2x2x2
-  # slice, or one host of the external cluster while its nightly is idle.
+  # Per-commit TPU suite on any single host: a 2x2x1 slice or one host of the pr-gate
+  # 2x2x2 slice. With the `tpu-external` label: one host of the external cluster instead.
   unit:
     name: unit-test
-    needs: build
+    needs: [decide, build]
     uses: ./.github/workflows/_tpu-test.yml
     with:
       # PR head SHA (immutable, matches the pushed code) rather than the test-merge
@@ -165,18 +170,19 @@ jobs:
       # Unit suite (kernels/backends; each test self-contained, no model server) runs
       # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+      display_name: ${{ needs.decide.outputs.external == 'true' && 'stage-a-test-tpu-unit (external)' || 'stage-a-test-tpu-unit' }}
       # Most unit tests are registered chips=1 and run four at a time, each
       # pinned to one chip of the slice. Whole-node tests follow sequentially.
       tpu_chip_workers: 4
       multihost_slots: true
-      external_slots: true
+      external: ${{ needs.decide.outputs.external == 'true' }}
     secrets: inherit
     permissions:
       contents: read
       id-token: write
       actions: read
 
-  # In-project only: the external cluster has no model-weights PVC.
+  # In-project only, even with `tpu-external`: the external cluster has no model-weights PVC.
   e2e:
     name: e2e-test
     needs: build
