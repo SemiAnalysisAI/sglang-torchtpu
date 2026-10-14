@@ -675,6 +675,7 @@ class SWAComponent(TreeComponent):
             )
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[ct] -= freed
+            self.tree_core.record_device_eviction(ct, node, freed)
             cd.value = None
 
         # Host layer

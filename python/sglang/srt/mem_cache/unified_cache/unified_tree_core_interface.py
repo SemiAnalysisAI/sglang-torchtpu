@@ -375,6 +375,12 @@ class UnifiedTreeCoreInterface(ABC):
         """Finish the component's device-eviction walk."""
         ...
 
+    def take_device_eviction_age(self) -> dict[ComponentType, tuple[int, float]]:
+        """Drain (tokens, token-seconds of age) evicted from device since the last
+        call, per component that triggered the eviction. Age is wall time since the
+        component last refreshed the entry. Backends that do not track it return {}."""
+        return {}
+
     @abstractmethod
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         """Bump the reference count on a node's host-side component locks."""

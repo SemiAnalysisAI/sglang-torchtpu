@@ -181,6 +181,7 @@ class FullComponent(TreeComponent):
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
+            self.tree_core.record_device_eviction(self.component_type, node, freed)
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None

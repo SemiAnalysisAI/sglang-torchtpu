@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
@@ -123,6 +124,9 @@ class UnifiedTreeNode:
             ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
         ]
         self.last_access_time = get_and_increase_time_counter()
+        # Wall-clock twins of last_access_time and of each LRU slot's MRU move,
+        # used only to report how old evicted entries were.
+        self.last_access_wall = time.monotonic()
         self.creation_time = get_and_increase_time_counter()
         # Last insert or lock release on this node: a forward formed after
         # it cannot write the node's device values.
@@ -141,6 +145,9 @@ class UnifiedTreeNode:
             _NUM_COMPONENT_TYPES * 2
         )
         self.lru_next: list[UnifiedTreeNode | None] = [None] * (
+            _NUM_COMPONENT_TYPES * 2
+        )
+        self.lru_wall: list[float] = [self.last_access_wall] * (
             _NUM_COMPONENT_TYPES * 2
         )
         self.id = UnifiedTreeNode.counter
@@ -268,12 +275,14 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node(node)
+        node.lru_wall[self._pt] = time.monotonic()
 
     def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
         assert prev_node.id in self.cache
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node_after(prev_node, node)
+        node.lru_wall[self._pt] = prev_node.lru_wall[self._pt]
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -284,6 +293,7 @@ class UnifiedLRUList:
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
+        node.lru_wall[self._pt] = time.monotonic()
 
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:
@@ -318,6 +328,7 @@ class UnifiedLRUList:
         is_referenced = self._is_referenced
         prev_ref = self.head
         prev_unref = self.head if self.mid is None else self.mid
+        now = time.monotonic()
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
@@ -329,6 +340,7 @@ class UnifiedLRUList:
                 else:
                     self._add_node_after(prev_unref, node)
                     prev_unref = node
+                node.lru_wall[self._pt] = now
             node = node.parent
 
     def reset_node_and_window_ancestors_mru(
@@ -341,6 +353,7 @@ class UnifiedLRUList:
         is_referenced = self._is_referenced
         prev_ref = self.head
         prev_unref = self.head if self.mid is None else self.mid
+        now = time.monotonic()
         accumulated = 0
         while node != root_node and accumulated < window_size:
             if should_include(node):
@@ -353,6 +366,7 @@ class UnifiedLRUList:
                 else:
                     self._add_node_after(prev_unref, node)
                     prev_unref = node
+                node.lru_wall[self._pt] = now
             accumulated += len(node.key)
             node = node.parent
 
@@ -505,6 +519,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 component.evict_device_end()
         # Internal victims awaiting the controller's backup and finish call.
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
+        # Component whose device-eviction walk is running; cascade frees of the
+        # other components are not attributed to their own pool's age.
+        self._evicting_component: Optional[ComponentType] = None
+        self._device_eviction_age: dict[ComponentType, list] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -1052,8 +1070,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        now = time.monotonic()
         while node_update:
             node_update.last_access_time = cur_time
+            node_update.last_access_wall = now
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -1123,6 +1143,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        node.last_access_wall = time.monotonic()
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1536,6 +1557,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
+        child.last_access_wall = time.monotonic()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1657,6 +1679,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, request_cnt: int
     ) -> None:
         """Begin a component's device-eviction walk for up to request_cnt tokens."""
+        self._evicting_component = component_type
         self.components_by_type[component_type].evict_device_start(request_cnt)
 
     def _begin_tracking_unbacked_tokens(self) -> None:
@@ -1788,6 +1811,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Finish a component's device-eviction walk."""
         self.components_by_type[component_type].evict_device_end()
         self._pending_internal_evictions.pop(component_type, None)
+        self._evicting_component = None
+
+    def record_device_eviction(
+        self, component_type: ComponentType, node: UnifiedTreeNode, tokens: int
+    ) -> None:
+        """Account a device eviction's age, only for the walk's own component."""
+        if component_type != self._evicting_component or tokens <= 0:
+            return
+        stamp = (
+            node.last_access_wall
+            if component_type == BASE_COMPONENT_TYPE
+            else node.lru_wall[component_type]
+        )
+        stats = self._device_eviction_age.setdefault(component_type, [0, 0.0])
+        stats[0] += tokens
+        stats[1] += tokens * max(0.0, time.monotonic() - stamp)
+
+    def take_device_eviction_age(self) -> dict[ComponentType, tuple[int, float]]:
+        taken = {ct: (n, s) for ct, (n, s) in self._device_eviction_age.items()}
+        self._device_eviction_age = {}
+        return taken
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool

@@ -2375,6 +2375,23 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "sglang:hicache_dropped_tokens_total).",
             labelnames=labels.keys(),
         )
+        # Mean age at eviction per pool is age_seconds_total / tokens_total. With
+        # LRU it is the pool's reach in time: a pool that evicts younger entries
+        # than its peer is the one cutting hits.
+        self.device_eviction_age_tokens = Counter(
+            name="sglang:device_eviction_age_tokens_total",
+            documentation="Device token slots evicted by each pool's own eviction "
+            "walk (cascade frees of the other pools excluded); the denominator of "
+            "sglang:device_eviction_age_token_seconds_total.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+        self.device_eviction_age_token_seconds = Counter(
+            name="sglang:device_eviction_age_token_seconds_total",
+            documentation="Sum over evicted device token slots of the wall time "
+            "since the pool last refreshed them (Full: last access of the node; "
+            "SWA: last move to the MRU end of the SWA LRU).",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
@@ -2451,6 +2468,14 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_device_eviction_age(
+        self, *, pool: str, tokens: int, token_seconds: float
+    ) -> None:
+        self.device_eviction_age_tokens.labels(**self.labels, pool=pool).inc(tokens)
+        self.device_eviction_age_token_seconds.labels(**self.labels, pool=pool).inc(
+            token_seconds
+        )
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

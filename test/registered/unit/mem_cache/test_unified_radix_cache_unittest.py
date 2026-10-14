@@ -6884,6 +6884,63 @@ class UnifiedRadixCacheSuite:
             0,
         )
 
+    def test_device_eviction_age_counts_only_the_triggering_pool(self):
+        """Each pool's eviction walk reports the age of what it evicted, measured
+        from that pool's own last refresh; cascade frees of the other pool are
+        not attributed to it."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        seq = list(range(1, 1 + 8 * self.cfg.page_size))
+
+        def reported(evict_params, now):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            cache.metrics_collector = mock.MagicMock()
+            with mock.patch("time.monotonic", return_value=100.0):
+                self._insert(cache, allocator, req_to_token_pool, seq)
+            with mock.patch("time.monotonic", return_value=now):
+                cache.evict(evict_params)
+            calls = cache.metrics_collector.increment_device_eviction_age.call_args_list
+            return cache, {
+                c.kwargs["pool"]: (c.kwargs["tokens"], c.kwargs["token_seconds"])
+                for c in calls
+            }
+
+        cache, swa_ages = reported(EvictParams(swa_num_tokens=len(seq)), 130.0)
+        _, full_ages = reported(EvictParams(num_tokens=len(seq)), 150.0)
+        if cache._tree_core_backend == "rust":
+            self.assertEqual((swa_ages, full_ages), ({}, {}))
+            return
+        self.assertEqual(set(swa_ages), {"swa"})
+        swa_tokens, swa_seconds = swa_ages["swa"]
+        self.assertGreater(swa_tokens, 0)
+        self.assertAlmostEqual(swa_seconds, 30.0 * swa_tokens)
+        self.assertEqual(set(full_ages), {"kv"})
+        full_tokens, full_seconds = full_ages["kv"]
+        self.assertGreater(full_tokens, 0)
+        self.assertAlmostEqual(full_seconds, 50.0 * full_tokens)
+
+    def test_device_eviction_age_restarts_when_a_match_splits_a_node(self):
+        """A match that diverges inside a node refreshes both halves' Full
+        recency, so their eviction age must count from the split, not the insert."""
+        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+SWA")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        if cache._tree_core_backend == "rust":
+            self.skipTest("the Rust tree core does not report eviction age")
+        cache.metrics_collector = mock.MagicMock()
+        with mock.patch("time.monotonic", return_value=100.0):
+            self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
+        with mock.patch("time.monotonic", return_value=200.0):
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5, 6, 99])))
+            )
+        with mock.patch("time.monotonic", return_value=300.0):
+            cache.evict(EvictParams(num_tokens=8))
+        calls = cache.metrics_collector.increment_device_eviction_age.call_args_list
+        full = [c.kwargs for c in calls if c.kwargs["pool"] == "kv"]
+        self.assertEqual(sum(c["tokens"] for c in full), 8)
+        self.assertAlmostEqual(sum(c["token_seconds"] for c in full), 8 * 100.0)
+
     def test_has_swa_host_pool_flag_matches_attached_pool(self):
         """init_hicache caches SWA host-pool presence on the tree core after
         the pool assembler runs; the flag must agree with the attached handle."""

@@ -162,6 +162,14 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+# Same pool label values as the load-back, backup and dropped-token counters.
+_EVICTION_AGE_POOL_NAMES = {
+    ComponentType.FULL: PoolName.KV.value,
+    ComponentType.SWA: PoolName.SWA.value,
+    ComponentType.MAMBA: PoolName.MAMBA.value,
+}
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -680,6 +688,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return result
 
+    def _report_device_eviction_age(self) -> None:
+        ages = self.tree_core.take_device_eviction_age()
+        if self.metrics_collector is None:
+            return
+        for ct, (tokens, token_seconds) in ages.items():
+            pool = _EVICTION_AGE_POOL_NAMES.get(ct)
+            if pool is not None:
+                self.metrics_collector.increment_device_eviction_age(
+                    pool=pool, tokens=tokens, token_seconds=token_seconds
+                )
+
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
         return {
@@ -732,6 +751,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        self._report_device_eviction_age()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
