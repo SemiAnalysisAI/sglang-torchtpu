@@ -534,17 +534,66 @@ Implemented in [`decode_megakernel.py`](../sglang_tpu/kimi_k3_megakernel/_vendor
 
 ---
 
-## 7. File Inventory & Verification
+## 7. Launch Contract, Runtime Guards & Compile-Cache Key
+
+Decode state lives only in the megakernel's row-major buffers. SGLang's paged `MLATokenToKVPool` / `MambaPool` are read once, at the prefill→decode handoff (§4), and **never updated with decoded tokens**. Any component that reads those pools after the handoff would see prefill-time state, so the integration enforces a launch contract, derived from the repo's review rules (`.agents/skills/tpu-integration-review`, rules CFG-1, KVS-*, CMP-9, CFG-2, SYN-1, PLC-6).
+
+### 7.1 Startup Validation (`validate_megakernel_server_args`)
+
+[`config.py`](../sglang_tpu/kimi_k3_megakernel/config.py) runs from `TpuSRTPlatform.apply_server_args_defaults`, at argument resolution and before the model loads or any TPU runtime starts. It does nothing unless `SGLANG_TPU_K3_MEGAKERNEL` is set.
+
+| Requirement | Failure it prevents | Enforced as |
+| :--- | :--- | :--- |
+| `--tp-size 32 --ep-size 8` | In-kernel collectives and expert layout are built for TP32/EP8 | error |
+| `--max-running-requests <= SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS` (default 8) | A larger decode batch would fall back to SGLang decode over stale KV/Mamba caches | error if larger; declared if unset |
+| Radix cache off | Finished requests' decoded tokens would be shared with stale KV/Mamba state on later prefix hits | declared `disable_radix_cache=True` with a warning |
+| `--context-length` fits the megakernel context (rounded up to 128, min 384) | Positions past the state buffers have no decode state | error if larger; declared from `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` if unset; error if neither set |
+| No speculative decoding, PP, DP / DP attention, P/D disaggregation, hierarchical cache | These read or move pool state the megakernel does not keep | error |
+
+The validated `mk_e2e6` launch (`--disable-radix-cache`, concurrency ≤ 8, `--context-length = ISL + OSL + 20`) satisfies the contract unchanged.
+
+### 7.2 Runtime Guards (`KimiK3MegakernelRunner.prepare_batch`)
+
+- A **real** decode batch larger than `max_rows`, or with a position past the state context, raises `RuntimeError` instead of silently falling back to SGLang's decode. Warmup dummy batches (no `reqs`, all pool index 0) above `max_rows` still take SGLang's decode, so precompiled buckets above the megakernel rows keep working.
+- Request generations are read once per step as a vectorized host read of `req_to_token_pool.req_generation`, with an assert that the counter stays host-resident, so it can never become a per-request device→host sync.
+
+### 7.3 Compile-Cache Key, Env Registry & Core Footprint
+
+- **Compile cache:** `kimi_k3_megakernel/` is part of `get_pallas_kernel_sources()` in [`compile_cache.py`](../sglang_tpu/compile_cache.py). Pallas custom ops are opaque in FX graphs, so without this, editing `decode_megakernel.py` (as in §6.4) could reuse a stale torch.compile artifact.
+- **Env vars:** declared once in [`sglang_tpu/envs.py`](../sglang_tpu/envs.py), read through `.get()`, never `os.environ`.
+
+  | Variable | Default | Meaning |
+  | :--- | :--- | :--- |
+  | `SGLANG_TPU_K3_MEGAKERNEL` | `false` | Run decode through the megakernel |
+  | `SGLANG_TPU_K3_MEGAKERNEL_CHECKPOINT` | served model path | Where dense families load from |
+  | `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` | `--context-length` | Decode-state tokens per row |
+  | `SGLANG_TPU_K3_MEGAKERNEL_MAX_ROWS` | `8` | Decode rows (1–8); caps `--max-running-requests` |
+  | `SGLANG_TPU_K3_MEGAKERNEL_RECIPE` | `tuned` | Kernel tuning recipe |
+
+- **Core footprint:** core `kimi_k3.py` makes a single `maybe_attach_decode_megakernel(self)` call at the end of `post_load_weights`. The runner must exist before KV-pool sizing, because it stacks the MoE experts in place and allocates ~4 GiB of decode state. This counts against the TPU debt ratchet (which passes) and carries a TODO to move onto a platform post-load hook once core has one.
+
+### 7.4 Known Gaps
+
+- **No registered TPU end-to-end test** for `SGLANG_TPU_K3_MEGAKERNEL=1`. It needs the 4-host slice and the 2.7T weights, so validation remains the manual CDK harness (§6).
+- `register_megakernel_decode_op` still uses the private `pallas_impl._get_kernel_invocation_key`.
+- An upstream seam issue for a platform post-load hook is not yet filed.
+
+---
+
+## 8. File Inventory & Verification
 
 | File | Role |
 | :--- | :--- |
 | [`sglang_tpu/kimi_k3_megakernel/weights.py`](../sglang_tpu/kimi_k3_megakernel/weights.py) | `stack_sglang_moe_experts_in_place` (5D `uint8` zero-copy expert stacking + `f32 -> E8M0` scale conversion) and `load_dense_families` |
 | [`sglang_tpu/kimi_k3_megakernel/handoff.py`](../sglang_tpu/kimi_k3_megakernel/handoff.py) | `handoff_request_to_row` (on-device KDA + MLA `m_kb` state handoff) and `apply_row_move` |
-| [`sglang_tpu/kimi_k3_megakernel/runner.py`](../sglang_tpu/kimi_k3_megakernel/runner.py) | `register_megakernel_decode_op` and `KimiK3MegakernelRunner` |
+| [`sglang_tpu/kimi_k3_megakernel/config.py`](../sglang_tpu/kimi_k3_megakernel/config.py) | Launch contract `validate_megakernel_server_args`, `megakernel_context`, `megakernel_max_rows`, `is_megakernel_enabled` |
+| [`sglang_tpu/kimi_k3_megakernel/runner.py`](../sglang_tpu/kimi_k3_megakernel/runner.py) | `register_megakernel_decode_op`, `KimiK3MegakernelRunner` (incl. runtime decode guards), and `maybe_attach_decode_megakernel` |
 | [`sglang_tpu/kimi_k3_megakernel/program.py`](../sglang_tpu/kimi_k3_megakernel/program.py) | `make_decode_program` (`shard_map` over `decode_local(rank=0)` with donated state buffers) |
 | [`sglang_tpu/kimi_k3_megakernel/slots.py`](../sglang_tpu/kimi_k3_megakernel/slots.py) | `SlotTable`, `RowMove`, and `row_bucket` |
 | [`sglang_tpu/kimi_k3_megakernel/_vendor/kimi/decode_megakernel.py`](../sglang_tpu/kimi_k3_megakernel/_vendor/kimi/decode_megakernel.py) | `SGLANG-PATCH` modifications: rows-subset `[0, B)` indexing, `_bitcast_u8_expert_ref_to_u32`, `position < 0` padding row guards, optional `rank` parameter, and `return_state_updates=True` compact state-tile returns + in-place `dynamic_update_slice` |
+| [`sglang_tpu/envs.py`](../sglang_tpu/envs.py), [`compile_cache.py`](../sglang_tpu/compile_cache.py), [`tpu_platform.py`](../sglang_tpu/tpu_platform.py) | Megakernel env declarations; megakernel sources in the compile-cache key; launch contract invoked from `apply_server_args_defaults` |
 | [`sglang_tpu/moe/pallas/gmm_v2.py`](../sglang_tpu/moe/pallas/gmm_v2.py) & [`fused_moe_op.py`](../sglang_tpu/moe/pallas/fused_moe_op.py) | Static 5D `pl.BlockSpec` indexing (`moe_layer_idx`) for shared 5D expert tensors |
-| [`python/sglang/srt/models/kimi_k3.py`](../python/sglang/srt/models/kimi_k3.py) | `mk_m_kb` preservation in `KimiK3MLAAttention` and `KimiK3MegakernelRunner` dispatch in `KimiK3LinearForCausalLM` / `KimiK3ForConditionalGeneration` |
+| [`python/sglang/srt/models/kimi_k3.py`](../python/sglang/srt/models/kimi_k3.py) | `mk_m_kb` preservation in `KimiK3MLAAttention`, the single `maybe_attach_decode_megakernel` call, and the megakernel decode dispatch in `KimiK3LinearForCausalLM` / `KimiK3ForConditionalGeneration` |
 | [`test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_slots.py`](../test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_slots.py) | Unit tests for `SlotTable` and 5,000-step random request churn |
 | [`test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py`](../test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_handoff_and_runner.py) | Unit tests for 5D expert stacking, E8M0 scale roundtrip, KDA/MLA handoff, row compaction, runner lifecycle, non-zero `tp_rank` vocabulary offset, and `return_state_updates=True` parity & StableHLO verification |
+| [`test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_config.py`](../test/registered/unit/hardware_backend/tpu/test_kimi_k3_megakernel_config.py) | Launch contract and its platform wiring, runtime decode guards, host-only generation read, env registry, compile-cache key (each fix's revert fails its test) |
