@@ -783,12 +783,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # holds only while step i's backend carries speculative_step_id == i,
         # which is how TpuPallasRpaMultiStepDraftBackend constructs them.
         assert all(b.speculative_step_id == i for i, b in enumerate(attn_backends))
-        out_cache_loc = per_step_draft_out_cache_loc(
-            forward_batch.out_cache_loc,
-            forward_batch.batch_size,
-            self.topk,
-            self.speculative_num_steps,
-        )
+        layouts = spec_info.device_accept_layouts
+        if layouts is not None and forward_batch.out_cache_loc is layouts.draft:
+            # The device-accept select op already emitted the per-step rows.
+            out_cache_loc = layouts.draft_per_step
+        else:
+            out_cache_loc = per_step_draft_out_cache_loc(
+                forward_batch.out_cache_loc,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
         steps_fn = self._compiled_fused_steps
         if steps_fn is None:
