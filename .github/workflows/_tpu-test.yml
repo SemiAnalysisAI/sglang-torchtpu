@@ -4,6 +4,7 @@
 #   * multi-host group    -> pass `launch_script` + `files` + `hosts` (+ weights_pvc)
 # A single-host suite may also race for any single-host slot (multihost_slots /
 # external_slots): it is submitted to every eligible target and the first to start wins.
+# external_only drops the in-project targets.
 name: _tpu-test
 
 on:
@@ -108,6 +109,11 @@ on:
         required: false
         type: boolean
         default: false
+      # With external_slots: skip the in-project targets and wait out a live external nightly.
+      external_only:
+        required: false
+        type: boolean
+        default: false
 
 # No permissions block: a called workflow may not exceed its caller's grant, and only
 # external_slots callers grant actions: read. Every caller sets contents + id-token.
@@ -193,6 +199,10 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           multihost_slots='${{ inputs.multihost_slots }}'
           external_slots='${{ inputs.external_slots }}'
+          external_only='${{ inputs.external_only }}'
+          if [ "$external_only" = true ] && [ "$external_slots" != true ]; then
+            echo "::error::external_only needs external_slots"; exit 1
+          fi
           if { [ "$multihost_slots" = true ] || [ "$external_slots" = true ]; } && \
              { [ -z "$suite" ] || [ -n "${{ inputs.launch_script }}${{ inputs.exec_cmd }}" ] || \
                [ '${{ inputs.hosts }}' != 1 ] || [ '${{ inputs.pd_prefill_hosts }}' != 0 ]; }; then
@@ -229,20 +239,22 @@ jobs:
             echo "== rendered ${id} (key fields) =="
             grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|gke-nodepool|claimName:|bash "benchmark|for f in|run_suite.py' "/tmp/job-${id}.yaml" | head
           }
-          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
-          # render time. Unions topology.yaml's list with any pool labelled
-          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
-          # so adding a slice needs no code change. Fails open to topology.yaml.
-          pools="$(python3 .github/tpu-ci/discover_pools.py \
-                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
-          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
-          add_target slice "$IN_CTX" tpu-ci 1 --pools "${pools}" \
-            --service-account '${{ vars.TPU_CI_POD_KSA }}'
-          if [ "$multihost_slots" = true ]; then
-            pools2="$(python3 .github/tpu-ci/discover_pools.py --lane '${{ inputs.lane }}' --hosts 2 --sync)"
-            echo "pools for lane=${{ inputs.lane }} hosts=2 (one host per job): ${pools2}"
-            add_target host-of-2h "$IN_CTX" tpu-ci 1 --pools "${pools2}" --slice-hosts 2 \
+          if [ "$external_only" != true ]; then
+            # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
+            # render time. Unions topology.yaml's list with any pool labelled
+            # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
+            # so adding a slice needs no code change. Fails open to topology.yaml.
+            pools="$(python3 .github/tpu-ci/discover_pools.py \
+                       --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
+            echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
+            add_target slice "$IN_CTX" tpu-ci 1 --pools "${pools}" \
               --service-account '${{ vars.TPU_CI_POD_KSA }}'
+            if [ "$multihost_slots" = true ]; then
+              pools2="$(python3 .github/tpu-ci/discover_pools.py --lane '${{ inputs.lane }}' --hosts 2 --sync)"
+              echo "pools for lane=${{ inputs.lane }} hosts=2 (one host per job): ${pools2}"
+              add_target host-of-2h "$IN_CTX" tpu-ci 1 --pools "${pools2}" --slice-hosts 2 \
+                --service-account '${{ vars.TPU_CI_POD_KSA }}'
+            fi
           fi
 
           # The external nightly owns the external cluster while any run of it is live.
@@ -259,11 +271,7 @@ jobs:
               [ -n "${!v:-}" ] || { echo "::error::repo secret ${v} is not set (external/README.md 'Configuration')"; exit 1; }
               ext_pools="${ext_pools} ${!v}"
             done
-            if external_nightly_live; then
-              echo "external nightly is live; external slots stay off for this job"
-            else
-              add_target external "$EXT_CTX" default "" --external-pools "${ext_pools}"
-            fi
+            add_target external "$EXT_CTX" default "" --external-pools "${ext_pools}"
           fi
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
           # be right at the moment admission is decided. Fails open -- a stale quota is
@@ -282,10 +290,11 @@ jobs:
             for t in "${!T_NAME[@]}"; do kt "$t" delete "${T_NAME[$t]}" --ignore-not-found --wait=false || true; done
           }
           trap cleanup EXIT
-          for t in "${targets[@]}"; do
+          submit() {  # t
+            local t="$1" uid wl_sel
             T_NAME[$t]="$(kt "$t" create -f "${T_FILE[$t]}" -o name)"
             echo "Created ${T_NAME[$t]} on ${t}"
-            [ -n "${T_KUEUE[$t]}" ] || continue
+            [ -n "${T_KUEUE[$t]}" ] || return 0
             # No Workload means Kueue ignored this JobSet and it would run with no gang
             # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
             # deadlocked until their deadline. Fail closed instead.
@@ -303,6 +312,13 @@ jobs:
               exit 1
             fi
             echo "Kueue Workload present on ${t}; admission control active."
+          }
+          for t in "${targets[@]}"; do
+            if [ "$t" = external ] && external_nightly_live; then
+              echo "external nightly is live; the external target waits for it to finish"
+              continue
+            fi
+            submit "$t"
           done
 
           # Runtime budget, computed here because the admission budget is whatever is left
@@ -394,7 +410,7 @@ jobs:
           admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
           echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
           echo "racing for a slot on: ${targets[*]}"
-          kt slice get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  in-project workloads queued:"
+          [ "$external_only" = true ] || kt slice get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  in-project workloads queued:"
           admit_deadline=$(( $(date +%s) + admit_s ))
           next_refresh=$(( $(date +%s) + 2400 ))
           next_gate=$(( $(date +%s) + 30 ))
@@ -423,11 +439,17 @@ jobs:
               refresh_cluster_token || echo "credential refresh failed; will retry"
               auth_fails=0
             fi
-            if [ -n "${T_NAME[external]:-}" ] && [ "$(date +%s)" -ge "$next_gate" ]; then
-              external_nightly_live && withdraw external "external nightly went live"
+            # Yield the external target to a live nightly; (re)submit it once none is live,
+            # including after the nightly's drain deleted its unstarted pod.
+            if [ "$external_slots" = true ] && [ "$(date +%s)" -ge "$next_gate" ]; then
+              if external_nightly_live; then
+                [ -z "${T_NAME[external]:-}" ] || withdraw external "external nightly went live"
+              elif [ -z "${T_NAME[external]:-}" ]; then
+                submit external
+              fi
               next_gate=$(( $(date +%s) + 30 ))
             fi
-            if [ "${#T_NAME[@]}" = 0 ]; then
+            if [ "${#T_NAME[@]}" = 0 ] && [ "$external_slots" != true ]; then
               echo "❌ ${label}: every target was withdrawn or deleted before starting"; exit 1
             fi
             if [ "$(date +%s)" -ge "$next_refresh" ]; then
@@ -441,7 +463,7 @@ jobs:
               fi
             fi
             if [ "$(date +%s)" -ge "$admit_deadline" ]; then
-              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- no slot freed on ${!T_NAME[*]}"
+              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- no slot freed on ${targets[*]}"
               for t in "${!T_NAME[@]}"; do
                 [ -n "${T_KUEUE[$t]}" ] && { kt "$t" get workloads 2>/dev/null | grep -- "${T_NAME[$t]##*/}" || true; }
                 kt "$t" describe "${T_NAME[$t]}" 2>/dev/null | tail -n 40 || true
