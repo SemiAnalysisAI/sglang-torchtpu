@@ -33,6 +33,9 @@ _POLICY_CHOICES = (
     "prefix_hash",
 )
 
+# MiniLB routing policies, implemented in mini_lb.py and mini_lb_policy.py.
+MINI_LB_POLICY_CHOICES = ("random", "session_affinity")
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -43,6 +46,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    mini_lb_policy: str = "session_affinity"
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
@@ -372,6 +376,17 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}mini-lb-policy",
+            type=str,
+            default=RouterArgs.mini_lb_policy,
+            choices=MINI_LB_POLICY_CHOICES,
+            help="(MiniLB only) How to pick prefill and decode engines. 'random' picks "
+            "both uniformly. 'session_affinity' pins each x-routing-key header to a "
+            "prefill engine, spills it to a less loaded engine when the pinned one "
+            "is overloaded, sends decode to the less loaded of two sampled engines, "
+            "and answers 429 when every sampled engine is over a load guardrail.",
         )
         pd_group.add_argument(
             f"--{prefix}test-external-dp-routing",

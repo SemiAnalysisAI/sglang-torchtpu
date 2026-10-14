@@ -3,6 +3,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import random
@@ -15,9 +16,10 @@ from typing import Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from sglang_router.router_args import RouterArgs
+from sglang_router.mini_lb_policy import EngineOverloaded, SessionAffinityPolicy
+from sglang_router.router_args import MINI_LB_POLICY_CHOICES, RouterArgs
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,65 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return f"[{address}]"
     except ValueError:
         return address
+
+
+_TRANSPORT_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
+
+
+def _server_error(prefill_status: int, decode_status: int) -> Optional[str]:
+    for side, status in (("prefill", prefill_status), ("decode", decode_status)):
+        if status >= 500:
+            return f"{side} returned {status}"
+    return None
+
+
+def _server_error_in_event(event: bytes) -> Optional[str]:
+    """Server error carried by one SSE event, or None.
+
+    After a 200 status, engines report a failure as a data event holding an
+    "error" object or an "abort" finish_reason, each with an HTTP status code.
+    """
+    event = event.strip()
+    # These keys cannot appear unescaped in generated text, so most events skip parsing.
+    if not event.startswith(b"data:") or (
+        b'"error"' not in event and b'"abort"' not in event
+    ):
+        return None
+    try:
+        payload = orjson.loads(event[len(b"data:") :])
+    except orjson.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(error := payload.get("error"), dict):
+        status, message = error.get("code"), error.get("message")
+    else:
+        finish_reason = (payload.get("meta_info") or {}).get("finish_reason")
+        if not isinstance(finish_reason, dict) or finish_reason.get("type") != "abort":
+            return None
+        status, message = finish_reason.get("status_code"), finish_reason.get("message")
+    if isinstance(status, int) and status >= 500:
+        return f"in-band error {status}: {message}"
+    return None
+
+
+class _InbandErrorScanner:
+    """Finds the first server error event in an SSE stream read in any chunking."""
+
+    def __init__(self):
+        self.error: Optional[str] = None
+        self._partial_event = b""
+
+    def feed(self, chunk: bytes) -> None:
+        if self.error is not None:
+            return
+        events = (self._partial_event + chunk).split(b"\n\n")
+        self._partial_event = events.pop()
+        for event in events:
+            self.error = _server_error_in_event(event)
+            if self.error is not None:
+                self._partial_event = b""
+                return
 
 
 class MiniLoadBalancer:
@@ -50,16 +111,28 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        # None routes uniformly at random.
+        self.affinity_policy = (
+            SessionAffinityPolicy()
+            if router_args.mini_lb_policy == "session_affinity"
+            else None
+        )
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is only for debugging purposes, it only supports the "
+            "policies of --mini-lb-policy!\033[0m"
         )
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
-            logger.warning("[MiniLB] Overriding policy to random")
+            logger.warning("[MiniLB] Ignoring --policy, see --mini-lb-policy")
             router_args.policy = "random"
+        if router_args.mini_lb_policy not in MINI_LB_POLICY_CHOICES:
+            raise ValueError(
+                f"Unknown MiniLB policy {router_args.mini_lb_policy!r}, "
+                f"expected one of {MINI_LB_POLICY_CHOICES}"
+            )
 
         if not router_args.pd_disaggregation:
             raise ValueError("MiniLB only supports PD disaggregation mode")
@@ -72,7 +145,24 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        # Routing decisions and pair breaker resets log at INFO. force replaces
+        # the WARNING root handler an import-time logging.warning installs.
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+            force=True,
+        )
         uvicorn.run(app, host=self.host, port=self.port)
+
+    def start_load_polling(self) -> Optional[asyncio.Task]:
+        """Starts refreshing engine loads when the policy reads them."""
+        if self.affinity_policy is None:
+            return None
+        return asyncio.create_task(
+            self.affinity_policy.run_load_polling(
+                lambda: self.prefill_urls + self.decode_urls
+            )
+        )
 
     async def _ensure_dp_sizes(self):
         if self.prefill_dp_size is not None:
@@ -100,16 +190,48 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
-    def select_pair(self):
+    def select_pair(self, routing_key=None, room=None):
+        """Returns (prefill_url, bootstrap_port, decode_url).
+
+        Raises EngineOverloaded when the session-affinity policy rejects the
+        request. room only labels the policy's decision log lines.
+        """
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
-        pidx = random.randint(0, len(self.prefill_urls) - 1)
-        didx = random.randint(0, len(self.decode_urls) - 1)
-        return (
-            self.prefill_urls[pidx],
-            self.prefill_bootstrap_ports[pidx],
-            self.decode_urls[didx],
+        if self.affinity_policy is None:
+            pidx = random.randint(0, len(self.prefill_urls) - 1)
+            didx = random.randint(0, len(self.decode_urls) - 1)
+            return (
+                self.prefill_urls[pidx],
+                self.prefill_bootstrap_ports[pidx],
+                self.decode_urls[didx],
+            )
+
+        decisions = self.affinity_policy.select(
+            prefill_urls=self.prefill_urls,
+            decode_urls=self.decode_urls,
+            routing_key=routing_key,
         )
+        for decision in decisions:
+            logger.info(
+                "[MiniLB] routing decision "
+                + decision.to_log_json(room=room, routing_key=routing_key)
+            )
+        prefill, decode = decisions
+        pidx = self.prefill_urls.index(prefill.engine)
+        return prefill.engine, self.prefill_bootstrap_ports[pidx], decode.engine
+
+    def _record_success(self, prefill_server, decode_server):
+        if self.affinity_policy is not None:
+            self.affinity_policy.record_success(
+                prefill_url=prefill_server, decode_url=decode_server
+            )
+
+    def _record_failure(self, prefill_server, decode_server, reason):
+        if self.affinity_policy is not None:
+            self.affinity_policy.record_failure(
+                prefill_url=prefill_server, decode_url=decode_server, reason=reason
+            )
 
     def current_role_and_port(self, worker_url):
         """Return (role, bootstrap_port) of a registered server, or (None, None)
@@ -175,7 +297,18 @@ class MiniLoadBalancer:
             ]
 
             # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+            try:
+                prefill_response, decode_response = await asyncio.gather(*tasks)
+            except _TRANSPORT_ERRORS as e:
+                self._record_failure(
+                    prefill_server, decode_server, f"transport error: {e!r}"
+                )
+                raise
+            failure = _server_error(prefill_response.status, decode_response.status)
+            if failure is not None:
+                self._record_failure(prefill_server, decode_server, failure)
+            elif prefill_response.status == decode_response.status == 200:
+                self._record_success(prefill_server, decode_server)
 
             if "return_logprob" in modified_request:
                 prefill_json = await prefill_response.json()
@@ -229,43 +362,56 @@ class MiniLoadBalancer:
                 response.close()
             await session.close()
 
-        async def stream_results():
-            try:
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+        async def relay_decode_stream():
+            if modified_request.get("return_logprob", False):
+                prefill_chunks = []
+                async for chunk in prefill_response.content:
+                    prefill_chunks.append(chunk)
+                first_prefill_chunk = prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
-                    async for chunk in decode_response.content:
-                        # Note: This is inefficient
-                        # merge prefill input_token_logprobs, output_token_logprobs to decode
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
-                        ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
-                        else:
-                            yield chunk
-                else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
+                async for chunk in decode_response.content:
+                    # Note: This is inefficient
+                    # merge prefill input_token_logprobs, output_token_logprobs to decode
+                    decoded_chunk = chunk.decode("utf-8")
+                    if (
+                        decoded_chunk
+                        and decoded_chunk.startswith("data:")
+                        and "[DONE]" not in decoded_chunk
                     ):
+                        ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                        ret_json["meta_info"]["input_token_logprobs"] = (
+                            first_prefill_chunk_json["meta_info"][
+                                "input_token_logprobs"
+                            ]
+                            + ret_json["meta_info"]["input_token_logprobs"]
+                        )
+                        yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                    else:
                         yield chunk
+            else:
+                async for chunk in decode_response.content.iter_chunked(
+                    AIOHTTP_STREAM_READ_CHUNK_SIZE
+                ):
+                    yield chunk
+
+        async def stream_results():
+            scanner = _InbandErrorScanner()
+            try:
+                async for chunk in relay_decode_stream():
+                    scanner.feed(chunk)
+                    yield chunk
+            except _TRANSPORT_ERRORS as e:
+                self._record_failure(
+                    prefill_server, decode_server, f"stream failed: {e!r}"
+                )
+                raise
             finally:
                 await close_upstreams()
+            if scanner.error is not None:
+                self._record_failure(prefill_server, decode_server, scanner.error)
+            else:
+                self._record_success(prefill_server, decode_server)
 
         # The session and both upstream responses stay open only for an
         # accepted request, whose stream_results() closes them when the
@@ -275,11 +421,20 @@ class MiniLoadBalancer:
             # Both servers answer the headers before any token is produced, so
             # a request either server rejects is known here, before the
             # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
-            )
+            try:
+                prefill_response, decode_response = await asyncio.gather(
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                )
+            except _TRANSPORT_ERRORS as e:
+                self._record_failure(
+                    prefill_server, decode_server, f"transport error: {e!r}"
+                )
+                raise
             responses.extend((prefill_response, decode_response))
+            failure = _server_error(prefill_response.status, decode_response.status)
+            if failure is not None:
+                self._record_failure(prefill_server, decode_server, failure)
             for response in responses:
                 if response.status != 200:
                     body = await response.read()
@@ -298,7 +453,19 @@ class MiniLoadBalancer:
                 await close_upstreams()
 
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    load_polling = lb.start_load_polling() if lb is not None else None
+    try:
+        yield
+    finally:
+        if load_polling is not None:
+            load_polling.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await load_polling
+
+
+app = FastAPI(lifespan=_lifespan)
 lb: Optional[MiniLoadBalancer] = None
 
 
@@ -485,23 +652,38 @@ async def get_model_info():
 
 
 @app.post("/generate")
-async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+async def handle_generate_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "generate", x_routing_key)
+
+
+async def _forward_to_backend(
+    request_data: dict, endpoint_name: str, routing_key: Optional[str]
+):
+    batch_size = _get_request_batch_size(request_data)
+    bootstrap_rooms = [_generate_bootstrap_room() for _ in range(batch_size or 1)]
+    try:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair(
+            routing_key=routing_key, room=bootstrap_rooms[0]
+        )
+    except EngineOverloaded as e:
+        logger.warning(f"[MiniLB] POST /{endpoint_name} failed: {e}")
+        return ORJSONResponse(
+            content={"error": {"message": str(e)}},
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+        )
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
-
-    batch_size = _get_request_batch_size(modified_request)
     if batch_size is not None:
         modified_request.update(
             {
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
+                "bootstrap_room": bootstrap_rooms,
             }
         )
     else:
@@ -509,34 +691,9 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
+                "bootstrap_room": bootstrap_rooms[0],
             }
         )
-
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-
-
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
-    )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -555,13 +712,17 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
 
 
 @app.post("/v1/chat/completions")
-async def handle_chat_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/chat/completions")
+async def handle_chat_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/chat/completions", x_routing_key)
 
 
 @app.post("/v1/completions")
-async def handle_completion_request(request_data: dict):
-    return await _forward_to_backend(request_data, "v1/completions")
+async def handle_completion_request(
+    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+):
+    return await _forward_to_backend(request_data, "v1/completions", x_routing_key)
 
 
 def _generate_bootstrap_room():

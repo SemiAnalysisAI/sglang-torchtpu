@@ -389,7 +389,7 @@ python3 -m sglang_router.launch_router \
   --prefill http://localhost:30001 \
   --decode http://localhost:30011
 ```
-MiniLB forwards PD requests using simple random routing and is intended for local debugging only.
+MiniLB is intended for local debugging only. By default (`--mini-lb-policy session_affinity`) it places requests like a production P/D router: prefill sticks to the engine pinned for the `x-routing-key` header and spills to a less loaded engine when the pinned one is overloaded, decode goes to the less loaded of two sampled engines, loads come from polling each engine's `/v1/loads`, and an engine over a load guardrail is answered with 429. `--mini-lb-policy random` picks prefill and decode uniformly at random.
 
 ### Running Worker Servers
 Use upstream SGLang binaries to start dedicated worker processes.
