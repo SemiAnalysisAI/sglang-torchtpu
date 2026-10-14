@@ -1043,9 +1043,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
             query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
-            # EXTEND and DRAFT_EXTEND use current lengths.
+            # EXTEND and DRAFT_EXTEND use current lengths. A draft extend over
+            # the verify window may carry the verify's int32 kv lengths.
             assert forward_batch.extend_seq_lens is not None
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
+            spec_info = forward_batch.spec_info
+            kv_lens = None if spec_info is None else spec_info.verify_kv_lens
+            if kv_lens is None or kv_lens.shape[0] != bs:
+                kv_lens = forward_batch.seq_lens.to(torch.int32)
             query_lens = self._extend_query_lens(forward_batch, bs)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)

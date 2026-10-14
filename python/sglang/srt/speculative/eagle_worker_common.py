@@ -161,7 +161,11 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
-        if _is_tpu and not batch.forward_mode.is_idle():
+        if (
+            _is_tpu
+            and not batch.forward_mode.is_idle()
+            and draft_extend_input.positions is None
+        ):
             draft_extend_input.positions = draft_extend_positions_tpu(
                 batch.seq_lens, num_window_tokens
             )
@@ -729,6 +733,15 @@ def run_eagle_verify(
     # CUDA fuses the commit bookkeeping (and a chain's next draft-extend inputs)
     # into one post-sampling kernel, replacing the generic bookkeeping below.
     fused_commit_outputs = batch.seq_lens.is_cuda and not batch.forward_mode.is_idle()
+    # The TPU top-1 chain verify op also returns the commit outputs; they are
+    # taken only when no padding has to be trimmed off them afterwards.
+    want_chain_commit = (
+        _is_tpu
+        and topk == 1
+        and verify_padding is None
+        and batch.mamba_track_indices is None
+    )
+    chain_commit = None
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
@@ -738,11 +751,17 @@ def run_eagle_verify(
             logits_output,
             grammar_mask,
             uno_target_max_top_k=uno_target_max_top_k,
+            with_commit_outputs=want_chain_commit,
         )
+        if want_chain_commit:
+            *verify_result, chain_commit = verify_result
+            verify_result = tuple(verify_result)
         post_predict, post_accept_lens, post_accept_index = verify_result
         # Sampling and bookkeeping must use the same physical rows, including
         # padded idle DP peers. finalize_spec_verify restores the logical batch.
-        if not fused_commit_outputs:
+        if chain_commit is not None:
+            verify_bookkeeping_result = chain_commit[:2]
+        elif not fused_commit_outputs:
             verify_bookkeeping_result = verify_bookkeeping_func(
                 batch.seq_lens,
                 post_accept_lens,
@@ -785,6 +804,10 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens, bonus_tokens = verify_bookkeeping_result
+        if chain_commit is not None:
+            _, _, last_step, select_index, predict_i64 = chain_commit
+            prepared_commit_steps = (last_step, None)
+            prepared_draft_inputs = (last_step, select_index, predict_i64)
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
