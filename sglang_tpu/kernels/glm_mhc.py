@@ -22,8 +22,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 # [1, VEC_WIDTH] f32 parameter row: hc_base in [0, mix), hc_scale in [mix, mix + 3).
 VEC_WIDTH = 128
-# Prefill token block; decode buckets below this run as one block.
-_MAX_BLOCK_TOKENS = 32
+# Prefill token block; decode buckets below this run as one block. 128 fills
+# the tokens-on-lanes Sinkhorn rows; 256 overflows VMEM at d = 4096.
+_MAX_BLOCK_TOKENS = 128
 _PREFILL_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
@@ -68,15 +69,17 @@ def _gates_and_collapse(
     )
     rms = jax.lax.rsqrt(sq / (hc * d) + rms_eps)
     dims = (((1,), (1,)), ((), ()))
+    # The streams hold bf16 values and fn is the checkpoint's bf16 weight, so
+    # one bf16 MXU pass with f32 accumulation forms the exact products a
+    # HIGHEST f32 dot would (its extra passes multiply zero low halves).
     mixes = (
         functools.reduce(
             jnp.add,
             [
                 jax.lax.dot_general(
-                    s,
+                    s.astype(jnp.bfloat16),
                     fn_ref[:, i * d : (i + 1) * d],
                     dims,
-                    precision=jax.lax.Precision.HIGHEST,
                     preferred_element_type=jnp.float32,
                 )
                 for i, s in enumerate(streams)
@@ -234,7 +237,8 @@ def mhc_site(
         operands.append(pad(res))
         in_specs.append(rows_spec(width))
     if has_pre:
-        operands += [fn.astype(jnp.float32), vec]
+        # bf16 weight (the checkpoint dtype); see _gates_and_collapse.
+        operands += [fn.astype(jnp.bfloat16), vec]
         in_specs += [full_spec((mix, width)), full_spec((1, VEC_WIDTH))]
         if norm_weight is not None:
             operands.append(norm_weight.astype(jnp.float32).reshape(1, d))
