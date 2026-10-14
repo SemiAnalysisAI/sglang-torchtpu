@@ -1,0 +1,34 @@
+# TEMPORARY, branch-only: runs the PR-gate unit suite pinned to the external cluster.
+name: TMP TPU external smoke
+
+on:
+  push:
+    branches: [junyanxu/tpu-external-smoke]
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  unit:
+    name: unit-test
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: stage-a-test-tpu-unit
+      display_name: stage-a-test-tpu-unit (external smoke)
+      tpu_chip_workers: 4
+      multihost_slots: true
+      external_slots: true
+      external_only: true
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
