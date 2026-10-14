@@ -1671,30 +1671,47 @@ def biased_grouped_topk_impl(
     scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
         -1, num_experts
     )
-    group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
-        .sum(dim=-1)
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores_for_choice.masked_fill(
-        ~score_mask.bool(), float("-inf")
-    )  # [n, e]
-    _, topk_ids = torch.topk(
-        tmp_scores,
-        k=topk,
-        dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
+    if num_expert_group == 1 and topk_group == 1:
+        # The single group is always selected: the group mask is all ones.
+        tmp_scores = scores_for_choice
+    else:
+        group_scores = (
+            scores_for_choice.view(num_token, num_expert_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )  # [n, n_group]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+            1
+        ]  # [n, top_k_group]
+        group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+        group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+            .reshape(num_token, -1)
+        )  # [n, e]
+        tmp_scores = scores_for_choice.masked_fill(
+            ~score_mask.bool(), float("-inf")
+        )  # [n, e]
+    if _is_tpu and num_fused_shared_experts == 0 and topk <= 8:
+        # XLA's TopK costs ~0.25 ms per layer at 8k tokens x 288 experts; k
+        # argmax-and-mask rounds are k fused passes. Same picks as TopK: the
+        # largest values, ties to the lowest index.
+        experts = torch.arange(num_experts, device=tmp_scores.device)
+        remaining = tmp_scores
+        picks = []
+        for _ in range(topk):
+            pick = remaining.argmax(dim=-1, keepdim=True)
+            picks.append(pick)
+            remaining = remaining.masked_fill(experts == pick, float("-inf"))
+        topk_ids = torch.cat(picks, dim=-1)
+    else:
+        _, topk_ids = torch.topk(
+            tmp_scores,
+            k=topk,
+            dim=-1,
+            sorted=(True if num_fused_shared_experts > 0 else False),
+        )
     if _is_tpu:
         # XLA lowers this row gather to a slow general gather on TPU (0.55 ms
         # per layer at 8k tokens); a one-hot reduce is one fused pass and
