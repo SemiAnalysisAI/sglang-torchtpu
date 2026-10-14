@@ -1695,7 +1695,15 @@ def biased_grouped_topk_impl(
         dim=-1,
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
-    topk_weights = scores.gather(1, topk_ids)
+    if _is_tpu:
+        # XLA lowers this row gather to a slow general gather on TPU (0.55 ms
+        # per layer at 8k tokens); a one-hot reduce is one fused pass and
+        # exact, adding finite scores to zeros.
+        experts = torch.arange(num_experts, device=topk_ids.device)
+        hit = topk_ids.unsqueeze(-1) == experts
+        topk_weights = torch.where(hit, scores.unsqueeze(1), 0.0).sum(dim=-1)
+    else:
+        topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
