@@ -4,34 +4,37 @@
 The reference keeps each request's raw keys and gates as plain arrays and, at
 every step, recompresses all closed pools, scores them and expands the choice;
 the step under test pages its caches and closes pools incrementally across
-prefill, decode and speculative-verify steps.
+prefill, decode and speculative-verify steps. Scoring runs on the StreamIndex
+Pallas kernel, so this needs a TPU.
 """
 
+import os
+import sys
 import unittest
 
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
+
+assert "jax" not in sys.modules
+os.environ["JAX_PLATFORMS"] = "tpu"
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
 
-try:
-    import jax
-    import jax.numpy as jnp
-
-    from sglang_tpu.attention.pallas import dsa_kpool_topk as kp
-
-    _HAS_JAX = True
-except Exception:  # pragma: no cover - host without JAX
-    _HAS_JAX = False
-
-register_cpu_ci(est_time=60, suite="stage-a-test-cpu")
-
-D, HEADS, KPOOL, PAGE, PAGES_PER_SEQ, TOPK = 128, 4, 4, 16, 4, 16
+# The kernel needs whole 128-token pages; TOPK keeps 16 of up to 128 pools.
+D, HEADS, KPOOL, PAGE, PAGES_PER_SEQ, TOPK = 128, 8, 4, 128, 4, 64
 NUM_PAGES = 2 * PAGES_PER_SEQ + 1
+# The kernel scales scores in bf16, so near-tied pools may swap.
+SCORE_RTOL = 2e-2
 
 
-def _ref_select(keys, gates, ape, q, w, pos, weight_scale):
-    """Token positions the reference selects for one query at sequence position pos."""
+def _ref_scores(keys, gates, ape, q, w, pos, weight_scale):
+    """Reference score of every closed pool for one query at sequence position pos."""
     pool_len = (pos + 1) // KPOOL
     pooled = []
     for p in range(pool_len):
@@ -43,22 +46,34 @@ def _ref_select(keys, gates, ape, q, w, pos, weight_scale):
     q8, qs, _ = kp.quantize_ue8m0(q_rot)
     q8 = np.asarray(q8.astype(jnp.float32))
     ww = np.asarray(w) * np.asarray(qs)[:, 0] * weight_scale
-    scores = np.array(
+    return np.array(
         [np.sum(ww * np.maximum(q8 @ k, 0.0)) * s for k, s in pooled], np.float32
     )
-    n_pick = TOPK // KPOOL
-    groups = (
-        np.argsort(-scores, kind="stable")[:n_pick]
-        if pool_len > n_pick
-        else range(pool_len)
-    )
-    toks = {g * KPOOL + j for g in groups for j in range(KPOOL)}
-    toks |= {pool_len * KPOOL + j for j in range((pos + 1) % KPOOL)}
-    return toks
 
 
-@unittest.skipUnless(_HAS_JAX, "requires JAX")
 class TestKpoolIndexerStep(CustomTestCase):
+    def _check_row(self, row, scores, pos):
+        pool_len = (pos + 1) // KPOOL
+        n_pick = min(TOPK // KPOOL, pool_len)
+        n = int((row >= 0).sum())
+        # Selected positions form a prefix of the row.
+        self.assertTrue((row[:n] >= 0).all() and (row[n:] == -1).all())
+        hist, tail = row[: n_pick * KPOOL], row[n_pick * KPOOL : n]
+        # The open pool's tokens follow the history.
+        want_tail = [pool_len * KPOOL + j for j in range((pos + 1) % KPOOL)]
+        self.assertEqual(sorted(tail.tolist()), want_tail, f"pos {pos} tail")
+        groups = hist.reshape(n_pick, KPOOL)
+        self.assertTrue(
+            (groups == groups[:, :1] + np.arange(KPOOL)).all(), f"pos {pos}"
+        )
+        picked = groups[:, 0] // KPOOL
+        self.assertEqual(len(set(picked.tolist())), n_pick, f"pos {pos} dup")
+        self.assertTrue((picked < pool_len).all(), f"pos {pos} future pool")
+        if n_pick < pool_len:
+            kth = np.sort(scores)[::-1][n_pick - 1]
+            tol = SCORE_RTOL * max(np.abs(scores).max(), 1e-6)
+            self.assertGreaterEqual(scores[picked].min(), kth - tol, f"pos {pos}")
+
     def test_matches_reference_over_prefill_decode_verify(self):
         rng = np.random.default_rng(0)
         ape = jnp.asarray(rng.normal(size=(KPOOL, D)).astype(np.float32))
@@ -79,13 +94,14 @@ class TestKpoolIndexerStep(CustomTestCase):
         )
         hist = {r: ([], []) for r in range(2)}  # committed raw keys / gates
         lens = [0, 0]
-        # (tokens per request, committed per request) for each forward.
-        plan = [((13, 9), (13, 9)), ((1, 1), (1, 1)), ((1, 1), (1, 1))]
+        # (tokens per request, committed per request) for each forward. The
+        # first is a chunked prefill (4096 rows > the kernel's 2048-row chunk).
+        plan = [((301, 214), (301, 214)), ((1, 1), (1, 1)), ((1, 1), (1, 1))]
         plan += [((8, 8), (3, 8)), ((1, 1), (1, 1)), ((8, 8), (8, 2)), ((1, 1), (1, 1))]
-        plan += [((1, 1), (1, 1))] * 8
+        plan += [((1, 1), (1, 1))] * 6
         for new, keep in plan:
             n_tok = sum(new)
-            pad = 32
+            pad = 4096 if n_tok > 32 else 32
             keys = rng.normal(size=(pad, D)).astype(np.float32)
             gates = rng.normal(size=(pad, D)).astype(np.float32)
             query = rng.normal(size=(pad, HEADS, D)).astype(np.float32)
@@ -115,9 +131,7 @@ class TestKpoolIndexerStep(CustomTestCase):
                 win_g = gs + list(gb[t : t + new[r]])
                 for i in range(new[r]):
                     pos = lens[r] + i
-                    row = out[t + i]
-                    got = set(row[row >= 0].tolist())
-                    want = _ref_select(
+                    scores = _ref_scores(
                         np.stack(win_k[: pos + 1]),
                         np.stack(win_g[: pos + 1]),
                         ape,
@@ -126,10 +140,7 @@ class TestKpoolIndexerStep(CustomTestCase):
                         pos,
                         weight_scale,
                     )
-                    self.assertEqual(got, want, f"req {r} pos {pos}")
-                    # Selected positions form a prefix of the row.
-                    n = int((row >= 0).sum())
-                    self.assertTrue((row[:n] >= 0).all() and (row[n:] == -1).all())
+                    self._check_row(out[t + i], scores, pos)
                 # Keep only the accepted tokens, as a verify step would.
                 hist[r] = (win_k[: lens[r] + keep[r]], win_g[: lens[r] + keep[r]])
                 lens[r] += keep[r]

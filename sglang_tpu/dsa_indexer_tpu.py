@@ -16,12 +16,14 @@ them to the op. This module keeps no state except the registered op.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang_tpu.pallas_export import (
     argnums,
+    source_fingerprint,
     tpu_info_for_cpu_export,
 )
 
@@ -32,6 +34,16 @@ if TYPE_CHECKING:
 
 _PALLAS_DSA_INDEX_TOPK_OP = None
 _PALLAS_DSA_KPOOL_TOPK_OP = None
+
+
+def _indexer_source_fingerprint() -> str:
+    """Digest of the indexer steps and the StreamIndex kernel (see source_fingerprint)."""
+    root = Path(__file__).resolve().parent
+    return source_fingerprint(
+        root / "attention" / "pallas" / "dsa_index_topk.py",
+        root / "attention" / "pallas" / "dsa_kpool_topk.py",
+        *sorted((root / "dsv4" / "streamindex_topk").glob("*.py")),
+    )
 
 
 def build_dsa_index_topk_op():
@@ -45,7 +57,7 @@ def build_dsa_index_topk_op():
 
     from sglang_tpu.attention.pallas.dsa_index_topk import dsa_indexer_step
 
-    op_name = "sglang_tpu_pallas::dsa_index_topk"
+    op_name = f"sglang_tpu_pallas::dsa_index_topk_{_indexer_source_fingerprint()}"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step has
@@ -200,7 +212,7 @@ def build_dsa_kpool_topk_op():
 
     from sglang_tpu.attention.pallas.dsa_kpool_topk import kpool_indexer_step
 
-    op_name = "sglang_tpu_pallas::dsa_kpool_topk"
+    op_name = f"sglang_tpu_pallas::dsa_kpool_topk_{_indexer_source_fingerprint()}"
 
     # Same adapter as build_dsa_index_topk_op: positional jax.Array tensors.
     def _wrapped(

@@ -19,14 +19,15 @@ tokens (upstream ``IndexerKPool``, CUDA only). Per indexer layer and forward:
 Pools closed by rejected speculative tokens are rewritten when the pool closes
 again, and a query only sees pools closed at or before its own position.
 
-TODO(Bob-Chen222): scoring gathers every pool of a request (XLA), which is fine
-for ~10k-token contexts; long contexts need the StreamIndex kernel with a
-closed-pools-only causal mask.
+Step 3 runs on the StreamIndex top-k kernel (DeepSeek-V4's compressed indexer)
+with a closed-pools-only causal mask.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from sglang_tpu.dsv4.streamindex_topk import KVLayout, streamindex_topk
 
 _FP8_MAX = 448.0
 # The index-key record layout (dsa_index_topk.index_key_cache_shape): FP8 key
@@ -35,6 +36,12 @@ _LANE_BYTES = 128
 _TOKENS_PER_ROW = 4
 # Upstream act_quant / the kpool writer floor the absolute max before scaling.
 _AMAX_FLOOR = 1e-4
+# StreamIndex block sizes for its (decode, prefill, mixed) passes, as in
+# dsa_index_topk; not tuned for GLM.
+_NUM_KV_PAGES_PER_BLOCK = (2, 2, 2)
+_NUM_QUERIES_PER_BLOCK = (1, 128, 128)
+# Query rows per scoring chunk: the kernel's score buffer is rows x positions.
+_CHUNK_TOKENS = 2048
 
 
 def _hadamard_matrix(n: int) -> np.ndarray:
@@ -195,45 +202,46 @@ def kpool_indexer_step(
         p_page, p_slot // tokens_per_row, p_slot % tokens_per_row
     ].set(records, mode="drop")
 
-    # 3. Score each query against its request's closed pools.
+    # 3. Score each query against its request's closed pools and keep the best
+    # topk // kpool. Pool p sits at position p of its request, so the kernel
+    # needs only the first 1/kpool of each request's page table.
+    # Round to whole kernel blocks so no block reads past a request's row.
     pages_per_seq = page_indices.shape[0] // num_seqs
-    max_pools = pages_per_seq * page_size // kpool
-    p_idx = jnp.arange(max_pools, dtype=jnp.int32)
-    seq = jnp.arange(num_seqs, dtype=jnp.int32)
-    all_page = page_indices[seq[:, None] * pages_per_seq + p_idx[None, :] // page_size]
-    all_slot = p_idx % page_size
-    rec = pooled_cache[all_page, all_slot // tokens_per_row, all_slot % tokens_per_row]
-    k_fp8 = jax.lax.bitcast_convert_type(rec[..., :d], jnp.float8_e4m3fn)
-    k_scale = jnp.exp2(rec[..., d].astype(jnp.float32) - 127.0)  # [S, P]
-    k_f32 = k_fp8.astype(jnp.float32).reshape(num_seqs * max_pools, d)
-
+    block_pages = max(_NUM_KV_PAGES_PER_BLOCK)
+    pool_pages = min(_align(-(-pages_per_seq // kpool), block_pages), pages_per_seq)
+    pool_page_indices = page_indices.reshape(num_seqs, pages_per_seq)[
+        :, :pool_pages
+    ].reshape(-1)
     # Upstream rotates the bf16 query (rotate_activation) before quantizing.
     query = hadamard_rotate(query).astype(jnp.bfloat16)
     q_fp8, q_scale, _ = quantize_ue8m0(query)
-    q_f32 = q_fp8.astype(jnp.float32)
     w = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale  # [T, H]
-    logits = jnp.zeros((num_tokens, num_seqs * max_pools), jnp.float32)
-    for h in range(n_heads):
-        s = jnp.dot(q_f32[:, h], k_f32.T, precision=jax.lax.Precision.HIGHEST)
-        logits = logits + jnp.maximum(s, 0.0) * w[:, h : h + 1]
-    logits = logits * k_scale.reshape(1, -1)
+    n_pick = topk // kpool
+    chunked = num_tokens > _CHUNK_TOKENS and num_tokens % _CHUNK_TOKENS == 0
+    # causal_offset = kpool - 1: a query at pos sees pools < (pos + 1) // kpool,
+    # the ones closed at or before it.
+    picked = streamindex_topk(
+        q_fp8,
+        w,
+        pooled_cache,
+        kv_lens,
+        pool_page_indices,
+        cu_q_lens,
+        distribution,
+        k=n_pick,
+        compression_ratio=kpool,
+        causal_offset=kpool - 1,
+        num_kv_pages_per_block=_NUM_KV_PAGES_PER_BLOCK,
+        num_queries_per_block=_NUM_QUERIES_PER_BLOCK,
+        enable_early_exit=False,
+        kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        chunk_tokens=_CHUNK_TOKENS if chunked else None,
+    )  # i32[T, n_pick], chosen pools first, then -1
 
     pool_len = (pos + 1) // kpool
-    col_seq = jnp.repeat(seq, max_pools)
-    col_pool = jnp.tile(p_idx, num_seqs)
-    visible = (col_seq[None, :] == req[:, None]) & (
-        col_pool[None, :] < pool_len[:, None]
-    )
-    visible = visible & valid[:, None]
-    logits = jnp.where(visible, logits, -jnp.inf)
-
-    n_pick = min(topk // kpool, num_seqs * max_pools)
-    best, picked = jax.lax.top_k(logits, n_pick)
-    picked_pool = picked % max_pools
-    picked_ok = best > -jnp.inf  # visible pools sort first
-    tokens = picked_pool[:, :, None] * kpool + jnp.arange(kpool, dtype=jnp.int32)
+    picked_ok = picked >= 0
+    tokens = picked[:, :, None] * kpool + jnp.arange(kpool, dtype=jnp.int32)
     tokens = jnp.where(picked_ok[:, :, None], tokens, -1).reshape(num_tokens, -1)
-    tokens = jnp.pad(tokens, ((0, 0), (0, topk - tokens.shape[1])), constant_values=-1)
 
     # Tail: the open pool's tokens, right after the selected history.
     hist_len = jnp.minimum(pool_len, n_pick) * kpool
