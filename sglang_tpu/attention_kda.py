@@ -151,6 +151,10 @@ class TpuKDAAttnBackend(TpuGDNAttnBackend):
             batched_only=self._is_decode,
             prefill_only=not self._is_decode,
             packed_weights=layer.kda_packed_weights,
+            # Radix snapshot routing (None with the radix cache off); the base
+            # backend builds it from the scheduler's tracking plan.
+            track_indices=self._track_indices,
+            track_end=self._track_end,
             read_offsets=self._read_offsets,
             num_spec_tokens=self._num_spec_tokens,
             spec_window=self._spec_window,

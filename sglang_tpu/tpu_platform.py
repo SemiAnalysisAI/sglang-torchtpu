@@ -961,11 +961,16 @@ class TpuSRTPlatform(SRTPlatform):
     supports_mamba_extra_buffer = True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
-        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
 
-        # KDA shares GDN metadata setup, but does not pass snapshot tracking
-        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
-        return hybrid_gdn_config(model_config) is not None
+        # GDN and KDA share the fused kernel and its snapshot tracking; both
+        # backends pass the tracking plan through. Snapshots inside a
+        # speculative verify window are not supported yet (see the kernel's
+        # "Radix snapshots require dense, non-speculative states").
+        return (
+            hybrid_gdn_config(model_config) is not None
+            or hybrid_kda_config(model_config) is not None
+        )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
         # Mixed-batch merging drops the tracking plan while requests retain
@@ -974,6 +979,14 @@ class TpuSRTPlatform(SRTPlatform):
             raise ValueError(
                 "TPU GDN prefix caching does not support --enable-mixed-chunk. "
                 "Remove --enable-mixed-chunk or use --disable-radix-cache."
+            )
+        # The speculative verify commit moves the read offset and the kernel
+        # takes no snapshots inside a verify window, so a cached prefix could
+        # point at an unwritten state.
+        if view.speculative_algorithm is not None and not view.disable_radix_cache:
+            raise ValueError(
+                "TPU GDN/KDA prefix caching does not support speculative decoding "
+                "yet. Use --disable-radix-cache or drop the speculative algorithm."
             )
         # Lazy slot allocation/release has not been validated with TPU snapshots.
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
