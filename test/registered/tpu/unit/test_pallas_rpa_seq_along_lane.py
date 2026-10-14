@@ -261,5 +261,59 @@ class TestPrefillBlockSizes(CustomTestCase):
         self.assertEqual(self._resolve().bkv_sz, derived)
 
 
+class TestKernelBlockSizes(CustomTestCase):
+    """Block sizes the batched-RPA kernel can run."""
+
+    def _block_sizes(
+        self, *, page_size, kv_layout, dtype_kv, geometry, vmem_limit_bytes=1 << 26
+    ):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        num_q_heads, num_kv_heads, head_dim, cp_group_size = geometry
+        model = configs.ModelConfigs(
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask_value=float("-inf"),
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=16,
+                num_page_indices=16 * 32,
+                total_q_tokens=16,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=dtype_kv,
+                dtype_out=jnp.bfloat16,
+                page_size=page_size,
+                kv_layout=kv_layout,
+                cache_only=cp_group_size is not None,
+                skip_kv_write=cp_group_size is not None,
+                return_lse=cp_group_size is not None,
+                cp_group_size=cp_group_size,
+            )
+            return wrapper.calculate_block_sizes(model, serve, vmem_limit_bytes)
+
+    def test_budget_below_one_lane_and_one_buffer_is_refused(self):
+        """A VMEM budget too small for one lane and one buffer is refused, not
+        answered with a buffer count below one."""
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        for vmem_limit_bytes in (1 << 18, 1 << 19, 1 << 20, 1 << 21):
+            with self.subTest(vmem_limit_bytes=vmem_limit_bytes):
+                with self.assertRaises(ValueError):
+                    self._block_sizes(
+                        page_size=256,
+                        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                        dtype_kv=jnp.float8_e4m3fn,
+                        geometry=(4, 1, 128, None),
+                        vmem_limit_bytes=vmem_limit_bytes,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

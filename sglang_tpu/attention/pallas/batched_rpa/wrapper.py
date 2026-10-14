@@ -327,14 +327,40 @@ def calculate_block_sizes(
 
         return batch_size * num_muls
 
+    # Even if we loose some potential performance, we want to avoid OOM at all
+    # costs. Therefore, we conservatively only use 80% of the VMEM budget.
+    capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+
+    def fit_lanes_and_buffers(
+        batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
+    ) -> tuple[int, int]:
+        # Lanes go first; fewer buffers is the last resort. Neither drops below one.
+        while (
+            batch_size > 1
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            batch_size -= 1
+        while (
+            n_buffer > 1
+            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            n_buffer -= 1
+        if (
+            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            > capped_vmem_limit_bytes
+        ):
+            raise ValueError(
+                f"Cannot fit a {bq_sz=}, {bkv_sz=} tile within 80% of"
+                f" {vmem_limit_bytes=}."
+            )
+        return batch_size, n_buffer
+
     def find_best_block_sizes(
         max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
-
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
         bkv_sz = bkv_stride = mxu_column_size
         if fixed_bq_sz is None:
@@ -342,33 +368,11 @@ def calculate_block_sizes(
         else:
             bq_sz = fixed_bq_sz
             bq_stride = 0
-        batch_size = max_batch_size
-        n_buffer = max_n_buffer
-
         # Step 1: Lower batch_size and/or n_buffer if even the smallest bq and bkv
         # size can trigger OOM.
-
-        # If current batch size triggers OOM, decrease batch size until the kernel
-        # fits within VMEM limit.
-        while (
-            batch_size > 1
-            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            batch_size -= 1
-
-        # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-            > capped_vmem_limit_bytes
-        ):
-            n_buffer -= 1
-
-        # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
-        # NOTE: If the function does not exit at this point even when either values
-        # are zero, it will trigger infinite loop at the next while loop.
-        if batch_size == 0 or n_buffer == 0:
-            raise ValueError("Cannot find batch size that fits within VMEM limit.")
+        batch_size, n_buffer = fit_lanes_and_buffers(
+            max_batch_size, max_n_buffer, bq_sz, bkv_sz
+        )
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         while (
