@@ -8,7 +8,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
 
 import torch
@@ -494,6 +494,16 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
+    # The direct tracer gets the KV cache buffers from the pool's get_state and
+    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
+    # buffers, so the first compile would fail.
+    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
+    # tracer.
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
 
 
 def _register_attention_backends() -> None:
@@ -509,6 +519,12 @@ def _register_attention_backends() -> None:
         )
 
         return TpuPallasSparseMlaAttnBackend(runner)
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -985,6 +1001,18 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuMambaPool
 
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        from sglang.srt.mem_cache.pool_host.base import (
+            host_memory_budget_bytes,
+            host_memory_budget_scope,
+        )
+        from sglang.srt.runtime_context import get_memory
+
+        if get_memory().hicache_io_backend != "raiden":
+            return super().get_hicache_explicit_size_context()
+        # Full, SWA, and draft pools must fit within one combined RAM budget.
+        return host_memory_budget_scope(host_memory_budget_bytes())
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.memory_pool_host import (
             TpuFusedMHATokenToKVPoolHost,
@@ -1028,9 +1056,9 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
-        from sglang_tpu.kv_pool import TpuFusedDSATokenToKVPool
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
-        return TpuFusedDSATokenToKVPool
+        return TpuSplitMLATokenToKVPool
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -1182,6 +1210,13 @@ class TpuSRTPlatform(SRTPlatform):
             "[tpu] Warmup complete; froze torch.compile via "
             "set_stance('fail_on_recompile')."
         )
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return tier-1 misses, including compiles and persistent-cache loads."""
+        get_cache_misses = getattr(
+            getattr(torch, "tpu", None), "_get_cache_misses", None
+        )
+        return None if get_cache_misses is None else int(get_cache_misses())
 
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel
