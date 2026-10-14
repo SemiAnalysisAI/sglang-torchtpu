@@ -90,6 +90,13 @@ def make_device_accept_select_args(
     )
 
 
+def make_verify_kv_lens_args(context: SpecOpWarmupContext) -> tuple:
+    return (
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        context.num_verify_tokens,
+    )
+
+
 def make_verify_bookkeeping_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:
