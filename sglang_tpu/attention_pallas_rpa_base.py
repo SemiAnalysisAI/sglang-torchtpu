@@ -1040,7 +1040,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             assert forward_batch.spec_info is not None
             verify_width = forward_batch.spec_info.num_tokens_per_req
             kv_len_bump = verify_width
-            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            kv_lens = forward_batch.spec_info.verify_kv_lens
+            # A flow-built kv_lens covers the requests it was built for; when
+            # the forward runs a bucket-padded batch (DFlash slices its block
+            # lens to the live rows), derive them from the padded seq_lens.
+            if kv_lens is None or kv_lens.shape[0] != bs:
+                kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
             query_width = verify_width
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths. A draft extend over
