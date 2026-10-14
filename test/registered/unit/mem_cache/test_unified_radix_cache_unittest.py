@@ -7325,6 +7325,7 @@ class UnifiedRadixCacheSuite:
             result.full_kv_device_hit_length,
             len(tokens) - _node_key_length(cache, leaf),
         )
+        self.assertEqual(result.best_match_length, len(tokens))
 
     def test_swa_branching_seqlen_uses_device_full_hit(self):
         if (

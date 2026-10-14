@@ -705,7 +705,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
             self.hicache_host_swa_total_tokens = Gauge(
                 name="sglang:hicache_host_swa_total_tokens",
-                documentation="Total capacity of the host SWA KV cache in tokens.",
+                documentation="Logical capacity of the host SWA KV cache in tokens; "
+                "on a page-envelope host backing the bytes are shared with full KV.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )

@@ -140,6 +140,9 @@ pub struct MatchResult {
     pub full_kv_hit_length: usize,
     /// Leading part of `full_kv_hit_length` whose Full KV is on device.
     pub full_kv_device_hit_length: usize,
+    /// Prefix length up to `best_match_node_id`, the deepest node every validator
+    /// accepted (host-restorable components included).
+    pub best_match_length: usize,
     /// Actions for the controller to apply.
     pub cache_actions: Vec<CacheAction>,
 }
@@ -1180,6 +1183,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_value_len,
             full_kv_hit_length,
             full_kv_device_hit_length,
+            best_match_length,
             action,
         ) = self.match_prefix_helper_(root_id, params.namespace, key, aligned_key_len);
         self.match_post_processor_(
@@ -1191,6 +1195,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_value_len,
             full_kv_hit_length,
             full_kv_device_hit_length,
+            best_match_length,
             action,
         )
     }
@@ -1248,6 +1253,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         usize,
         usize,
         usize,
+        usize,
         Option<CacheAction>,
     ) {
         // Non-HiCache mode has only device-resident matches, so the scheduler
@@ -1265,6 +1271,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // Leading atoms whose Full KV is on device; stops growing at the first host-only node.
         let mut full_kv_device_hit_length = 0;
         let mut full_kv_on_device = true;
+        let mut best_match_length = 0;
         let mut action: Option<CacheAction> = None;
         let separate_device_match = self.enable_hicache;
         let mut validators = Vec::with_capacity(self.components.len());
@@ -1348,6 +1355,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 if !node.evicted() {
                     value.push(node.device_value(FULL).shallow_clone());
                 }
+                let previous_best = best_match_node_id;
                 update_best_if_valid(
                     self,
                     node_id,
@@ -1359,6 +1367,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     &mut best_match_device_node_id,
                     &mut best_match_device_value_len,
                 );
+                if best_match_node_id != previous_best {
+                    best_match_length = full_kv_hit_length;
+                }
                 break;
             }
 
@@ -1366,6 +1377,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 value.push(child.device_value(FULL).shallow_clone());
             }
             node_id = child_id;
+            let previous_best = best_match_node_id;
             update_best_if_valid(
                 self,
                 node_id,
@@ -1377,6 +1389,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut best_match_device_node_id,
                 &mut best_match_device_value_len,
             );
+            if best_match_node_id != previous_best {
+                best_match_length = full_kv_hit_length;
+            }
             offset += prefix_len;
         }
 
@@ -1387,6 +1402,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_value_len,
             full_kv_hit_length,
             full_kv_device_hit_length,
+            best_match_length,
             action,
         )
     }
@@ -1402,6 +1418,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         best_match_device_value_len: usize,
         full_kv_hit_length: usize,
         full_kv_device_hit_length: usize,
+        best_match_length: usize,
         action: Option<CacheAction>,
     ) -> MatchResult {
         for i in 0..self.components.len() {
@@ -1454,6 +1471,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_branching_seqlen: None,
             full_kv_hit_length,
             full_kv_device_hit_length,
+            best_match_length,
             cache_actions: Vec::new(),
         };
         for i in 0..self.components.len() {
@@ -1485,6 +1503,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_branching_seqlen: None,
             full_kv_hit_length: 0,
             full_kv_device_hit_length: 0,
+            best_match_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
             cache_actions: Vec::new(),

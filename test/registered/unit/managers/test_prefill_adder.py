@@ -614,6 +614,7 @@ class TestPrefillAdder(CustomTestCase):
             host_hit_length=0,
             full_kv_hit_length=0,
             full_kv_device_hit_length=0,
+            best_match_length=0,
         )
         match = swa_prefix_match(tree_cache=tree_cache, match_result=match_result)
         got = swa_prefix_admission(match=match, prefix_len=8)
@@ -621,6 +622,23 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(got.full_kv_host_hit, 0)
         self.assertEqual(got.swa_miss, 0)
         self.assertEqual(got.swa_restored, 0)
+
+    def test_swa_prefix_match_treats_host_restorable_window_as_reusable(self):
+        """A prefix whose FULL is on device and whose SWA window is on host is
+        reusable; declining its load-back is a capacity loss, not an SWA miss."""
+        tree_cache = SimpleNamespace(swa_is_only_match_cut=lambda: True)
+        match_result = SimpleNamespace(
+            device_indices=torch.arange(16),
+            host_hit_length=0,
+            full_kv_hit_length=32,
+            full_kv_device_hit_length=32,
+            best_match_length=32,
+        )
+        match = swa_prefix_match(tree_cache=tree_cache, match_result=match_result)
+        declined = swa_prefix_admission(match=match, prefix_len=16)
+        self.assertEqual((declined.swa_miss, declined.swa_restored), (0, 0))
+        loaded = swa_prefix_admission(match=match, prefix_len=32)
+        self.assertEqual((loaded.swa_miss, loaded.swa_restored), (0, 16))
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

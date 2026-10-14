@@ -295,6 +295,8 @@ class MatchResult(NamedTuple):
                             host, independent of other components.
         full_kv_device_hit_length: Leading part of `full_kv_hit_length` whose
                             Full KV is on device.
+        best_match_length: Prefix length up to `best_match_node` (all component
+                            validators passed, host-restorable components included).
     """
 
     device_indices: torch.Tensor
@@ -309,6 +311,7 @@ class MatchResult(NamedTuple):
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
     full_kv_device_hit_length: int = 0
+    best_match_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -333,6 +336,7 @@ def zero_match_result(
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
         full_kv_device_hit_length=0,
+        best_match_length=0,
     )
 
 

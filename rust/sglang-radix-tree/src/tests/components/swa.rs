@@ -6376,6 +6376,7 @@ fn finalize_branching(
                 host_hit_length,
                 full_kv_hit_length,
                 full_kv_device_hit_length: 0,
+                best_match_length: 0,
                 ..tc.empty_match_result()
             },
             /* last_device_node_idx = */ tc.arena.root(),

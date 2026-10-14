@@ -8620,6 +8620,7 @@ fn full_kv_device_hit_length_stops_at_the_first_host_only_node() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert_eq!(result.full_kv_hit_length, 4);
     assert_eq!(result.full_kv_device_hit_length, 2);
+    assert_eq!(result.best_match_length, 4);
 }
 
 #[test]

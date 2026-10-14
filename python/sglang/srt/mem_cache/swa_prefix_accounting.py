@@ -21,8 +21,8 @@ class SwaPrefixMatch(msgspec.Struct, frozen=True):
     full_kv_device_hit_length: int = 0
     # Prefix every validator accepted on device.
     device_hit_length: int = 0
-    # Device hit plus host hit; the host hit also covers backed-up nodes whose FULL
-    # is still on device but whose SWA window is only on host.
+    # Deepest prefix every validator accepted, including host-restorable windows and
+    # backed-up FULL; a load-back declined past it is a capacity loss, not an SWA miss.
     reusable_length: int = 0
 
 
@@ -41,7 +41,9 @@ def swa_prefix_match(
     if not tree_cache.swa_is_only_match_cut():
         return SwaPrefixMatch()
     device_hit = len(match_result.device_indices)
-    reusable = device_hit + match_result.host_hit_length
+    reusable = max(
+        match_result.best_match_length, device_hit + match_result.host_hit_length
+    )
     # Producers that skip the tree walk (streaming sessions) leave the full-KV
     # lengths at 0; whatever the match reuses has full KV too.
     return SwaPrefixMatch(
