@@ -144,7 +144,9 @@ jobs:
           cluster_name: ${{ env.GKE_CLUSTER }}
           location: ${{ env.GKE_ZONE }}
       - id: in-ctx
-        run: echo "ctx=$(kubectl config current-context)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "ctx=$(kubectl config current-context)" >> "$GITHUB_OUTPUT"
+          echo "kubeconfig=${KUBECONFIG}" >> "$GITHUB_OUTPUT"
       - if: inputs.external_slots
         uses: google-github-actions/get-gke-credentials@v2
         with:
@@ -154,10 +156,21 @@ jobs:
           use_dns_based_endpoint: true
       - id: ext-ctx
         if: inputs.external_slots
+        # get-gke-credentials writes a fresh kubeconfig per call, so merge both clusters into one.
         # Bare kubectl (discover_pools, reconcile_quota) must keep talking to the in-project cluster.
         run: |
           echo "ctx=$(kubectl config current-context)" >> "$GITHUB_OUTPUT"
-          kubectl config use-context '${{ steps.in-ctx.outputs.ctx }}'
+          merged="$RUNNER_TEMP/kubeconfig-merged"
+          KUBECONFIG="${{ steps.in-ctx.outputs.kubeconfig }}:${KUBECONFIG}" kubectl config view --flatten > "$merged"
+          echo "KUBECONFIG=${merged}" >> "$GITHUB_ENV"
+          KUBECONFIG="$merged" kubectl config use-context '${{ steps.in-ctx.outputs.ctx }}'
+
+      - name: TPU inventory
+        continue-on-error: true
+        run: |
+          python3 .github/tpu-ci/tpu_inventory.py --summary "$GITHUB_STEP_SUMMARY" \
+            --context 'internal=${{ steps.in-ctx.outputs.ctx }}' \
+            --context 'external=${{ steps.ext-ctx.outputs.ctx }}'
 
       - name: Render + acquire a TPU slot
         id: acquire
