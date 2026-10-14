@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_prefix_accounting import (
     SwaPrefixMatch,
     swa_prefix_admission,
+    swa_prefix_match,
 )
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
@@ -603,6 +604,23 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(got.swa_restored, swa_restored)
                 self.assertEqual(got.full_kv_device_hit, 32)
                 self.assertEqual(got.full_kv_host_hit, 0)
+
+    def test_swa_prefix_match_counts_reuse_from_walkless_producers(self):
+        """Streaming-session matches skip the tree walk and leave the full-KV
+        lengths at 0; the reused device prefix must still count as a full-KV hit."""
+        tree_cache = SimpleNamespace(swa_is_only_match_cut=lambda: True)
+        match_result = SimpleNamespace(
+            device_indices=torch.arange(8),
+            host_hit_length=0,
+            full_kv_hit_length=0,
+            full_kv_device_hit_length=0,
+        )
+        match = swa_prefix_match(tree_cache=tree_cache, match_result=match_result)
+        got = swa_prefix_admission(match=match, prefix_len=8)
+        self.assertEqual(got.full_kv_device_hit, 8)
+        self.assertEqual(got.full_kv_host_hit, 0)
+        self.assertEqual(got.swa_miss, 0)
+        self.assertEqual(got.swa_restored, 0)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

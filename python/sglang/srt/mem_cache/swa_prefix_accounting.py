@@ -40,11 +40,17 @@ def swa_prefix_match(
 ) -> SwaPrefixMatch:
     if not tree_cache.swa_is_only_match_cut():
         return SwaPrefixMatch()
+    device_hit = len(match_result.device_indices)
+    reusable = device_hit + match_result.host_hit_length
+    # Producers that skip the tree walk (streaming sessions) leave the full-KV
+    # lengths at 0; whatever the match reuses has full KV too.
     return SwaPrefixMatch(
-        full_kv_hit_length=match_result.full_kv_hit_length,
-        full_kv_device_hit_length=match_result.full_kv_device_hit_length,
-        device_hit_length=len(match_result.device_indices),
-        reusable_length=len(match_result.device_indices) + match_result.host_hit_length,
+        full_kv_hit_length=max(match_result.full_kv_hit_length, reusable),
+        full_kv_device_hit_length=max(
+            match_result.full_kv_device_hit_length, device_hit
+        ),
+        device_hit_length=device_hit,
+        reusable_length=reusable,
     )
 
 
