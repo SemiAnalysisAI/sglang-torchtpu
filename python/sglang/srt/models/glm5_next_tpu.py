@@ -16,7 +16,12 @@ from torch.nn import functional as F
 
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.configs.model_config import GLM5_NEXT_TPU_MLA_ROPE_PAD
-from sglang.srt.distributed import divide
+from sglang.srt.distributed import (
+    divide,
+    get_tp_group,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang_tpu.kda_layout import pack_kda_weights
@@ -266,9 +271,12 @@ class Glm5NextLinearAttention(nn.Module):
 
 
 class Glm5NextDenseAttention(nn.Module):
-    """Unabsorbed MLA, exact while all causal keys fit the indexer budget."""
+    """Unabsorbed MLA, exact while all causal keys fit the indexer budget.
 
-    def __init__(self, config, layer_id, quant_config, prefix):
+    reduce_output=False returns o_proj's per-rank partial sums for the caller
+    to reduce (the target model reduce-scatters prefill outputs)."""
+
+    def __init__(self, config, layer_id, quant_config, prefix, reduce_output=True):
         super().__init__()
         self.heads = divide(config.num_attention_heads, get_parallel().attn_tp_size)
         self.q_dim = config.qk_nope_head_dim
@@ -304,6 +312,7 @@ class Glm5NextDenseAttention(nn.Module):
             config.num_attention_heads * self.v_dim,
             config.hidden_size,
             bias=False,
+            reduce_results=reduce_output,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -340,8 +349,8 @@ class Glm5NextLatentAttention(Glm5NextDenseAttention):
 
     rope_pad = GLM5_NEXT_TPU_MLA_ROPE_PAD
 
-    def __init__(self, config, layer_id, quant_config, prefix):
-        super().__init__(config, layer_id, quant_config, prefix)
+    def __init__(self, config, layer_id, quant_config, prefix, reduce_output=True):
+        super().__init__(config, layer_id, quant_config, prefix, reduce_output)
         # forward views kv_b_proj.weight as [heads, q_dim + v_dim, kv_rank]; that
         # holds only for the unquantized [out, in] layout the checkpoint ships.
         assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
@@ -381,8 +390,8 @@ class Glm5NextSparseAttention(Glm5NextLatentAttention):
     """DeepSeek Sparse Attention: the pooled (kpool) indexer picks each query's
     keys, and absorbed MLA attends over only those (pallas_tpu_mla_sparse)."""
 
-    def __init__(self, config, layer_id, quant_config, prefix):
-        super().__init__(config, layer_id, quant_config, prefix)
+    def __init__(self, config, layer_id, quant_config, prefix, reduce_output=True):
+        super().__init__(config, layer_id, quant_config, prefix, reduce_output)
         from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 
         self.layer_id = layer_id
@@ -442,6 +451,11 @@ def _runs_dsa() -> bool:
     return envs.SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT.get() is None
 
 
+# Token count from which the target keeps its mHC residual sequence-parallel
+# (see Glm5NextModel._forward_fused_mhc); decode and verify batches stay below.
+_SP_MIN_TOKENS = 1024
+
+
 def _full_attention_cls(*, draft: bool = False):
     if not draft and _runs_dsa():
         return Glm5NextSparseAttention
@@ -491,11 +505,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 config,
                 quant_config,
                 prefix=f"{prefix}.self_attn",
-                reduce_results=True,
+                reduce_results=False,
             )
         else:
             self.self_attn = _full_attention_cls()(
-                config, layer_id, quant_config, f"{prefix}.self_attn"
+                config, layer_id, quant_config, f"{prefix}.self_attn", reduce_output=False
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -509,6 +523,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 quant_config,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
+                reduce_results=False,
             )
         else:
             self.mlp = DeepseekV2MoE(
@@ -516,6 +531,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 layer_id=layer_id,
+                reduce_results=False,
             )
         for site in ("attn", "ffn"):
             h = config.hc_mult
@@ -602,13 +618,41 @@ class Glm5NextModel(nn.Module):
         # so layer_in is already normalized.
         eps = float(c.rms_norm_eps)
         site = (h, c.hc_sinkhorn_iters, eps, float(c.hc_eps), eps)
+        # Sublayers return per-rank partial sums. Prefill-sized batches keep the
+        # mHC residual sequence-parallel: reduce-scatter each sublayer output,
+        # run the seam on this rank's 1/tp of the tokens (it is per-token and
+        # bandwidth-bound) and all-gather the next sublayer's input. Same ICI
+        # bytes as an all-reduce, 1/tp of the seam work. Small batches
+        # all-reduce as before.
+        tp_group = get_tp_group()
+        tp = tp_group.world_size
+        tokens = x.shape[0]
+        seq_parallel = tp > 1 and tokens >= _SP_MIN_TOKENS and tokens % tp == 0
+        if seq_parallel:
+            local = tokens // tp
+            x = x.narrow(0, tp_group.rank_in_group * local, local)
+
+            def reduce(out):
+                part = out.new_empty((local, out.shape[-1]))
+                tp_group.reduce_scatter_tensor(part, out)
+                return part
+
+            def gather(part):
+                return tensor_model_parallel_all_gather(part, dim=0)
+
+        else:
+            reduce = tensor_model_parallel_all_reduce if tp > 1 else (lambda t: t)
+
+            def gather(part):
+                return part
+
         res = x.unsqueeze(-2).expand(-1, h, -1).reshape(x.shape[0], -1)
         first = self.layers[0]
         layer_in, post, comb = pre_op(
             res, first.hc_attn_fn, first.hc_attn_vec, first.hc_attn_norm_weight, *site
         )
         for i, layer in enumerate(self.layers):
-            out = layer.self_attn(layer_in, forward_batch)
+            out = reduce(layer.self_attn(gather(layer_in), forward_batch))
             res, layer_in, post, comb = seam_op(
                 out,
                 res,
@@ -619,7 +663,7 @@ class Glm5NextModel(nn.Module):
                 layer.hc_ffn_norm_weight,
                 *site,
             )
-            out = layer.mlp(layer_in, forward_batch)
+            out = reduce(layer.mlp(gather(layer_in), forward_batch))
             if i + 1 < len(self.layers):
                 nxt = self.layers[i + 1]
                 res, layer_in, post, comb = seam_op(
@@ -633,10 +677,10 @@ class Glm5NextModel(nn.Module):
                     *site,
                 )
                 if i + 1 in self.layers_to_capture:
-                    aux.append(res.view(-1, h, c.hidden_size).mean(-2))
+                    aux.append(gather(res.view(-1, h, c.hidden_size).mean(-2)))
             else:
                 res = post_op(out, res, post, comb, h)
-        return self.norm(res.view(-1, h, c.hidden_size).mean(-2))
+        return gather(self.norm(res.view(-1, h, c.hidden_size).mean(-2)))
 
 
 def _load_flash_weights(params, weights, n_routed_experts):
