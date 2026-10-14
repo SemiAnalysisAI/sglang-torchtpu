@@ -30,8 +30,10 @@ class TpuEnvs:
     SGLANG_TPU_OPT_SKIP_GUARD_EVAL = EnvBool(True)
     # KDA (attention_gdn_pallas)
     # Bounded-gate KDA prefill through the sglang-jax Mega kernel
-    # (kernels/mega_kda.py) instead of the fused GDN v3 kernel.
-    SGLANG_TPU_OPT_MEGA_KDA_PREFILL = EnvBool(True)
+    # (kernels/mega_kda.py) instead of the fused GDN v3 kernel. Off: faster in
+    # isolation (0.64 vs 0.79 ms/layer at 8k) but not in a served GLM-5.3-Flash
+    # prefill, where the XLA conv glue and the fallback cond cost the gain.
+    SGLANG_TPU_OPT_MEGA_KDA_PREFILL = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
