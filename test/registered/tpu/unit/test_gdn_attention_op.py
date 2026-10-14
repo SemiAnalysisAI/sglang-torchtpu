@@ -6,7 +6,8 @@ test). This file pins the torch<->JAX bridge in
 :mod:`sglang_tpu.attention_gdn_pallas`:
 
   * a torch.library custom op ``sglang_tpu_pallas::gdn_attention`` is
-    registered and reachable via ``torch.ops.sglang_tpu_pallas``;
+    registered (its name carries a source digest) and reachable via
+    ``torch.ops.sglang_tpu_pallas``;
   * ``build_gdn_pallas_op`` is idempotent (the ``_PALLAS_GDN_OP`` singleton
     short-circuits — torch.library rejects double registration);
   * the op's output matches the underlying JAX kernel, and it mutates
@@ -233,6 +234,7 @@ class TestGDNAttentionOp(CustomTestCase):
 
     def test_op_registered_and_idempotent(self):
         from sglang_tpu.attention_gdn_pallas import (
+            _kernel_source_fingerprint,
             build_gdn_pallas_op,
         )
 
@@ -240,7 +242,9 @@ class TestGDNAttentionOp(CustomTestCase):
         op2 = build_gdn_pallas_op()
         self.assertIs(op1, op2, "builder must be idempotent (singleton)")
         self.assertTrue(hasattr(torch.ops, "sglang_tpu_pallas"))
-        self.assertTrue(hasattr(torch.ops.sglang_tpu_pallas, "gdn_attention"))
+        # The op name carries a digest of the kernel sources.
+        name = f"gdn_attention_{_kernel_source_fingerprint()}"
+        self.assertTrue(hasattr(torch.ops.sglang_tpu_pallas, name))
 
     def test_op_lowers_under_cpu_export_pin(self):
         """The op must lower on a host where JAX is pinned to CPU.
