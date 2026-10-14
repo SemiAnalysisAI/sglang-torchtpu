@@ -707,10 +707,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return tensor
 
             if prebuilt_tree is not None:
-                # Trim rows before flattening so verify pads each request once.
+                # Trim rows so verify pads each request once; positions and
+                # verify tokens arrive flat, num_draft_tokens per request.
+                width = self.speculative_num_draft_tokens
                 prebuilt_tree = (
                     prebuilt_tree[0],
-                    *(tensor[:real_bs] for tensor in prebuilt_tree[1:]),
+                    *(
+                        tensor[: real_bs * width] if tensor.dim() == 1 else tensor[:real_bs]
+                        for tensor in prebuilt_tree[1:]
+                    ),
                 )
             else:
                 parent_list = _unpad_rows(parent_list)
@@ -888,10 +893,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
+        tree = build_topk1_verify_chain_torch(
             bonus_tokens,
             torch.cat(tokens, dim=1),
             seq_lens,
+        )
+        # Flatten positions and verify tokens in-graph: flattening the outputs
+        # afterwards hands the verify graph views, which cost a program each.
+        mask, positions, retrieve_index, next_token, next_sibling, verify_tokens = tree
+        return (
+            mask,
+            positions.reshape(-1),
+            retrieve_index,
+            next_token,
+            next_sibling,
+            verify_tokens.reshape(-1),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
