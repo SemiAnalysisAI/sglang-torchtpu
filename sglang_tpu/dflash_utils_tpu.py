@@ -65,6 +65,7 @@ def build_tpu_draft_extend_metadata(
     draft_prefix_lens: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     extend_seq_lens_buf: Optional[torch.Tensor] = None,
+    extend_prefix_lens: Optional[torch.Tensor] = None,
 ) -> TpuDraftExtendMetadata:
     """Build the draft block's extend metadata.
 
@@ -89,7 +90,8 @@ def build_tpu_draft_extend_metadata(
         raise RuntimeError(
             "TPU draft extend metadata requires the host seq_lens mirror, got None."
         )
-    extend_prefix_lens = draft_prefix_lens.to(torch.int32)
+    if extend_prefix_lens is None:
+        extend_prefix_lens = draft_prefix_lens.to(torch.int32)
     if extend_seq_lens_buf is not None:
         # The caller fills the buffer with `width` once; refilling it every
         # round would launch an eager program per step.
@@ -386,7 +388,9 @@ def build_dflash_block_tpu(
     materializes reshaped views (and buffers written through them) in an extra
     program per launch, so the flat forms are copies, not views. candidates
     holds the slot ids for [base, base + 2 * block_size); returns (block_ids,
-    block_ids flat, positions flat, cache_loc, cache_loc flat).
+    block_ids flat, positions flat, cache_loc, cache_loc flat, prefix int32,
+    prefix + block_size int32). The last two are the draft's extend prefix and
+    both verify forwards' RPA kv_lens, each otherwise an eager cast per round.
     """
     cache_loc = _select_verify_cache_locs(
         candidates, seq_lens, committed_lens, block_size
@@ -402,6 +406,8 @@ def build_dflash_block_tpu(
         positions.reshape(-1).clone(),
         cache_loc,
         cache_loc.reshape(-1).clone(),
+        seq_lens.to(torch.int32),
+        (seq_lens + block_size).to(torch.int32),
     )
 
 
@@ -495,6 +501,18 @@ class DeviceVerifyBlockSelector:
         the caller trims off.
         """
         pad_bs = self._pad_bs(bs)
+        inputs = (candidates, prefix_lens, committed_lens, bonus_tokens)
+        if pad_bs == bs and all(t.dtype == torch.int64 for t in inputs):
+            # The batch already fills its bucket: staging would only add four
+            # copy launches.
+            return build_dflash_block_tpu(
+                candidates,
+                prefix_lens,
+                committed_lens,
+                bonus_tokens,
+                mask_token,
+                self.block_size,
+            )
         self._ensure_capacity(pad_bs)
         padded_candidates = self._candidates[:pad_bs]
         padded_committed = self._committed_lens[:pad_bs]

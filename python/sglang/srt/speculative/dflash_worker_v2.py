@@ -2315,9 +2315,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         *,
         batch: ScheduleBatch,
-        seq_lens_pre_verify: torch.Tensor,
+        seq_lens_pre_verify: Optional[torch.Tensor],
         seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
+        accept_len: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
 
@@ -2329,7 +2330,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        if attn_backend.linear_attn_backend.commits_verify_by_read_offset:
+            # The read-offset commit takes int32 rows, which accept_len already is
+            # (commit_lens - 1); deriving it again costs eager launches on TPU.
+            last_correct_step_indices = accept_len
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -2858,6 +2864,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 padded_positions,
                 padded_cache_loc_2d,
                 padded_cache_loc,
+                padded_prefix_i32,
+                padded_verify_kv_lens,
             ) = self._verify_block_selector.build_block(
                 candidates=verify_cache_candidates,
                 committed_lens=draft_input.tpu_committed_lens,
@@ -2868,6 +2876,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             block_ids = padded_block_ids[:bs]
             verify_out_cache_loc_2d = padded_cache_loc_2d[:bs]
+            # Rows past bs are bucket padding; slice only when there are some.
+            if padded_verify_kv_lens.shape[0] == bs:
+                block_prefix_i32 = padded_prefix_i32
+                block_verify_kv_lens = padded_verify_kv_lens
+            else:
+                block_prefix_i32 = padded_prefix_i32[:bs]
+                block_verify_kv_lens = padded_verify_kv_lens[:bs]
         else:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
@@ -2959,6 +2974,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_prefix_lens=draft_prefix_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 extend_seq_lens_buf=self._draft_extend_seq_lens_buf,
+                extend_prefix_lens=block_prefix_i32 if fused_block else None,
             )
             # The draft forward runs as TARGET_VERIFY, whose attention metadata
             # adds the block width to seq_lens itself; keep the committed prefix.
@@ -2982,6 +2998,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         )
 
+        # The draft runs as TARGET_VERIFY over the committed prefix plus one
+        # block: the same kv_lens as the target verify built in the block op.
+        self._draft_block_spec_info.verify_kv_lens = (
+            block_verify_kv_lens if fused_block else None
+        )
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc_is_physical=True,
@@ -3178,12 +3199,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
+        if fused_block:
+            verify_input.verify_kv_lens = block_verify_kv_lens
 
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
+        # Read only to place mamba-track checkpoints.
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+            batch.seq_lens.clone()
+            if self._need_mamba_verify_commit and batch.mamba_track_indices is not None
+            else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -3344,7 +3370,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if self._need_mamba_verify_commit:
-            assert seq_lens_pre_verify is not None
             if new_seq_lens is None:
                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             self._update_target_mamba_state_after_verify(
@@ -3352,6 +3377,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
+                accept_len=accept_len,
             )
 
         if new_seq_lens is None:
