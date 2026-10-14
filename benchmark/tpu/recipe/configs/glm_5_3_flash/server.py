@@ -6,9 +6,11 @@ Sample usage (from the repo root):
         --config recipe/configs/glm_5_3_flash/server.py
     # add --dry-run to print the resolved sglang.launch_server command.
 
-Full attention runs densely: DSA selects index_topk = 2048 tokens, so dense is
-exact up to a 2048-token context. 8k/1k needs ~9.3k, so this recipe raises the
-dense limit; past 2048 tokens the attention is denser than the model's DSA.
+The 11 full-attention layers run the model's own sparse attention (pooled DSA:
+the kpool indexer picks 2048 tokens per query) on pallas_tpu_mla_sparse, over an
+FP8 latent cache. SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT (attend densely instead)
+is a perf-only escape hatch that does not match the model past 2048 tokens; do
+not set it for results.
 """
 
 from copy import deepcopy
@@ -49,9 +51,10 @@ CONFIG["server_args"].update(
         # Linear-attention (KDA) state slots: one per running request; the +2
         # spare is arbitrary headroom.
         "max_mamba_cache_size": MAX_RUNNING + 2,
-        # Only the 11 full-attention layers have a KV cache; bf16 matches the
-        # dense attention path these numbers were measured on.
-        "kv_cache_dtype": "bfloat16",
+        # Only the 11 full-attention layers have a KV cache: the absorbed MLA
+        # latent (FP8, split NoPE | RoPE pool) plus each indexer's raw keys.
+        "attention_backend": "pallas_tpu_mla_sparse",
+        "kv_cache_dtype": "fp8_e4m3",
         "mem_fraction_static": 0.9,
         "disable_shared_experts_fusion": True,
         "watchdog_timeout": 1800,
@@ -59,7 +62,8 @@ CONFIG["server_args"].update(
 )
 CONFIG["runtime_env"].update(
     {
-        "SGLANG_TPU_GLM_FLASH_DENSE_MAX_CONTEXT": str(CONTEXT_LENGTH),
+        # Absorbed-MLA attention modules (the MTP head runs them densely).
+        "SGLANG_TPU_GLM_FLASH_MLA": "1",
         "SGLANG_MAMBA_SSM_DTYPE": "float32",
         # Decode speed flags, each measured by interleaved A/B on 8k/1k c=1:
         # route-meta MoE path (single-token SMEM counting sort).

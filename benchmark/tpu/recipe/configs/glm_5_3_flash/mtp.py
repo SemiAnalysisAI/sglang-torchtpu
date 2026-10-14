@@ -31,6 +31,9 @@ CONFIG["server_args"].update(
         "speculative_eagle_topk": 1,
         "speculative_num_steps": NUM_STEPS,
         "speculative_num_draft_tokens": NUM_STEPS + 1,
+        # The MTP head attends densely over the absorbed latent (it takes no
+        # shared DSA top-k on TPU); only acceptance depends on that.
+        "speculative_draft_attention_backend": "pallas_tpu_mla",
     }
 )
 CONFIG["runtime_env"].update({"SGLANG_SPEC_TP_SYNC": "rng"})
