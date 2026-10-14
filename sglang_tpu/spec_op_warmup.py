@@ -42,6 +42,37 @@ def make_verify_tree_greedy_args(
     )
 
 
+def make_greedy_verify_chain_args(
+    context: SpecOpWarmupContext,
+) -> tuple:
+    from sglang.srt.speculative.eagle_utils import SIM_FIXED, SIM_OFF, SIM_REAL
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+    )
+
+    if SIMULATE_ACC_LEN <= 0:
+        simulate_mode = SIM_OFF
+    elif SIMULATE_ACC_TOKEN_MODE == "fixed":
+        simulate_mode = SIM_FIXED
+    else:
+        simulate_mode = SIM_REAL
+    num_verify_rows = context.physical_bs * context.num_verify_tokens
+    return (
+        torch.zeros(
+            (num_verify_rows, context.vocab_size),
+            dtype=torch.float32,
+            device=context.device,
+        ),
+        torch.zeros((num_verify_rows,), dtype=torch.int64, device=context.device),
+        torch.arange(num_verify_rows, dtype=torch.int64, device=context.device).view(
+            context.physical_bs, context.num_verify_tokens
+        ),
+        torch.ones((1,), dtype=torch.int32, device=context.device),
+        simulate_mode,
+    )
+
+
 def make_verify_bookkeeping_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor, ...]:
