@@ -44,7 +44,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # Holds freed pages back from non-forward allocations; None frees at once.
     kv_free_fence: KVFreeFence | None = None
     # Class-level: SWA and HiSparse allocators do not call the base __init__.
-    draft_kv_pools: tuple[KVCache, ...] = ()
+    full_draft_kv_pool: KVCache | None = None
 
     @abc.abstractmethod
     def __init__(
@@ -72,13 +72,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def size_full(self):
         return self.size
 
-    def register_draft_kv_pools(self, pools: tuple[KVCache, ...]) -> None:
-        """Declare draft KV pools indexed by this allocator's token ids, so CPU
-        retraction carries them with the target KV."""
-        for pool in pools:
-            assert pool.supports_cpu_copy, type(pool).__name__
-            pool.is_draft_pool = True
-        self.draft_kv_pools = pools
+    def register_full_draft_kv_pool(self, pool: KVCache) -> None:
+        """Declare a draft KV pool indexed by this allocator's token ids, so CPU
+        retraction carries it with the target KV."""
+        self.full_draft_kv_pool = pool
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches

@@ -15,7 +15,6 @@ from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_sch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -178,20 +177,6 @@ class BaseSpecWorker(ABC):
         if spec_algorithm.is_dflash_family():
             return (draft_worker.model_runner,)
         return tuple(draft_worker.draft_runners)
-
-    def cpu_retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
-        """Draft pools CPU retraction can carry at the target allocator's token ids."""
-        target_pool = self.target_worker.model_runner.token_to_kv_pool
-        pools = []
-        for runner in self._draft_model_runners():
-            pool = runner.token_to_kv_pool
-            if (
-                pool is not target_pool
-                and pool.supports_cpu_copy
-                and all(pool is not seen for seen in pools)
-            ):
-                pools.append(pool)
-        return tuple(pools)
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:

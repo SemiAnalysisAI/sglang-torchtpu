@@ -38,8 +38,8 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
-    # One payload per allocator draft_kv_pools entry, at the target's token ids.
-    draft_cpu: tuple = ()
+    # Draft KV of a registered full draft pool (same token ids as the target).
+    draft_cpu: Any = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:

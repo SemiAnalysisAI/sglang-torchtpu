@@ -23,7 +23,7 @@ class _MambaPool:
 
 
 class _Allocator:
-    draft_kv_pools = ()
+    full_draft_kv_pool = None
 
     def __init__(self, carries_mamba: bool):
         self._kv = type("_KV", (), {"cpu_copy_carries_mamba": carries_mamba})()

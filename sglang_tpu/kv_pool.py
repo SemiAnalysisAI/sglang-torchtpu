@@ -335,11 +335,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             # whenever the resume allocation maps fewer window tokens than the
             # save did. That member takes the row path instead.
             swa_member = self.allocation_label == "SWA"
-            # The staging budget is sized for the target pool; draft rows are
-            # small and take the row path.
-            self._raiden_backup_obj = (
-                None if swa_member or self.is_draft_pool else maybe_build_backup(self)
-            )
+            self._raiden_backup_obj = None if swa_member else maybe_build_backup(self)
         return self._raiden_backup_obj
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
@@ -750,8 +746,6 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     be called.
     """
 
-    supports_cpu_copy = False
-
     HEAD_DIM_ALIGNMENT = 128
 
     def __init__(
@@ -1010,8 +1004,6 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     large (about 2.5% for GLM-5.2). Pass --max-total-tokens until the sizer can
     ask the pool for its bytes per token.
     """
-
-    supports_cpu_copy = False
 
     NOPE_BYTES = 512
     # One lane. A token's RoPE bytes are padded to this size.

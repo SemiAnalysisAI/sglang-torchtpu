@@ -2049,9 +2049,12 @@ class Req(ReqDllmMixin):
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
-            draft_cpu=tuple(
-                pool.get_cpu_copy(token_indices, req_pool_index=self.kv.req_pool_idx)
-                for pool in token_to_kv_pool_allocator.draft_kv_pools
+            draft_cpu=(
+                token_to_kv_pool_allocator.full_draft_kv_pool.get_cpu_copy(
+                    token_indices, req_pool_index=self.kv.req_pool_idx
+                )
+                if token_to_kv_pool_allocator.full_draft_kv_pool is not None
+                else None
             ),
         )
 
@@ -2072,12 +2075,9 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
-        for pool, draft_cpu in zip(
-            token_to_kv_pool_allocator.draft_kv_pools,
-            self.kv.retraction_backup.draft_cpu,
-            strict=True,
-        ):
-            pool.load_cpu_copy(
+        draft_cpu = self.kv.retraction_backup.draft_cpu
+        if draft_cpu is not None:
+            token_to_kv_pool_allocator.full_draft_kv_pool.load_cpu_copy(
                 draft_cpu, token_indices, req_pool_index=self.kv.req_pool_idx
             )
         self.kv.retraction_backup = None

@@ -478,9 +478,6 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
     (extend attention reads prefix *and* chunk through the scratch page table).
     """
 
-    # Each rank keeps only its stripe of the token rows.
-    supports_cpu_copy = False
-
     def __init__(
         self,
         *args,
@@ -593,9 +590,6 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
     table. The current chunk is staged into the slot at write time so the
     page-table consumers cover ``[prefix | chunk]`` uniformly.
     """
-
-    # Each rank keeps only its stripe of the token rows.
-    supports_cpu_copy = False
 
     def __init__(
         self,

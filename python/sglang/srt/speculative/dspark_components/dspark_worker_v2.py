@@ -14,6 +14,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -454,6 +455,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        # The draft KV is injected at the target allocator's token ids. A
+        # DeepSeek-V4 draft pool has no CPU copy; its targets rebootstrap instead.
+        draft_pool = self._draft_worker.model_runner.token_to_kv_pool
+        if isinstance(draft_pool, MHATokenToKVPool):
+            token_to_kv_pool_allocator.register_full_draft_kv_pool(draft_pool)
 
     def init_attention_backends(self):
         if not self._hosts_draft:

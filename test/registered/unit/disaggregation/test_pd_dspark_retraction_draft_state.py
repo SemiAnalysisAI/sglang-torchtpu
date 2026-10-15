@@ -1,5 +1,5 @@
-"""A PD decode retraction must hand a speculative request back its own draft KV,
-not whatever reused its slots; target verification hides the loss, acceptance drops."""
+"""A PD decode retraction must hand a DSpark request back its own draft KV, not
+whatever reused its slots; target verification hides the loss, acceptance drops."""
 
 import unittest
 from types import SimpleNamespace
@@ -11,14 +11,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import restore_kv_cache
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -75,31 +71,25 @@ def _rows_equal(pool: MHATokenToKVPool, indices: torch.Tensor, expected) -> bool
     )
 
 
-class TestPdEagleRetractionDraftState(CustomTestCase):
+class TestPdDSparkRetractionDraftState(CustomTestCase):
     def setUp(self):
         enter_scope(
             self,
             published_topology(
                 disaggregation_mode="decode",
                 disaggregation_decode_retraction_backup="cpu_tensor",
-                speculative_algorithm="EAGLE3",
-                speculative_eagle_topk=1,
-                speculative_num_steps=3,
-                speculative_num_draft_tokens=4,
+                speculative_algorithm="DSPARK",
             ),
         )
         # CPU tensors; the platform's device sync has nothing to wait for.
         enter_scope(self, patch.object(memory_pool.current_platform, "synchronize"))
 
         self.target = _pool(layer_num=3)
-        # Multi-layer EAGLE runs one draft runner, and pool, per step.
-        self.drafts = (_pool(layer_num=1), _pool(layer_num=1))
+        self.draft = _pool(layer_num=1)
         self.allocator = TokenToKVPoolAllocator(
             POOL_SIZE, torch.float32, "cpu", self.target, need_sort=False
         )
-        self.allocator.register_draft_kv_pools(
-            _spec_worker(self.target, self.drafts).cpu_retraction_draft_kv_pools()
-        )
+        self._alloc_dspark_draft_pool()
 
         seqlen = PROMPT_LEN + DECODED
         self.req = Req(
@@ -116,11 +106,22 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         self.req_pool.req_to_token[self.req.kv.req_pool_idx, : seqlen - 1] = self.old
 
         _seed(self.target, self.old, base=1.0)
+        _seed(self.draft, self.old, base=9.0)
         self.target_before = _snapshot(self.target, self.old)
-        self.drafts_before = []
-        for step, draft in enumerate(self.drafts):
-            _seed(draft, self.old, base=9.0 + 100 * step)
-            self.drafts_before.append(_snapshot(draft, self.old))
+        self.draft_before = _snapshot(self.draft, self.old)
+
+    def _alloc_dspark_draft_pool(self) -> None:
+        """Attach the draft pool through DSparkWorkerV2.alloc_memory_pool, as the
+        scheduler does: the draft worker shares the target allocator."""
+        worker = object.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
+        worker._draft_worker = SimpleNamespace(
+            alloc_memory_pool=Mock(),
+            model_runner=SimpleNamespace(token_to_kv_pool=self.draft),
+        )
+        worker.alloc_memory_pool(
+            req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
+        )
 
     def _retract_and_resume(self) -> None:
         """retract_decode's release_req, slot reuse, then the resume path's
@@ -141,8 +142,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         self.assertTrue(batch.release_req(0, 0))
 
         _poison(self.target)
-        for draft in self.drafts:
-            _poison(draft)
+        _poison(self.draft)
         self.req_pool.alloc([self.req])  # _pre_alloc on resume
         self.req_pool.req_to_token[self.req.kv.req_pool_idx, : len(self.new)] = self.new
         restore_kv_cache(
@@ -161,35 +161,11 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
     def test_draft_kv_survives_retraction(self):
         """Draft KV shares the target allocator's slots, so it must travel with it."""
         self._retract_and_resume()
-        for step, (draft, before) in enumerate(
-            zip(self.drafts, self.drafts_before, strict=True)
-        ):
-            self.assertTrue(
-                _rows_equal(draft, self.new, before),
-                f"cpu_tensor retraction restored the target KV but not draft pool "
-                f"{step}: the resumed request drafts against another request's KV",
-            )
-
-    def test_uncarriable_draft_pools_are_skipped(self):
-        """A draft pool whose CPU copy drops rows, the target pool itself, or a pool
-        shared by two draft runners must not be carried (again)."""
-        fp4 = object.__new__(MHATokenToKVPoolFP4)
-        worker = _spec_worker(
-            self.target, (fp4, self.target, self.drafts[0], self.drafts[0])
+        self.assertTrue(
+            _rows_equal(self.draft, self.new, self.draft_before),
+            "cpu_tensor retraction restored the target KV but not the DSpark "
+            "draft KV: the resumed request drafts against another request's KV",
         )
-        self.assertEqual(worker.cpu_retraction_draft_kv_pools(), (self.drafts[0],))
-
-
-def _spec_worker(target: MHATokenToKVPool, drafts) -> EAGLEWorkerV2:
-    """A spec worker whose draft runners own ``drafts``."""
-    worker = object.__new__(EAGLEWorkerV2)
-    worker._target_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(token_to_kv_pool=target)
-    )
-    worker._draft_model_runners = lambda: tuple(
-        SimpleNamespace(token_to_kv_pool=pool) for pool in drafts
-    )
-    return worker
 
 
 if __name__ == "__main__":

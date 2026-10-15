@@ -2039,11 +2039,6 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
-    # Whether get_cpu_copy/load_cpu_copy round-trip every row the pool keeps
-    # for the allocator token ids they are given.
-    supports_cpu_copy: bool = False
-    # Set when the target allocator carries this pool as a draft KV pool.
-    is_draft_pool: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -2231,7 +2226,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-    supports_cpu_copy = True
     hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __init__(
@@ -3511,8 +3505,6 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
     this pool; those paths raise loudly so misuse is visible.
     """
 
-    supports_cpu_copy = False
-
     def _create_buffers(self):
         # No-op pool keeps tiny NHD placeholders regardless of SGLANG_USE_HND_KVCACHE
         # (no real KV is stored), so force NHD here to keep the store/move fast paths.
@@ -3607,9 +3599,6 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
-    # The inherited CPU copy leaves the scale buffers behind.
-    supports_cpu_copy = False
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -3770,8 +3759,6 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     gone, and ServerArgs rejects the static page-major arm at boot. The class
     stays as the seat for the per-layer-view reimplementation.
     """
-
-    supports_cpu_copy = False
 
     def __init__(
         self,
@@ -4755,8 +4742,6 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache):
-    supports_cpu_copy = True
-
     def __init__(
         self,
         size: int,
@@ -5089,9 +5074,6 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
-    # The inherited CPU copy leaves the scale buffer behind.
-    supports_cpu_copy = False
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
