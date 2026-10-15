@@ -145,7 +145,7 @@ class TestDpSchedulerCount(CustomTestCase):
         ]
     )
     def test_counts_attention_dp_groups_and_replicas(self, _name, info, expected):
-        self.assertEqual(self.bench._dp_scheduler_count(info), expected)
+        self.assertEqual(self.bench._dp_schedulers(info), expected)
 
 
 def _deprecated_flag_reads(path):
