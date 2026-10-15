@@ -216,11 +216,20 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         manager.waiting_queue = [waiting, keep]
         manager.staging_queue = [staging, waiting]
 
-        aborted = manager.pop_aborted_reqs(False, "abort")
+        self.assertEqual(manager.pop_aborted_reqs(False, "abort"), [])
+        self.assertEqual(manager.waiting_queue, [waiting, keep])
+        self.assertEqual(manager.staging_queue, [staging, waiting])
 
-        self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
-        )
+        aborted = manager.pop_aborted_reqs(False, waiting.rid)
+
+        # The same request is removed from both queues and returned only once.
+        self.assertEqual(aborted, [waiting])
+        self.assertEqual(manager.waiting_queue, [keep])
+        self.assertEqual(manager.staging_queue, [staging])
+
+        aborted = manager.pop_aborted_reqs(False, staging.rid)
+
+        self.assertEqual(aborted, [staging])
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
 
