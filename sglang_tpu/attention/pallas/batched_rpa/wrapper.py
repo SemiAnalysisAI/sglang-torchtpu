@@ -396,27 +396,46 @@ def calculate_block_sizes(
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
         # Step 3: Given current tile size, calculate compute tile size.
+        if fixed_bq_sz is not None:
+            return configs.BlockSizes(
+                bq_sz=bq_sz,
+                bq_c_sz=bq_sz,
+                bkv_sz=bkv_sz,
+                batch_size=batch_size,
+                n_buffer=n_buffer,
+            )
 
         # Fixed threshold value based on hardware spec.
         # TODO(kyuyeunk): Use different threshold based on hardware and precision.
         threshold = 1500
-
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
-
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
+        # In flash_attention, each compute sub-tile reshapes Q to
+        # (bq_c_sz * aligned_num_q_heads_per_kv_head, head_dim), so keep
+        # bq_c_sz a power-of-2 divisor >= 1 full sublane tile (num_lanes)
+        # where possible, and return the divisor that satisfies threshold
+        # rather than the previous divisor that exceeded it.
+        min_bq_c_sz = min(bq_sz, max(1, num_lanes // aligned_num_q_heads_per_kv_head))
+        max_num_bq_c = min(bq_sz, 32)
+        best_bq_c_sz = bq_sz
+        for num_bq_c in range(1, max_num_bq_c + 1):
             bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+            if bq_c_rem != 0:
+                continue
+            if (
+                bq_c_sz > min_bq_c_sz
+                and (bq_c_sz & (bq_c_sz - 1)) != 0
+                and bq_c_sz != bq_sz
+            ):
+                continue
+            best_bq_c_sz = bq_c_sz
+            if (
+                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) <= threshold
+                or bq_c_sz <= min_bq_c_sz
+            ):
+                break
 
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=last_valid_bq_c_sz,
+            bq_c_sz=best_bq_c_sz,
             bkv_sz=bkv_sz,
             batch_size=batch_size,
             n_buffer=n_buffer,

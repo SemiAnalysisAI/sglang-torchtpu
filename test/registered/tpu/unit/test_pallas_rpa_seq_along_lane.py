@@ -195,7 +195,14 @@ class TestKvCacheDtypeDefault(CustomTestCase):
 class TestPrefillBlockSizes(CustomTestCase):
     """The prefill tile: one cell, and an operator override for the k block."""
 
-    def _resolve(self, num_q_heads=4, ctx_pages=133):
+    def _resolve(
+        self,
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        page_size=256,
+        ctx_pages=133,
+    ):
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
@@ -205,8 +212,8 @@ class TestPrefillBlockSizes(CustomTestCase):
 
         model = configs.ModelConfigs(
             num_q_heads=num_q_heads,
-            num_kv_heads=1,
-            head_dim=128,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
             mask_value=float("-inf"),
         )
         with tpu_info_for_cpu_export():
@@ -217,7 +224,7 @@ class TestPrefillBlockSizes(CustomTestCase):
                 dtype_q=jnp.bfloat16,
                 dtype_kv=jnp.float8_e4m3fn,
                 dtype_out=jnp.bfloat16,
-                page_size=256,
+                page_size=page_size,
                 kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
             )
             _, prefill = wrapper.calculate_block_sizes(model, serve, 67108864)
@@ -235,6 +242,28 @@ class TestPrefillBlockSizes(CustomTestCase):
     def test_compute_chunk_divides_the_q_block(self):
         blocks = self._resolve()
         self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
+
+    def test_compute_chunk_is_power_of_two_and_meets_threshold(self):
+        for nq, nkv, hd in [
+            (64, 8, 64),
+            (32, 4, 64),
+            (16, 2, 64),
+            (8, 1, 64),
+            (4, 1, 128),
+        ]:
+            blocks = self._resolve(num_q_heads=nq, num_kv_heads=nkv, head_dim=hd)
+            self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
+            self.assertLessEqual(blocks.bq_sz // blocks.bq_c_sz, 32)
+            self.assertEqual(blocks.bq_c_sz & (blocks.bq_c_sz - 1), 0)
+        # 64q/8kv with bq_sz=256 has compute buffer time 2048 > 1500 at bq_c_sz=32,
+        # so bq_c_sz must step down to 16 (time=1024 <= 1500).
+        self.assertEqual(
+            self._resolve(num_q_heads=64, num_kv_heads=8, head_dim=64).bq_c_sz, 16
+        )
+        # 8q/1kv with bq_sz=1280 must keep power-of-2 bq_c_sz=64 instead of 1280//32=40.
+        self.assertEqual(
+            self._resolve(num_q_heads=8, num_kv_heads=1, head_dim=64).bq_c_sz, 64
+        )
 
     def test_k_block_is_a_page_multiple(self):
         # A k block below one page gives an empty DMA schedule leaf and fails
