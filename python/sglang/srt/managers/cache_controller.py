@@ -134,6 +134,10 @@ class BatchDoneCounter:
     int slot index), so the shim / cache_controller are unchanged.
     """
 
+    # Waited on once, before the forward (see wait()); per-layer consumers
+    # need not hold it.
+    gates_whole_batch = True
+
     def __init__(self, num_counters: int = 2):
         self.num_counters = num_counters
         # Each slot holds a reload's completion event (None before first use).

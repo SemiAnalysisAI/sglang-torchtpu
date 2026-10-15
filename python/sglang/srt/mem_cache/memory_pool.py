@@ -1577,6 +1577,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return clone
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+        # A whole-batch counter is waited on before the forward starts, so the
+        # per-layer state accessors have nothing to gate. Holding it anyway
+        # makes compiled graphs specialize on whether it is set, and graphs
+        # warmed before registration then miss their guard when serving.
+        if getattr(layer_transfer_counter, "gates_whole_batch", False):
+            return
         self.layer_transfer_counter = layer_transfer_counter
 
     # For chunk prefill req, we do not need to allocate mamba cache,
