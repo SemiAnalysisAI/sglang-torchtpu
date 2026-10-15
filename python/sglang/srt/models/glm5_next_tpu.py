@@ -779,10 +779,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             raise ValueError(
                 f"Dense GLM-5.3-Flash requires --context-length <= {dense_limit}"
             )
-        if not args.disable_radix_cache:
-            raise ValueError(
-                "GLM-5.3-Flash TPU currently requires --disable-radix-cache"
-            )
+        # Radix prefix caching is validated by TpuPlatform.validate_mamba_prefix_cache
+        # (KDA snapshot tracking; refused together with speculative decoding).
         if args.speculative_algorithm not in (None, "DFLASH", "EAGLE", "NEXTN"):
             raise ValueError(
                 "GLM-5.3-Flash TPU supports DFLASH and NEXTN (MTP) speculative decoding"
