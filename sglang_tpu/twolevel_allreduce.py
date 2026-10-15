@@ -92,9 +92,7 @@ def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
 
     if local > 1:
         exchange(packed, gather1, loc, local_peers, s1, r1)
-        part[...] = jnp.sum(gather1[...].astype(jnp.float32), axis=0).astype(
-            part.dtype
-        )
+        part[...] = jnp.sum(gather1[...].astype(jnp.float32), axis=0).astype(part.dtype)
     else:
         part[...] = packed[...].astype(part.dtype)
     if groups > 1:
