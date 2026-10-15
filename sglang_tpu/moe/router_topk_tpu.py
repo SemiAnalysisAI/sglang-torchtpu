@@ -5,7 +5,8 @@
 TPU to an XLA sort over all experts plus a gather and reductions: 7 us per
 MoE layer for Kimi-K3's top-16 of 896 at batch 1. This kernel does sigmoid,
 the biased choice, k rounds of argmax-and-mask, the weight gather and the
-renormalization in VMEM.
+renormalization in VMEM. Core's select_experts calls ``router_topk`` on TPU
+and keeps the sort when it returns None.
 
 Ties pick the lowest expert id, which ``torch.topk`` does not promise; the
 selected set differs from the sort only on exactly tied scores.
@@ -150,40 +151,39 @@ def _build_op() -> Callable:
 
 
 def register_router_topk_op() -> None:
-    """Register the op when enabled; must run before torch.compile traces the
-    model. Left unregistered, every call keeps the generic top-k."""
+    """Register the op; TpuSRTPlatform.init_backend calls this before any model
+    is built, so torch.compile traces a registered op."""
     global _OP_READY
-    from sglang_tpu.envs import envs as tpu_envs
-
-    if not tpu_envs.SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL.get():
-        return
     with _OP_LOCK:
         if not _OP:
             _OP.append(_build_op())
         _OP_READY = True
 
 
-def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) -> bool:
-    return (
+def router_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int,
+    routed_scaling_factor,
+    apply_routed_scaling_factor_on_output: bool,
+):
+    """(topk_weights, topk_ids) of sigmoid scores plus a shared correction bias,
+    or None when the kernel does not apply and the caller keeps its top-k.
+
+    Callers pass sigmoid routing over a single expert group only.
+    """
+    if not (
         _OP_READY
         and num_fused_shared_experts == 0
-        and correction_bias is not None
         and correction_bias.dim() == 1
         and gating_output.dim() == 2
         and 0 < gating_output.shape[0] <= MAX_TOKENS
         and gating_output.shape[1] % 128 == 0
         and topk <= 128
-    )
-
-
-def _run(
-    gating_output,
-    correction_bias,
-    topk,
-    renormalize,
-    routed_scaling_factor,
-    apply_routed_scaling_factor_on_output,
-):
+    ):
+        return None
     from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
 
     scale = (
@@ -200,89 +200,4 @@ def _run(
         bool(renormalize),
         float(_RENORMALIZE_SUM_EPSILON),
         scale,
-    )
-
-
-def biased_topk_around(
-    original,
-    hidden_states,
-    gating_output,
-    correction_bias,
-    topk,
-    renormalize,
-    scoring_func="sigmoid",
-    num_fused_shared_experts=0,
-    routed_scaling_factor=None,
-    num_token_non_padded=None,
-    expert_location_dispatch_info=None,
-    apply_routed_scaling_factor_on_output=False,
-):
-    """AROUND hook for ``topk.biased_topk_impl``."""
-    if not (
-        scoring_func == "sigmoid"
-        and expert_location_dispatch_info is None
-        and _eligible(gating_output, correction_bias, topk, num_fused_shared_experts)
-    ):
-        return original(
-            hidden_states,
-            gating_output,
-            correction_bias,
-            topk,
-            renormalize,
-            scoring_func,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-            num_token_non_padded,
-            expert_location_dispatch_info,
-            apply_routed_scaling_factor_on_output,
-        )
-    return _run(
-        gating_output,
-        correction_bias,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
-    )
-
-
-def biased_grouped_topk_around(
-    original,
-    hidden_states,
-    gating_output,
-    correction_bias,
-    topk,
-    renormalize,
-    num_expert_group=None,
-    topk_group=None,
-    num_fused_shared_experts=0,
-    routed_scaling_factor=None,
-    apply_routed_scaling_factor_on_output=False,
-):
-    """AROUND hook for ``topk.biased_grouped_topk_impl``: with one expert group
-    the group mask keeps every expert, so it is the plain biased top-k."""
-    if not (
-        num_expert_group in (None, 1)
-        and topk_group in (None, 1)
-        and _eligible(gating_output, correction_bias, topk, num_fused_shared_experts)
-    ):
-        return original(
-            hidden_states,
-            gating_output,
-            correction_bias,
-            topk,
-            renormalize,
-            num_expert_group,
-            topk_group,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-            apply_routed_scaling_factor_on_output,
-        )
-    return _run(
-        gating_output,
-        correction_bias,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
     )

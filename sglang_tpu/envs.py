@@ -26,9 +26,6 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
-    # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
-    # batches (moe/router_topk_tpu.py); False keeps the generic top-k.
-    SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:

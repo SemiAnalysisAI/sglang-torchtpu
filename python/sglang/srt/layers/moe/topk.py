@@ -1801,6 +1801,31 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+def _tpu_router_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: Optional[bool],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The TPU plugin's fused Pallas top-k of sigmoid scores plus a shared
+    correction bias over one expert group, for decode-sized batches; None when
+    it does not apply. It replaces an XLA sort over every expert."""
+    from sglang_tpu.moe.router_topk_tpu import router_topk
+
+    return router_topk(
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        bool(apply_routed_scaling_factor_on_output),
+    )
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1819,6 +1844,25 @@ def biased_grouped_topk_gpu(
         num_experts // num_expert_group if num_expert_group else num_experts
     )
     dynamic_bias = correction_bias.ndim == 2
+
+    # One expert group keeps every expert, so this is the plain biased top-k.
+    if (
+        _is_tpu
+        and not dynamic_bias
+        and num_expert_group in (None, 1)
+        and topk_group in (None, 1)
+    ):
+        routed = _tpu_router_topk(
+            gating_output,
+            correction_bias,
+            topk,
+            renormalize,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        if routed is not None:
+            return routed
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
@@ -2741,17 +2785,31 @@ def select_experts(
             and correction_bias is not None
             and scoring_func in ("sqrtsoftplus", "sigmoid")
         ):
-            topk_weights, topk_ids = biased_topk_impl(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
+            routed = None
+            if scoring_func == "sigmoid":
+                routed = _tpu_router_topk(
+                    router_logits,
+                    correction_bias,
+                    top_k,
+                    renormalize,
+                    num_fused_shared_experts_for_gate,
+                    routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output,
+                )
+            if routed is not None:
+                topk_weights, topk_ids = routed
+            else:
+                topk_weights, topk_ids = biased_topk_impl(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_fused_shared_experts_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
         else:
             if not _is_tpu:
                 assert num_token_non_padded is None, (

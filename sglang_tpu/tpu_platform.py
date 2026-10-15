@@ -1186,6 +1186,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         apply_tpu_patches()
         _register_attention_backends()
+        # Before any model is built, so torch.compile traces a registered op.
+        from sglang_tpu.moe.router_topk_tpu import register_router_topk_op
+
+        register_router_topk_op()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:
