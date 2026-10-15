@@ -2148,7 +2148,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        # Empty rid would startswith-match every request on the scheduler.
+        # Ignore an empty ID unless the caller explicitly requests abort_all.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
