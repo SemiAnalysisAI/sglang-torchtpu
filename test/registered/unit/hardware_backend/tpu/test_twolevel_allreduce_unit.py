@@ -1,8 +1,8 @@
-"""CPU-side logic of the two-level Pallas all-reduce and its core call sites.
+"""CPU-side logic of the two-level Pallas all-reduce and Kimi-K3's use of it.
 
 The kernel itself runs on TPU in test_twolevel_allreduce.py; these cover the
-host split, the eligibility gate, the None fallbacks, and how
-GroupCoordinator.all_reduce and Kimi-K3's MoE tail use them.
+host split, the eligibility gate, the None fallbacks, registration, and the
+Kimi-K3 construction-time switch and merge gate.
 """
 
 import unittest
@@ -53,7 +53,6 @@ class TestEligibility(CustomTestCase):
 
 class TestPluginEntryPoints(CustomTestCase):
     def setUp(self):
-        self.tp_group = mock.Mock(world_size=WORLD)
         self.ops = {
             (WORLD, 1): mock.Mock(return_value="one"),
             (WORLD, 2): mock.Mock(return_value=("a", "b")),
@@ -62,10 +61,6 @@ class TestPluginEntryPoints(CustomTestCase):
             mock.patch.object(tl, "_READY", True),
             mock.patch.object(tl, "_WORLD", WORLD),
             mock.patch.object(tl, "_OPS", self.ops),
-            mock.patch(
-                "sglang.srt.distributed.parallel_state.get_tp_group",
-                return_value=self.tp_group,
-            ),
             mock.patch(
                 "sglang.srt.distributed.parallel_state."
                 "get_tensor_model_parallel_world_size",
@@ -76,19 +71,9 @@ class TestPluginEntryPoints(CustomTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def test_all_reduce_takes_the_kernel(self):
-        self.assertEqual(tl.all_reduce(self.tp_group, _bf16(1, 7168)), "one")
-
-    def test_all_reduce_returns_none_when_it_does_not_apply(self):
-        other_group = mock.Mock(world_size=WORLD)
-        cases = {
-            "not registered": (self.tp_group, _bf16(1, 7168), False),
-            "not the TP group": (other_group, _bf16(1, 7168), True),
-            "several tokens": (self.tp_group, _bf16(4, 7168), True),
-        }
-        for name, (group, x, ready) in cases.items():
-            with self.subTest(name), mock.patch.object(tl, "_READY", ready):
-                self.assertIsNone(tl.all_reduce(group, x))
+    def test_tp_all_reduce_takes_single_tokens(self):
+        self.assertEqual(tl.tp_all_reduce(_bf16(1, 7168)), "one")
+        self.assertIsNone(tl.tp_all_reduce(_bf16(4, 7168)))
 
     def test_merged_takes_the_kernel(self):
         got = tl.merged_moe_all_reduce(_bf16(1, 3584), _bf16(1, 7168))
@@ -100,46 +85,69 @@ class TestPluginEntryPoints(CustomTestCase):
         with self.subTest("several tokens"):
             self.assertIsNone(tl.merged_moe_all_reduce(_bf16(4, 3584), _bf16(4, 7168)))
 
-    def test_registration_off_by_default(self):
-        with mock.patch.object(tl, "register") as reg:
+
+class TestRegistration(CustomTestCase):
+    def test_off_by_default(self):
+        with (
+            mock.patch.object(tl, "register") as reg,
+            mock.patch.object(tl, "_READY", False),
+        ):
             tl.register_from_parallel_state()
+            self.assertFalse(tl.enabled())
         reg.assert_not_called()
 
+    def _register(self, world, nnodes):
+        from sglang_tpu.envs import envs as tpu_envs
 
-class TestGroupCoordinatorAllReduce(CustomTestCase):
-    """GroupCoordinator.all_reduce on TPU: the plugin's result when it has one,
-    otherwise the in-place custom op as before."""
-
-    def _call(self, plugin_result):
-        from sglang.srt.distributed import parallel_state as ps
-
-        group = SimpleNamespace(world_size=WORLD, unique_name="tp:0")
-        x = mock.Mock(is_cpu=False)
         with (
-            mock.patch.object(ps, "_is_tpu", True),
-            mock.patch.object(
-                ps, "_tpu_twolevel_all_reduce", return_value=plugin_result
-            ) as plugin,
-            mock.patch.object(ps, "inplace_all_reduce") as inplace,
+            tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.override(True),
+            mock.patch.object(tl, "register") as reg,
+            mock.patch("torch.distributed.get_world_size", return_value=world),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=world,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=SimpleNamespace(nnodes=nnodes),
+            ),
         ):
-            out = ps.GroupCoordinator.all_reduce(group, x)
-        plugin.assert_called_once_with(group, x)
-        return out, x, inplace
+            tl.register_from_parallel_state()
+        return reg
 
-    def test_uses_the_plugin_result(self):
-        out, _, inplace = self._call("reduced")
-        self.assertEqual(out, "reduced")
-        inplace.assert_not_called()
+    def test_registers_with_the_host_split(self):
+        self._register(WORLD, 4).assert_called_once_with(WORLD, 8)
 
-    def test_falls_back_to_the_custom_op(self):
-        out, x, inplace = self._call(None)
-        self.assertIs(out, x)
-        inplace.assert_called_once_with(x, group_name="tp:0")
+    def test_no_host_split_registers_nothing(self):
+        self._register(30, 4).assert_not_called()
+
+
+class TestKimiK3Switch(CustomTestCase):
+    """kimi_k3._tpu_twolevel_all_reduce: the plugin module only on TPU with the
+    ops built, read once at construction."""
+
+    def _switch(self, is_tpu, ready):
+        from sglang.srt.models import kimi_k3
+
+        with (
+            mock.patch.object(kimi_k3, "_is_tpu", is_tpu),
+            mock.patch.object(tl, "_READY", ready),
+        ):
+            return kimi_k3._tpu_twolevel_all_reduce()
+
+    def test_on_when_built(self):
+        self.assertIs(self._switch(True, True), tl)
+
+    def test_off_otherwise(self):
+        self.assertIsNone(self._switch(True, False))
+        self.assertIsNone(self._switch(False, True))
 
 
 class TestKimiK3MergeGate(CustomTestCase):
     def _moe(self, **overrides):
         attrs = dict(
+            _merged_tp_all_reduce=tl.merged_moe_all_reduce,
             tp_size=WORLD,
             _routed_needs_reduce=True,
             _shared_experts_tp1=False,
@@ -148,43 +156,35 @@ class TestKimiK3MergeGate(CustomTestCase):
         attrs.update(overrides)
         return SimpleNamespace(**attrs)
 
-    def _can_merge(self, moe, shared="shared", event=None, is_tpu=True):
+    def _can_merge(self, moe, shared="shared", event=None):
         from sglang.srt.models import kimi_k3
 
-        with mock.patch.object(kimi_k3, "_is_tpu", is_tpu):
-            return kimi_k3.KimiK3MoE._can_merge_moe_all_reduce(moe, shared, event)
+        return kimi_k3.KimiK3MoE._can_merge_moe_all_reduce(moe, shared, event)
 
     def test_both_need_a_tp_reduce(self):
         self.assertTrue(self._can_merge(self._moe()))
 
     def test_otherwise_keeps_two_reduces(self):
         cases = {
-            "not TPU": (self._moe(), "shared", None, False),
-            "no shared output": (self._moe(), None, None, True),
-            "shared on a side stream": (self._moe(), "shared", "event", True),
-            "tp1": (self._moe(tp_size=1), "shared", None, True),
+            "two-level off": (self._moe(_merged_tp_all_reduce=None), "shared", None),
+            "no shared output": (self._moe(), None, None),
+            "shared on a side stream": (self._moe(), "shared", "event"),
+            "tp1": (self._moe(tp_size=1), "shared", None),
             "routed already reduced": (
                 self._moe(_routed_needs_reduce=False),
                 "shared",
                 None,
-                True,
             ),
-            "tp1 shared experts": (
-                self._moe(_shared_experts_tp1=True),
-                "shared",
-                None,
-                True,
-            ),
+            "tp1 shared experts": (self._moe(_shared_experts_tp1=True), "shared", None),
             "shared reduce fused": (
                 self._moe(_shared_experts_tp_comm=True),
                 "shared",
                 None,
-                True,
             ),
         }
-        for name, (moe, shared, event, is_tpu) in cases.items():
+        for name, (moe, shared, event) in cases.items():
             with self.subTest(name):
-                self.assertFalse(self._can_merge(moe, shared, event, is_tpu))
+                self.assertFalse(self._can_merge(moe, shared, event))
 
 
 if __name__ == "__main__":

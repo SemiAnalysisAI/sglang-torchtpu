@@ -247,17 +247,6 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
-def _tpu_twolevel_all_reduce(
-    group: "GroupCoordinator", input_: torch.Tensor
-) -> Optional[torch.Tensor]:
-    """The TPU plugin's two-level Pallas all-reduce (host-local, then
-    cross-host) for single-token TP decode tensors; None when it does not
-    apply."""
-    from sglang_tpu.twolevel_allreduce import all_reduce
-
-    return all_reduce(group, input_)
-
-
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -728,11 +717,6 @@ class GroupCoordinator:
             return input_
 
         if _is_tpu:
-            # Single-token TP decode tensors: the plugin's two-level Pallas
-            # all-reduce (opt-in), None when it does not apply.
-            reduced = _tpu_twolevel_all_reduce(self, input_)
-            if reduced is not None:
-                return reduced
             # Raw torch.distributed.all_reduce lowers to
             # _c10d_functional.all_reduce, which Dynamo cannot trace under
             # torch.compile at tp>1; the registered custom op is traceable.

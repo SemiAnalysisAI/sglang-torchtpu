@@ -14,10 +14,11 @@ Measured on that slice: 13.0 us at H=7168, 15.3 us at H=10752.
 
 Opt-in via SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE. It applies to the TP group
 only, when TP spans the whole world (no DP / PP / extra ranks) so TP ranks are
-host-major, for bf16 [1, H] tensors with H a multiple of 128. Core's
-GroupCoordinator.all_reduce calls ``all_reduce`` and Kimi-K3's MoE tail calls
-``merged_moe_all_reduce`` on TPU; both keep their own reduce when these return
-None.
+host-major, for bf16 [1, H] tensors with H a multiple of 128. Kimi-K3
+reads ``enabled()`` at construction; when on, its decoder layer completes the
+attention reduce through ``tp_all_reduce`` and its MoE tail reduces the latent
+and shared output through ``merged_moe_all_reduce``, keeping its own reduce
+when these return None. Nothing else calls this module.
 """
 
 import functools
@@ -250,17 +251,16 @@ def eligible(t: torch.Tensor) -> bool:
     )
 
 
-def all_reduce(group, input_: torch.Tensor) -> Optional[torch.Tensor]:
-    """The TP group's single-token all-reduce through the two-level kernel, or
-    None when it does not apply. Called from GroupCoordinator.all_reduce."""
-    from sglang.srt.distributed.parallel_state import get_tp_group
+def enabled() -> bool:
+    """Whether the ops are built for the TP group. Models read it once at
+    construction, after the parallel groups (and these ops) exist."""
+    return _READY
 
-    if not (
-        _READY
-        and group.world_size == _WORLD
-        and group is get_tp_group()
-        and eligible(input_)
-    ):
+
+def tp_all_reduce(input_: torch.Tensor) -> Optional[torch.Tensor]:
+    """TP all-reduce of a single-token tensor through the two-level kernel;
+    None for everything else (the caller keeps its own all-reduce)."""
+    if not eligible(input_):
         return None
     return _OPS[(_WORLD, 1)](input_)
 
