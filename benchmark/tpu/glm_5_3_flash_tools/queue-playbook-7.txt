@@ -1,2 +1,0 @@
-# Round 7: fused one-group sigmoid router (on top of 8.29 ms).
-router|EXP_TAG=router MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1 SGLANG_TPU_ROUTER_TOPK_SMALL_M_KERNEL=1

@@ -1,2 +1,0 @@
-# Round 2: host out_cache_loc for paged decode allocation (from #1151 / #1105), code change on top of base.
-hostalloc|MOE_THRESHOLD=512 FP8_SMALL_M=1

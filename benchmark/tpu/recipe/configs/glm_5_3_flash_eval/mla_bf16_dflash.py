@@ -1,6 +1,0 @@
-from copy import deepcopy
-
-from benchmark.tpu.recipe.configs.glm_5_3_flash.dflash import CONFIG as _BASE
-from benchmark.tpu.recipe.configs.glm_5_3_flash_eval.mla import apply
-
-CONFIG = apply(deepcopy(_BASE), kv_dtype="bfloat16")
