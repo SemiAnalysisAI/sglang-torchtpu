@@ -19,6 +19,7 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -40,6 +41,7 @@ from sglang_tpu.dsa_indexer_tpu import (
 )
 from sglang_tpu.pallas_export import (
     argnums,
+    source_fingerprint,
     tpu_info_for_cpu_export,
 )
 
@@ -71,7 +73,14 @@ def _build_pallas_sparse_mla_kernel_op():
         sparse_mla_attention_fused,
     )
 
-    op_name = "sglang_tpu_pallas::sparse_mla_attention_fused"
+    # The JAX body (and the kernels it calls) is part of the op's identity for
+    # the persistent compile cache (see source_fingerprint).
+    pallas_dir = Path(__file__).resolve().parent / "attention" / "pallas"
+    fingerprint = source_fingerprint(
+        pallas_dir / "mla_sparse_fused.py",
+        *sorted((pallas_dir / "mla_sparse").glob("*.py")),
+    )
+    op_name = f"sglang_tpu_pallas::sparse_mla_attention_fused_{fingerprint}"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
