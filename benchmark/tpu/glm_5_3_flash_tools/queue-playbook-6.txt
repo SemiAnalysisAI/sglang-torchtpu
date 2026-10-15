@@ -1,0 +1,2 @@
+# Round 6: sublayer input RMSNorm fused into the mHC site kernel (on top of 8.95 ms).
+mhcnorm|EXP_TAG=mhcnorm MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1

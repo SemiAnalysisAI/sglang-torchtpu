@@ -1,0 +1,6 @@
+# Playbook round 1 (all on top of the 10.16 ms config: EP8, route-meta 512, FP8 small-M).
+# base includes the alloc_for_decode host-sync fix (code change, not an env flag).
+base|MOE_THRESHOLD=512 FP8_SMALL_M=1
+# Playbook 3.7: SparseCore offload for the all-reduces only, then all four collectives.
+sc_ar|MOE_THRESHOLD=512 FP8_SMALL_M=1 SC_OFFLOAD=allreduce
+sc_all|MOE_THRESHOLD=512 FP8_SMALL_M=1 SC_OFFLOAD=all

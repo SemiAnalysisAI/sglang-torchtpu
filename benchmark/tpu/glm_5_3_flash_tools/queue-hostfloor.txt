@@ -1,0 +1,2 @@
+# Host-overhead floor: same server, model truncated to 4 layers (weights 'toy' by design).
+l4|EXP_TAG=l4 LAYERS=4 MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1 SGLANG_TPU_ROUTER_TOPK_KERNEL=1

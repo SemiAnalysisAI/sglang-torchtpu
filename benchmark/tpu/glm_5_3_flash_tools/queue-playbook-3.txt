@@ -1,0 +1,2 @@
+# Round 3: the per-step bf16[36,1,1,4096] MoE scale relayout copy (85/step, 0.23 ms).
+fp32scales|EXP_TAG=fp32s MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1

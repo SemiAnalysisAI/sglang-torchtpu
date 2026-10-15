@@ -1,0 +1,2 @@
+# Round 9: rank-based single-kernel router (on top of 8.29 ms).
+rankrouter|EXP_TAG=rankrouter MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1 SGLANG_TPU_ROUTER_TOPK_KERNEL=1

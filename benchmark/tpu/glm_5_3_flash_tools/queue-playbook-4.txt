@@ -1,0 +1,2 @@
+# Round 4: kernel-native rank-4 conv state + bound [dim,1,K] conv weight (from #1151 9e4c31f9e0), on top of fp32 scales.
+convnative|EXP_TAG=conv4 MOE_THRESHOLD=512 FP8_SMALL_M=1 SGLANG_TPU_FP8_MOE_FP32_SCALES=1

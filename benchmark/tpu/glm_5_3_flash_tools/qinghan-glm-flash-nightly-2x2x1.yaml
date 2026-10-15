@@ -1,0 +1,41 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: qinghan-glm-flash
+  namespace: grok-2-tpuv7
+spec:
+  failurePolicy: {maxRestarts: 0}
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        activeDeadlineSeconds: 23400
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-nodepool: ci-tpu7x-2x2x1-nightly
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            tolerations:
+            - {effect: NoSchedule, key: google.com/tpu, operator: Exists}
+            containers:
+            - name: main
+              image: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:base-6bc366f1705c6362
+              command: ["/bin/bash", "-c", "sleep infinity"]
+              securityContext: {privileged: true}
+              resources:
+                requests: {cpu: "100", memory: 700Gi, ephemeral-storage: 40Gi, google.com/tpu: "4"}
+                limits: {cpu: "100", memory: 700Gi, ephemeral-storage: 80Gi, google.com/tpu: "4"}
+              volumeMounts:
+              - {mountPath: /dev/shm, name: dev-shm}
+              - {mountPath: /tmp, name: tmp}
+              - {mountPath: /weights, name: weights, readOnly: true}
+            volumes:
+            - {name: dev-shm, emptyDir: {medium: Memory}}
+            - {name: tmp, emptyDir: {medium: Memory}}
+            - {name: weights, persistentVolumeClaim: {claimName: model-weights-filestore, readOnly: true}}
