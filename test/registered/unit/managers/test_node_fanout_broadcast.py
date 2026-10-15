@@ -10,10 +10,14 @@ polls, entirely inline inputs, and a remote node that cannot allocate SHM.
 """
 
 import datetime
+import errno
+import mmap
 import os
 import pickle
+import sys
 import unittest
 from array import array
+from contextlib import ExitStack
 from multiprocessing import shared_memory
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,6 +34,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import (  # noqa: E402
+    BatchTokenizedEmbeddingReqInput,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
 )
@@ -42,6 +47,7 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.managers.scheduler_components import node_fanout  # noqa: E402
 from sglang.srt.managers.scheduler_components.node_fanout import (  # noqa: E402
     node_fanout_enabled,
 )
@@ -49,6 +55,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.utils import broadcast_pyobj  # noqa: E402
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -142,6 +149,14 @@ def _exercise_receiver(rank, receiver):
     for base in (30, 90):
         _check_mixed_requests(rank, receiver, base)
 
+    # Exercise a larger mapping granularity even on a 4-KiB-page CI host.
+    with patch.object(
+        node_fanout.mmap,
+        "ALLOCATIONGRANULARITY",
+        max(mmap.ALLOCATIONGRANULARITY, 65536),
+    ):
+        _check_packed_batch(rank, receiver)
+
     # No SHM on any node: this must not enter a materialization collective.
     # This tensor is large enough to use broadcast_pyobj's separate buffer path.
     reqs = (
@@ -157,22 +172,10 @@ def _exercise_receiver(rank, receiver):
         allocate.assert_not_called()
     assert torch.all(reqs[0].mm_inputs.mm_items[0].feature == 42)
 
-    # Remote allocation failure must reject the request on every rank.
-    reqs = None
-    if rank == 0:
-        req = _request("remote-shm-full", [torch.ones(8, dtype=torch.uint8)])
-        wrap_shm_features(req, force=True)
-        reqs = pickle.loads(pickle.dumps([req]))
-    with patch(
-        "sglang.srt.managers.scheduler_components.node_fanout._allocate_segment",
-        return_value=None,
-    ):
-        reqs = receiver._broadcast_reqs_across_ranks(reqs)
-    names = [item.feature.shm_name for item in reqs[0].mm_inputs.mm_items]
-    receiver._finalize_shm_features(reqs)
-    assert isinstance(reqs[0].mm_inputs, MMInputsProcessError)
-    torch.distributed.barrier()
-    _assert_unlinked(names)
+    for index, fault in enumerate(("allocation", "source", "receiver")):
+        _check_failure(rank, receiver, fault)
+        # Reuse the same fan-out groups for a valid SHM request after each fault.
+        _check_mixed_requests(rank, receiver, 110 + 10 * index)
 
     # The opt-out continues to use the flat broadcast.
     with patch.dict(os.environ, {"SGLANG_NODE_FANOUT_REQ_BROADCAST": "0"}):
@@ -180,6 +183,36 @@ def _exercise_receiver(rank, receiver):
             [_request("text-only", None)] if rank == 0 else None
         )
     assert reqs[0].rid == "text-only"
+
+
+def _check_failure(rank, receiver, fault):
+    reqs = None
+    if rank == 0:
+        req = _request(f"failed-{fault}", [torch.ones(8, dtype=torch.uint8)])
+        wrap_shm_features(req, force=True)
+        if fault == "source":
+            req.mm_inputs.mm_items[0].feature.close_and_unlink()
+        # Keep a healthy inline request in the batch to verify per-request errors.
+        reqs = pickle.loads(pickle.dumps([req, _request("healthy", [torch.arange(4)])]))
+    with ExitStack() as stack:
+        if fault == "allocation":
+            stack.enter_context(
+                patch.object(node_fanout, "_allocate_segment", return_value=None)
+            )
+        elif fault == "receiver" and rank == WORLD - 1:
+            stack.enter_context(
+                patch(
+                    "sglang.srt.managers.mm_utils.shared_memory.SharedMemory",
+                    side_effect=FileNotFoundError("injected receiver open failure"),
+                )
+            )
+        reqs = receiver._broadcast_reqs_across_ranks(reqs)
+    names = [item.feature.shm_name for item in reqs[0].mm_inputs.mm_items]
+    receiver._finalize_shm_features(reqs)
+    assert isinstance(reqs[0].mm_inputs, MMInputsProcessError)
+    assert torch.equal(reqs[1].mm_inputs.mm_items[0].feature, torch.arange(4))
+    torch.distributed.barrier()
+    _assert_unlinked(names)
 
 
 def _check_mixed_requests(rank, receiver, base):
@@ -194,12 +227,25 @@ def _check_mixed_requests(rank, receiver, base):
         wrap_shm_features(shm_req, force=True)
         shm_req = pickle.loads(pickle.dumps(shm_req))
         inline = [t.clone() + 100 for t in pixels]
+        # Exceeds broadcast_pyobj's 1-MiB separate-buffer threshold. Reopening
+        # SHM pointers must not repickle this tensor or replace its storage.
+        inline[0] = torch.full((2 << 20,), base + 100, dtype=torch.uint8)
         reqs = [
             shm_req,
             _request(f"inline-{base}", inline),
             _request(f"text-{base}", None),
         ]
-    reqs = receiver._broadcast_reqs_across_ranks(reqs)
+    sent_inline = []
+
+    def observe_broadcast(data, *args, **kwargs):
+        if data is not None:
+            sent_inline.append(data[1].mm_inputs.mm_items[0].feature)
+        return broadcast_pyobj(data, *args, **kwargs)
+
+    with patch.object(node_fanout, "broadcast_pyobj", side_effect=observe_broadcast):
+        reqs = receiver._broadcast_reqs_across_ranks(reqs)
+    if rank % (WORLD // NNODES) == 0:
+        assert reqs[1].mm_inputs.mm_items[0].feature is sent_inline[-1]
     assert [r.rid for r in reqs] == [
         f"vlm-{base}",
         f"inline-{base}",
@@ -214,7 +260,9 @@ def _check_mixed_requests(rank, receiver, base):
         # Forwarded tensors land in one segment on the second node.
         forwarded = reqs[0].mm_inputs.mm_items
         assert len({it.feature.shm_name for it in forwarded}) == 1
-        assert all(it.feature.offset % 4096 == 0 for it in forwarded)
+        assert all(
+            it.feature.offset % mmap.ALLOCATIONGRANULARITY == 0 for it in forwarded
+        )
     receiver._finalize_shm_features(reqs)
     for shift, req in ((0, reqs[0]), (100, reqs[1])):
         for i, it in enumerate(req.mm_inputs.mm_items):
@@ -231,6 +279,80 @@ def _check_mixed_requests(rank, receiver, base):
     _assert_unlinked(names)
 
 
+def _check_packed_batch(rank, receiver):
+    expected = _request(
+        "packed",
+        [
+            torch.arange(5, dtype=torch.uint8),
+            [torch.arange(12, dtype=torch.float32).reshape(3, 4).T],
+            (
+                torch.arange(7, dtype=torch.bfloat16),
+                torch.arange(3, dtype=torch.float32),
+            ),
+            None,
+        ],
+    )
+    expected.mm_inputs.mm_items[2].precomputed_embeddings = (
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        torch.arange(4, dtype=torch.bfloat16),
+    )
+    expected.mm_inputs.mm_items[3].precomputed_embeddings = torch.arange(
+        8, dtype=torch.float32
+    )
+    reqs = None
+    if rank == 0:
+        req = pickle.loads(pickle.dumps(expected))
+        wrap_shm_features(req, force=True)
+        reqs = pickle.loads(
+            pickle.dumps(
+                [BatchTokenizedEmbeddingReqInput(batch=[req, _request("text", None)])]
+            )
+        )
+    reqs = receiver._broadcast_reqs_across_ranks(reqs)
+    batch = reqs[0].batch
+    assert [req.rid for req in batch] == ["packed", "text"]
+    names, offsets = [], []
+    for item in batch[0].mm_inputs.mm_items:
+        for value in (item.feature, item.precomputed_embeddings):
+            if value is None:
+                continue
+            pointers = value if isinstance(value, (list, tuple)) else [value]
+            for pointer in pointers:
+                assert isinstance(pointer, ShmPointerMMData)
+                assert pointer.precomputed_hash == (
+                    None if isinstance(value, (list, tuple)) else item.hash
+                )
+                names.append(pointer.shm_name)
+                offsets.append(pointer.offset)
+    if rank >= WORLD // NNODES:
+        assert len(set(names)) == 1
+        assert len(set(offsets)) == len(offsets)
+        assert any(offset > 0 for offset in offsets)
+        assert all(offset % mmap.ALLOCATIONGRANULARITY == 0 for offset in offsets)
+    receiver._finalize_shm_features(reqs)
+    assert batch[1].mm_inputs is None
+    for actual, reference in zip(
+        batch[0].mm_inputs.mm_items, expected.mm_inputs.mm_items, strict=True
+    ):
+        assert actual.hash == reference.hash
+        for attr in ("feature", "precomputed_embeddings"):
+            value, wanted = getattr(actual, attr), getattr(reference, attr)
+            assert type(value) is type(wanted)
+            if wanted is None:
+                continue
+            pairs = (
+                zip(value, wanted, strict=True)
+                if isinstance(wanted, (list, tuple))
+                else [(value, wanted)]
+            )
+            for tensor, source in pairs:
+                assert tensor.shape == source.shape
+                assert tensor.dtype == source.dtype
+                assert torch.equal(tensor, source)
+    torch.distributed.barrier()
+    _assert_unlinked(names)
+
+
 def _assert_unlinked(names):
     for name in set(names):
         try:
@@ -243,20 +365,24 @@ def _assert_unlinked(names):
 class TestNodeFanoutBroadcast(unittest.TestCase):
     def test_transport_eligibility(self):
         cases = [
-            ({}, False, True),
-            ({"nnodes": 1}, False, False),
-            ({"tp_size": 1}, False, False),
-            ({"pp_size": 2}, False, False),
-            ({"tp_size": 3}, False, False),
-            ({"attn_dp_enabled": True}, False, False),
-            ({}, True, False),
+            ({}, False, None, False),
+            ({}, False, "0", False),
+            ({}, False, "1", True),
+            ({"nnodes": 1}, False, "1", False),
+            ({"tp_size": 1}, False, "1", False),
+            ({"pp_size": 2}, False, "1", False),
+            ({"tp_size": 3}, False, "1", False),
+            ({"attn_dp_enabled": True}, False, "1", False),
+            ({}, True, "1", False),
         ]
-        for overrides, skip_tokenizer, expected in cases:
-            with self.subTest(overrides=overrides, skip_tokenizer=skip_tokenizer):
+        for overrides, skip_tokenizer, flag, expected in cases:
+            with self.subTest(
+                overrides=overrides, skip_tokenizer=skip_tokenizer, flag=flag
+            ):
                 config = dict(nnodes=2, tp_size=4, pp_size=1, attn_dp_enabled=False)
                 config.update(overrides)
                 with (
-                    patch.dict(os.environ, {"SGLANG_NODE_FANOUT_REQ_BROADCAST": "1"}),
+                    patch.dict(os.environ),
                     patch(
                         "sglang.srt.managers.scheduler_components.node_fanout.get_parallel",
                         return_value=SimpleNamespace(**config),
@@ -268,7 +394,56 @@ class TestNodeFanoutBroadcast(unittest.TestCase):
                         ),
                     ),
                 ):
+                    if flag is None:
+                        os.environ.pop("SGLANG_NODE_FANOUT_REQ_BROADCAST", None)
+                    else:
+                        os.environ["SGLANG_NODE_FANOUT_REQ_BROADCAST"] = flag
                     self.assertEqual(node_fanout_enabled(), expected)
+
+    def test_segment_creation_failure_is_recoverable(self):
+        with patch.object(
+            node_fanout.shared_memory,
+            "SharedMemory",
+            side_effect=OSError(errno.ENOSPC, "injected allocation failure"),
+        ):
+            self.assertIsNone(node_fanout._allocate_segment(mmap.ALLOCATIONGRANULARITY))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires posix_fallocate")
+    def test_reservation_failure_closes_and_unlinks_segment(self):
+        created = []
+        allocate = shared_memory.SharedMemory
+
+        def record_segment(*args, **kwargs):
+            shm = allocate(*args, **kwargs)
+            created.append(shm)
+            return shm
+
+        try:
+            with (
+                patch.object(
+                    node_fanout.shared_memory,
+                    "SharedMemory",
+                    side_effect=record_segment,
+                ),
+                patch.object(
+                    node_fanout.os,
+                    "posix_fallocate",
+                    side_effect=OSError(errno.ENOSPC, "injected reservation failure"),
+                ),
+            ):
+                self.assertIsNone(
+                    node_fanout._allocate_segment(mmap.ALLOCATIONGRANULARITY)
+                )
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0]._fd, -1)
+            _assert_unlinked([created[0].name])
+        finally:
+            for shm in created:
+                shm.close()
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
 
     def test_pixels_reach_every_rank_through_node_shm(self):
         with TemporaryDirectory() as directory:

@@ -15,9 +15,8 @@ by node, with the same number of TP ranks on each node.
 from __future__ import annotations
 
 import logging
-import math
+import mmap
 import os
-import pickle
 import sys
 from multiprocessing import shared_memory
 from typing import Any, List, Optional
@@ -32,10 +31,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.mm_utils import (
-    ShmPointerMMData,
-    has_shm_features,
-)
+from sglang.srt.managers.mm_utils import ShmPointerMMData
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -105,12 +101,9 @@ class NodeFanoutBroadcaster:
         # Keep inline fallbacks inline on every node. Retrying SHM allocation
         # independently could leave SHM on only some nodes, causing ranks to
         # disagree on whether to enter the finalization barrier.
-        reqs = broadcast_pyobj(reqs, self._rank, self._node_group, src=self._node_src)
-        if has_shm_features(tokenized):
-            # Reopen the segments the way receivers do, so the leader also maps
-            # them in _finalize_shm_features instead of holding closed pointers.
-            reqs = pickle.loads(pickle.dumps(reqs))
-        return reqs
+        # Source pointers opened during IPC decoding; remote pointers attach in
+        # in_segment. Both leaders and local receivers can now finalize them.
+        return broadcast_pyobj(reqs, self._rank, self._node_group, src=self._node_src)
 
     def _forward_shm_tensors(self, tokenized: List[Any]) -> None:
         """Copy rank 0's /dev/shm tensors into each other node's /dev/shm."""
@@ -240,8 +233,9 @@ def _nbytes(pointer: ShmPointerMMData) -> int:
     return pointer.shape.numel() * pointer.dtype.itemsize
 
 
-def _page_align(size: int, page: int = 4096) -> int:
-    return math.ceil(size / page) * page
+def _page_align(size: int) -> int:
+    page = mmap.ALLOCATIONGRANULARITY
+    return (size + page - 1) // page * page
 
 
 def get_node_fanout(tp_group, nnodes: int) -> NodeFanoutBroadcaster:

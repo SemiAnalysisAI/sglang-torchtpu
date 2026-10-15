@@ -1330,6 +1330,9 @@ class ShmPointerMMData:
     # Byte offset of the tensor in its segment: a node fan-out receiver lands a
     # request's tensors in one segment. Page-aligned so ``materialize`` can map it.
     offset = 0
+    _shm_handle: Optional[shared_memory.SharedMemory]
+    tensor: Optional[torch.Tensor]
+    _materialization_error: Optional[str]
 
     def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         self._shm_handle = None
@@ -1364,14 +1367,14 @@ class ShmPointerMMData:
 
     @classmethod
     def in_segment(cls, shm_name, offset, shape, dtype, precomputed_hash=None):
-        """Point at a tensor already written into ``shm_name`` at ``offset``."""
+        """Attach to an existing tensor, deferring open errors to materialization."""
         pointer = object.__new__(cls)
         pointer.shm_name = shm_name
         pointer.offset = offset
         pointer.shape = shape
         pointer.dtype = dtype
         pointer.precomputed_hash = precomputed_hash
-        pointer._shm_handle = pointer.tensor = pointer._materialization_error = None
+        pointer._open_segment()
         return pointer
 
     def __getstate__(self):
@@ -1389,11 +1392,14 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
+        self._open_segment()
+
+    def _open_segment(self) -> None:
+        """Open without raising so every rank can finish the broadcast."""
         self._shm_handle = None
         self.tensor = None
         self._materialization_error = None
 
-        # keep deserialization infallible so all TP ranks finish the broadcast
         handle = None
         tensor = None
         try:
@@ -1430,9 +1436,11 @@ class ShmPointerMMData:
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if self._shm_handle is None or self.tensor is None:
+                raise RuntimeError("Multimodal SHM pointer has not been opened")
             if sys.platform == "linux":
                 owned = mmap.mmap(
-                    self._shm_handle._fd,
+                    self._shm_handle._fd,  # type: ignore[attr-defined]
                     self.tensor.numel() * self.tensor.element_size(),
                     access=mmap.ACCESS_COPY,
                     offset=self.offset,
