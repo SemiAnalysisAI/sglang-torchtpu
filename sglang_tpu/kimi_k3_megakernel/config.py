@@ -93,8 +93,8 @@ def validate_megakernel_server_args(server_args) -> None:
         "--enable-dp-attention": bool(cfg.enable_dp_attention),
         "--disaggregation-mode": cfg.disaggregation_mode != "null",
         "--enable-hierarchical-cache": bool(cfg.enable_hierarchical_cache),
-        # A mixed batch carries decode rows in an EXTEND-mode forward, which
-        # skips the megakernel (decode-only) and runs those rows through
+        # A mixed batch carries decode rows in a ForwardMode.MIXED forward,
+        # which skips the megakernel (decode-only) and runs those rows through
         # SGLang's layers over the stale pools; the token they decode then
         # never reaches the megakernel's own state either.
         "--enable-mixed-chunk": bool(cfg.enable_mixed_chunk),
