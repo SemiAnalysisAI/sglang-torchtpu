@@ -112,9 +112,7 @@ def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]
     if "latent_up" in parts and moe.routed_expert_norm is not None:
         up = _dense_weight_kn(moe.routed_expert_up_proj, moe.moe_hidden_size)
         if up is not None:
-            moe._static_fp8_latent_up = _pack(
-                up, moe.routed_expert_norm.weight
-            )
+            moe._static_fp8_latent_up = _pack(up, moe.routed_expert_norm.weight)
             freed += _release(moe.routed_expert_up_proj)
             bound.append("latent_up")
     return bound, freed

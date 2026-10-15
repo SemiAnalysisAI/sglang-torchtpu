@@ -23,9 +23,7 @@ FP8_MAX = 448.0
 def _reference(x, w, out_scale, inv_x):
     """apply_tpu_static_fp8_linear: clamp-then-cast quantize, fp8 dot with f32
     accumulation, f32 per-channel scale, cast to x.dtype."""
-    xq = jnp.clip(x.astype(jnp.float32) * inv_x[0], -FP8_MAX, FP8_MAX).astype(
-        w.dtype
-    )
+    xq = jnp.clip(x.astype(jnp.float32) * inv_x[0], -FP8_MAX, FP8_MAX).astype(w.dtype)
     acc = jnp.dot(xq, w, preferred_element_type=jnp.float32)
     return (acc * out_scale[None, :]).astype(x.dtype)
 
