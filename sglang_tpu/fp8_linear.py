@@ -339,6 +339,10 @@ def quantize_rmsnorm_fed_weight(
 
 def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Tensor:
     """x [M, K] @ w with the static input scale; returns x.dtype [M, N]."""
+    from sglang_tpu import static_fp8_gemv_pallas
+
+    if static_fp8_gemv_pallas.eligible(x, w):
+        return static_fp8_gemv_pallas.run(x, w)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x.float())
     # The clamp is free in the quantize fusion and guards the cast, which

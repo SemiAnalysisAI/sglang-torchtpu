@@ -45,6 +45,15 @@ def selected_parts() -> frozenset[str]:
     return PARTS if "all" in parts else frozenset(parts)
 
 
+def _pack(weight_kn: torch.Tensor, norm_weight: torch.Tensor) -> StaticFp8Weight:
+    """Quantize, then pad N for the Pallas GEMV when it is registered."""
+    from sglang_tpu import static_fp8_gemv_pallas
+
+    return static_fp8_gemv_pallas.pad_n(
+        quantize_rmsnorm_fed_weight(weight_kn, norm_weight)
+    )
+
+
 def _dense_weight_kn(linear: nn.Module, k: int) -> Optional[torch.Tensor]:
     """An unquantized linear's weight as [K, N], or None if it is quantized."""
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -92,7 +101,7 @@ def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]
         if down is not None and gate_up is not None:
             # One GEMV for both: they read the same normed hidden state, so the
             # activation is quantized once.
-            moe._static_fp8_front = quantize_rmsnorm_fed_weight(
+            moe._static_fp8_front = _pack(
                 torch.cat([down, gate_up], dim=1), in_norm_weight
             )
             moe._static_fp8_front_split = [down.shape[1], gate_up.shape[1]]
@@ -103,7 +112,7 @@ def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]
     if "latent_up" in parts and moe.routed_expert_norm is not None:
         up = _dense_weight_kn(moe.routed_expert_up_proj, moe.moe_hidden_size)
         if up is not None:
-            moe._static_fp8_latent_up = quantize_rmsnorm_fed_weight(
+            moe._static_fp8_latent_up = _pack(
                 up, moe.routed_expert_norm.weight
             )
             freed += _release(moe.routed_expert_up_proj)
@@ -115,7 +124,7 @@ def _bind_linear(owner, attr: str, linear: Optional[nn.Module], norm_weight):
     w = None if linear is None else _dense_weight_kn(linear, norm_weight.shape[0])
     if w is None or w.shape[1] % 16:
         return 0, 0
-    setattr(owner, attr, quantize_rmsnorm_fed_weight(w, norm_weight))
+    setattr(owner, attr, _pack(w, norm_weight))
     return 1, _release(linear)
 
 
@@ -130,6 +139,9 @@ def bind_static_fp8(model: nn.Module) -> None:
     if not parts or getattr(model, "_static_fp8_bound", False):
         return
     model._static_fp8_bound = True
+    from sglang_tpu import static_fp8_gemv_pallas
+
+    static_fp8_gemv_pallas.register()
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.models.kimi_k3 import (
         KimiK3DeltaAttention,
