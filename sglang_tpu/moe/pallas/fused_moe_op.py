@@ -513,6 +513,38 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
+    # streams only the hit experts (single_token_moe.py) replaces route
+    # metadata + two gmm_v2 calls + activation + combine.
+    if m == 1 and not no_combine and permute_dense_threshold > topk:
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas import single_token_moe
+
+        if tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get() and (
+            single_token_moe.eligible(
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                w1_channel_scale,
+                w2_channel_scale,
+            )
+        ):
+            return single_token_moe.single_token_moe(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_ids,
+                topk_weights,
+                offset=(expert_group_offset if global_num_experts > num_experts else 0),
+                act=_fuse_act_name(activation_name),
+                hidden_size=hidden_size,
+            ).astype(out_dtype)
+
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
     # Block size (32 MXFP4, 512 NVFP4) is data-driven from the scale.
