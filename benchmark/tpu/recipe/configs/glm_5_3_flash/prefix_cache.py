@@ -1,13 +1,19 @@
-"""GLM-5.3-Flash with the radix prefix cache, no speculative decoding, one tpu7x host.
+"""GLM-5.3-Flash with the radix prefix cache backed by host RAM (Raiden HiCache),
+no speculative decoding, one tpu7x host.
 
 Sample usage (from the repo root):
     python3 -m benchmark.tpu.launch_server \\
         --config recipe/configs/glm_5_3_flash/prefix_cache.py
 
 A cached prefix reuses the 11 DSA layers' latent and indexer pages and restores
-the 34 KDA layers from a state snapshot taken at the cache boundary. Speculative
-decoding (DFlash / MTP) is refused together with the radix cache on TPU: verify
-windows take no KDA snapshots yet.
+the 34 KDA layers from a state snapshot taken at the cache boundary. Every cached
+prefix is also written through to host RAM; when the device pool evicts it, a
+later hit loads both back by Raiden DMA. A reload that carries KDA state waits
+for the in-flight forward first (one device sync per host hit). Set
+KV_OFFLOAD = False for a device-only cache.
+
+Speculative decoding (DFlash / MTP) is refused together with the radix cache on
+TPU: verify windows take no KDA snapshots yet.
 
 The KDA state pool must be sized for radix: each running request holds about
 MAMBA_RATIO state slots (its live state plus checkpoints), and every cached
@@ -30,6 +36,10 @@ MAX_RUNNING = CONCURRENCY + 2
 MAMBA_RATIO = 5
 # Cached prefixes that keep a KDA snapshot (one slot each, ~18 MB per rank).
 CACHED_PREFIX_SLOTS = 64
+# Host RAM tier: HICACHE_RATIO x the device pools (KV tokens and KDA slots).
+# At ratio 2 that is about 3 GB of KV and 4 GB of KDA state per rank.
+KV_OFFLOAD = True
+HICACHE_RATIO = 2
 
 CONFIG = deepcopy(BASE_CONFIG)
 CONFIG["server_args"].update(
@@ -41,5 +51,16 @@ CONFIG["server_args"].update(
         "tpu_compile_bs": [1, 2, 4, 8],
         "max_total_tokens": MAX_TOTAL_TOKENS,
         "max_mamba_cache_size": MAX_RUNNING * MAMBA_RATIO + CACHED_PREFIX_SLOTS,
+        "enable_cache_report": True,
     }
 )
+if KV_OFFLOAD:
+    CONFIG["server_args"].update(
+        {
+            "enable_hierarchical_cache": True,
+            "hicache_ratio": HICACHE_RATIO,
+            "hicache_io_backend": "raiden",
+            "hicache_mem_layout": "page_first_fused",
+            "hicache_write_policy": "write_through",
+        }
+    )
