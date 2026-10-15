@@ -4428,9 +4428,22 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_page_buffers(self, layer_id: int) -> list:
+        """TPU split DSA pool: page-major buffers of a full-attention layer."""
+        return self.full_kv_pool.get_page_buffers(
+            self._transfer_full_attention_id(layer_id)
+        )
+
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if hasattr(self.full_kv_pool, "get_page_buffers"):
+            # Several page buffers per layer (TPU split DSA pool).
+            return [
+                layer_id
+                for layer_id in layer_ids
+                for _ in self.get_page_buffers(layer_id)
+            ]
         if self.use_mla and _is_npu and layer_ids:
             data_ptrs, _, _ = self.get_contiguous_buf_infos()
             return layer_ids * (len(data_ptrs) // len(layer_ids))

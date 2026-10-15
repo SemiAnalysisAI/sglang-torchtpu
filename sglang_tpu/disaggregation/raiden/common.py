@@ -79,6 +79,26 @@ def get_raiden_kv_caches(
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
         layers_mapping = getattr(current_pool, "layers_mapping", None)
         start = current_pool.start_layer
+        full_attention = getattr(current_pool, "full_attention_layer_id_mapping", None)
+        if hasattr(current_pool, "get_page_buffers") and (
+            full_attention is not None or not hasattr(current_pool, "full_kv_pool")
+        ):
+            # TPU split DSA pool (bare, or inside a hybrid pool): several
+            # page-major buffers per full-attention layer, all sharing the
+            # request's page ids, so they join the full namespace.
+            layer_ids = (
+                sorted(full_attention)
+                if full_attention is not None
+                else list(range(start, start + current_pool.layer_num))
+            )
+            buffers, ids = [], []
+            for layer_id in layer_ids:
+                for buf in current_pool.get_page_buffers(layer_id):
+                    buffers.append(buf)
+                    ids.append(layer_id)
+            return RaidenKVCacheGroups(
+                full=buffers, swa=[], full_layer_ids=ids, swa_layer_ids=[]
+            )
         if hasattr(current_pool, "get_fused_kv_buffer"):
             layer_ids = (
                 sorted(layers_mapping)

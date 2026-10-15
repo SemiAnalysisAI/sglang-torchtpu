@@ -1205,8 +1205,29 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, *args, **kwargs):
         self._unsupported("get_kv_buffer")
 
-    def get_contiguous_buf_infos(self, *args, **kwargs):
-        self._unsupported("get_contiguous_buf_infos")
+    def get_page_buffers(self, layer_id: int) -> list:
+        """This layer's page-major buffers, in a fixed order: NoPE, RoPE, then the
+        index keys and raw key|gate when the layer has an indexer. Every one
+        leads with ``num_pages``, so a page id addresses the same tokens in all
+        of them -- what PD transfer moves for a request's pages."""
+        i = layer_id - self.start_layer
+        bufs = [self.nope_buffer[i], self.rope_buffer[i]]
+        bufs += [b for b in (self.index_key_buffer[i], self.kpool_raw_buffer[i]) if b is not None]
+        return bufs
+
+    def get_contiguous_buf_infos(self):
+        # One item = one page of one buffer, over every layer's page buffers in
+        # get_page_buffers order (so prefill and decode register identically).
+        bufs = [
+            buf
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+            for buf in self.get_page_buffers(layer_id)
+        ]
+        return (
+            [buf.data_ptr() for buf in bufs],
+            [buf.nbytes for buf in bufs],
+            [buf[0].nbytes for buf in bufs],
+        )
 
     def get_cpu_copy(self, *args, **kwargs):
         self._unsupported("get_cpu_copy")
