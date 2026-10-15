@@ -389,7 +389,7 @@ class TestAbortRequests(unittest.TestCase):
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         return mgr
 
-    def test_abort_by_rid_prefix(self):
+    def test_abort_by_exact_rid(self):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
@@ -442,19 +442,22 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = ""
         mgr.abort_requests(abort_req)  # Should not raise
 
-    def test_abort_prefix_match(self):
-        """rid.startswith means prefix matching, not exact matching."""
-        mgr = self._make_mgr_with_queue()
-        req = _make_req(rid="req-123-suffix")
-        req.grammar = MagicMock(spec=Future)
-        mgr.grammar_queue.append(req)
+    def test_abort_leaves_prefix_sharing_ids_untouched(self):
+        """An individual abort must leave unrelated prefix-sharing IDs active."""
+        for rid in ("req-123-suffix", "req-1230", "req-123_0"):
+            with self.subTest(rid=rid):
+                mgr = self._make_mgr_with_queue()
+                req = _make_req(rid=rid)
+                req.grammar = MagicMock(spec=Future)
+                mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+                abort_req = MagicMock()
+                abort_req.abort_all = False
+                abort_req.rid = "req-123"
 
-        mgr.abort_requests(abort_req)
-        req.set_finish_with_abort.assert_called_once()
+                mgr.abort_requests(abort_req)
+                req.grammar.cancel.assert_not_called()
+                req.set_finish_with_abort.assert_not_called()
 
 
 class TestGetReadyGrammarRequests(unittest.TestCase):
