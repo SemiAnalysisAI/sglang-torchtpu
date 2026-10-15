@@ -4,7 +4,9 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit", chips=1)
 
+import contextlib
 import unittest
+from unittest import mock
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,12 +44,17 @@ class TestSingleTokenMoe(CustomTestCase):
         )
 
     def _run(self, ids, offset, kernel_on):
-        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas import single_token_moe
         from sglang_tpu.moe.pallas.fused_moe_op import _fused_moe_jax
 
         w = np.random.default_rng(len(ids)).random(K).astype(np.float32)
         w /= w.sum()
-        with tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.override(kernel_on):
+        # Off: the dispatch sees the kernel as ineligible and takes gmm_v2.
+        with (
+            contextlib.nullcontext()
+            if kernel_on
+            else mock.patch.object(single_token_moe, "eligible", return_value=False)
+        ):
             out = jax.jit(
                 lambda: _fused_moe_jax(
                     hidden_states=self.x,

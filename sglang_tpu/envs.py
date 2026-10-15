@@ -21,9 +21,6 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
-    # MoE: one fused kernel for single-token packed-MXFP4 decode
-    # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
-    SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
