@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -100,6 +102,18 @@ class EagleDraftWorkerBase(ABC):
 
     def alloc_memory_pool(self, **kwargs):
         pass
+
+    def _register_draft_kv_pools(self, token_to_kv_pool_allocator) -> None:
+        """Let CPU retraction carry each step's draft KV, which is indexed by the
+        target allocator's token ids."""
+        # MHA and SWA only: the paged TPU MLA pools have no CPU copy.
+        token_to_kv_pool_allocator.register_draft_kv_pools(
+            tuple(
+                runner.token_to_kv_pool
+                for runner in self.draft_runners
+                if isinstance(runner.token_to_kv_pool, (MHATokenToKVPool, SWAKVPool))
+            )
+        )
 
     def init_attention_backends(self):
         """Subclasses wrap this with their context managers (draft_tp_context,

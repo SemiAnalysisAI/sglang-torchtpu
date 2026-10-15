@@ -1,5 +1,6 @@
-"""A PD decode retraction must hand an EAGLE3 request back its own draft KV, not
-whatever reused its slots; target verification hides the loss, acceptance drops."""
+"""A PD decode retraction must hand an EAGLE3 request back its own draft KV, every
+step's pool under multi-layer EAGLE, not whatever reused its slots; target
+verification hides the loss, acceptance drops."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,6 +16,10 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    MultiLayerEagleDraftWorker,
+    MultiLayerEagleWorkerV2,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -72,6 +77,8 @@ def _rows_equal(pool: MHATokenToKVPool, indices: torch.Tensor, expected) -> bool
 
 
 class TestPdEagleRetractionDraftState(CustomTestCase):
+    NUM_DRAFT_POOLS = 1
+
     def setUp(self):
         enter_scope(
             self,
@@ -88,11 +95,11 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         enter_scope(self, patch.object(memory_pool.current_platform, "synchronize"))
 
         self.target = _pool(layer_num=3)
-        self.draft = _pool(layer_num=1)
+        self.drafts = [_pool(layer_num=1) for _ in range(self.NUM_DRAFT_POOLS)]
         self.allocator = TokenToKVPoolAllocator(
             POOL_SIZE, torch.float32, "cpu", self.target, need_sort=False
         )
-        self._alloc_eagle3_draft_pool()
+        self._alloc_draft_pools()
 
         seqlen = PROMPT_LEN + DECODED
         self.req = Req(
@@ -109,16 +116,18 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         self.req_pool.req_to_token[self.req.kv.req_pool_idx, : seqlen - 1] = self.old
 
         _seed(self.target, self.old, base=1.0)
-        _seed(self.draft, self.old, base=9.0)
         self.target_before = _snapshot(self.target, self.old)
-        self.draft_before = _snapshot(self.draft, self.old)
+        self.drafts_before = []
+        for step, draft in enumerate(self.drafts):
+            _seed(draft, self.old, base=9.0 + 100 * step)
+            self.drafts_before.append(_snapshot(draft, self.old))
 
-    def _alloc_eagle3_draft_pool(self) -> None:
+    def _alloc_draft_pools(self) -> None:
         """Attach the draft pool through EAGLEWorkerV2.alloc_memory_pool, as the
         scheduler does: the draft worker shares the target allocator."""
         draft_tp_worker = SimpleNamespace(
             alloc_memory_pool=Mock(),
-            model_runner=SimpleNamespace(token_to_kv_pool=self.draft),
+            model_runner=SimpleNamespace(token_to_kv_pool=self.drafts[0]),
         )
         draft_worker = object.__new__(EagleDraftWorker)
         draft_worker.draft_worker = draft_tp_worker
@@ -152,7 +161,8 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         self.assertTrue(batch.release_req(0, 0))
 
         _poison(self.target)
-        _poison(self.draft)
+        for draft in self.drafts:
+            _poison(draft)
         self.req_pool.alloc([self.req])  # _pre_alloc on resume
         self.req_pool.req_to_token[self.req.kv.req_pool_idx, : len(self.new)] = self.new
         restore_kv_cache(
@@ -171,11 +181,36 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
     def test_draft_kv_survives_retraction(self):
         """Draft KV shares the target allocator's slots, so it must travel with it."""
         self._retract_and_resume()
-        self.assertTrue(
-            _rows_equal(self.draft, self.new, self.draft_before),
-            "cpu_tensor retraction restored the target KV but not the EAGLE3 "
-            "draft KV: the resumed request drafts against another request's KV",
-        )
+        for step, (draft, before) in enumerate(
+            zip(self.drafts, self.drafts_before, strict=True)
+        ):
+            self.assertTrue(
+                _rows_equal(draft, self.new, before),
+                f"cpu_tensor retraction restored the target KV but not draft step "
+                f"{step}: the resumed request drafts against another request's KV",
+            )
+
+
+class TestPdMultiLayerEagleRetractionDraftState(TestPdEagleRetractionDraftState):
+    NUM_DRAFT_POOLS = 2
+
+    def _alloc_draft_pools(self) -> None:
+        """Attach one draft pool per step through
+        MultiLayerEagleWorkerV2.alloc_memory_pool."""
+        draft_worker = object.__new__(MultiLayerEagleDraftWorker)
+        draft_worker.draft_worker = SimpleNamespace(alloc_memory_pool=Mock())
+        draft_worker.draft_runner_list = [
+            SimpleNamespace(token_to_kv_pool=draft) for draft in self.drafts
+        ]
+        worker = object.__new__(MultiLayerEagleWorkerV2)
+        worker._draft_worker = draft_worker
+        with (
+            patch.object(MultiLayerEagleDraftWorker, "init_lm_head"),
+            patch.object(MultiLayerEagleDraftWorker, "_init_boundary_kv_fix_state"),
+        ):
+            worker.alloc_memory_pool(
+                req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
+            )
 
 
 if __name__ == "__main__":

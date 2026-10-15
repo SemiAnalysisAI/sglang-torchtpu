@@ -41,7 +41,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -238,11 +237,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # The draft pool is indexed by the target allocator's token ids. MHA only:
-        # the paged TPU MLA pools have no CPU copy.
-        draft_pool = self.draft_runner.token_to_kv_pool
-        if isinstance(draft_pool, MHATokenToKVPool):
-            token_to_kv_pool_allocator.register_full_draft_kv_pool(draft_pool)
+        self._register_draft_kv_pools(token_to_kv_pool_allocator)
         self.init_token_map()
         self.init_lm_head()
 
