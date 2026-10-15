@@ -2989,17 +2989,6 @@ class KimiK3LinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        if (
-            _is_tpu
-            and envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.get()
-            and config.attn_res_block_size is not None
-        ):
-            from sglang_tpu.kimi_attn_residual import (
-                register_kimi_attn_res_decode_ops,
-            )
-
-            register_kimi_attn_res_decode_ops()
-
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -3622,29 +3611,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
-        if _is_tpu and envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.get():
-            from sglang_tpu.kimi_attn_residual import (
-                get_norm_weight_f32,
-            )
-
-            # The TPU decode kernel's fp32 copy of each aggregation point's out
-            # norm, also built before the trace.
-            for layer in self.model.layers:
-                if isinstance(layer, PPMissingLayer) or not layer.use_attn_residuals:
-                    continue
-                get_norm_weight_f32(layer.input_layernorm)
-                get_norm_weight_f32(layer.post_attention_layernorm)
-            if hasattr(self.model, "output_attn_res_proj"):
-                get_norm_weight_f32(self.model.norm)
-            # The kernel reads these copies and the cached fp32 score weights
-            # (get_cw), which writes that skip post-load would leave stale. The
-            # updater's derived-cache guard rejects every update path.
-            self.model._derived_weight_cache_error = (
-                "Online weight updates are not supported with "
-                "SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1: the attention-residual "
-                "kernel reads weight copies built at load time. Restart the "
-                "server to change weights."
-            )
 
         # Post-load: merge the horizontally-fused decode weights (views of the
         # merged buffers, ~0 extra memory); must run before cuda graph capture.

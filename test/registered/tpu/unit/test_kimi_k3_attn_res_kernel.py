@@ -4,14 +4,15 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
+import contextlib
 import importlib.util
 import itertools
 import unittest
+from collections import defaultdict
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import attn_residual
 from sglang.srt.layers.attn_residual import (
     AttnResidual,
@@ -20,13 +21,40 @@ from sglang.srt.layers.attn_residual import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.plugins.hook_registry import HookRegistry
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.hooks import HOOKS
+from sglang_tpu.hooks import attn_residual as hooks
 
 H = 7168  # Kimi-K3 hidden size
 NB = 9  # bank rows allocated; nvb <= NB
 EPS = 1e-6
 
 _HAS_TORCH_TPU = importlib.util.find_spec("torch_tpu") is not None
+
+
+@contextlib.contextmanager
+def _aggregation_hooks(kernel):
+    """The plugin's AROUND hooks on attn_residual._aggregate and
+    _aggregate_fused_add, applied through HookRegistry as on a server with
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL=1, and undone on exit."""
+    prefix = attn_residual.__name__ + "."
+    arounds = [h for h in HOOKS if h[0].startswith(prefix)]
+    with contextlib.ExitStack() as stack:
+        for target, _, _ in arounds:
+            name = target[len(prefix) :]
+            # Re-sets the original now, so exit undoes whatever apply_hooks installs.
+            stack.enter_context(
+                patch.object(attn_residual, name, getattr(attn_residual, name))
+            )
+        stack.enter_context(patch.object(HookRegistry, "_hooks", defaultdict(list)))
+        stack.enter_context(patch.object(HookRegistry, "_patched", set()))
+        stack.enter_context(patch.object(hooks, "_kernel", kernel))
+        for target, hook, hook_type in arounds:
+            HookRegistry.register(target, hook, hook_type)
+        HookRegistry.apply_hooks()
+        assert HookRegistry._patched == {t for t, _, _ in arounds}
+        yield
 
 
 def _modules(seed: int, eps: float = EPS):
@@ -143,27 +171,23 @@ class TestKimiK3AttnResKernel(CustomTestCase):
         ar.num_valid_blocks = nvb
         a_dev, b_dev = prefix_a.to(dev), prefix_b.to(dev)
         modules = (score_proj, score_norm, out_norm)
-        with (
-            patch.object(attn_residual, "_is_tpu", True),
-            envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.override(True),
-        ):
-            self.assertTrue(
-                attn_residual._use_tpu_decode(
-                    a_dev,
-                    b_dev if has_addend else None,
-                    ar.block_residual,
-                    score_norm,
-                    out_norm,
-                )
+        self.assertTrue(
+            self.kernel.supports_attn_res_decode(
+                a_dev,
+                b_dev if has_addend else None,
+                ar.block_residual,
+                score_norm,
+                out_norm,
             )
+        )
+        with _aggregation_hooks(self.kernel):
             if has_addend:
                 # Pending add: hidden_states is the addend, prefix_sum the prefix.
                 normed, prefix_out = ar.forward(b_dev, a_dev, *modules)
             else:
                 normed, prefix_out = ar.forward(a_dev, None, *modules)
-            # Flag off: the torch reference path this kernel replaces.
-            envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.set(False)
-            torch_path, _ = ar.forward(prefix.to(dev), None, *modules)
+        # Hooks off: the torch reference path this kernel replaces.
+        torch_path, _ = ar.forward(prefix.to(dev), None, *modules)
         normed, torch_path = normed.cpu(), torch_path.cpu()
         err = (normed.float() - expected.float()).abs().max().item()
         torch_err = (torch_path.float() - expected.float()).abs().max().item()
@@ -194,7 +218,8 @@ class TestKimiK3AttnResKernel(CustomTestCase):
 
     def test_compiled_stack_matches_eager(self):
         """A K3-like stack (bank writes, pending adds, nvb 0..4, two epsilons)
-        compiles to one graph that only looks up the ops registered at init."""
+        compiles through the plugin's hooks to one graph that only looks up the
+        ops registered at init."""
         kimi_attn_residual = self.kernel
         tokens = kimi_attn_residual._DECODE_MAX_TOKENS
         dev = torch.device("tpu")
@@ -230,8 +255,7 @@ class TestKimiK3AttnResKernel(CustomTestCase):
             return torch._dynamo.lookup_backend("tpu")(gm, example_inputs)
 
         with (
-            patch.object(attn_residual, "_is_tpu", True),
-            envs.SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL.override(True),
+            _aggregation_hooks(kimi_attn_residual),
             patch.object(
                 kimi_attn_residual,
                 "cpu_export_jax_op",
