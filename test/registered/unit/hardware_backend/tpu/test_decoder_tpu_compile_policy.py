@@ -1462,9 +1462,7 @@ class TestPrecompileLoops(_PolicyTestCase):
 
     def test_extend_warms_full_capture_when_prompt_logprobs_enabled(self):
         self.publish_config(enable_mixed_chunk=True)
-        policy = _make_policy(
-            _model_runner(), token_buckets=(8, 16), bs_buckets=(4, 8)
-        )
+        policy = _make_policy(_model_runner(), token_buckets=(8, 16), bs_buckets=(4, 8))
         policy.extend_bs = 4
         policy._run_one = MagicMock()
 
@@ -1495,14 +1493,62 @@ class TestPrecompileLoops(_PolicyTestCase):
         self.assertEqual(
             seen,
             [
-                (8, 4, ForwardMode.EXTEND, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.NULL),
-                (16, 4, ForwardMode.EXTEND, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.NULL),
-                (8, 8, ForwardMode.MIXED, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.NULL),
-                (16, 8, ForwardMode.MIXED, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.NULL),
-                (8, 4, ForwardMode.EXTEND, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.FULL),
-                (16, 4, ForwardMode.EXTEND, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.FULL),
-                (8, 8, ForwardMode.MIXED, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.FULL),
-                (16, 8, ForwardMode.MIXED, LogitsOutputMode.FULL_VOCAB, CaptureHiddenMode.FULL),
+                (
+                    8,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    16,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    8,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    16,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    8,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    16,
+                    4,
+                    ForwardMode.EXTEND,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    8,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    16,
+                    8,
+                    ForwardMode.MIXED,
+                    LogitsOutputMode.FULL_VOCAB,
+                    CaptureHiddenMode.FULL,
+                ),
             ],
         )
 

@@ -1146,8 +1146,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         cp_items = [
-            (*item, CaptureHiddenMode.NULL)
-            for item in self._extend_cp_compile_items()
+            (*item, CaptureHiddenMode.NULL) for item in self._extend_cp_compile_items()
         ]
         compile_items += cp_items
         # When prompt logprobs are enabled, also warm the plain extend/mixed
