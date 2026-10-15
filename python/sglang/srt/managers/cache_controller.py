@@ -174,6 +174,13 @@ class BatchDoneCounter:
         if ev is not None:
             ev.synchronize()
 
+    def wait_until(self, threshold: int) -> None:
+        """Per-layer gate: already satisfied. The forward shim calls ``wait()``
+        for the whole batch before entering the graph, so pools that gate each
+        layer (e.g. the recurrent-state accessors) have nothing left to wait
+        for, and must not touch the event from inside a compiled region."""
+        del threshold
+
     def reset(self) -> None:
         """Reset lifecycle: land pending commits, then clear every slot.
 
