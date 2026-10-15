@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvTuple
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvTuple
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -25,6 +25,11 @@ class TpuEnvs:
     # input scale (see kimi_k3_static_fp8.py). Comma-separated subset of
     # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all". Empty keeps bf16.
     SGLANG_TPU_K3_STATIC_FP8 = EnvTuple(())
+    # Launch-time xprof capture (see profile_auto.py): each stage once, without
+    # /start_profile. Keep the step count small: each chip's trace is hundreds
+    # of MB.
+    SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
+    SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
 
     @classmethod
     def names(cls) -> list[str]:

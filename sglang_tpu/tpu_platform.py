@@ -8,7 +8,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
 
 import torch
@@ -337,11 +337,14 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
             )
-    if cfg.speculative_algorithm is not None:
+    # PD prefill only exports the target's hidden states for the decode node;
+    # the draft loop itself never runs here, so the stage relay stays spec-free.
+    if cfg.speculative_algorithm is not None and cfg.disaggregation_mode != "prefill":
         raise NotImplementedError(
             "Speculative decoding "
             f"(--speculative-algorithm {cfg.speculative_algorithm}) "
-            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp}) "
+            "outside --disaggregation-mode prefill."
         )
     if cfg.enable_dynamic_chunking:
         raise NotImplementedError(
@@ -494,6 +497,16 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
+    # The direct tracer gets the KV cache buffers from the pool's get_state and
+    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
+    # buffers, so the first compile would fail.
+    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
+    # tracer.
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
 
 
 def _register_attention_backends() -> None:
@@ -509,6 +522,12 @@ def _register_attention_backends() -> None:
         )
 
         return TpuPallasSparseMlaAttnBackend(runner)
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -941,12 +960,61 @@ class TpuSRTPlatform(SRTPlatform):
             store_dtype=kv_cache_dtype,
         )
 
+    supports_mamba_extra_buffer = True
+
+    def supports_mamba_prefix_cache(self, model_config) -> bool:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # KDA shares GDN metadata setup, but does not pass snapshot tracking
+        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
+        return hybrid_gdn_config(model_config) is not None
+
+    def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
+        # Mixed-batch merging drops the tracking plan while requests retain
+        # checkpoint depths, so the radix tree could cache unwritten states.
+        if view.enable_mixed_chunk and not view.disable_radix_cache:
+            raise ValueError(
+                "TPU GDN prefix caching does not support --enable-mixed-chunk. "
+                "Remove --enable-mixed-chunk or use --disable-radix-cache."
+            )
+        # Lazy slot allocation/release has not been validated with TPU snapshots.
+        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+            raise ValueError(
+                "extra_buffer_lazy is not supported for TPU GDN prefix caching. "
+                "Use --mamba-radix-cache-strategy extra_buffer."
+            )
+        # Host and int8 stores expect stacked GPU-layout states; TPU owns
+        # independent kernel-layout tensors per layer.
+        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
+            if getattr(view, flag):
+                raise ValueError(
+                    f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
+                    "Use device-resident, uncompressed Mamba states."
+                )
+        if hf_config is not None:
+            text_config = getattr(hf_config, "text_config", hf_config)
+            assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
+                "TPU GDN prefix caching requires mamba_chunk_size=64."
+            )
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
         from sglang_tpu.mamba_pool import TpuMambaPool
 
         return TpuMambaPool
+
+    def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
+        from sglang.srt.mem_cache.pool_host.base import (
+            host_memory_budget_bytes,
+            host_memory_budget_scope,
+        )
+        from sglang.srt.runtime_context import get_memory
+
+        if get_memory().hicache_io_backend != "raiden":
+            return super().get_hicache_explicit_size_context()
+        # Full, SWA, and draft pools must fit within one combined RAM budget.
+        return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.mem_cache.memory_pool_host import (
@@ -991,9 +1059,9 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
-        from sglang_tpu.kv_pool import TpuFusedDSATokenToKVPool
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
-        return TpuFusedDSATokenToKVPool
+        return TpuSplitMLATokenToKVPool
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -1075,12 +1143,6 @@ class TpuSRTPlatform(SRTPlatform):
                 "Initialize it from the scheduler worker bootstrap."
             )
 
-        from sglang_tpu.compile_cache import (
-            add_pallas_kernel_sources_to_compile_cache_key,
-        )
-
-        add_pallas_kernel_sources_to_compile_cache_key()
-
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
@@ -1112,6 +1174,13 @@ class TpuSRTPlatform(SRTPlatform):
         # the inherited launch environment here; any TorchTPU-dependent
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+
+        from sglang_tpu.compile_cache import (
+            add_tpu_kernel_inputs_to_compile_cache_key,
+        )
+
+        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+        add_tpu_kernel_inputs_to_compile_cache_key()
 
         import torch_tpu  # noqa: F401
 
@@ -1145,6 +1214,13 @@ class TpuSRTPlatform(SRTPlatform):
             "[tpu] Warmup complete; froze torch.compile via "
             "set_stance('fail_on_recompile')."
         )
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return tier-1 misses, including compiles and persistent-cache loads."""
+        get_cache_misses = getattr(
+            getattr(torch, "tpu", None), "_get_cache_misses", None
+        )
+        return None if get_cache_misses is None else int(get_cache_misses())
 
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel
