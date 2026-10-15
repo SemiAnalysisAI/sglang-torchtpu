@@ -16,10 +16,6 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
-from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
-from sglang_tpu.hooks.twolevel_allreduce import (
-    merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +35,6 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
         skip_spec_op_precompile_without_draft,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
-        twolevel_all_reduce,
-        HookType.AROUND,
-    ),
-    (
-        "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
-        twolevel_merged_moe_all_reduce,
         HookType.AROUND,
     ),
 ]

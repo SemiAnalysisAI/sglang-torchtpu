@@ -14,13 +14,16 @@ Measured on that slice: 13.0 us at H=7168, 15.3 us at H=10752.
 
 Opt-in via SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE. It applies to the TP group
 only, when TP spans the whole world (no DP / PP / extra ranks) so TP ranks are
-host-major, for bf16 [1, H] tensors with H a multiple of 128; everything else
-keeps the original all-reduce.
+host-major, for bf16 [1, H] tensors with H a multiple of 128. Core's
+GroupCoordinator.all_reduce calls ``all_reduce`` and Kimi-K3's MoE tail calls
+``merged_moe_all_reduce`` on TPU; both keep their own reduce when these return
+None.
 """
 
 import functools
 import logging
 from threading import Lock
+from typing import Optional
 
 import torch
 
@@ -184,10 +187,8 @@ def _build(world: int, local: int, n: int):
 
 def local_size(world: int, nnodes: int) -> int:
     """Ranks per host for a host-major TP group of ``world`` ranks, or 0 when
-    the two-level split does not apply. SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE
-    overrides the derived value (0 = derive)."""
-    override = tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE.get()
-    local = override or (world // nnodes if nnodes > 0 else 0)
+    the two-level split does not apply."""
+    local = world // nnodes if nnodes > 0 else 0
     if local <= 0 or world % local:
         return 0
     return local
@@ -249,8 +250,9 @@ def eligible(t: torch.Tensor) -> bool:
     )
 
 
-def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
-    """AROUND hook for ``GroupCoordinator.all_reduce``."""
+def all_reduce(group, input_: torch.Tensor) -> Optional[torch.Tensor]:
+    """The TP group's single-token all-reduce through the two-level kernel, or
+    None when it does not apply. Called from GroupCoordinator.all_reduce."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
     if not (
@@ -259,13 +261,15 @@ def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
         and group is get_tp_group()
         and eligible(input_)
     ):
-        return original(group, input_)
+        return None
     return _OPS[(_WORLD, 1)](input_)
 
 
-def merged_moe_all_reduce_around(original, latent, shared):
-    """AROUND hook for ``kimi_k3.merged_moe_all_reduce``: both TP-partial
-    tensors in one packed exchange, with no concat / split copies."""
+def merged_moe_all_reduce(
+    latent: torch.Tensor, shared: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Kimi-K3's TP-partial routed latent and shared-expert output reduced in
+    one packed exchange, or None when it does not apply."""
     from sglang.srt.distributed.parallel_state import (
         get_tensor_model_parallel_world_size,
     )
@@ -278,5 +282,5 @@ def merged_moe_all_reduce_around(original, latent, shared):
         and eligible(shared)
         and latent.numel() + shared.numel() <= MAX_ELEMS
     ):
-        return original(latent, shared)
+        return None
     return _OPS[(_WORLD, 2)](latent, shared)

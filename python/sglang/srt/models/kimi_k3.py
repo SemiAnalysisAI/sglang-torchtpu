@@ -389,18 +389,15 @@ class KimiK3MLP(nn.Module):
         return hidden_states
 
 
-def merged_moe_all_reduce(
+def _tpu_merged_moe_all_reduce(
     latent: torch.Tensor, shared: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """TP all-reduce of the routed latent and the shared-expert output with
-    one collective (SGLANG_K3_MERGE_MOE_ALLREDUCE). The default concatenates
-    them; a platform may replace this function with a multi-tensor collective
-    that avoids the concat / split copies."""
-    latent_dim = latent.shape[-1]
-    reduced = tensor_model_parallel_all_reduce(
-        torch.cat([latent, shared.to(latent.dtype)], dim=-1)
-    )
-    return reduced[:, :latent_dim], reduced[:, latent_dim:]
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """The TPU plugin's two-level Pallas all-reduce of the TP-partial routed
+    latent and shared-expert output in one packed exchange (opt-in); None when
+    it does not apply."""
+    from sglang_tpu.twolevel_allreduce import merged_moe_all_reduce
+
+    return merged_moe_all_reduce(latent, shared)
 
 
 def _add3(
@@ -1026,11 +1023,11 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
-    def _merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
-        """SGLANG_K3_MERGE_MOE_ALLREDUCE applies: both the routed latent and a
-        synchronous TP-sharded shared-expert output still need a TP reduce."""
+    def _can_merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
+        """Both the routed latent and a synchronous TP-sharded shared-expert
+        output still need a TP reduce, so one collective can serve both."""
         return (
-            envs.SGLANG_K3_MERGE_MOE_ALLREDUCE.get()
+            _is_tpu
             and shared_output is not None
             and shared_event is None
             and self.tp_size > 1
@@ -1274,12 +1271,15 @@ class KimiK3MoE(nn.Module):
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            if self._merge_moe_all_reduce(shared_output, shared_event):
+            merged = (
+                _tpu_merged_moe_all_reduce(expert_output, shared_output)
+                if self._can_merge_moe_all_reduce(shared_output, shared_event)
+                else None
+            )
+            if merged is not None:
                 # One collective for the TP-partial latent and shared output;
                 # the norm only needs the reduced latent.
-                latent, shared_output = merged_moe_all_reduce(
-                    expert_output, shared_output
-                )
+                latent, shared_output = merged
                 latent = self._latent_norm(latent)
                 shared_reduced = True
             else:
