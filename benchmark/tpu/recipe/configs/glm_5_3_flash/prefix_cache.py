@@ -21,8 +21,7 @@ MAX_RUNNING = CONCURRENCY + 2
 # Too few does not fail; cache hits silently stop.
 MAMBA_RATIO = 5
 CACHED_PREFIX_SLOTS = 64
-# Off until concurrent decode with offload is verified.
-KV_OFFLOAD = False
+KV_OFFLOAD = True
 HICACHE_RATIO = 2
 
 CONFIG = deepcopy(BASE_CONFIG)
