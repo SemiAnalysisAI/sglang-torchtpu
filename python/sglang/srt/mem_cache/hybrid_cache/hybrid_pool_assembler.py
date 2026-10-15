@@ -1246,7 +1246,7 @@ def build_hybrid_mamba_stack(
             )
         )
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,
@@ -1369,7 +1369,7 @@ def build_hybrid_mamba_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
