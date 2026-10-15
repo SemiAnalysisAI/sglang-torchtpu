@@ -70,5 +70,14 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "512",
         # f32 MoE scales remove a per-step scale relayout.
         "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
+        # With the fast-merge fix below, the SparseCore KV writer is correct at
+        # every pool size.
+        "SGLANG_TPU_SPARSE_MLA_KV_WRITER": "sparsecore",
     }
+)
+# libtpu >= 0.0.46 (sglang-torchtpu#1137, fixed in 0.0.51): the fast-merge buffer
+# assignment fallback misplaces the SparseCore kernels' buffers once the KV pool
+# passes 131072 tokens, which halts the SparseCore or feeds the MoE router NaN.
+CONFIG["runtime_env"]["LIBTPU_INIT_ARGS"] += (
+    " --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false"
 )
