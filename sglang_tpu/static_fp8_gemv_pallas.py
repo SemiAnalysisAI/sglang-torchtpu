@@ -19,8 +19,6 @@ from threading import Lock
 
 import torch
 
-from sglang_tpu.envs import envs as tpu_envs
-
 # Decode-sized batches only; larger M keeps the XLA dot.
 MAX_TOKENS = 16
 # One fp8 sublane tile; the activation is zero-padded to it.
@@ -29,6 +27,8 @@ _FP8_MAX = 448.0
 # Scoped VMEM the kernel may use: the double-buffered weight block dominates.
 _VMEM_LIMIT = 40 * 1024 * 1024
 _VMEM_BUDGET = 32 * 1024 * 1024
+# Largest K block tried; 1792 measured best on the Kimi-K3 TP32 shapes.
+_MAX_BLOCK_K = 1792
 
 _OP: list = []
 _LOCK = Lock()
@@ -37,9 +37,9 @@ _READY = False
 
 
 def block_k(k: int, n: int) -> int:
-    """Largest 128-multiple divisor of ``k`` that is <= the configured K block
-    and whose working set fits the VMEM budget; 0 when none fits."""
-    want = min(tpu_envs.SGLANG_TPU_K3_STATIC_FP8_GEMV_BLOCK_K.get(), k)
+    """Largest 128-multiple divisor of ``k`` that is <= _MAX_BLOCK_K and whose
+    working set fits the VMEM budget; 0 when none fits."""
+    want = min(_MAX_BLOCK_K, k)
     # f32 accumulator + bf16 output tile, plus the double-buffered x block.
     fixed = _ROWS * n * (4 + 2 * 2)
     for bk in range(want - want % 128, 0, -128):
@@ -123,11 +123,9 @@ def _build_op():
 
 
 def register() -> None:
-    """Register the op when enabled; must run before torch.compile traces the
-    model (the static fp8 binder calls it post-load)."""
+    """Register the op; must run before torch.compile traces the model (the
+    static fp8 binder calls it post-load)."""
     global _READY
-    if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
-        return
     with _LOCK:
         if not _OP:
             _OP.append(_build_op())

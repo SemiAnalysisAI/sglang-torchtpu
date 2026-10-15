@@ -22,15 +22,9 @@ class TpuEnvs:
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
     # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static
-    # input scale (see kimi_k3_static_fp8.py). Comma-separated subset of
+    # input scale (see kimi_k3/static_fp8.py). Comma-separated subset of
     # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all". Empty keeps bf16.
     SGLANG_TPU_K3_STATIC_FP8 = EnvTuple(())
-    # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
-    # (static_fp8_gemv_pallas.py); False keeps the XLA fp8 dot.
-    SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
-    # K block of that kernel, rounded down to a 128-multiple divisor of K that
-    # fits its VMEM budget.
-    SGLANG_TPU_K3_STATIC_FP8_GEMV_BLOCK_K = EnvInt(1792)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

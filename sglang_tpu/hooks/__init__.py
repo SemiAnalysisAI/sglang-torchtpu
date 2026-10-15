@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
-from sglang_tpu.hooks.kimi_k3 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -37,11 +36,6 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
         skip_spec_op_precompile_without_draft,
         HookType.AROUND,
-    ),
-    (
-        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
-        bind_kimi_k3_static_fp8,
-        HookType.AFTER,
     ),
 ]
 
