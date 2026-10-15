@@ -165,59 +165,67 @@ def resolve_layout_io_compatibility(server_args: Any):
                 "Re-run with --hicache-mem-layout page_first_fused."
             )
 
+        # raiden copies the TPU split DSA pool's page buffers as they are, so
+        # that MLA layout needs none of the fused-pool checks below.
+        if (
+            use_mla_backend(server_args)
+            and cfg.hicache_io_backend == "raiden"
+            and cfg.attention_backend == "pallas_tpu_mla_sparse"
+        ):
+            pass
         # TODO: support more backend but for now left a guard for other configs
-        if use_mla_backend(server_args):
+        elif use_mla_backend(server_args):
             raise ValueError(
                 f"{cfg.hicache_io_backend} KV offloading supports only dense "
                 "MHA models; this is an MLA model, which has no fused TPU host "
                 "pool. Disable --enable-hierarchical-cache, or serve without "
                 "the TPU KV-offload io backend."
             )
+        else:
+            # Offload copies the device KV pool, so its class declares the io
+            # backends that can copy its layout. Map backend -> pool statically
+            # (the runtime context does not exist yet), and read both helpers
+            # through the module, because plugins patch them to register their
+            # own backends and pools.
+            from sglang_tpu import tpu_platform
 
-        # Offload copies the device KV pool, so its class declares the io
-        # backends that can copy its layout. Map backend -> pool statically
-        # (the runtime context does not exist yet), and read both helpers
-        # through the module, because plugins patch them to register their
-        # own backends and pools.
-        from sglang_tpu import tpu_platform
-
-        pool_cls = tpu_platform._mha_kv_pool_cls(cfg.attention_backend)
-        if cfg.hicache_io_backend not in getattr(
-            pool_cls, "kv_offload_io_backends", ()
-        ):
-            raise ValueError(
-                f"{cfg.hicache_io_backend} KV offloading does not support the "
-                f"{pool_cls.__name__} KV pool of attention backend "
-                f"{cfg.attention_backend!r}: the pool does not list this io "
-                "backend in kv_offload_io_backends. Re-run with an attention "
-                "backend whose pool does (in-tree: pallas_tpu_rpa_v3 or "
-                "pallas_tpu_rpa_batched), or disable KV offload."
-            )
-
-        # Reloaded KV lands through the reload-commit hook in the shared RPA
-        # backend base, so every backend that reads the pool must be an RPA
-        # backend. It must also read the pool's layout: the pool is built for
-        # the base backend only, and split prefill/decode backends share it.
-        for backend in dict.fromkeys(
-            (cfg.attention_backend, *attention_backends_of(cfg))
-        ):
-            if tpu_platform._rpa_kernel_spec(backend) is None:
+            pool_cls = tpu_platform._mha_kv_pool_cls(cfg.attention_backend)
+            if cfg.hicache_io_backend not in getattr(
+                pool_cls, "kv_offload_io_backends", ()
+            ):
                 raise ValueError(
-                    f"{cfg.hicache_io_backend} KV offloading does not support "
-                    f"attention backend {backend!r}: it is not a Pallas RPA "
-                    "backend, so it never runs the HiCache reload-commit hook. "
-                    "Re-run with RPA attention backends, or disable KV offload."
+                    f"{cfg.hicache_io_backend} KV offloading does not support the "
+                    f"{pool_cls.__name__} KV pool of attention backend "
+                    f"{cfg.attention_backend!r}: the pool does not list this io "
+                    "backend in kv_offload_io_backends. Re-run with an attention "
+                    "backend whose pool does (in-tree: pallas_tpu_rpa_v3 or "
+                    "pallas_tpu_rpa_batched), or disable KV offload."
                 )
-            backend_pool_cls = tpu_platform._mha_kv_pool_cls(backend)
-            if backend_pool_cls is not pool_cls:
-                raise ValueError(
-                    f"{cfg.hicache_io_backend} KV offloading does not support "
-                    f"attention backend {backend!r} with --attention-backend "
-                    f"{cfg.attention_backend!r}: it reads "
-                    f"{backend_pool_cls.__name__}, but "
-                    f"the shared KV pool is {pool_cls.__name__}. Re-run with "
-                    "backends that use the same KV pool, or disable KV offload."
-                )
+
+            # Reloaded KV lands through the reload-commit hook in the shared RPA
+            # backend base, so every backend that reads the pool must be an RPA
+            # backend. It must also read the pool's layout: the pool is built for
+            # the base backend only, and split prefill/decode backends share it.
+            for backend in dict.fromkeys(
+                (cfg.attention_backend, *attention_backends_of(cfg))
+            ):
+                if tpu_platform._rpa_kernel_spec(backend) is None:
+                    raise ValueError(
+                        f"{cfg.hicache_io_backend} KV offloading does not support "
+                        f"attention backend {backend!r}: it is not a Pallas RPA "
+                        "backend, so it never runs the HiCache reload-commit hook. "
+                        "Re-run with RPA attention backends, or disable KV offload."
+                    )
+                backend_pool_cls = tpu_platform._mha_kv_pool_cls(backend)
+                if backend_pool_cls is not pool_cls:
+                    raise ValueError(
+                        f"{cfg.hicache_io_backend} KV offloading does not support "
+                        f"attention backend {backend!r} with --attention-backend "
+                        f"{cfg.attention_backend!r}: it reads "
+                        f"{backend_pool_cls.__name__}, but "
+                        f"the shared KV pool is {pool_cls.__name__}. Re-run with "
+                        "backends that use the same KV pool, or disable KV offload."
+                    )
 
         if (
             cfg.hicache_io_backend == "torch_tpu"

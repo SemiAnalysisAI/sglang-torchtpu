@@ -148,14 +148,15 @@ def build_kv_host_pool(
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost
+        current_platform.get_mla_kv_pool_host_cls(kv_pool)
         if use_mla
         else current_platform.get_mha_kv_pool_host_cls(kv_pool)
     )
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
-        # device pool already resolved the row width.
-        override_kv_cache_dim = kv_pool.kv_cache_dim
+        # device pool already resolved the row width (a split-buffer pool has
+        # no single row width and leaves it to its host pool).
+        override_kv_cache_dim = getattr(kv_pool, "kv_cache_dim", None)
     check_packed_kv_rows(
         kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
     )
@@ -1197,7 +1198,9 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    from sglang.srt.platforms import current_platform
+
+    mamba_host_pool = current_platform.get_mamba_pool_host_cls(mamba_pool)(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,

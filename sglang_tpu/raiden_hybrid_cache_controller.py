@@ -1,4 +1,4 @@
-"""Raiden-backed hybrid HiCache controller for TPU (full + SWA pools).
+"""Raiden-backed hybrid HiCache controller for TPU (full + SWA or state pools).
 
 Hybrid sliding-window models run under the unified cache with a
 ``HostPoolGroup`` of two host pools: the full-attention pool (anchor,
@@ -44,14 +44,17 @@ from sglang_tpu.raiden_transfer import (
 logger = logging.getLogger(__name__)
 
 # Pools indexed by KV allocator pages, which the KV free fence keeps from loads
-# while a forward may still write them; any other pool's slots are unfenced.
+# while a forward may still write them.
 _KV_PAGE_POOLS = frozenset(
     (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA)
 )
+# Recurrent-state slots: the fence does not hold freed slots, so a load into
+# one waits for the in-flight forwards instead (see ``start_loading``).
+_STATE_SLOT_POOLS = frozenset((PoolName.MAMBA,))
 
 
 def _check_kv_page_pool(name: PoolName) -> None:
-    if name not in _KV_PAGE_POOLS:
+    if name not in _KV_PAGE_POOLS | _STATE_SLOT_POOLS:
         raise NotImplementedError(
             f"The TPU raiden hybrid HiCache path does not offload the {name.value} pool."
         )
@@ -231,6 +234,14 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
+        # Under overlap, a request that finished at N-1 is still in forward N
+        # and writes its state slot, which was already freed and may be this
+        # load's target. Unlike KV pages, freed slots are not held back, so
+        # the DMA must not start until that forward is done.
+        if self.kv_free_fence is not None and any(
+            t.name in _STATE_SLOT_POOLS for t in op.pool_transfers or []
+        ):
+            self.kv_free_fence.wait_for_in_flight()
 
         # All pools' H2d; each future-event comes back before its DMA lands.
         # The consuming forward's CompiledForwardShim wait() polls the combined

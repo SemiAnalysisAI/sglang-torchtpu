@@ -118,6 +118,18 @@ class SRTPlatform(DeviceMixin):
 
         return get_mha_host_pool_cls(device_pool)
 
+    def get_mla_kv_pool_host_cls(self, device_pool) -> type:
+        """Return the host (L2) MLA KV pool class matching ``device_pool``."""
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        return MLATokenToKVPoolHost
+
+    def get_mamba_pool_host_cls(self, device_pool) -> type:
+        """Return the host (L2) recurrent-state pool class matching ``device_pool``."""
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+        return MambaPoolHost
+
     def get_hicache_explicit_size_context(self) -> AbstractContextManager[None]:
         """Scope host-pool construction for an explicit HiCache ratio or size.
 

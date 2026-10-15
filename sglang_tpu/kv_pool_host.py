@@ -66,6 +66,9 @@ class TpuRaidenHostKVCache(HostKVCache):
         *,
         pool_label: str = "kv",
         mtp_draft_device_pools: tuple = (),
+        # MLA row-width override for the flat host layout; raiden copies the
+        # device pages as they are, so the width comes from the page buffers.
+        override_kv_cache_dim: Optional[int] = None,
     ):
         if mtp_draft_device_pools:
             raise NotImplementedError(
@@ -73,9 +76,9 @@ class TpuRaidenHostKVCache(HostKVCache):
             )
         # Raiden owns the DMA-pinned storage, so skip the base allocator setup
         # but retain its sizing and host-memory admission check.
+        from sglang_tpu.raiden_transfer import raiden_page_tensors
+
         self.device_pool = device_pool
-        self.pool_label = pool_label
-        self.page_size = page_size
         self.layout = RAIDEN_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
@@ -84,17 +87,42 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.layer_num = device_pool.layer_num
+        self._init_raiden_pages(
+            raiden_page_tensors(device_pool),
+            page_size=page_size,
+            device_size=device_pool.size,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            pool_label=pool_label,
+        )
 
-        self.size_per_token = self.get_size_per_token()
+    def _init_raiden_pages(
+        self,
+        device_tensors: List[torch.Tensor],
+        *,
+        page_size: int,
+        device_size: int,
+        host_to_device_ratio: float,
+        host_size: int,
+        pool_label: str,
+    ) -> None:
+        """Size the host pool in pages of ``device_tensors`` (each page-major),
+        check it against the host-memory budget and build its raiden engine."""
+        self.pool_label = pool_label
+        self.page_size = page_size
+        # Host bytes per token, from the real (padded) page rows so the
+        # host_size GB budget matches raiden's per-page allocation.
+        page_bytes = sum(t.nbytes // t.shape[0] for t in device_tensors)
+        self.size_per_token = page_bytes // page_size
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_size * host_to_device_ratio)
         # Align the pool up to a whole number of pages.
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        if self.size <= device_pool.size:
+        if self.size <= device_size:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device "
                 "pool (%d tokens); L2 cache effectiveness is reduced. "
@@ -102,7 +130,7 @@ class TpuRaidenHostKVCache(HostKVCache):
                 "higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_pool.size,
+                device_size,
             )
 
         requested_bytes = self.size * self.size_per_token
@@ -123,26 +151,15 @@ class TpuRaidenHostKVCache(HostKVCache):
 
         from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
-        self.transfer = RaidenKVTransfer(device_pool, self.page_num)
+        self.transfer = RaidenKVTransfer(
+            self.device_pool, self.page_num, device_tensors=device_tensors
+        )
 
         self.lock = threading.RLock()
         self.clear()
 
-    # ------------------------------------------------------------------ #
-    # Sizing
-    # ------------------------------------------------------------------ #
-
     def get_size_per_token(self) -> int:
-        """Host bytes per cached token = fused device page bytes / page_size.
-
-        Uses the *real* (padded) fused-page byte size so the host_size GB
-        budget matches raiden's actual per-page allocation, not the logical
-        ``2 * head_num * head_dim`` lower bound.
-        """
-        fused = self.device_pool.get_fused_kv_buffer(self.start_layer)
-        page_bytes = int(np.prod(fused.shape[1:])) * fused.element_size()
-        per_token = page_bytes // self.page_size
-        return per_token * self.layer_num
+        return self.size_per_token
 
     def init_kv_buffer(self):
         # raiden owns host memory; there is no torch host buffer.
@@ -244,3 +261,43 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         raise NotImplementedError("L3 storage not yet supported on TPU raiden path")
+
+
+class TpuRaidenMambaPoolHost(TpuRaidenHostKVCache):
+    """Host store for recurrent (KDA / GDN) state slots, backed by raiden.
+
+    ``TpuMambaPool`` keeps one ``[slots + 1, ...]`` tensor per layer and state
+    kind, so a slot is one row of each: raiden registers every tensor and moves
+    a slot as a page of size 1 across all of them in one call.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        layout: str = "page_first_direct",
+    ):
+        if device_pool.spec_window != 1:
+            raise NotImplementedError(
+                "Host offload of recurrent state is not supported with "
+                "speculative decoding: a slot then spans several rows."
+            )
+        self.device_pool = device_pool
+        self.layout = RAIDEN_LAYOUT
+        self.pin_memory = pin_memory
+        self.device = device
+        self.num_mamba_layers = device_pool.num_mamba_layers
+        tensors = [state for _, state, _, _ in device_pool._iter_transfer_state_entries()]
+        self.dtype = tensors[0].dtype
+        self._init_raiden_pages(
+            tensors,
+            page_size=1,
+            device_size=device_pool.size,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            pool_label="mamba",
+        )

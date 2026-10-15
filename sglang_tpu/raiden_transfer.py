@@ -16,11 +16,13 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 logger = logging.getLogger(__name__)
@@ -111,9 +113,25 @@ class CombinedFutureEvent:
         return None
 
 
+def raiden_page_tensors(device_pool) -> List["torch.Tensor"]:
+    """Every device tensor of ``device_pool`` whose leading dim is the page id.
+
+    A fused pool has one buffer per layer; the split MLA (DSA) pool has several
+    (latent NoPE, RoPE, indexer keys, pooled raw keys), each page-major.
+    """
+    layers = range(device_pool.start_layer, device_pool.start_layer + device_pool.layer_num)
+    if hasattr(device_pool, "get_page_buffers"):
+        return [buf for layer_id in layers for buf in device_pool.get_page_buffers(layer_id)]
+    return [device_pool.get_fused_kv_buffer(layer_id) for layer_id in layers]
+
+
 class RaidenKVTransfer:
-    """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
-    page-granular D2H / H2D transfers.
+    """Owns a raiden ``KVCacheManager`` over a set of page-major device tensors
+    and issues page-granular D2H / H2D transfers.
+
+    Raiden registers each tensor as a "layer" and a page as one row of its
+    leading dim, so tensors of different row sizes mix freely: the KV pool's
+    per-layer buffers, or a recurrent-state pool whose rows are state slots.
 
     The device buffers are registered with raiden by raw PJRT pointer; the
     tensor list MUST stay alive for raiden's lifetime or ``D2h``/``H2d`` will
@@ -124,19 +142,19 @@ class RaidenKVTransfer:
         self,
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
+        device_tensors: Optional[List["torch.Tensor"]] = None,
     ):
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
-        self.layer_num = device_pool.layer_num
+        if device_tensors is None:
+            device_tensors = raiden_page_tensors(device_pool)
+        self.layer_num = len(device_tensors)
 
         # outer list = layer, inner list = shard (one shard per TPU core here).
         # Keep-alive: held on self so the underlying buffers outlive raiden.
-        self._device_tensors = [
-            [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
-            for i in range(self.layer_num)
-        ]
+        self._device_tensors = [[t] for t in device_tensors]
         # raiden issues ``d2h`` / ``h2d`` copies on a background thread only
         # when this variable is set; otherwise the calls block the scheduler
         # thread until every per-layer copy has been submitted. The manager
@@ -150,10 +168,10 @@ class RaidenKVTransfer:
             unsafe_skip_buffer_lock=True,
         )
         logger.info(
-            "Raiden KV transfer ready: %d layers, %d host pages (page=%d tokens)",
+            "Raiden KV transfer ready: %d tensors, %d host pages, %.2f MB per page",
             self.layer_num,
             num_host_pages,
-            device_pool.page_size,
+            sum(t.nbytes // t.shape[0] for t in device_tensors) / 2**20,
         )
 
     def backup(

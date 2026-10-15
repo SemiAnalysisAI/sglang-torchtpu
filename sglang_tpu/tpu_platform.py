@@ -994,9 +994,15 @@ class TpuSRTPlatform(SRTPlatform):
                 "extra_buffer_lazy is not supported for TPU GDN prefix caching. "
                 "Use --mamba-radix-cache-strategy extra_buffer."
             )
-        # Host and int8 stores expect stacked GPU-layout states; TPU owns
-        # independent kernel-layout tensors per layer.
-        for flag in ("enable_hierarchical_cache", "enable_int8_mamba_checkpoint"):
+        # The torch-copy host store and the int8 store expect stacked GPU-layout
+        # states; TPU owns independent kernel-layout tensors per layer, which
+        # only the raiden host store moves (one slot = one row of each).
+        if view.enable_hierarchical_cache and view.hicache_io_backend != "raiden":
+            raise ValueError(
+                "TPU GDN/KDA prefix caching offloads states to host only with "
+                "--hicache-io-backend raiden."
+            )
+        for flag in ("enable_int8_mamba_checkpoint",):
             if getattr(view, flag):
                 raise ValueError(
                     f"--{flag.replace('_', '-')} is not supported for TPU GDN prefix caching. "
@@ -1051,6 +1057,25 @@ class TpuSRTPlatform(SRTPlatform):
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
         return MHATokenToKVPoolHost
+
+    def get_mla_kv_pool_host_cls(self, device_pool) -> type:
+        from sglang.srt.runtime_context import get_memory
+
+        # raiden copies the device pool's own pages, whatever their layout.
+        if get_memory().hicache_io_backend == "raiden":
+            from sglang_tpu.kv_pool_host import TpuRaidenHostKVCache
+
+            return TpuRaidenHostKVCache
+        return super().get_mla_kv_pool_host_cls(device_pool)
+
+    def get_mamba_pool_host_cls(self, device_pool) -> type:
+        from sglang.srt.runtime_context import get_memory
+
+        if get_memory().hicache_io_backend == "raiden":
+            from sglang_tpu.kv_pool_host import TpuRaidenMambaPoolHost
+
+            return TpuRaidenMambaPoolHost
+        return super().get_mamba_pool_host_cls(device_pool)
 
     def get_mla_kv_pool_cls(self) -> type:
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
