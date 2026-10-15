@@ -23,9 +23,6 @@ from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream_torch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.model_executor.model_runner_components.weight_updater import (
-    _unsupported_derived_weight_cache_error,
-)
 from sglang.srt.models import kimi_k3
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang.srt.runtime_context import get_context
@@ -287,16 +284,16 @@ class TestKimiK3AttnResHookModelSetup(CustomTestCase):
         built = [c.args for c in kernel.get_norm_weight_f32.call_args_list]
         self.assertEqual(built, [(out_norm,) for _, out_norm in points])
 
+        # Checked on the module this hook marks: the TPU KDA layers publish a
+        # guard of their own, so the updater rejects updates either way.
         reason = model.model._derived_weight_cache_error
         self.assertIn("SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL", reason)
-        self.assertIsNotNone(_unsupported_derived_weight_cache_error(model))
 
     def test_flag_off_never_imports_the_kernel(self):
         # None in sys.modules makes importing the kernel module raise.
         model, kernel_after_init = self._build(flag=False, kernel=None)
         self.assertIsNone(kernel_after_init)
         self.assertIsNone(getattr(model.model, "_derived_weight_cache_error", None))
-        self.assertIsNone(_unsupported_derived_weight_cache_error(model))
 
 
 if __name__ == "__main__":
