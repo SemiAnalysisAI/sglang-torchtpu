@@ -137,6 +137,7 @@ anything that would read those pools after the handoff:
 | Radix cache off | declared (`disable_radix_cache=True`) with a warning |
 | `--context-length` fits the megakernel context | error if larger; declared from `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` if unset; error if neither is set |
 | No speculative decoding, PP, DP / DP attention, P/D disaggregation, hierarchical cache | error |
+| No `--enable-mixed-chunk` (decode rows would run outside the megakernel) | error |
 
 At runtime a real decode batch above the row count, or a position past the
 state context, raises instead of falling back to SGLang's decode.

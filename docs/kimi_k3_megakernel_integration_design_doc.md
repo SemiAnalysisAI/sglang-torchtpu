@@ -549,6 +549,7 @@ Decode state lives only in the megakernel's row-major buffers. SGLang's paged `M
 | Radix cache off | Finished requests' decoded tokens would be shared with stale KV/Mamba state on later prefix hits | declared `disable_radix_cache=True` with a warning |
 | `--context-length` fits the megakernel context (rounded up to 128, min 384) | Positions past the state buffers have no decode state | error if larger; declared from `SGLANG_TPU_K3_MEGAKERNEL_CONTEXT` if unset; error if neither set |
 | No speculative decoding, PP, DP / DP attention, P/D disaggregation, hierarchical cache | These read or move pool state the megakernel does not keep | error |
+| No `--enable-mixed-chunk` | A mixed batch decodes rows in an EXTEND forward, outside the megakernel, over stale pools | error |
 
 The validated `mk_e2e6` launch (`--disable-radix-cache`, concurrency ≤ 8, `--context-length = ISL + OSL + 20`) satisfies the contract unchanged.
 

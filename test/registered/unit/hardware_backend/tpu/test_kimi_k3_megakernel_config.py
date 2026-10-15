@@ -39,6 +39,7 @@ def _mk_args(**overrides):
         speculative_algorithm=None,
         disaggregation_mode="null",
         enable_hierarchical_cache=False,
+        enable_mixed_chunk=False,
         max_running_requests=8,
         disable_radix_cache=True,
         context_length=9344,
@@ -73,6 +74,7 @@ class TestValidateMegakernelServerArgs(CustomTestCase):
             "--enable-dp-attention": dict(enable_dp_attention=True),
             "--disaggregation-mode": dict(disaggregation_mode="decode"),
             "--enable-hierarchical-cache": dict(enable_hierarchical_cache=True),
+            "--enable-mixed-chunk": dict(enable_mixed_chunk=True),
         }
         with tpu_envs.SGLANG_TPU_K3_MEGAKERNEL.override(True):
             for flag, override in cases.items():

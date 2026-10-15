@@ -15,7 +15,9 @@ refused or turned off here, before the model loads:
 * positions past the state buffers' context are out of range -> the context
   must fit the megakernel context;
 * speculative decoding, PP, DP attention, P/D disaggregation and the
-  hierarchical cache read or move pool state the megakernel does not keep.
+  hierarchical cache read or move pool state the megakernel does not keep;
+* mixed chunked prefill would decode some rows outside the megakernel, over
+  the stale pools -> ``--enable-mixed-chunk`` refused.
 
 This module imports nothing heavy so ``apply_server_args_defaults`` can call it
 in the orchestrator before any TPU runtime starts.
@@ -91,6 +93,11 @@ def validate_megakernel_server_args(server_args) -> None:
         "--enable-dp-attention": bool(cfg.enable_dp_attention),
         "--disaggregation-mode": cfg.disaggregation_mode != "null",
         "--enable-hierarchical-cache": bool(cfg.enable_hierarchical_cache),
+        # A mixed batch carries decode rows in an EXTEND-mode forward, which
+        # skips the megakernel (decode-only) and runs those rows through
+        # SGLang's layers over the stale pools; the token they decode then
+        # never reaches the megakernel's own state either.
+        "--enable-mixed-chunk": bool(cfg.enable_mixed_chunk),
     }
     refused = [flag for flag, on in unsupported.items() if on]
     if refused:
