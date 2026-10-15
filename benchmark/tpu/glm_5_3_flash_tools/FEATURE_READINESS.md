@@ -103,3 +103,13 @@ the draft's `positions` and `seq_lens` were sometimes one tensor and sometimes t
 - DFlash at 32+ concurrent: a recompiled RPA verify graph failed with
   `Expected cu_q_lens.shape=(33,) to be (32,)` (metadata one sequence longer than the
   compiled batch). DFlash AIME runs at concurrency 8 (eval-proven) meanwhile.
+
+## Smoke tests on device (2026-10-15, HEAD 65fba312f6, DSA, no spec, psdr + x5kk)
+
+| Feature | Result |
+|---|---|
+| Prefix cache (radix, `dsa_nospec_radix`, 16 KDA state slots) | **Boots and hits.** 6571-token prompt: cold 0 cached / 0.65 s; repeat 6528 cached / 0.38 s; shared-prefix question 6528 cached / 0.35 s. **Suspect:** the greedy repeat's first token differs from the cold run (`" Station 5."` vs `"</think>Station 5."`), so restored state may not match a fresh prefill. Needs a logprob comparison on several prompts. |
+| KV offload (Raiden HiCache, `dsa_nospec_hicache`) | **Refused at startup** by `TpuPlatform.validate_mamba_prefix_cache`: `--enable-hierarchical-cache is not supported for TPU GDN prefix caching`. Needs a host store for per-layer KDA state and Raiden support for the split DSA pool. |
+| PD (Raiden, `dsa_pd`, prefill psdr / decode x5kk) | Upstream refuses `--language-model-only` with PD (`model_hook.py`); with that relaxed (smoke-only patch, not committed) both engines fail in `init_disaggregation`: `get_contiguous_buf_infos is not supported on the TPU split MLA pool`. The DSA split pool exposes no token-addressable buffers for transfer; KDA state has no Raiden state type either. |
+
+Radix needs about mamba_ratio (5) KDA state slots per running request: with the c1 recipe's 3 slots the server refuses to start.
