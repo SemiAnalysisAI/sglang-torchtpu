@@ -375,6 +375,9 @@ class Envs:
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    # Multi-node TP: broadcast requests to node leaders, then share multimodal
+    # tensors with the other ranks on each node through /dev/shm.
+    SGLANG_NODE_FANOUT_REQ_BROADCAST = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
     # When set, get_open_port() and shm_broadcast search upwards from this

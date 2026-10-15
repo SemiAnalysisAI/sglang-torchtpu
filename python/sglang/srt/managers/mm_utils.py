@@ -1327,6 +1327,10 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
+    # Byte offset of the tensor in its segment: a node fan-out receiver lands a
+    # request's tensors in one segment. Page-aligned so ``materialize`` can map it.
+    offset = 0
+
     def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         self._shm_handle = None
         self.tensor = None
@@ -1358,9 +1362,22 @@ class ShmPointerMMData:
         self.shm_name = shm.name
         shm.close()
 
+    @classmethod
+    def in_segment(cls, shm_name, offset, shape, dtype, precomputed_hash=None):
+        """Point at a tensor already written into ``shm_name`` at ``offset``."""
+        pointer = object.__new__(cls)
+        pointer.shm_name = shm_name
+        pointer.offset = offset
+        pointer.shape = shape
+        pointer.dtype = dtype
+        pointer.precomputed_hash = precomputed_hash
+        pointer._shm_handle = pointer.tensor = pointer._materialization_error = None
+        return pointer
+
     def __getstate__(self):
         return {
             "shm_name": self.shm_name,
+            "offset": self.offset,
             "shape": self.shape,
             "dtype": self.dtype,
             "precomputed_hash": self.precomputed_hash,
@@ -1368,6 +1385,7 @@ class ShmPointerMMData:
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
+        self.offset = state.get("offset", 0)
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.precomputed_hash = state.get("precomputed_hash")
@@ -1380,7 +1398,12 @@ class ShmPointerMMData:
         tensor = None
         try:
             handle = shared_memory.SharedMemory(name=self.shm_name)
-            tensor = torch.frombuffer(handle.buf, dtype=self.dtype)
+            tensor = torch.frombuffer(
+                handle.buf,
+                dtype=self.dtype,
+                count=self.shape.numel(),
+                offset=self.offset,
+            )
             self.tensor = tensor.reshape(self.shape)
             self._shm_handle = handle
         except Exception as error:
@@ -1412,6 +1435,7 @@ class ShmPointerMMData:
                     self._shm_handle._fd,
                     self.tensor.numel() * self.tensor.element_size(),
                     access=mmap.ACCESS_COPY,
+                    offset=self.offset,
                 )
                 try:
                     return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
@@ -1505,11 +1529,15 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
-def wrap_shm_features(obj):
+def wrap_shm_features(obj, force: bool = False):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
+
+    ``force`` wraps even when the tokenizer transport is the default inline one
+    (multi-node): the scheduler's node fan-out ships pixels through each node's
+    /dev/shm itself.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    if not force and (_get_is_default_transport() or get_serving().skip_tokenizer_init):
         return obj
 
     if obj.mm_inputs:
@@ -1593,7 +1621,9 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    # No transport gate: values that are not SHM pointers pass through, and the
+    # scheduler's node fan-out wraps features even under the default transport.
+    if get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):
