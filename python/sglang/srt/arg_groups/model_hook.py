@@ -1016,11 +1016,9 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
-        raise ValueError(
-            "--language-model-only is incompatible with --disaggregation-mode "
-            "prefill/decode"
-        )
+    # Text-only serving of a multimodal checkpoint (skip the vision tower) does
+    # not interact with prefill/decode disaggregation, which moves only the
+    # language model's KV and state; GLM-5.3-Flash on TPU requires the flag.
     architectures = model_config_of(server_args).hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
