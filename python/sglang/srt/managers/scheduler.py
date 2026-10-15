@@ -5187,6 +5187,12 @@ class Scheduler(
                 "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
             )
             return
+        if os.environ.get("SGLANG_TPU_DISABLE_FAIL_ON_RECOMPILE", "0") == "1":
+            logger.info(
+                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
+                "because SGLANG_TPU_DISABLE_FAIL_ON_RECOMPILE is set."
+            )
+            return
         torch.compiler.set_stance("fail_on_recompile")
         logger.info(
             "[tpu] Warmup complete; froze torch.compile via "
