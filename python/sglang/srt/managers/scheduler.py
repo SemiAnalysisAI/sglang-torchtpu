@@ -1084,6 +1084,9 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+            allocator.register_draft_kv_pools(
+                self.draft_worker.cpu_retraction_draft_kv_pools()
+            )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""

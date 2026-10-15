@@ -34,6 +34,8 @@ else:
 
 
 class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+    supports_cpu_copy = False
+
     def __init__(
         self,
         size: int,
@@ -151,6 +153,8 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
     Used by MiniMax M3 HiSparse. The index pools (index_kv_pool, index_k_pool)
     stay fully resident on the device and do not use this mapping.
     """
+
+    supports_cpu_copy = False
 
     def __init__(
         self,

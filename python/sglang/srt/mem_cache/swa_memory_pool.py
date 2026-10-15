@@ -26,6 +26,8 @@ class SWAKVPool(BaseSWAKVPool):
     without adding model-specific behavior to the pool selector.
     """
 
+    supports_cpu_copy = True
+
     def __init__(
         self,
         size: int,
