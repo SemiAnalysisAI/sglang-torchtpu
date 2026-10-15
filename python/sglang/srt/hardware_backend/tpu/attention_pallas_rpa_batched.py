@@ -153,7 +153,6 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         self._pp_schedule_runner = model_runner if get_parallel().pp_size > 1 else None
         self._cp_op = None
         self.pcp_forward_metadata = PcpBatchedMetadata.create_empty(self.device)
-        self._cp_reqs: set[int] = set()
         if get_parallel().attn_cp_size > 1 or get_parallel().attn_dcp_size > 1:
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
                 build_batched_rpa_cp_op,
@@ -217,13 +216,6 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             )
             if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
                 self.forward_metadata.pcp_metadata = self.pcp_forward_metadata
-            req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-            if req_pool_indices is not None and hasattr(req_pool_indices, "tolist"):
-                try:
-                    for r_idx in req_pool_indices.tolist():
-                        self._cp_reqs.add(r_idx)
-                except Exception:
-                    pass
         else:
             from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
                 PcpBatchedMetadata,
@@ -233,15 +225,6 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             self.pcp_forward_metadata = empty_pcp_meta
             if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
                 self.forward_metadata.pcp_metadata = empty_pcp_meta
-            forward_mode = getattr(forward_batch, "forward_mode", None)
-            if forward_mode is not None and forward_mode.is_extend():
-                req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-                if req_pool_indices is not None and hasattr(req_pool_indices, "tolist"):
-                    try:
-                        for r_idx in req_pool_indices.tolist():
-                            self._cp_reqs.discard(r_idx)
-                    except Exception:
-                        pass
 
     def forward_extend(
         self,
@@ -295,11 +278,20 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 _quantize_kv_to_fp8,
             )
 
-            k = _quantize_kv_to_fp8(k, k_scale, self.kv_cache_quant_dtype)
-            v = _quantize_kv_to_fp8(v, v_scale, self.kv_cache_quant_dtype)
+            fp8_dtype = self.kv_cache_quant_dtype
+            # K/V are all-gathered over the CP group in the compute dtype and
+            # quantized *after* the gather: an 8-bit all-gather returns wrong
+            # rows from remote ranks on libtpu 0.0.47 (PR #662 hit the same).
+            quantize_kv = (
+                lambda k_, v_: (
+                    _quantize_kv_to_fp8(k_, k_scale, fp8_dtype),
+                    _quantize_kv_to_fp8(v_, v_scale, fp8_dtype),
+                )
+            )
         else:
             k_scale = None
             v_scale = None
+            quantize_kv = None
 
         pcp_meta = pcp_meta or self.pcp_forward_metadata or getattr(self.forward_metadata, "pcp_metadata", None)
         out = batched_rpa_pcp_forward(
@@ -315,28 +307,33 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             k_scale=k_scale,
             v_scale=v_scale,
             sinks=kwargs.get("sinks"),
+            quantize_kv=quantize_kv,
         )
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _is_cp_decode(self, forward_batch) -> bool:
+    @staticmethod
+    def decode_cp_size() -> int:
+        """Width of the CP group the decode attention must ring over.
+
+        Explicit DCP (``--dcp-size``) wins. Otherwise prefill CP alone already
+        forces it: the PCP kernel page-stripes the KV pool (rank ``r`` writes
+        only pages ``p % cp_size == r`` of every CP-prefilled request, see
+        ``schedule_cp.py``), so a plain local-pool decode would read 1 - 1/cp of
+        its pages unwritten. ``batched_rpa_dcp_forward`` falls back to the
+        ``attn_cp`` group in that case. Requests that were prefilled without CP
+        (``ZigzagCPStrategy.can_apply`` false: fewer than ``2 * cp_size`` new
+        tokens) hold the full layout on every rank; the striped read is a
+        subset of that, so the ring is correct for both layouts and decode can
+        take one static path for the whole batch (no per-request bookkeeping,
+        and nothing data-dependent for Dynamo to guard on).
+        """
         from sglang.srt.runtime_context import get_parallel
 
-        if get_parallel().attn_dcp_size <= 1:
-            return False
-        if (
-            (hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling") and torch.compiler.is_compiling())
-            or (hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "is_compiling") and torch._dynamo.is_compiling())
-        ):
-            return True
-        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-        if req_pool_indices is None:
-            return False
-        try:
-            reqs = req_pool_indices.tolist()
-            return len(reqs) > 0 and all(r in self._cp_reqs for r in reqs)
-        except Exception:
-            return True
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1:
+            return parallel.attn_dcp_size
+        return parallel.attn_cp_size
 
     def forward_decode(
         self,
@@ -348,12 +345,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        from sglang.srt.runtime_context import get_parallel
-
-        if not forward_batch.forward_mode.is_idle() and (
-            get_parallel().attn_dcp_size > 1
-            and self._is_cp_decode(forward_batch)
-        ):
+        if not forward_batch.forward_mode.is_idle() and self.decode_cp_size() > 1:
             return self._forward_cp_decode(q, k, v, layer, forward_batch, **kwargs)
         return super().forward_decode(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs

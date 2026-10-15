@@ -591,7 +591,18 @@ def _pad_forward_batch_inputs(
         if forward_batch.cp_last_owner_mask is not None and forward_batch.cp_last_owner_mask.shape[0] < pad_b:
             forward_batch.cp_last_owner_mask = _zero_pad_dim0(forward_batch.cp_last_owner_mask, pad_b)
         forward_batch.gather_reorder_index = getattr(meta, "gather_reorder_index", None)
-        if forward_batch.gather_reorder_index is not None:
+        if getattr(meta, "gather_rank", None) is not None:
+            # The in-graph K/V all-gather sees `pad_t` rows per rank (every
+            # token field is padded to the bucket below), not the 16-aligned
+            # `meta.stride` the host index was built for. Rebuild it for the
+            # real row count, or rows owned by rank >= 1 land on rank 0's
+            # padding (zero K/V for 1 - 1/cp of the prompt).
+            from sglang.srt.layers.cp.padding import gather_reorder_index_for
+
+            forward_batch.gather_reorder_index = gather_reorder_index_for(
+                meta, pad_t, forward_batch.input_ids.device
+            )
+        elif forward_batch.gather_reorder_index is not None:
             from sglang.srt.runtime_context import get_parallel
 
             cp_size = get_parallel().attn_cp_size
@@ -620,7 +631,13 @@ def _pad_forward_batch_inputs(
             if local_rows.device != device:
                 local_rows = local_rows.to(device)
 
-            forward_batch.input_ids = forward_batch.input_ids.index_select(0, local_rows)
+            # Do NOT shard `input_ids` here. The vocab-parallel embedding
+            # all-reduces its per-shard partial rows over the TP group, so
+            # every rank has to embed the same (global) ids; the model selects
+            # this rank's rows from the embedded batch via `cp_local_rows`
+            # (same scheme as PR #662). Positions and KV slots are per-row and
+            # are sharded directly.
+            forward_batch.cp_local_rows = local_rows
             forward_batch.positions = forward_batch.positions.index_select(0, local_rows)
             if getattr(forward_batch, "out_cache_loc", None) is not None and isinstance(forward_batch.out_cache_loc, torch.Tensor):
                 loc_len = forward_batch.out_cache_loc.shape[0]
@@ -646,9 +663,16 @@ def _pad_forward_batch_inputs(
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         dim = _TOKEN_FIELD_DIM.get(field, 0)
-        if isinstance(val, torch.Tensor) and val.shape[dim] < pad_t:
+        target_len = pad_t
+        if field == "input_ids" and forward_batch.cp_local_rows is not None:
+            # Global ids for the whole CP group's rows (see cp_local_rows):
+            # cp * local bucket, the shape the CP warmup family traces.
+            from sglang.srt.runtime_context import get_parallel
+
+            target_len = pad_t * get_parallel().attn_cp_size
+        if isinstance(val, torch.Tensor) and val.shape[dim] < target_len:
             on_host = host_pad and field in _HOST_PAD_TOKEN_FIELDS
-            val = _pad_tensor(val, pad_t, dim=dim, on_host=on_host)
+            val = _pad_tensor(val, target_len, dim=dim, on_host=on_host)
             setattr(forward_batch, field, val)
 
     if is_draft_extend_v2:

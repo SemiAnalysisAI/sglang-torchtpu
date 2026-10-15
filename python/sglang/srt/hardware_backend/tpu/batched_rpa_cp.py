@@ -940,12 +940,17 @@ def batched_rpa_pcp_forward(
     k_scale: float | None = None,
     v_scale: float | None = None,
     sinks: torch.Tensor | None = None,
+    quantize_kv=None,
 ) -> torch.Tensor:
     """Executes the two-phase PCP forward pass on Batched RPA.
 
     1. Cache Phase: Attends sharded KV cache via ICI Ring Attention (CACHE_ONLY).
     2. Current Phase: All-gathers current tokens and attends causally (NEW_TOKENS_ONLY).
     3. Merges softmax states using Log-Sum-Exp.
+
+    ``quantize_kv(k, v) -> (k, v)`` casts K/V into the (fp8) pool dtype. It is
+    applied after the all-gather, which must move the compute-dtype rows: an
+    8-bit all-gather returns wrong remote rows on libtpu 0.0.47.
     """
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
@@ -993,6 +998,48 @@ def batched_rpa_pcp_forward(
     cache_lens_2x = pcp_meta.pcp_cache_lens.repeat_interleave(2)
     zeros_2x = torch.zeros_like(cache_lens_2x, dtype=torch.int32)
 
+    # 2. Current Phase (All-Gather current chunk tokens)
+    if (
+        strategy is not None
+        and getattr(forward_batch, "attn_cp_metadata", None) is not None
+    ):
+        # Gather K and V as one flat [T, 2 * heads * head_dim] tensor in the
+        # compute dtype. On TPU a [T, heads, head_dim] gather with small minor
+        # dims (e.g. (2, 64) bf16) came back with NaN rows in a tiled pattern;
+        # a lane-dense 2-D tensor (like the hidden-state gathers) is moved
+        # correctly. The gather must not run on fp8 data (see `quantize_kv`).
+        num_local = k.shape[0]
+        kd = k.shape[1] * k.shape[2]
+        vd = v.shape[1] * v.shape[2]
+        kv_local = torch.cat(
+            [k.reshape(num_local, kd), v.reshape(num_local, vd)], dim=-1
+        ).contiguous()
+        kv_glob = cp_all_gather_rows(kv_local, forward_batch)
+        num_glob = kv_glob.shape[0]
+        k_reordered = kv_glob[:, :kd].reshape(num_glob, k.shape[1], k.shape[2]).contiguous()
+        v_reordered = kv_glob[:, kd:].reshape(num_glob, v.shape[1], v.shape[2]).contiguous()
+    else:
+        k_curr = get_parallel().attn_cp_group.all_gather(k, dim=0)
+        v_curr = get_parallel().attn_cp_group.all_gather(v, dim=0)
+        c_per_req = max(1, q.shape[0] // (2 * num_reqs))
+        k_curr_5d = k_curr.view(cp_size, num_reqs, 2, c_per_req, k.shape[1], k.shape[2])
+        head_k = k_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
+        tail_k = k_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
+        k_reordered = torch.cat([head_k, tail_k], dim=1).reshape(-1, k.shape[1], k.shape[2])
+
+        v_curr_5d = v_curr.view(cp_size, num_reqs, 2, c_per_req, v.shape[1], v.shape[2])
+        head_v = v_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
+        tail_v = v_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
+        v_reordered = torch.cat([head_v, tail_v], dim=1).reshape(-1, v.shape[1], v.shape[2])
+
+    if quantize_kv is not None:
+        k_reordered, v_reordered = quantize_kv(k_reordered, v_reordered)
+        k_logical, v_logical = quantize_kv(k_logical, v_logical)
+        k_logical = k_logical.contiguous()
+        v_logical = v_logical.contiguous()
+        k_reordered = k_reordered.contiguous()
+        v_reordered = v_reordered.contiguous()
+
     # 1. Cache Phase (Ring Attention over ICI)
     # Always executed unconditionally to keep the Dynamo graph static across
     # batches with and without cached prefix tokens. When prefix_lens == 0,
@@ -1019,39 +1066,6 @@ def batched_rpa_pcp_forward(
         k_scale,
         v_scale,
     )
-
-    # 2. Current Phase (All-Gather current chunk tokens)
-    if (
-        strategy is not None
-        and getattr(forward_batch, "attn_cp_metadata", None) is not None
-    ):
-        # Gather K and V as one flat [T, 2 * heads * head_dim] tensor. On TPU a
-        # [T, heads, head_dim] gather with small minor dims (e.g. (2, 64) bf16)
-        # came back with NaN rows in a tiled pattern; a lane-dense 2-D tensor
-        # (like the hidden-state gathers) is moved correctly.
-        num_local = k.shape[0]
-        kd = k.shape[1] * k.shape[2]
-        vd = v.shape[1] * v.shape[2]
-        kv_local = torch.cat(
-            [k.reshape(num_local, kd), v.reshape(num_local, vd)], dim=-1
-        ).contiguous()
-        kv_glob = cp_all_gather_rows(kv_local, forward_batch)
-        num_glob = kv_glob.shape[0]
-        k_reordered = kv_glob[:, :kd].reshape(num_glob, k.shape[1], k.shape[2]).contiguous()
-        v_reordered = kv_glob[:, kd:].reshape(num_glob, v.shape[1], v.shape[2]).contiguous()
-    else:
-        k_curr = get_parallel().attn_cp_group.all_gather(k, dim=0)
-        v_curr = get_parallel().attn_cp_group.all_gather(v, dim=0)
-        c_per_req = max(1, q.shape[0] // (2 * num_reqs))
-        k_curr_5d = k_curr.view(cp_size, num_reqs, 2, c_per_req, k.shape[1], k.shape[2])
-        head_k = k_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
-        tail_k = k_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
-        k_reordered = torch.cat([head_k, tail_k], dim=1).reshape(-1, k.shape[1], k.shape[2])
-
-        v_curr_5d = v_curr.view(cp_size, num_reqs, 2, c_per_req, v.shape[1], v.shape[2])
-        head_v = v_curr_5d[:, :, 0].permute(1, 0, 2, 3, 4)
-        tail_v = v_curr_5d[:, :, 1].flip(0).permute(1, 0, 2, 3, 4)
-        v_reordered = torch.cat([head_v, tail_v], dim=1).reshape(-1, v.shape[1], v.shape[2])
 
     # Each virtual sequence's KV is the cached prefix plus the whole
     # all-gathered new KV of its request; causality is enforced by q_positions.
@@ -1173,7 +1187,9 @@ def batched_rpa_dcp_forward(
         striped_page_indices = owned_pages.reshape(-1)
 
     seq_lens = base_meta.kv_lens
-    q_positions = (seq_lens - 1).to(torch.int32)
+    # Padded batch rows carry kv_len 0; keep their scalars non-negative (the
+    # schedule skips them via `distribution`, but the metadata is still read).
+    q_positions = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
     kv_new_lens = torch.ones_like(seq_lens, dtype=torch.int32)
 
     # 1. Cache Phase (CACHE_ONLY)
@@ -1181,7 +1197,7 @@ def batched_rpa_dcp_forward(
     # written until the new-token phase, so it must not be in the cache scope.
     cache_update_kv = torch.zeros_like(base_meta.kv_lens, dtype=torch.int32)
     cache_kv_new_lens = torch.zeros_like(seq_lens, dtype=torch.int32)
-    cache_kv_lens = (seq_lens - kv_new_lens).to(torch.int32)
+    cache_kv_lens = torch.clamp(seq_lens - kv_new_lens, min=0).to(torch.int32)
     context_out, context_lse = cp_op(
         q,
         k,
@@ -1235,48 +1251,52 @@ def batched_rpa_dcp_forward(
     )
 
     # 3. DCP State Merge
+    # Every rank holds a partial softmax state over its page stripe. Gather all
+    # of them (plus the local new-token state) and merge locally under one
+    # global max; with decode-sized T the gathered [cp, T, H, D] is tiny.
+    #
+    # The gather moves the f32 payload as bit-exact bf16 pairs: the in-graph
+    # f32 all-gather aborts in torch_tpu's lowering
+    # (`tensor_to_buffer.cc: result_buf.element_type() == tpu_layout.element_type`),
+    # while the bf16 / fp8 row gathers of the prefill path lower fine.
+    num_tok, num_heads = context_lse.shape[0], context_lse.shape[1]
+    head_dim = context_out.shape[-1]
+    n_lse = num_tok * num_heads
+
     context_lse_safe = torch.nan_to_num(
         context_lse.to(torch.float32), nan=-float("inf")
     )
-    curr_lse_safe = torch.nan_to_num(curr_lse.to(torch.float32), nan=-float("inf"))
-
-    # Gather one flat row per rank (see the PCP K/V gather for why narrow minor
-    # dims are avoided on TPU), then view back to [cp, tokens, heads].
-    all_context_lse = cp_group.all_gather(context_lse_safe.reshape(1, -1), dim=0)
-    all_context_lse_3d = all_context_lse.view(cp_size, *context_lse.shape)
-
-    stacked_lses = torch.cat(
-        [curr_lse_safe.unsqueeze(0), all_context_lse_3d], dim=0
+    context_out_safe = torch.nan_to_num(context_out.to(torch.float32), nan=0.0)
+    packed = torch.cat(
+        [context_lse_safe.reshape(1, -1), context_out_safe.reshape(1, -1)], dim=1
+    ).contiguous()
+    packed_bits = packed.view(torch.bfloat16)
+    gathered_bits = packed_bits.new_empty((cp_size, packed_bits.shape[1]))
+    cp_group.all_gather_into_tensor(gathered_bits, packed_bits)
+    gathered = gathered_bits.view(torch.float32)
+    all_context_lse = gathered[:, :n_lse].reshape(cp_size, num_tok, num_heads)
+    all_context_out = gathered[:, n_lse:].reshape(
+        cp_size, num_tok, num_heads, head_dim
     )
+
+    curr_lse_safe = torch.nan_to_num(curr_lse.to(torch.float32), nan=-float("inf"))
+    curr_out_safe = torch.nan_to_num(curr_out.to(torch.float32), nan=0.0)
+
+    stacked_lses = torch.cat([curr_lse_safe.unsqueeze(0), all_context_lse], dim=0)
+    stacked_outs = torch.cat([curr_out_safe.unsqueeze(0), all_context_out], dim=0)
     global_max_lse = torch.amax(stacked_lses, dim=0)
     global_max_lse_safe = torch.where(
         torch.isinf(global_max_lse), torch.zeros_like(global_max_lse), global_max_lse
     )
-
-    exp_all = torch.exp(stacked_lses - global_max_lse_safe.unsqueeze(0))
-    sum_exp = torch.sum(exp_all, dim=0)
+    # A rank with no tokens in scope reports lse = -inf; give it weight 0.
+    weights = torch.where(
+        torch.isinf(stacked_lses),
+        torch.zeros_like(stacked_lses),
+        torch.exp(stacked_lses - global_max_lse_safe.unsqueeze(0)),
+    )
+    sum_exp = torch.sum(weights, dim=0)
     sum_exp_safe = torch.where(sum_exp == 0.0, torch.ones_like(sum_exp), sum_exp)
-
-    # Mask -inf LSE and sanitize outputs to prevent 0 * NaN propagation
-    context_out_safe = torch.nan_to_num(context_out.to(torch.float32), nan=0.0)
-    curr_out_safe = torch.nan_to_num(curr_out.to(torch.float32), nan=0.0)
-
-    scale_context = torch.where(
-        torch.isinf(context_lse_safe),
-        torch.zeros_like(context_lse_safe),
-        torch.exp(context_lse_safe - global_max_lse_safe),
-    ).unsqueeze(-1)
-    scaled_context_out = context_out_safe * scale_context
-    sum_scaled_context = cp_group.all_reduce(scaled_context_out)
-
-    scale_curr = torch.where(
-        torch.isinf(curr_lse_safe),
-        torch.zeros_like(curr_lse_safe),
-        torch.exp(curr_lse_safe - global_max_lse_safe),
-    ).unsqueeze(-1)
-    scaled_curr_out = curr_out_safe * scale_curr
-
-    total_out = sum_scaled_context + scaled_curr_out
+    total_out = torch.sum(weights.unsqueeze(-1) * stacked_outs, dim=0)
     merged_out = total_out / sum_exp_safe.unsqueeze(-1)
 
     # Fold in attention sinks if present (e.g. GPT-OSS-120B)

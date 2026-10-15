@@ -749,6 +749,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     cp_last_owner_mask: Optional[torch.Tensor] = None
     gather_reorder_index: Optional[torch.Tensor] = None
     direct_reorder_index: Optional[torch.Tensor] = None
+    # TPU prefill CP: global row index of each of this rank's zigzag rows
+    # (padded to the local token bucket). `input_ids` stays global so the
+    # vocab-parallel embedding's TP all-reduce sees identical ids on every
+    # rank; the model selects these rows right after the embedding.
+    cp_local_rows: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

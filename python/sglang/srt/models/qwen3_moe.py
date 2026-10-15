@@ -1144,6 +1144,16 @@ class Qwen3MoeForCausalLM(nn.Module):
             )
             return logits_output
 
+        cp_local_rows = getattr(forward_batch, "cp_local_rows", None)
+        if _is_tpu and cp_local_rows is not None:
+            # TPU prefill CP: `input_ids` are the whole batch's ids so the
+            # vocab-parallel embedding's TP all-reduce sums matching rows on
+            # every rank; this rank's zigzag rows are selected afterwards.
+            if input_embeds is None:
+                input_embeds = self.get_input_embeddings()(input_ids)
+            input_embeds = input_embeds.index_select(0, cp_local_rows)
+            input_ids = input_ids.index_select(0, cp_local_rows)
+
         hidden_states = self.model(
             input_ids,
             positions,

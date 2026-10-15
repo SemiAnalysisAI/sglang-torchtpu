@@ -67,6 +67,11 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     perm: Optional[List[int]] = None
     direct_reorder_index: Optional[Any] = None
     gather_reorder_index: Optional[Any] = None
+    # Host (numpy int32) owner rank / local row of each natural-order token;
+    # `padding.gather_reorder_index_for` re-strides them for a gather whose
+    # per-rank row count differs from `stride`.
+    gather_rank: Optional[Any] = None
+    gather_local: Optional[Any] = None
     local_rows: Optional[Any] = None
     cp_last_rows: Optional[Any] = None
     cp_last_owner_mask: Optional[Any] = None
