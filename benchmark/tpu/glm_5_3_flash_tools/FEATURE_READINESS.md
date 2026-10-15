@@ -113,3 +113,25 @@ the draft's `positions` and `seq_lens` were sometimes one tensor and sometimes t
 | PD (Raiden, `dsa_pd`, prefill psdr / decode x5kk) | Upstream refuses `--language-model-only` with PD (`model_hook.py`); with that relaxed (smoke-only patch, not committed) both engines fail in `init_disaggregation`: `get_contiguous_buf_infos is not supported on the TPU split MLA pool`. The DSA split pool exposes no token-addressable buffers for transfer; KDA state has no Raiden state type either. |
 
 Radix needs about mamba_ratio (5) KDA state slots per running request: with the c1 recipe's 3 slots the server refuses to start.
+
+## Update 2026-10-15 (later): prefix cache verified, PD working, large-pool fix
+
+**Prefix cache (no spec):** works and is correct. KL consistency (kl_test_utils, same server,
+24-32 LongBench prompts, 512 tokens): DSA no-cache 0.0063 vs prefill-from-cache-hit 0.0078;
+dense 0.0062 vs 0.0070 (decode-on-warm-cache 0.0034). Prompts with decoded tokens hit too
+(3072 of 3300 cached). Sizing: radix needs KDA state slots for running requests plus one
+snapshot per cached prefix; undersized pools drop hits silently (both test failures were this).
+The earlier "chunk-split logprob gap" is MoE routing noise, not a bug (no split pattern agrees
+with any other; KL level matches dense).
+
+**PD (Raiden, no spec, same TP):** works end to end on two 2x2x1 slices. Commits f03ec6b319
+(split DSA pool page buffers), 4efe5a26f8 (KDA state as Raiden's second namespace, one slot per
+request on the closing read), 14dabab821 (language-model-only + PD), 5fe5a0c2bc (no separate
+DSA state component). Pods need tpu-sync-torch==0.0.1.dev20261008082921 (base image has the
+Sep 30 build without poll_stats_with_details; bootstrap-port-pod.sh installs it). 5-prompt check
+vs single server: 2 identical, 3 same answers in different words (incl. two 3.3k-token prompts).
+
+**DSA with KV pools > 131072 tokens:** the SparseCore cache writer halts the SparseCore once a
+layer's NoPE buffer passes 64 MiB. 0243899b72 uses the XLA writer above that size.
+
+**KV offload:** still refused at startup for KDA hybrids (next).

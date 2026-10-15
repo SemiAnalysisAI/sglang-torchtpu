@@ -17,6 +17,8 @@ bash $S/deploy-port.sh "$P"
 "${K[@]}" /usr/local/bin/python3 -m venv --system-site-packages $H/venv-port
 "${K[@]}" $H/venv-port/bin/pip install -q --no-deps --no-build-isolation -e $W/glm-port/python 2>&1 | tail -2
 "${K[@]}" $H/venv-port/bin/pip install -q --no-deps --no-build-isolation -e $W/glm-port 2>&1 | tail -2
+# The base image's tpu-sync-torch predates what the Raiden PD code calls (python/pyproject_tpu.toml pin).
+"${K[@]}" $H/venv-port/bin/pip install -q --no-deps "tpu-sync-torch==0.0.1.dev20261008082921" 2>&1 | tail -2
 "${K[@]}" $H/venv-port/bin/python -c "import sglang, sglang_tpu; print(sglang.__file__, sglang_tpu.__file__)"
 "${K[@]}" setsid -f bash $W/memguard.sh 820 < /dev/null > /dev/null 2>&1
 echo bootstrapped "$P"
