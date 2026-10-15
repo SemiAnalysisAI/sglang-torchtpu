@@ -234,6 +234,24 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertFalse(kwargs["dynamic"])
         self.mock_register.assert_called_once()
 
+    def test_native_mtp_discovers_named_root_only(self):
+        child = self._annotate(_model_with(forward=MagicMock()))
+        child_forward = child.forward
+        model = self._annotate(_model_with(forward=MagicMock()))
+        model.named_modules = lambda: [("", model), ("backbone", child)]
+        runner = self._runner_for(model)
+        runner.is_draft_worker = True
+        runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        # Exercise discovery independently of device-specific speculative tracing.
+        with patch(
+            "sglang_tpu.graph_runner.tpu_graph_runner._augment_spec_policy",
+            side_effect=lambda cls, _: cls,
+        ):
+            TpuGraphRunner(runner)
+        self.assertIs(runner.compile_policy.owner, model)
+        self.assertEqual(runner.compile_policy.name, "draft/forward")
+        self.assertIs(child.forward, child_forward)
+
     def test_module_annotation_wraps_forward_only(self):
         model = self._annotate(
             _model_with(
@@ -418,6 +436,21 @@ class TestTpuGraphRunner(CustomTestCase):
         # Idempotent: a policy that already implements spec is left untouched.
         self.assertIs(_augment_spec_policy(cls, mr), cls)
 
+    def test_augment_spec_policy_mixes_spec_over_base_for_native_mtp(self):
+        # EAGLE spec composes the Eagle3 spec mixin over the resolved policy.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
+        # Idempotent: a policy that already implements spec is left untouched.
+        self.assertIs(_augment_spec_policy(cls, mr), cls)
+
     def test_augment_spec_policy_mixes_spec_over_base_for_dflash(self):
         # DFLASH spec composes the DFlash spec mixin over the resolved policy.
         mr = SimpleNamespace(
@@ -583,7 +616,7 @@ class TestTpuGraphRunner(CustomTestCase):
 
         support_torch_compile(_VisionModule, policy=_VisionPolicy)
         model = _model_with()
-        model.modules = lambda: (model, _VisionModule())
+        model.named_modules = lambda: (("", model), ("vision", _VisionModule()))
         with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
             TpuGraphRunner(self._runner_for(model))
         self.assertTrue(
@@ -782,6 +815,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         events = []
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
+        from sglang.srt.runtime_context import get_flags
+
+        self.enterContext(get_flags().capture.override(enable_torch_compile=True))
         worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group, **_kwargs: contextlib.nullcontext()
         worker.draft_owns_attention = False

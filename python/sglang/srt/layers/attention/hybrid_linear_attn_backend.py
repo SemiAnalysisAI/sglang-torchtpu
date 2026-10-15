@@ -69,6 +69,16 @@ class MambaAttnBackendBase(AttentionBackend):
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
 
+    def commit_mamba_state_after_verify(
+        self,
+        last_correct_step_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        req_pool_indices=None,
+    ) -> bool:
+        """Return True when a backend owns its speculative state commit."""
+        return False
+
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
         super().__init__()
@@ -1428,6 +1438,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        if self.linear_attn_backend.commit_mamba_state_after_verify(
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            req_pool_indices,
+        ):
+            return
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:

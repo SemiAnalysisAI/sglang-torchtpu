@@ -121,6 +121,8 @@ def build_gdn_pallas_op():
         packed_weights: Optional[jax.Array] = None,
         track_indices: Optional[jax.Array] = None,
         track_end: Optional[jax.Array] = None,
+        read_offsets: Optional[jax.Array] = None,
+        num_spec_tokens: int = 0,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -155,6 +157,8 @@ def build_gdn_pallas_op():
                 state_indices,
                 distribution,
                 seq_lens,
+                read_offsets=read_offsets,
+                num_spec_tokens=num_spec_tokens,
                 n_kq=n_kq,
                 n_v=n_v,
                 d_k=d_k,
@@ -184,8 +188,8 @@ def build_gdn_pallas_op():
         _wrapped,
         name=f"jax_{op_name}",
         # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
-        # prefill_only, fused_qkvg are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
+        # prefill_only, fused_qkvg, num_spec_tokens are static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -223,6 +227,8 @@ def build_gdn_pallas_op():
         packed_weights: Optional[torch.Tensor] = None,
         track_indices: Optional[torch.Tensor] = None,
         track_end: Optional[torch.Tensor] = None,
+        read_offsets: Optional[torch.Tensor] = None,
+        num_spec_tokens: int = 0,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -253,6 +259,7 @@ def build_gdn_pallas_op():
             packed_weights,
             track_indices,
             track_end,
+            read_offsets,
         )
         key = (
             tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors),
@@ -266,6 +273,7 @@ def build_gdn_pallas_op():
             batched_only,
             prefill_only,
             fused_qkvg,
+            num_spec_tokens,
         )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
@@ -295,6 +303,8 @@ def build_gdn_pallas_op():
                 packed_weights,
                 track_indices,
                 track_end,
+                read_offsets,
+                num_spec_tokens,
             )
         else:
             with (
@@ -328,6 +338,8 @@ def build_gdn_pallas_op():
                     packed_weights,
                     track_indices,
                     track_end,
+                    read_offsets,
+                    num_spec_tokens,
                 )
             _exported_shapes.add(key)
         return output
@@ -359,6 +371,8 @@ def build_gdn_pallas_op():
         packed_weights: Optional[torch.Tensor] = None,
         track_indices: Optional[torch.Tensor] = None,
         track_end: Optional[torch.Tensor] = None,
+        read_offsets: Optional[torch.Tensor] = None,
+        num_spec_tokens: int = 0,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
         return qkv.new_empty((num_tokens, n_v, d_v))
@@ -392,6 +406,13 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # the heavyweight export does not happen inside a torch.compile trace.
         self._op = build_gdn_pallas_op()
         self._extra_buffer_enabled = get_exec().mamba.enable_mamba_extra_buffer
+        if (
+            self._extra_buffer_enabled
+            and self.req_to_token_pool.mamba_pool.checkpoint_width > 1
+        ):
+            raise NotImplementedError(
+                "TPU GDN speculative prefix caching is unsupported"
+            )
         if self._extra_buffer_enabled:
             self.req_to_token_pool.mamba_pool.warmup_state_copy(
                 self.req_to_token_pool.size
@@ -409,6 +430,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # Cache the (shape-static) distribution vector across forwards, keyed by
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
+        self._read_offsets: Optional[torch.Tensor] = None
+        self._num_spec_tokens = 0
 
     def _get_distribution(
         self, is_decode: bool, bs: int, device: torch.device
@@ -437,7 +460,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (attention_pallas_rpa_base._pre_bucket_padded_batch_size).
         bs = int(getattr(forward_batch, "_tpu_real_b", forward_batch.seq_lens.shape[0]))
         device = forward_batch.seq_lens.device
-        is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        is_decode = forward_batch.forward_mode.is_decode_or_idle() or is_verify
         self._distribution = self._get_distribution(is_decode, bs, device)
         self._is_decode = is_decode
         # Full per-request sequence length (context + current); the kernel uses
@@ -492,6 +516,57 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             mamba_track_indices=self._track_indices,
         )
 
+        pool = self.req_to_token_pool.mamba_pool
+        self._num_spec_tokens = 0
+        if is_verify:
+            width = forward_batch.spec_info.num_tokens_per_req
+            if self.topk > 1 or width > pool.checkpoint_width:
+                raise ValueError(
+                    "TPU GDN verify requires a linear chain within the allocated checkpoint width"
+                )
+            self._num_spec_tokens = width - 1
+            self._query_start_loc = (
+                torch.arange(
+                    self._seq_lens.numel() + 1, device=device, dtype=torch.int32
+                )
+                * width
+            )
+            # SGLang verify seq_lens excludes the candidate inputs; the kernel
+            # expects context + query, as in its ordinary prefill path.
+            self._seq_lens = self._seq_lens + width
+        self._read_offsets = None
+        if pool.checkpoint_read_offsets is not None:
+            slots = self._state_indices.to(torch.int64)
+            self._read_offsets = pool.checkpoint_read_offsets.index_select(0, slots)
+            self._state_indices = self._state_indices * pool.checkpoint_width
+            if not is_verify:
+                # Prefill/decode consumes the selected checkpoint and writes
+                # its final state to checkpoint zero. Gather before resetting.
+                pool.checkpoint_read_offsets.index_fill_(0, slots, 0)
+
+    def commit_mamba_state_after_verify(
+        self,
+        last_correct_step_indices,
+        mamba_track_indices,
+        mamba_steps_to_track,
+        req_pool_indices=None,
+    ) -> bool:
+        if mamba_track_indices is not None:
+            raise NotImplementedError(
+                "TPU GDN speculative prefix caching is unsupported"
+            )
+        if req_pool_indices is None:
+            indices = self.forward_metadata.mamba_cache_indices[
+                : last_correct_step_indices.shape[0]
+            ]
+        else:
+            indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        self.req_to_token_pool.mamba_pool.select_checkpoints(
+            indices.clamp(min=0),
+            last_correct_step_indices,
+        )
+        return True
+
     def _run(
         self,
         layer: "RadixLinearAttention",
@@ -537,6 +612,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             prefill_only=not self._is_decode,
             track_indices=self._track_indices,
             track_end=self._track_end,
+            read_offsets=self._read_offsets,
+            num_spec_tokens=self._num_spec_tokens,
         )
         # Per-head [num_tokens, n_v, d_v], as the model's output-gate norm expects.
         return out

@@ -115,6 +115,9 @@ class TestGDNSinglePassFlags(CustomTestCase):
         )
         backend._extra_buffer_enabled = False
         backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(
+                checkpoint_width=1, checkpoint_read_offsets=None
+            ),
             mamba2_layer_cache=lambda _: cache,
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
@@ -161,6 +164,52 @@ class TestGDNSinglePassFlags(CustomTestCase):
                 self.assertEqual(distribution, [bs, bs, bs] if decode else [0, 0, bs])
                 self.assertEqual(batched_only, decode)
                 self.assertEqual(prefill_only, not decode)
+
+
+class TestGDNVerifyMetadata(CustomTestCase):
+    def test_verify_reads_selected_checkpoint_and_preserves_padded_rows(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = _BackendNoInit()
+        backend.topk = 1
+        pool = SimpleNamespace(
+            checkpoint_width=3,
+            checkpoint_read_offsets=torch.tensor([0, 2, 1], dtype=torch.int32),
+        )
+        backend._extra_buffer_enabled = False
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=pool,
+            get_mamba_indices=lambda indices: indices,
+            translate_mamba_indices=lambda indices: indices,
+        )
+        backend.forward_metadata = SimpleNamespace(
+            mamba_cache_indices=torch.tensor([2, 1, -1]),
+            query_start_loc=torch.tensor([0, 3, 6, 9]),
+        )
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([2, 1, -1]),
+            mamba_track_mask=None,
+            _tpu_real_b=2,
+            seq_lens=torch.tensor([17, 29, 0]),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(num_tokens_per_req=3),
+        )
+        backend.init_forward_metadata(batch)
+        self.assertEqual(backend._distribution.tolist(), [2, 2, 2])
+        self.assertEqual(backend._query_start_loc.tolist(), [0, 3, 6, 9])
+        self.assertEqual(backend._seq_lens.tolist(), [20, 32, 3])
+        self.assertEqual(backend._state_indices.tolist(), [6, 3, 0])
+        self.assertEqual(backend._read_offsets.tolist(), [1, 2, 0])
+        self.assertEqual(backend._num_spec_tokens, 2)
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 2, 1])
+
+        # Ordinary decode consumes the selected state and rewrites checkpoint zero.
+        batch.forward_mode = ForwardMode.DECODE
+        backend.forward_metadata.query_start_loc = torch.arange(4)
+        backend.init_forward_metadata(batch)
+        self.assertEqual(backend._read_offsets.tolist(), [1, 2, 0])
+        self.assertEqual(pool.checkpoint_read_offsets.tolist(), [0, 0, 0])
+        self.assertEqual(backend._num_spec_tokens, 0)
 
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")

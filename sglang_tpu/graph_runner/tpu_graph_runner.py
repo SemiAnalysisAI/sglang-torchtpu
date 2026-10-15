@@ -67,9 +67,9 @@ if TYPE_CHECKING:
 def _spec_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses speculative decoding on TPU."""
     return (
-        model_runner.spec_algorithm.is_eagle3()
-        or model_runner.spec_algorithm.is_dflash()
-    )
+        model_runner.spec_algorithm.is_eagle()
+        and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+    ) or model_runner.spec_algorithm.is_dflash()
 
 
 def _resolve_spec_compile_policy_mixin(
@@ -220,6 +220,15 @@ class TpuGraphRunner:
             if callable(getattr(self.model, "named_modules", None))
             else (("", self.model),)
         )
+        if (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_eagle()
+            and not model_runner.spec_algorithm.is_eagle3()
+        ):
+            # Native MTP wraps an annotated target backbone with its projection
+            # and logits processor. The speculative policy must own the complete
+            # draft, then compile its backbone and logits regions itself.
+            modules = (("", self.model),)
         warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[CompilePolicy] = []
