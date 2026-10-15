@@ -219,8 +219,12 @@ def get_last_loc(
         "pallas_tpu_mla",
         "pallas_tpu_flash",
     )
+    # TPU has no Triton: every TPU backend (pallas_tpu_mla_sparse included)
+    # takes the torch path.
     uses_triton_dispatch = (
-        prefill_backend not in non_triton and decode_backend not in non_triton
+        not _is_tpu
+        and prefill_backend not in non_triton
+        and decode_backend not in non_triton
     )
 
     if (_is_hip or _is_npu) and uses_triton_dispatch:

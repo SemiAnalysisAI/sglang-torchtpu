@@ -70,5 +70,9 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "512",
         # f32 MoE scales remove a per-step scale relayout.
         "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
+        # DSA's sparse-MLA gather runs on the SparseCore; with the fused MoE's
+        # SparseCore gathers also in the graph the SparseCore halts at run time,
+        # so the MoE gathers run on XLA (the indexer top-k is on XLA too).
+        "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
     }
 )

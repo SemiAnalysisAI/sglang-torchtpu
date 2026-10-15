@@ -236,6 +236,9 @@ def kpool_indexer_step(
         enable_early_exit=False,
         kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
         chunk_tokens=_CHUNK_TOKENS if chunked else None,
+        # The sparse-MLA gather runs on the SparseCore in the same program; a
+        # SparseCore top-k next to it halts the SparseCore.
+        topk_impl="xla",
     )  # i32[T, n_pick], chosen pools first, then -1
 
     pool_len = (pos + 1) // kpool

@@ -512,6 +512,21 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+def _xla_topk(
+    scores: jax.Array,  # i32[rows, positions]: f32 score bits
+    k: int,
+    row_lengths: jax.Array,  # i32[rows]
+) -> tuple[jax.Array, jax.Array]:
+    """``sparsecore_topk`` on the TensorCore: exact top-k of each row's first
+    ``row_lengths`` positions, chosen first, ``-1`` after."""
+    values = jax.lax.bitcast_convert_type(scores, jnp.float32)
+    col = jnp.arange(values.shape[1], dtype=jnp.int32)[None, :]
+    values = jnp.where(col < row_lengths[:, None], values, -jnp.inf)
+    best, idx = jax.lax.top_k(values, k)
+    idx = jnp.where(best > -jnp.inf, idx, -1).astype(jnp.int32)
+    return idx, jax.lax.bitcast_convert_type(best, jnp.int32)
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -560,6 +575,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "causal_offset",
+        "topk_impl",
     ),
 )
 def streamindex_topk(
@@ -586,13 +602,20 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     causal_offset: int = 0,
+    topk_impl: str = "sparsecore",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
     A query at position ``p`` sees compressed rows ``<= (p - causal_offset) //
     compression_ratio``. The default 0 lets a token see the row it falls in;
     ``compression_ratio - 1`` limits it to rows already closed (GLM-5.3-Flash's
-    pooled indexer)."""
+    pooled indexer).
+
+    ``topk_impl`` picks the selection after scoring: ``"sparsecore"`` (default)
+    or ``"xla"`` (``lax.top_k`` on the TensorCore, same exact top-k). Use
+    ``"xla"`` when another SparseCore kernel shares the compiled program: the
+    SparseCore top-k next to the sparse-MLA SparseCore gather halts the
+    SparseCore at run time (each is fine alone and in eager mode)."""
     kv_layout = KVLayout.parse(kv_layout)
 
     if cp_size < 1:
@@ -608,6 +631,8 @@ def streamindex_topk(
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1."
             )
+    if topk_impl not in ("sparsecore", "xla"):
+        raise ValueError(f"topk_impl must be 'sparsecore' or 'xla', got {topk_impl!r}.")
     if enable_early_exit and causal_offset:
         raise NotImplementedError(
             "causal_offset is not supported with enable_early_exit."
@@ -975,15 +1000,19 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
-            chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                scores,
-                k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
-                write_empty_rows=True,
-                scheduling_group_id=sc_group,
-                stage2_scheduling_group_id=sc2_group,
-                return_scores=True,
-            )
+            row_lengths = eff_row_lengths[start : start + chunk_len]
+            if topk_impl == "xla":
+                chunk_topk_idxs, chunk_topk_scores = _xla_topk(scores, k, row_lengths)
+            else:
+                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=row_lengths,
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    stage2_scheduling_group_id=sc2_group,
+                    return_scores=True,
+                )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
