@@ -9,8 +9,8 @@ A cached prefix reuses the 11 DSA layers' latent and indexer pages and restores
 the 34 KDA layers from a state snapshot taken at the cache boundary. Every cached
 prefix is also written through to host RAM; when the device pool evicts it, a
 later hit loads both back by Raiden DMA. A reload that carries KDA state waits
-for the in-flight forward first (one device sync per host hit). Set
-KV_OFFLOAD = False for a device-only cache.
+for the in-flight forward first (one device sync per host hit). KV_OFFLOAD
+turns the host tier on (off by default; see below).
 
 Speculative decoding (DFlash / MTP) is refused together with the radix cache on
 TPU: verify windows take no KDA snapshots yet.
@@ -38,7 +38,10 @@ MAMBA_RATIO = 5
 CACHED_PREFIX_SLOTS = 64
 # Host RAM tier: HICACHE_RATIO x the device pools (KV tokens and KDA slots).
 # At ratio 2 that is about 3 GB of KV and 4 GB of KDA state per rank.
-KV_OFFLOAD = True
+# Off by default for now: host offload passes one request at a time (evicted
+# prefixes reload exactly), but two requests decoding together trip a
+# recompile after warmup.
+KV_OFFLOAD = False
 HICACHE_RATIO = 2
 
 CONFIG = deepcopy(BASE_CONFIG)

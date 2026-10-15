@@ -14,7 +14,7 @@ for P in $PS $PX; do
   k $P bash -c 'for f in /proc/[0-9]*/cmdline; do grep -qs launch_router $f && kill ${f//[^0-9]/} 2>/dev/null; done; true' < /dev/null
   for f in $(cd $R && git diff --name-only 369d483ac1 HEAD -- python sglang_tpu benchmark/tpu/recipe/configs/glm_5_3_flash); do k $P tee $W/glm-port/$f < $R/$f > /dev/null; done
   ( cd $S/eval_configs && COPYFILE_DISABLE=1 tar cf - --no-xattrs *.py ) | k $P tar xf - -C $W/glm-port/benchmark/tpu/recipe/configs/glm_5_3_flash_eval
-  for f in run-cfg-port.sh stop_wait.sh stop_sglang.sh pd_check.py; do k $P tee $W/$f < $S/$f > /dev/null; done
+  for f in run-cfg-port.sh stop_wait.sh stop_sglang.sh pd_check.py pd_stress.py; do k $P tee $W/$f < $S/$f > /dev/null; done
 done
 log "synced HEAD $(cd $R && git rev-parse --short HEAD)"
 PS_IP=$(kubectl --context $C -n tpuq get pod $PS -o jsonpath='{.status.podIP}'); PX_IP=$(kubectl --context $C -n tpuq get pod $PX -o jsonpath='{.status.podIP}')
@@ -30,11 +30,13 @@ ready $PS $TAG-prefill || { okp=0; log "prefill engine failed:"; err $PS $TAG-pr
 ready $PX $TAG-decode || { okd=0; log "decode engine failed:"; err $PX $TAG-decode; }
 if [ $okp = 1 ] && [ $okd = 1 ]; then
   log "both engines up; router + requests"
-  k $PX env HOME=$H setsid -f bash -c "$H/venv-port/bin/python -m sglang_router.launch_router --pd-disaggregation --mini-lb --prefill http://$PS_IP:30000 8998 --decode http://$PX_IP:30000 --host 0.0.0.0 --port 8000 > $W/glm-run/$TAG-router.log 2>&1" < /dev/null > /dev/null 2>&1
+  k $PX env HOME=$H setsid -f bash -c "$H/venv-port/bin/python -m sglang_router.launch_router --pd-disaggregation --mini-lb --prefill http://$PS_IP:30000 8998 --decode http://$PX_IP:30000 --host 0.0.0.0 --port 8000 < /dev/null > $W/glm-run/$TAG-router.log 2>&1" < /dev/null > /dev/null 2>&1
   until k $PX grep -q "Application startup complete" $W/glm-run/$TAG-router.log < /dev/null 2>/dev/null; do sleep 10; done
   log "router up"
   k $PX timeout 900 $H/venv-port/bin/python $W/pd_check.py http://127.0.0.1:8000 $W/glm-run/$TAG-out.json < /dev/null 2>&1 | tail -8
   k $PX cat $W/glm-run/$TAG-out.json < /dev/null > $S/pd-out.json 2>/dev/null
+  log "stress (16 concurrent, ground-truth answers, aborts):"
+  k $PX $H/venv-port/bin/python $W/pd_stress.py http://127.0.0.1:8000 16 < /dev/null 2>&1 | tail -24
   log "errors after requests (if any):"; err $PX $TAG-decode; err $PS $TAG-prefill
   log "raiden warnings:"; k $PX grep -a -m3 "RaidenKVManager.*raised\|Raiden.*fail" $W/glm-run/$TAG-decode.log < /dev/null | cut -c1-220
 fi
