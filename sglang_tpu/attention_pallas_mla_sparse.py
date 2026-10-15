@@ -80,7 +80,13 @@ def _build_pallas_sparse_mla_kernel_op():
         pallas_dir / "mla_sparse_fused.py",
         *sorted((pallas_dir / "mla_sparse").glob("*.py")),
     )
-    op_name = f"sglang_tpu_pallas::sparse_mla_attention_fused_{fingerprint}"
+    from sglang.srt.environ import envs
+
+    # Part of the traced body, so part of the op name (see source_fingerprint).
+    kv_writer = envs.SGLANG_TPU_SPARSE_MLA_KV_WRITER.get()
+    op_name = (
+        f"sglang_tpu_pallas::sparse_mla_attention_fused_{fingerprint}_{kv_writer}"
+    )
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
@@ -117,6 +123,7 @@ def _build_pallas_sparse_mla_kernel_op():
             topk_indices,
             sm_scale=sm_scale,
             k_scale=k_scale,
+            kv_writer=kv_writer,
         )
 
     nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")

@@ -1973,6 +1973,10 @@ class Envs:
     SGLANG_TPU_VIT_NUM_PRECOMPILE_BUCKETS = EnvInt(None)
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # Experimental. Sparse MLA (DSA) KV-cache writer: "auto" (SparseCore while a
+    # layer's NoPE buffer is <= 64 MiB, XLA scatter above), "sparsecore" (always;
+    # halts the SparseCore past 64 MiB), or "xla" (always).
+    SGLANG_TPU_SPARSE_MLA_KV_WRITER = EnvStr("auto")
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);
     # 0 = SparseCore always. Measured crossover is 1024 (Kimi, R1, Qwen3-480B).
     SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS = EnvInt(0)

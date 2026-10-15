@@ -80,6 +80,7 @@ def sparse_mla_attention_fused(
     *,
     sm_scale: float,
     k_scale: float,
+    kv_writer: str = "auto",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
@@ -110,9 +111,15 @@ def sparse_mla_attention_fused(
     # a layer's NoPE buffer is larger than 64 MiB -- a KV pool past 131072 tokens
     # at 512 bytes per token -- while every size up to that runs. Bigger pools
     # take the XLA scatter (same result, TensorCore).
+    # ``kv_writer`` (SGLANG_TPU_SPARSE_MLA_KV_WRITER) can force either one.
+    if kv_writer not in ("auto", "sparsecore", "xla"):
+        raise ValueError(f"kv_writer must be auto, sparsecore or xla, got {kv_writer!r}")
+    use_sparsecore = kv_writer == "sparsecore" or (
+        kv_writer == "auto" and cache_nope.size <= _SPARSECORE_WRITER_MAX_BYTES
+    )
     writer = (
         kv_cache_utils.update_sparse_mla_kv_cache
-        if cache_nope.size <= _SPARSECORE_WRITER_MAX_BYTES
+        if use_sparsecore
         else kv_cache_utils.update_sparse_mla_kv_cache_jax
     )
     cache_nope, cache_rope = writer(
