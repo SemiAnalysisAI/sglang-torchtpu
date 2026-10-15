@@ -114,9 +114,10 @@ class TestPremappedBufferSizeDefault(CustomTestCase):
 
     def setUp(self):
         # Writing the default records this process's PID; keep it per-test.
-        self.enterContext(
-            patch.object(env_override, "_premapped_default_writer_pid", None)
-        )
+        # (start/addCleanup rather than enterContext, which needs Python 3.11.)
+        patcher = patch.object(env_override, "_premapped_default_writer_pid", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _apply(self, initial: str | None) -> tuple[str | None, str | None]:
         """Return the env value after the override and what torch_tpu saw."""
