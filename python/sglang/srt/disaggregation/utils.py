@@ -1564,7 +1564,11 @@ def setup_state_kv_args(
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
+            if getattr(token_to_kv_pool, "use_dsa", False) and not hasattr(
+                token_to_kv_pool.full_kv_pool, "get_page_buffers"
+            ):
+                # (The TPU split DSA pool keeps its index caches in its page
+                # buffers, which already travel with the KV pages.)
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
                 append_state_component(
