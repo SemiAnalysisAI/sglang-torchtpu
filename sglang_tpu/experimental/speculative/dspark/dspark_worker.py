@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -67,6 +68,7 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
+    accept_drafts_sampled_filtered,
     build_draft_block_inputs,
     sample_tokens,
 )
@@ -106,6 +108,9 @@ class TpuDsparkWorker(TpuSpecWorker):
             )
         if mambaish_config(target_model_config) is not None:
             raise NotImplementedError("TpuDsparkWorker does not support mamba targets.")
+        # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
+        if is_dp_attention_enabled():
+            raise NotImplementedError("TpuDsparkWorker does not support DP attention.")
         runtime_config = resolve_runtime_config(
             draft_hf_config=draft_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -141,18 +146,9 @@ class TpuDsparkWorker(TpuSpecWorker):
             target_model=cast(nn.Module, target_worker.model_runner.model),
             target_hf_text_config=target_model_config.hf_text_config,
         )
-        # Filled per batch bucket once the target compile policy exists.
-        self._num_verify_drafts: dict[int, torch.Tensor] = {}
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        # No confidence budget yet: every bucket verifies all gamma drafts.
-        self._num_verify_drafts = {
-            padded_bs: torch.full(
-                (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device
-            )
-            for padded_bs in self._bucket_sizes()
-        }
         self._warmup_draft_block_inputs()
         self._warmup_draft_sampling()
         # The base snapshot ran before these DSpark-only warmups.
@@ -171,7 +167,8 @@ class TpuDsparkWorker(TpuSpecWorker):
         block_hidden, graph_draft_tokens = self._forward_draft_block(
             bucket=bucket, rows=rows, verify_input=verify_input
         )
-        num_verify_drafts = self._num_verify_drafts[bs]
+        # No confidence budget yet: every bucket verifies all gamma drafts.
+        num_verify_drafts = self._all_drafts[bs]
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
         if temperatures is None or top_ks is None:
             # The draft graph already ran the greedy markov chain.
@@ -229,9 +226,11 @@ class TpuDsparkWorker(TpuSpecWorker):
         batch: ScheduleBatch,
         state: SpecState,
         rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> SpecState:
+        del verify_input
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
@@ -446,6 +445,20 @@ class TpuDsparkWorker(TpuSpecWorker):
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
+                # Sampled verify when requests restrict top-k/top-p/min-p.
+                warmup_compiled_op(
+                    accept_drafts_sampled_filtered,
+                    torch.zeros(
+                        (padded_bs * self.num_verify_rows, draft_logits.shape[-1]),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    draft_tokens,
+                    self._all_drafts[padded_bs],
+                    draft_logits.float(),
+                    torch.ones((padded_bs,), dtype=torch.float32, device=self.device),
+                    torch.ones((padded_bs,), dtype=torch.int32, device=self.device),
+                )
 
     # The base default reads draft_worker.draft_runners, which TpuDsparkDraftWorker lacks.
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:

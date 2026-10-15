@@ -36,7 +36,8 @@ class TpuEnvs:
     SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
 
     # Speculative decoding
-    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DSPARK / EAGLE3 to the sglang_tpu.experimental TpuSpecWorker
+    # (TpuDsparkWorker / TpuEagle3Worker); SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
     @classmethod

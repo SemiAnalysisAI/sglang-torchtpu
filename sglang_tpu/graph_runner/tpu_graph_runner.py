@@ -57,9 +57,12 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang_tpu.experimental import is_experimental_dspark
+from sglang_tpu.experimental import is_experimental_dspark, is_experimental_eagle3
 from sglang_tpu.experimental.compilation.dspark_compile_policy import (
     TpuDsparkSpecDecodeCompilePolicyMixin,
+)
+from sglang_tpu.experimental.compilation.eagle3_compile_policy import (
+    TpuEagle3SpecDecodeCompilePolicyMixin,
 )
 
 if TYPE_CHECKING:
@@ -86,6 +89,8 @@ def _resolve_spec_compile_policy_mixin(
         return DFlashSpecDecodeCompilePolicyMixin
     if is_experimental_dspark(spec_algorithm):
         return TpuDsparkSpecDecodeCompilePolicyMixin
+    if is_experimental_eagle3(spec_algorithm):
+        return TpuEagle3SpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 
