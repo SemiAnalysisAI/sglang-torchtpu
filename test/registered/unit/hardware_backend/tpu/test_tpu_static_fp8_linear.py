@@ -130,6 +130,68 @@ class TestStaticFp8Pack(CustomTestCase):
             quantize_rmsnorm_fed_weight(w[:, :250], g)
 
 
+class TestStaticFp8PallasGemvHelpers(CustomTestCase):
+    """CPU-side pieces of the Pallas GEMV path: N padding and the K block choice.
+
+    The kernel itself is covered on TPU by test_static_fp8_gemv_pallas.py.
+    """
+
+    def test_padded_n_matches_unpadded(self):
+        """N=2112 (Kimi-K3 MLA q_a) padded to 2176 must not change the output."""
+        from sglang_tpu.static_fp8_gemv_pallas import pad_n
+
+        gen = torch.Generator().manual_seed(6)
+        w = (torch.randn(K, 2112, generator=gen) * 0.02).to(torch.bfloat16)
+        g = (torch.rand(K, generator=gen) * 0.5 + 0.05).to(torch.bfloat16)
+        packed = quantize_rmsnorm_fed_weight(w, g)
+        padded = pad_n(packed, force=True)
+        self.assertEqual(tuple(padded.weight.shape), (K, 2176))
+        self.assertEqual(padded.n_out, 2112)
+        self.assertIsNone(padded.weight._base)
+        self.assertIsNone(padded.out_scale._base)
+        y = _rmsnorm(torch.randn(3, K, generator=gen), g)
+        torch.testing.assert_close(
+            apply_tpu_static_fp8_linear(y, padded),
+            apply_tpu_static_fp8_linear(y, packed),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_aligned_n_is_left_alone(self):
+        from sglang_tpu.static_fp8_gemv_pallas import pad_n
+
+        w, g, _ = _inputs(7)
+        packed = quantize_rmsnorm_fed_weight(w, g)
+        self.assertIs(pad_n(packed, force=True), packed)
+        self.assertIs(pad_n(packed), packed)  # kernel not registered on CPU
+
+    def test_inv_x_tensor_matches_scalar(self):
+        w, g, _ = _inputs(8)
+        packed = quantize_rmsnorm_fed_weight(w, g)
+        # f32 tensor for the kernel, Python float for the XLA path: equal
+        # up to the f32 rounding.
+        self.assertEqual(
+            float(packed.inv_x),
+            float(torch.tensor(packed.inv_x_scale, dtype=torch.float32)),
+        )
+
+    def test_block_k_divides_k_and_fits_vmem(self):
+        from sglang_tpu.static_fp8_gemv_pallas import block_k
+
+        # Kimi-K3 TP32 shapes: KDA qkvg, MoE front, latent up.
+        for k, n in ((7168, 1536), (7168, 3968), (3584, 7168)):
+            with self.subTest(k=k, n=n):
+                bk = block_k(k, n)
+                self.assertGreater(bk, 0)
+                self.assertEqual(k % bk, 0)
+                self.assertEqual(bk % 128, 0)
+                self.assertLessEqual(bk, 1792)
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8_GEMV_BLOCK_K.override(1024):
+            self.assertEqual(block_k(7168, 1536), 1024)
+        # A weight too wide for any K block falls back to the XLA path.
+        self.assertEqual(block_k(7168, 1 << 20), 0)
+
+
 class TestKimiK3StaticFp8Selector(CustomTestCase):
     def test_parts_and_all(self):
         from sglang_tpu.kimi_k3_static_fp8 import PARTS, selected_parts

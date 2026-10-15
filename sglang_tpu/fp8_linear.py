@@ -290,6 +290,9 @@ class StaticFp8Weight(NamedTuple):
     out_scale: torch.Tensor  # f32 [N]: per-channel weight scale * input scale
     inv_x_scale: float
     one: torch.Tensor  # f32 [1], the unit scale torch._scaled_mm requires
+    inv_x: torch.Tensor  # f32 [1], inv_x_scale as a tensor for the Pallas GEMV
+    # Real N when weight / out_scale are zero-padded to a 128 multiple; 0 if not.
+    n_out: int = 0
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return apply_tpu_static_fp8_linear(x, self)
@@ -328,6 +331,9 @@ def quantize_rmsnorm_fed_weight(
         out_scale=(w_scale * x_scale).clone(),
         inv_x_scale=1.0 / x_scale,
         one=torch.ones(1, dtype=torch.float32, device=weight_kn.device),
+        inv_x=torch.full(
+            (1,), 1.0 / x_scale, dtype=torch.float32, device=weight_kn.device
+        ),
     )
 
 
@@ -347,6 +353,8 @@ def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Te
     out = out * w.out_scale
     if pad:
         out = torch.narrow(out, 0, 0, x.shape[0])
+    if w.n_out:
+        out = out[:, : w.n_out]
     return out.to(x.dtype)
 
 
