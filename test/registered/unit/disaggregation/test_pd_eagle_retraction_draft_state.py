@@ -1,4 +1,4 @@
-"""A PD decode retraction must hand a DSpark request back its own draft KV, not
+"""A PD decode retraction must hand an EAGLE3 request back its own draft KV, not
 whatever reused its slots; target verification hides the loss, acceptance drops."""
 
 import unittest
@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.common import restore_kv_cache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -71,14 +71,17 @@ def _rows_equal(pool: MHATokenToKVPool, indices: torch.Tensor, expected) -> bool
     )
 
 
-class TestPdDSparkRetractionDraftState(CustomTestCase):
+class TestPdEagleRetractionDraftState(CustomTestCase):
     def setUp(self):
         enter_scope(
             self,
             published_topology(
                 disaggregation_mode="decode",
                 disaggregation_decode_retraction_backup="cpu_tensor",
-                speculative_algorithm="DSPARK",
+                speculative_algorithm="EAGLE3",
+                speculative_eagle_topk=1,
+                speculative_num_steps=3,
+                speculative_num_draft_tokens=4,
             ),
         )
         # CPU tensors; the platform's device sync has nothing to wait for.
@@ -89,7 +92,7 @@ class TestPdDSparkRetractionDraftState(CustomTestCase):
         self.allocator = TokenToKVPoolAllocator(
             POOL_SIZE, torch.float32, "cpu", self.target, need_sort=False
         )
-        self._alloc_dspark_draft_pool()
+        self._alloc_eagle3_draft_pool()
 
         seqlen = PROMPT_LEN + DECODED
         self.req = Req(
@@ -110,18 +113,25 @@ class TestPdDSparkRetractionDraftState(CustomTestCase):
         self.target_before = _snapshot(self.target, self.old)
         self.draft_before = _snapshot(self.draft, self.old)
 
-    def _alloc_dspark_draft_pool(self) -> None:
-        """Attach the draft pool through DSparkWorkerV2.alloc_memory_pool, as the
+    def _alloc_eagle3_draft_pool(self) -> None:
+        """Attach the draft pool through EAGLEWorkerV2.alloc_memory_pool, as the
         scheduler does: the draft worker shares the target allocator."""
-        worker = object.__new__(DSparkWorkerV2)
-        worker._hosts_draft = True
-        worker._draft_worker = SimpleNamespace(
+        draft_tp_worker = SimpleNamespace(
             alloc_memory_pool=Mock(),
             model_runner=SimpleNamespace(token_to_kv_pool=self.draft),
         )
-        worker.alloc_memory_pool(
-            req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
-        )
+        draft_worker = object.__new__(EagleDraftWorker)
+        draft_worker.draft_worker = draft_tp_worker
+        draft_worker.draft_runner = draft_tp_worker.model_runner
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = draft_worker
+        with (
+            patch.object(EagleDraftWorker, "init_token_map"),
+            patch.object(EagleDraftWorker, "init_lm_head"),
+        ):
+            worker.alloc_memory_pool(
+                req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
+            )
 
     def _retract_and_resume(self) -> None:
         """retract_decode's release_req, slot reuse, then the resume path's
@@ -163,7 +173,7 @@ class TestPdDSparkRetractionDraftState(CustomTestCase):
         self._retract_and_resume()
         self.assertTrue(
             _rows_equal(self.draft, self.new, self.draft_before),
-            "cpu_tensor retraction restored the target KV but not the DSpark "
+            "cpu_tensor retraction restored the target KV but not the EAGLE3 "
             "draft KV: the resumed request drafts against another request's KV",
         )
 
