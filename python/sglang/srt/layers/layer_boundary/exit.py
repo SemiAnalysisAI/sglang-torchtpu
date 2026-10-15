@@ -123,14 +123,16 @@ class ExitPolicy:
         stream: ResidualStream,
         forward_batch: ForwardBatch,
         *,
-        output_complete: bool = False,
+        summed_by_compute: bool = False,
     ):
         """Complete the output of the operation-scheduled producer path, which
         never defers: the sum it owes, then its move and write-back.
-        ``output_complete``: see ``ffn_exit``."""
+        ``summed_by_compute``: see ``ffn_exit``."""
         steps = self.plan.path_for(forward_batch)
-        if output_complete:
-            _refuse_summing_move(steps.output_move_completes_sum)
+        if summed_by_compute:
+            # This path never takes the attention-DP reduce-scatter (dp_step is
+            # None), so the CP move is the only one that could sum.
+            _check_not_summed_twice(steps.output_move_completes_sum)
         hidden_states, residual = self._complete_now(
             hidden_states,
             stream.residual,
@@ -140,7 +142,7 @@ class ExitPolicy:
             output_move=steps.output_move,
             owes_sum=steps.output.group is not None
             and not steps.output_move_completes_sum
-            and not output_complete,
+            and not summed_by_compute,
         )
         return self._record_output(
             hidden_states,
@@ -205,11 +207,11 @@ class ExitPolicy:
         return _sum_group(steps.output.group)
 
     def _decide(
-        self, forward_batch: ForwardBatch, steps, *, output_complete: bool = False
+        self, forward_batch: ForwardBatch, steps, *, summed_by_compute: bool = False
     ) -> ExitDecision:
         """Decide once, before the FFN runs, what completes its output's sum:
         the next layer's input, or this layer's postprocess step.
-        ``output_complete``: see ``ffn_exit``."""
+        ``summed_by_compute``: see ``ffn_exit``."""
         dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
         sum_in_reduce_scatter = self._sum_in_reduce_scatter(steps, dp_step)
         complete_now = partial(
@@ -221,11 +223,12 @@ class ExitPolicy:
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None
             and not sum_in_reduce_scatter
-            and not output_complete,
+            and not summed_by_compute,
         )
-        if output_complete:
-            # A later all-reduce or reduce-scatter would sum the output again.
-            _refuse_summing_move(sum_in_reduce_scatter)
+        if summed_by_compute:
+            # A deferred all-reduce or any summing reduce-scatter (attention DP,
+            # CP or input-scattered) would sum the output again.
+            _check_not_summed_twice(sum_in_reduce_scatter)
             return ExitDecision(
                 defer_moe_finalize=False,
                 sum_in_reduce_scatter=False,
@@ -340,16 +343,19 @@ class ExitPolicy:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
-        output_complete: bool = False,
+        summed_by_compute: bool = False,
     ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call when the FFN may hand
         off its MoE finalize, then call ``finish``.
 
-        ``output_complete`` marks an FFN whose compute already summed its
-        output (TPU fused-RS experts): nothing completes or defers a sum."""
+        ``summed_by_compute`` marks an FFN whose compute already summed its
+        output (TPU fused-RS experts): the boundary skips the sum, and still
+        runs the move and write-back. It is per call, not on the
+        ``OutputContract``, because ``handles_moe_reduction`` is only known
+        after ``process_weights_after_loading``, once the plan is fixed."""
         return FfnExit(
-            self, forward_batch, stream=stream, output_complete=output_complete
+            self, forward_batch, stream=stream, summed_by_compute=summed_by_compute
         )
 
     def _sum_deferral_allowed(self, steps) -> bool:
@@ -468,10 +474,11 @@ def _defer(
     return wrap(hidden_states), residual
 
 
-def _refuse_summing_move(move_sums: bool) -> None:
-    if move_sums:
+def _check_not_summed_twice(sum_in_move: bool) -> None:
+    if sum_in_move:
         raise NotImplementedError(
-            "a reduce-scatter after an FFN that sums its own output"
+            "FFN output is already summed by compute; a summing reduce-scatter "
+            "would sum it again"
         )
 
 
@@ -571,13 +578,13 @@ class FfnExit:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
-        output_complete: bool = False,
+        summed_by_compute: bool = False,
     ):
         self._stream = stream
         self.boundary = boundary
         steps = boundary.plan.path_for(forward_batch)
         completion = boundary._decide(
-            forward_batch, steps, output_complete=output_complete
+            forward_batch, steps, summed_by_compute=summed_by_compute
         )
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
