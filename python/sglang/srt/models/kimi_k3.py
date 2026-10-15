@@ -389,6 +389,20 @@ class KimiK3MLP(nn.Module):
         return hidden_states
 
 
+def merged_moe_all_reduce(
+    latent: torch.Tensor, shared: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TP all-reduce of the routed latent and the shared-expert output with
+    one collective (SGLANG_K3_MERGE_MOE_ALLREDUCE). The default concatenates
+    them; a platform may replace this function with a multi-tensor collective
+    that avoids the concat / split copies."""
+    latent_dim = latent.shape[-1]
+    reduced = tensor_model_parallel_all_reduce(
+        torch.cat([latent, shared.to(latent.dtype)], dim=-1)
+    )
+    return reduced[:, :latent_dim], reduced[:, latent_dim:]
+
+
 def _add3(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1012,6 +1026,19 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
+    def _merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
+        """SGLANG_K3_MERGE_MOE_ALLREDUCE applies: both the routed latent and a
+        synchronous TP-sharded shared-expert output still need a TP reduce."""
+        return (
+            envs.SGLANG_K3_MERGE_MOE_ALLREDUCE.get()
+            and shared_output is not None
+            and shared_event is None
+            and self.tp_size > 1
+            and self._routed_needs_reduce
+            and not self._shared_experts_tp1
+            and not self._shared_experts_tp_comm
+        )
+
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
@@ -1240,13 +1267,23 @@ class KimiK3MoE(nn.Module):
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
         expert_output = run_experts(routed_input, topk_output)
+        shared_reduced = False
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            latent = self._reduce_latent(expert_output)
+            if self._merge_moe_all_reduce(shared_output, shared_event):
+                # One collective for the TP-partial latent and shared output;
+                # the norm only needs the reduced latent.
+                latent, shared_output = merged_moe_all_reduce(
+                    expert_output, shared_output
+                )
+                latent = self._latent_norm(latent)
+                shared_reduced = True
+            else:
+                latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
@@ -1254,7 +1291,8 @@ class KimiK3MoE(nn.Module):
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
             if (
-                self.tp_size > 1
+                not shared_reduced
+                and self.tp_size > 1
                 and not self._shared_experts_tp1
                 and not self._shared_experts_tp_comm
             ):
