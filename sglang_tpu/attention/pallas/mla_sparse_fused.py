@@ -39,6 +39,9 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
 # Query tokens per sparse-attention gather chunk (one SparseCore program each).
 _GATHER_CHUNK_TOKENS = 256
 
+# Largest NoPE cache buffer (bytes, uint8) the SparseCore cache writer handles.
+_SPARSECORE_WRITER_MAX_BYTES = 64 * 1024 * 1024
+
 # The sparse kernels only support these two sizes.
 NOPE_DIM = 512
 ROPE_DIM = 64
@@ -103,7 +106,16 @@ def sparse_mla_attention_fused(
     # stored. distribution[2] is the number of real requests; clipping
     # cu_q_lens there makes the writer skip every token after them.
     active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
-    cache_nope, cache_rope = kv_cache_utils.update_sparse_mla_kv_cache(
+    # The SparseCore writer halts the SparseCore (RuntimeUnexpectedCoreHalt) once
+    # a layer's NoPE buffer is larger than 64 MiB -- a KV pool past 131072 tokens
+    # at 512 bytes per token -- while every size up to that runs. Bigger pools
+    # take the XLA scatter (same result, TensorCore).
+    writer = (
+        kv_cache_utils.update_sparse_mla_kv_cache
+        if cache_nope.size <= _SPARSECORE_WRITER_MAX_BYTES
+        else kv_cache_utils.update_sparse_mla_kv_cache_jax
+    )
+    cache_nope, cache_rope = writer(
         cache_nope,
         cache_rope,
         new_kv_c,
