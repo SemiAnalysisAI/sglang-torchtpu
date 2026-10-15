@@ -1045,11 +1045,17 @@ class TpuSRTPlatform(SRTPlatform):
     supports_mamba_extra_buffer = True
 
     def supports_mamba_prefix_cache(self, model_config) -> bool:
-        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.configs.hybrid_arch import (
+            hybrid_gdn_config,
+            hybrid_kda_config,
+        )
 
-        # KDA shares GDN metadata setup, but does not pass snapshot tracking
-        # to its kernel yet. Only the GDN backend writes reusable checkpoints.
-        return hybrid_gdn_config(model_config) is not None
+        # Both backends hand the shared fused kernel the snapshot plan
+        # (track_indices / track_end), which writes reusable checkpoints.
+        return (
+            hybrid_gdn_config(model_config) is not None
+            or hybrid_kda_config(model_config) is not None
+        )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
         # Mixed-batch merging drops the tracking plan while requests retain

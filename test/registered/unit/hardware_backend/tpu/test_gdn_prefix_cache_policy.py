@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.arg_groups import mamba_hook, overrides
-from sglang.srt.configs import Qwen3NextConfig
+from sglang.srt.configs import Qwen3NextConfig, hybrid_arch
 from sglang.srt.mem_cache import kv_cache_builder as builder
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.test_utils import CustomTestCase
@@ -92,19 +92,34 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                     ):
                         platform_cls().validate_mamba_prefix_cache(view)
 
+    def test_kimi_k3_config_reaches_kda_prefix_checkpoints(self):
+        """Kimi-K3's composite config resolves to the KDA backend's checkpoints."""
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.configs.kimi_k3 import KimiK3Config
+
+        model = SimpleNamespace(hf_config=KimiK3Config(), is_draft_model=False)
+        # Reached through KDA, not by being mistaken for a GDN model.
+        self.assertIsNone(hybrid_gdn_config(model))
+        for platform_cls in (TpuSRTPlatform, TpuOOTPlatform):
+            with self.subTest(platform=platform_cls.__name__):
+                self.assertTrue(platform_cls().supports_mamba_prefix_cache(model))
+
     def test_backend_guard_preserves_other_devices_and_explicit_disable(self):
         """Unsupported backends must not silently disable caching after pool sizing."""
+        # (tpu, recurrent, gdn, kda, disabled, expected); None means "rejects".
         cases = (
-            (True, True, False, False, None),  # Unsupported backend must reject
-            (True, True, False, True, True),  # Explicit disable sizes pools correctly
-            (True, True, True, False, False),
-            (True, True, True, True, True),
-            (True, False, False, False, False),  # Ordinary attention
-            (False, True, False, False, False),  # GPU KDA remains supported
+            (True, True, False, False, False, None),  # Unsupported backend rejects
+            (True, True, False, False, True, True),  # Explicit disable sizes pools
+            (True, True, True, False, False, False),
+            (True, True, True, False, True, True),
+            (True, True, False, True, False, False),  # TPU KDA writes checkpoints
+            (True, True, False, True, True, True),
+            (True, False, False, False, False, False),  # Ordinary attention
+            (False, True, False, False, False, False),  # GPU KDA remains supported
         )
-        for platform_cls, recurrent, gdn, disabled, expected in (
-            (platform_cls, recurrent, gdn, disabled, expected)
-            for tpu, recurrent, gdn, disabled, expected in cases
+        for platform_cls, recurrent, gdn, kda, disabled, expected in (
+            (platform_cls, recurrent, gdn, kda, disabled, expected)
+            for tpu, recurrent, gdn, kda, disabled, expected in cases
             for platform_cls in (
                 (TpuSRTPlatform, TpuOOTPlatform) if tpu else (SRTPlatform,)
             )
@@ -113,6 +128,7 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                 platform=platform_cls.__name__,
                 recurrent=recurrent,
                 gdn=gdn,
+                kda=kda,
                 disabled=disabled,
             ):
                 worker = MagicMock()
@@ -144,6 +160,15 @@ class TestTpuPrefixCachePolicy(CustomTestCase):
                         stack.enter_context(
                             patch.object(builder, name, return_value=value)
                         )
+                    # The platform resolves KDA from the model config; a mock
+                    # config has no real KimiLinearConfig to detect.
+                    stack.enter_context(
+                        patch.object(
+                            hybrid_arch,
+                            "hybrid_kda_config",
+                            return_value=object() if kda else None,
+                        )
+                    )
                     stack.enter_context(
                         patch("sglang.srt.platforms.current_platform", platform_cls())
                     )
