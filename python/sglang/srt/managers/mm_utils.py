@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import math
 import mmap
 import os
 import pickle
@@ -1407,7 +1408,7 @@ class ShmPointerMMData:
             tensor = torch.frombuffer(
                 handle.buf,
                 dtype=self.dtype,
-                count=self.shape.numel(),
+                count=math.prod(self.shape),
                 offset=self.offset,
             )
             self.tensor = tensor.reshape(self.shape)

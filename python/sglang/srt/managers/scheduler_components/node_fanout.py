@@ -15,6 +15,7 @@ by node, with the same number of TP ranks on each node.
 from __future__ import annotations
 
 import logging
+import math
 import mmap
 import os
 import sys
@@ -230,7 +231,7 @@ def _shm_slots(tokenized: List[Any]) -> List[_Slot]:
 
 
 def _nbytes(pointer: ShmPointerMMData) -> int:
-    return pointer.shape.numel() * pointer.dtype.itemsize
+    return math.prod(pointer.shape) * pointer.dtype.itemsize
 
 
 def _page_align(size: int) -> int:

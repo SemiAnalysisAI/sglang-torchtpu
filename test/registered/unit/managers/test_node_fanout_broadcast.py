@@ -303,6 +303,9 @@ def _check_packed_batch(rank, receiver):
     if rank == 0:
         req = pickle.loads(pickle.dumps(expected))
         wrap_shm_features(req, force=True)
+        # Rust ingress uses tuple shapes; exercise one at a nonzero packed offset.
+        pointer = req.mm_inputs.mm_items[1].feature[0]
+        pointer.shape = tuple(pointer.shape)
         reqs = pickle.loads(
             pickle.dumps(
                 [BatchTokenizedEmbeddingReqInput(batch=[req, _request("text", None)])]
