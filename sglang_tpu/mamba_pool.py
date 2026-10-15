@@ -131,6 +131,8 @@ class TpuMambaPool(MambaPool):
         self.device = device
         # Rows per slot: the verify window (anchor + drafts), or 1 without spec.
         self.spec_window = int(speculative_num_draft_tokens or 1)
+        # Global model-layer id of each state layer (PD transfer pairs by it).
+        self.mamba_layer_ids = list(mamba_layer_ids)
         rows = (size + 1) * self.spec_window
         # Checkpoint row within the slot's group that the next forward reads.
         self.read_offsets = torch.zeros(size + 1, dtype=torch.int32, device=device)
@@ -315,17 +317,17 @@ class TpuMambaPool(MambaPool):
             "so MambaPool.load_cpu_copy's `[:, indices]` does not apply."
         )
 
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU: "
-            "TpuMambaPool stores one tensor per layer, so the per-layer strides "
-            "MambaPool.get_contiguous_buf_infos derives from a stacked buffer "
-            "do not exist."
-        )
+    def _iter_transfer_state_entries(self):
+        """One entry per layer and state tensor -- every conv kind, then the
+        recurrent state -- each ``[slots + 1, ...]`` and owning its storage, so
+        a slot is one row. PD (Raiden) moves whole rows at matching attention
+        TP; the entries are not TP-sliced (slice axis None)."""
+        cache = self.mamba_cache
+        layer_ids = list(getattr(self, "mamba_layer_ids", range(len(cache.temporal))))
+        for layer, layer_id in enumerate(layer_ids):
+            for per_kind in cache.conv:
+                yield "conv", per_kind[layer], None, layer_id
+            yield "temporal", cache.temporal[layer], None, layer_id
 
-    def get_state_dim_per_tensor(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU; see "
-            "TpuMambaPool.get_contiguous_buf_infos. The TP-sliceable axis this "
-            "reports as dim 2 of a stacked buffer is dim 1 of a per-layer one."
-        )
+    def get_state_conv_shard_groups(self):
+        return [None for _ in self._iter_transfer_state_entries()]

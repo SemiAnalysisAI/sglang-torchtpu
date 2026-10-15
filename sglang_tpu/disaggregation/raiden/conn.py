@@ -323,6 +323,7 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        self._swa_state_type = kv_caches.swa_state_type
         if self._pipeline_enabled:
             from sglang_tpu.disaggregation.raiden.pipeline import PipelineTransfer
 
@@ -429,6 +430,8 @@ class RaidenKVManager(
         return max(1, math.ceil(max_len / self.kv_args.page_size))
 
     def _swa_max_request_blocks(self) -> int:
+        if getattr(self, "_swa_state_type", "swa") == "mamba":
+            return 1  # one recurrent-state slot per request
         override = int(os.environ.get("SGLANG_RAIDEN_SWA_MAX_BLOCKS", "0"))
         if override > 0:
             return override
@@ -908,19 +911,27 @@ class RaidenKVManager(
     ) -> List[int]:
         if not self._swa_kv_caches:
             return []
+        mamba = getattr(self, "_swa_state_type", "swa") == "mamba"
+        state_type = StateType.MAMBA if mamba else StateType.SWA
         try:
-            index = self.kv_args.state_types.index(StateType.SWA)
+            index = self.kv_args.state_types.index(state_type)
         except ValueError as exc:
             raise RuntimeError(
-                "Raiden has SWA KV tensors but StateType.SWA is not registered"
+                f"Raiden has second-namespace tensors but {state_type} is not registered"
             ) from exc
         if (
             state_indices is None
             or index >= len(state_indices)
             or state_indices[index] is None
         ):
-            raise RuntimeError("Raiden SWA transfer is missing its page indices")
-        return [int(x) for x in state_indices[index]]
+            raise RuntimeError(f"Raiden {state_type} transfer is missing its indices")
+        entry = state_indices[index]
+        if mamba:
+            # [array of the request's state slot(s)]; each slot is one row of
+            # every state tensor (no speculative window: one row per slot).
+            flat = [int(x) for part in entry for x in (part.reshape(-1) if hasattr(part, "reshape") else [part])]
+            return flat
+        return [int(x) for x in entry]
 
     @staticmethod
     def _monotonic() -> float:

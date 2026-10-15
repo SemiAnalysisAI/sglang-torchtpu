@@ -61,6 +61,11 @@ class RaidenKVCacheGroups:
     swa_layer_ids: List[int] = field(default_factory=list)
     # A speculative draft pool separate from the target pool, appended above.
     has_draft_pool: bool = False
+    # What the second namespace carries: "swa" (sliding-window pages, indexed by
+    # StateType.SWA) or "mamba" (a hybrid's recurrent state rows, one block per
+    # request -- its state slot -- indexed by StateType.MAMBA). Both are settled
+    # only when the prefill ends, so both ride on the closing read.
+    swa_state_type: str = "swa"
 
 
 def get_raiden_kv_caches(
@@ -146,6 +151,29 @@ def get_raiden_kv_caches(
         full_ids.extend(draft_groups.full_layer_ids)
         swa_ids.extend(draft_groups.swa_layer_ids)
 
+    swa_state_type = "swa"
+    mamba_pool = getattr(pool, "mamba_pool", None)
+    if not swa and mamba_pool is not None and hasattr(mamba_pool, "mamba_cache"):
+        # Recurrent hybrid (TPU KDA / GDN) without sliding-window layers: send
+        # the request's state rows -- every layer's conv and recurrent tensor,
+        # [slots + 1, ...] -- through the second namespace.
+        if int(getattr(mamba_pool, "spec_window", 1)) > 1:
+            # Speculative decoding gives each slot a group of rows (one per
+            # verify position) plus a read offset; a block is no longer a slot.
+            raise NotImplementedError(
+                "Raiden PD does not transfer recurrent state with speculative "
+                "decoding yet; run PD without a speculative algorithm."
+            )
+        cache = mamba_pool.mamba_cache
+        num_layers = len(cache.temporal)
+        layer_ids = list(getattr(mamba_pool, "get_state_layer_ids", lambda: [])())
+        for layer in range(num_layers):
+            for per_kind in cache.conv:
+                swa.append(per_kind[layer])
+            swa.append(cache.temporal[layer])
+            swa_ids.extend([layer_ids[layer] if layer < len(layer_ids) else layer] * (len(cache.conv) + 1))
+        swa_state_type = "mamba"
+
     for name, group in (("full", full), ("SWA", swa)):
         block_counts = {int(buf.shape[0]) for buf in group}
         if len(block_counts) > 1:
@@ -159,4 +187,5 @@ def get_raiden_kv_caches(
         full_layer_ids=full_ids,
         swa_layer_ids=swa_ids,
         has_draft_pool=has_draft_pool,
+        swa_state_type=swa_state_type,
     )
