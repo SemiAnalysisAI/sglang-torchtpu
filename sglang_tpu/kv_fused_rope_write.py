@@ -18,10 +18,6 @@ Each layer buffer is donated and aliased to its own output -- the in-place
 contract kv_page_write, the RPA v3 attention kernel, and
 TpuFusedMHATokenToKVPool.set_kv_buffer all share. K arrives normalized (post
 apply_k_norm) and unrotated; the K/V projections stay outside as XLA GEMMs.
-
-jax is imported eagerly, unlike the neighbouring Pallas modules: torch_tpu
-resolves the JAX-level signature with inspect.signature(eval_str=True), so its
-annotations have to be real names in this module's globals.
 """
 
 from __future__ import annotations
@@ -207,9 +203,26 @@ def get_fused_rope_write_op(num_layers: int, max_span_len: int) -> Callable[...,
 
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
+    # Tensors only: custom_jax_kernel traces a partial's `max_span_len` since
+    # torch_tpu 76284a1fa; register a functools.partial once it reaches jax.jit static.
+    # Unannotated: when dynamo traces this builder it rebuilds the closure with misaligned
+    # __annotations__, and custom_jax_kernel's inspect.signature(eval_str=True) evals them.
+    def _fused_rope_write(dst_starts, src_starts, span_lens, k, v, cos, sin, *kv_bufs):
+        return fused_rope_write_kv_jax(
+            dst_starts,
+            src_starts,
+            span_lens,
+            k,
+            v,
+            cos,
+            sin,
+            *kv_bufs,
+            max_span_len=max_span_len,
+        )
+
     aliases = {7 + i: i for i in range(num_layers)}
     jax_kernel = _torch_pallas.custom_jax_kernel(
-        functools.partial(fused_rope_write_kv_jax, max_span_len=max_span_len),
+        _fused_rope_write,
         name=f"jax_kv_fused_rope_write_{num_layers}_{max_span_len}",
         donate_argnums=tuple(aliases),
         input_output_aliases=aliases,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -76,13 +77,15 @@ def compiled_op(
     A ``warmup`` factory registers the helper for the speculative-op grid.
     Model-specific owners can instead
     call ``warmup_compiled_op(op, ...)`` with their own representative inputs.
-    The internal ``_warmup_async`` keyword submits each new specialization
-    without waiting when direct asynchronous compilation is enabled.
+    Direct helper warmups compile without executing; the queue joins compilation
+    futures without retaining example inputs. Dynamo warmups still execute to
+    trigger tracing and compilation.
     """
 
     def decorator(fn):
         compiled_fn = None
         use_direct = False
+        signature = inspect.signature(fn)
 
         @functools.wraps(fn)
         def wrapper(*args, _warmup_async=False, **kwargs):
@@ -95,7 +98,12 @@ def compiled_op(
                 return fn(*args, **kwargs)
             from jax import tree_util
 
-            args, kwargs = tree_util.tree_map(_canonical_tensor, (args, kwargs))
+            # Bind to fn's signature: positional warmups and keyword callers share a key.
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            args, kwargs = tree_util.tree_map(
+                _canonical_tensor, (bound.args, bound.kwargs)
+            )
             if compiled_fn is None:
                 use_direct = get_exec().graph.tpu_compile_tracer == "direct"
                 if use_direct:
@@ -113,12 +121,15 @@ def compiled_op(
                     compiled_fn = torch.compile(
                         fn, backend="tpu", fullgraph=True, dynamic=False
                     )
-            if use_direct and _warmup_async and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+            if use_direct and _warmup_async:
                 # Repeated storage/layout warmups share one compiled program.
-                # Keep only its first inputs alive until the queue joins.
                 if _specialization_key(*args, **kwargs) in compiled_fn.cache:
                     return None
-                return compiled_fn.warmup_async(*args, **kwargs)
+                return compiled_fn.precompile(
+                    *args,
+                    async_compile=envs.SGLANG_DIRECT_COMPILE_ASYNC.get(),
+                    **kwargs,
+                )
             return compiled_fn(*args, **kwargs)
 
         if warmup is not None:

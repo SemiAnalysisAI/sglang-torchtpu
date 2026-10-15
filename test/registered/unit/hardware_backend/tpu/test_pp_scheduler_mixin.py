@@ -149,10 +149,14 @@ class TestWaveRows(CustomTestCase):
     def _rows(self, compile_policy):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace()
+        scheduler.tp_group = SimpleNamespace()
+        scheduler.world_group = SimpleNamespace()
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 compile_policy=compile_policy,
                 model_config=SimpleNamespace(context_len=4096, hidden_size=16),
+                spec_aux_config=SimpleNamespace(eagle_use_aux_hidden_state=False),
+                model=SimpleNamespace(),
                 dtype=torch.bfloat16,
                 device="cpu",
             )

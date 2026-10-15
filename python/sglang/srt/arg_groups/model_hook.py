@@ -276,8 +276,11 @@ def handle_model_specific_adjustments(server_args: Any):
 
             _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
+            # TPU resolves DSA in its platform hook (apply_server_args_defaults).
             if (
-                not get_platform().is_npu and not get_platform().is_xpu
+                not get_platform().is_npu
+                and not get_platform().is_xpu
+                and not get_platform().is_tpu
             ):  # CUDA or ROCm GPU
                 if cfg.enable_prefill_cp:
                     # The DSA CP field declarations moved to the override
@@ -492,8 +495,6 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.set(False)
             envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.set(True)
-            if not envs.SGLANG_DSV4_FP4_DEQUANT.is_set():
-                envs.SGLANG_DSV4_FP4_DEQUANT.set(True)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the

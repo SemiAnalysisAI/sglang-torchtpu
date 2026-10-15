@@ -1772,7 +1772,8 @@ class Scheduler(
         )
 
     def maybe_init_kv_free_fence(self):
-        """Hold KV pages freed under overlap back from DMA write targets."""
+        """Hold KV pages freed under overlap back from DMA write targets.
+        Raises if the fence cannot cover every KV write of this server."""
         if not self._needs_kv_free_fence():
             return
         from sglang_tpu.kv_free_fence import (
@@ -1790,19 +1791,17 @@ class Scheduler(
             self.token_to_kv_pool_allocator, **fence_kwargs
         )
         if reason is not None:
-            if self._uses_raiden_hicache():
-                raise ValueError(
-                    f"The raiden HiCache backend needs the KV free fence: {reason}"
-                )
-            # Unlike raiden HiCache, a PD decode server can serve unfenced.
-            # TODO(#1213): fail startup here once every PD decode
-            # configuration can be fenced.
-            logger.warning(
-                "KV arriving on this PD decode server is not fenced against "
-                "in-flight forwards: %s",
-                reason,
+            # Unfenced, a DMA into a freed page can land before an in-flight
+            # forward's write to it and be overwritten without any error.
+            needed_by = (
+                "The raiden HiCache backend"
+                if self._uses_raiden_hicache()
+                else "A PD decode server under overlap scheduling"
             )
-            return
+            raise ValueError(
+                f"{needed_by} needs the KV free fence: {reason} "
+                "Pass --disable-overlap-schedule to run without it."
+            )
         self.kv_free_fence = install_kv_free_fence(
             self.token_to_kv_pool_allocator,
             synchronize_device=self.device_module.synchronize,
@@ -3800,11 +3799,7 @@ class Scheduler(
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
-            defer_page_release = (
-                getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
-                and hasattr(req.disagg_kv_sender, "drained")
-                and not self._group_drained([req.disagg_kv_sender])[0]
-            )
+            defer_page_release = self._defer_aborted_page_release(req.disagg_kv_sender)
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -3824,10 +3819,34 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
+    def _defer_aborted_page_release(self, sender) -> bool:
+        """Whether an aborted prefill request keeps its pages until ``sender``
+        has drained. Pipeline stages always defer: only the in-flight queue's
+        release consensus frees them, in the same iteration on every stage."""
+        if not (
+            getattr(sender, "group_failure_requires_drain", False) is True
+            and hasattr(sender, "drained")
+        ):
+            return False
+        return get_parallel().pp_size > 1 or not self._group_drained([sender])[0]
+
+    def _release_consensus_sender_aborts(self, rids) -> None:
+        """Pipeline prefill: free the pages of deferred aborts whose senders
+        every stage reported drained in the release consensus ``rids``."""
+        still_held = []
+        for req in self._deferred_chunked_sender_aborts:
+            if req.rid not in rids:
+                still_held.append(req)
+                continue
+            req.disagg_kv_sender.clear()
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._deferred_chunked_sender_aborts = still_held
+
     def _drain_deferred_chunked_sender_aborts(self) -> None:
         """Release locally-aborted prefill pages after raiden relinquishes them."""
         pending = self._deferred_chunked_sender_aborts
-        if not pending:
+        if not pending or get_parallel().pp_size > 1:
+            # Pipeline stages free them through _release_consensus_sender_aborts.
             return
         drained = None
         if current_platform.is_tpu():
@@ -5150,6 +5169,7 @@ class Scheduler(
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        self.maybe_signal_queued_health_checks(batch)
         self.metrics_reporter.update_device_timer()
         if self.kv_free_fence is not None:
             self.kv_free_fence.on_forward_done(result)
@@ -5218,6 +5238,46 @@ class Scheduler(
                 )
             )
 
+    def maybe_signal_queued_health_checks(self, batch: ScheduleBatch) -> None:
+        """Answer health probes that are queued behind a prefill doing real work.
+
+        A probe that arrives while the scheduler looks idle is admitted like a
+        normal request, yet it can still land behind a long prompt (e.g. on a
+        PD prefill both leave the bootstrap queue in the same poll, prompt
+        first). Each chunk of that prompt fills the prefill token budget, so
+        the probe is not scheduled until the chain ends, and a prefill server
+        sends the tokenizer nothing meanwhile. A completed prefill batch with
+        real work is the evidence the busy path in process_input_requests
+        relies on, so send the same HealthCheckOutput that
+        maybe_send_health_check_signal sends.
+
+        The queues are the only state: each queued probe is flagged when
+        signaled, so a long chain answers it once, not once per chunk. A
+        scheduler that completes no batch sends nothing, so a hung engine still
+        fails the probe. The probe stays queued and runs its 1-token forward
+        later; the tokenizer drops that late output.
+        """
+        if (
+            not batch.forward_mode.is_extend_without_speculative()
+            or not batch.reqs
+            or all(is_health_check_generate_req(req) for req in batch.reqs)
+        ):
+            return
+        queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        for queue in queues:
+            for req in queue:
+                if not is_health_check_generate_req(req) or getattr(
+                    req, "_health_check_signaled", False
+                ):
+                    continue
+                req._health_check_signaled = True
+                # One per probe rid, so an own-rid probe waiter can match it.
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
+                )
+
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -5281,6 +5341,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
+                # The /metrics gauges too: no batch report writes them in this
+                # state, and the fully-idle publish below is skipped, so a stuck
+                # P/D engine would otherwise look idle (#1303). Self-paced to
+                # once per 30 s without a stats log.
+                self.metrics_reporter.maybe_log_stall_metrics()
             if (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL

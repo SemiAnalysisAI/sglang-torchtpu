@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import ceil_align, next_power_of_2
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
     Bucketer,
@@ -88,6 +88,12 @@ _HOST_PAD_TOKEN_FIELDS = frozenset(
     ("input_ids", "positions", "out_cache_loc", "mrope_positions")
 )
 
+_MAMBA_TRACK_FIELDS = (
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+)
+
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
     "seq_lens",
@@ -98,6 +104,7 @@ _BS_FIELDS = (
     "extend_prefix_lens",
     "extend_start_loc",
     "encoder_lens",
+    *_MAMBA_TRACK_FIELDS,
 )
 
 # Python-list batch metadata can become Dynamo guards; pad to bucket length.
@@ -166,6 +173,7 @@ def _localize_cp_inputs(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     cp_layout: Any,
+    embeds_tokens: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[Any, ...]]:
     """Present this rank's zigzag rows to a context-parallel graph call.
 
@@ -181,15 +189,18 @@ def _localize_cp_inputs(
     # them local like every other token-indexed input; leaving them global is a
     # serve-time recompile, which `fail_on_recompile` turns into a crash on the
     # first request.
-    if kwargs.get("input_embeds") is not None:
+    supplied_embeds = kwargs.get("input_embeds") is not None
+    if supplied_embeds:
         kwargs["input_embeds"] = cp_local_embeds(
             input_embeds=kwargs["input_embeds"], layout=cp_layout
         )
-        # A caller that supplies embeddings has no lookup to run; the ids only
-        # size the local rows.
-        input_ids = local_ids
     else:
         args = _cp_localize_embeds_in_args(args=args, cp_layout=cp_layout)
+    if supplied_embeds or not embeds_tokens:
+        # Later stages take their activations from the proxy, and a caller that
+        # supplies embeddings has no lookup to run; the ids only size the rows.
+        input_ids = local_ids
+    else:
         # The embedding takes the global ids and keeps the rank's rows.
         kwargs["cp_local_rows"] = cp_layout.local_rows
     forward_batch.input_ids = local_ids
@@ -564,6 +575,29 @@ def _pad_tensor(
     return F.pad(t, padding)
 
 
+def _pad_mamba_tracking(forward_batch: Any, pad_b: int) -> None:
+    """Upload scheduler-owned tracking metadata only at the bucketed shape."""
+    originals = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+    if originals is None:
+        originals = {}
+    for field in _MAMBA_TRACK_FIELDS:
+        val = getattr(forward_batch, field, None)
+        if not isinstance(val, torch.Tensor):
+            continue
+        if val.device.type == "cpu":
+            originals[field] = val
+            setattr(
+                forward_batch,
+                field,
+                _zero_pad_dim0(val, pad_b).to(forward_batch.seq_lens.device),
+            )
+        elif val.shape[0] != pad_b:
+            # Already-padded inputs make repeated preparation harmless. Never
+            # hide an early upload by reading it back or padding it on TPU.
+            raise ValueError("TPU Mamba tracking metadata must be padded on CPU")
+    forward_batch._tpu_mamba_tracking_cpu = originals
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -654,7 +688,10 @@ def _pad_batch_fields(
     if pad_t is not None:
         _pad_token_fields(forward_batch, pad_t, is_draft_extend_v2)
 
+    _pad_mamba_tracking(forward_batch, pad_b)
     for field in _BS_FIELDS:
+        if field in _MAMBA_TRACK_FIELDS:
+            continue
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
             setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
@@ -746,8 +783,16 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
 
     for field in _BS_FIELDS:
         value = getattr(forward_batch, field, None)
+        if field in _MAMBA_TRACK_FIELDS:
+            # Restore the host snapshot, avoiding a variable-size TPU slice
+            # when unpadding the completed forward.
+            originals = getattr(forward_batch, "_tpu_mamba_tracking_cpu", None)
+            if originals is not None and field in originals:
+                value = originals[field]
+                setattr(forward_batch, field, value)
         if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
             setattr(forward_batch, field, value[:real_b])
+    forward_batch._tpu_mamba_tracking_cpu = None
 
     for field in _BS_CPU_LIST_FIELDS:
         value = getattr(forward_batch, field, None)
@@ -862,13 +907,14 @@ class CompiledForwardShim:
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
 
-    def _prompt_logprob_rejection(self) -> str | None:
+    @staticmethod
+    def _prompt_logprob_rejection(enabled: bool) -> str | None:
         """Why this server cannot serve input logprobs, or None if it can.
 
         Consulted only for requests that actually ask for them, so none of this
-        lands on anyone else's forward.
+        lands on anyone else's forward. Intake asks the same question first.
         """
-        if not self._prompt_logprob_enabled:
+        if not enabled:
             return (
                 "input/prompt logprobs (echo) need "
                 "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
@@ -1023,18 +1069,6 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
-        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
-        if pp_proxy_tensors is not None:
-            if self._is_first_pp_stage():
-                # The first stage embeds its own input; its graph takes no proxy.
-                kwargs.pop("pp_proxy_tensors")
-            else:
-                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
-                    pp_proxy_tensors, input_ids, forward_batch
-                )
-        elif any(isinstance(value, PPProxyTensors) for value in args):
-            if not self._is_first_pp_stage():
-                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across
@@ -1055,7 +1089,7 @@ class CompiledForwardShim:
         # extend graph is the NULL-capture one warmup has always compiled.
         wants_input_logprob = needs_input_logprob(forward_batch)
         if wants_input_logprob:
-            rejection = self._prompt_logprob_rejection()
+            rejection = self._prompt_logprob_rejection(self._prompt_logprob_enabled)
             if rejection is not None:
                 raise NotImplementedError(rejection)
         saved: dict[str, Any] = {}
@@ -1113,8 +1147,26 @@ class CompiledForwardShim:
                     args=args,
                     kwargs=kwargs,
                     cp_layout=cp_layout,
+                    embeds_tokens=self._is_first_pp_stage(),
                 )
         try:
+            # A proxy holds the previous stage's local rows; fit it after localizing.
+            pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+            if pp_proxy_tensors is not None:
+                if self._is_first_pp_stage():
+                    # The first stage embeds its own input; its graph takes no proxy.
+                    kwargs.pop("pp_proxy_tensors")
+                else:
+                    kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                        proxy=pp_proxy_tensors,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                    )
+            elif any(isinstance(value, PPProxyTensors) for value in args):
+                if not self._is_first_pp_stage():
+                    args = _fit_pp_proxy_in_args(
+                        args=args, input_ids=input_ids, forward_batch=forward_batch
+                    )
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
             if isinstance(out, PendingCall):
                 finalize_fields = {key: getattr(forward_batch, key) for key in saved}
@@ -1184,6 +1236,7 @@ def reconcile_tpu_batch_limits(
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
     attn_dp_size: int = 1,
+    attn_tp_size: int = 1,
 ) -> tuple[int, Optional[List[int]], int]:
     """Make the TPU compile grid cover scheduler concurrency without dead shapes.
 
@@ -1191,6 +1244,11 @@ def reconcile_tpu_batch_limits(
     at most ``max_running_requests // attn_dp_size`` requests (the same
     division kv_cache_configurator applies), so all coupling here uses that
     per-worker concurrency, not the global cap.
+
+    ``attn_tp_size`` is the attention-TP width under attention DP and 1
+    otherwise: attention DP rounds every worker's decode rows up to a multiple
+    of it before the bucket lookup (``get_dp_padded_token_counts``), so the
+    grid has to reach the rounded per-worker cap.
     """
     per_worker_mrr = (
         max(max_running_requests // attn_dp_size, 1)
@@ -1215,14 +1273,14 @@ def reconcile_tpu_batch_limits(
     else:
         tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
-    if per_worker_mrr is not None:
-        tcmb = max(tcmb, per_worker_mrr)
-    else:
+    if per_worker_mrr is None:
         per_worker_mrr = tcmb
         max_running_requests = tcmb * attn_dp_size
+    per_worker_rows = ceil_align(per_worker_mrr, attn_tp_size)
+    tcmb = max(tcmb, per_worker_rows)
 
-    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_mrr:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_mrr})
+    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_rows:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_rows})
 
     return tcmb, tpu_compile_bs, max_running_requests
 
