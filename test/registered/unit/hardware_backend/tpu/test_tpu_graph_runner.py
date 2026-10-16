@@ -860,6 +860,7 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
         self.platform = TpuSRTPlatform()
         self.runner = SimpleNamespace(
             sampler=MagicMock(spec=TpuSampler),
+            max_running_requests=8,
             model=SimpleNamespace(_can_torch_compile=True),
             model_config=SimpleNamespace(is_generation=True, vocab_size=128),
             is_draft_worker=False,
@@ -872,19 +873,30 @@ class TestTpuSamplingPrewarm(unittest.TestCase):
         )
         self.log = self.enterContext(patch("sglang_tpu.tpu_platform.logger.info"))
 
-    def test_sampling_warmup_does_not_depend_on_model_compilation(self):
-        for enable_compile, can_compile in ((True, True), (False, True), (True, False)):
+    def test_sampling_warmup_respects_limits_without_model_compilation(self):
+        for enable_compile, can_compile, serving_limit, compile_limit, expected in (
+            (True, True, 4, 32, 4),
+            (False, True, 32, 4, 4),
+            (True, False, 8, 8, 8),
+        ):
             with (
-                self.subTest(enable_compile=enable_compile, can_compile=can_compile),
+                self.subTest(
+                    enable_compile=enable_compile,
+                    can_compile=can_compile,
+                    serving_limit=serving_limit,
+                    compile_limit=compile_limit,
+                ),
                 get_context().override_server_args(
-                    enable_torch_compile=enable_compile, torch_compile_max_bs=8
+                    enable_torch_compile=enable_compile,
+                    torch_compile_max_bs=compile_limit,
                 ),
             ):
                 self.runner.model._can_torch_compile = can_compile
+                self.runner.max_running_requests = serving_limit
                 self.runner.sampler.warmup_small_top_k.reset_mock()
                 self.platform.prewarm_sampling(self.runner)
                 self.runner.sampler.warmup_small_top_k.assert_called_once_with(
-                    max_batch_size=8, vocab_size=128, device=torch.device("cpu")
+                    max_batch_size=expected, vocab_size=128, device=torch.device("cpu")
                 )
 
     def test_skips_draft_embedding_nonfinal_and_other_sampler(self):

@@ -704,7 +704,10 @@ class TpuSRTPlatform(SRTPlatform):
             and isinstance(model_runner.sampler, TpuSampler)
         ):
             model_runner.sampler.warmup_small_top_k(
-                max_batch_size=get_exec().graph.torch_compile_max_bs,
+                max_batch_size=min(
+                    model_runner.max_running_requests,
+                    get_exec().graph.torch_compile_max_bs,
+                ),
                 vocab_size=model_runner.model_config.vocab_size,
                 device=torch.device(model_runner.device),
             )
