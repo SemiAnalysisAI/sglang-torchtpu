@@ -93,6 +93,6 @@ Where to file what: TPU-specific bugs and feature requests here; engine bugs tha
 
 ## License and acknowledgments
 
-Apache-2.0. See NOTICE for code adapted from [tpu-inference](https://github.com/vllm-project/tpu-inference), [sglang-jax](https://github.com/sgl-project/sglang-jax), torchtpu-vllm, and [Helion](https://github.com/pytorch/helion).
+Apache-2.0. See NOTICE for code adapted from [tpu-inference](https://github.com/vllm-project/tpu-inference), [sglang-jax](https://github.com/sgl-project/sglang-jax), [vllm-torchtpu](https://github.com/vllm-project/vllm-torchtpu), and [Helion](https://github.com/pytorch/helion).
 
 SGLang-torchtpu is built by the SGLang community, RadixArk, Google, and Meta.
