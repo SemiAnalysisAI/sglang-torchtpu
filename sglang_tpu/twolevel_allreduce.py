@@ -68,7 +68,7 @@ def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
     if n > 1:
         packed[...] = jnp.zeros_like(packed)  # alignment gaps between tensors
     for x, r, off in zip(xs, rows, offs):
-        packed[off : off + r, :] = x[...]
+        packed[off : off + r, :] = x[...].reshape(r, 128)
     pltpu.semaphore_wait(barrier, len(local_peers) + len(remote_peers))
 
     def exchange(src, gather, slot, peers, send_sem, recv_sem):
@@ -101,7 +101,7 @@ def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
     else:
         total = part[...].astype(jnp.float32)
     for o, r, off in zip(outs, rows, offs):
-        o[...] = total[off : off + r, :].astype(o.dtype)
+        o[...] = total[off : off + r, :].astype(o.dtype).reshape(o.shape)
 
 
 def twolevel_all_reduce_local(*xs, world: int, local: int):
@@ -114,11 +114,10 @@ def twolevel_all_reduce_local(*xs, world: int, local: int):
 
     n = len(xs)
     groups = world // local
-    shapes = tuple(x.shape for x in xs)
-    # One token: a [1, H] row as dense (H / 128, 128) tiles; a (1, H) row
-    # measured 1-4 us slower to exchange.
-    xs = tuple(x.reshape(-1, 128) for x in xs)
-    rows = tuple(x.shape[0] for x in xs)
+    # One token: each [1, H] row is exchanged as dense (H / 128, 128) tiles; a
+    # (1, H) row measured 1-4 us slower to exchange. The kernel relayouts in
+    # VMEM: as XLA reshapes around the call it added two ~0.8 us ops per tensor.
+    rows = tuple(x.shape[0] * x.shape[1] // 128 for x in xs)
     offs, total = [], 0
     for r in rows:
         offs.append(total)
@@ -143,7 +142,6 @@ def twolevel_all_reduce_local(*xs, world: int, local: int):
         compiler_params=pltpu.CompilerParams(collective_id=_COLLECTIVE_ID),
         name=f"twolevel_allreduce{n}_w{world}_l{local}",
     )(*xs)
-    outs = tuple(o.reshape(s) for o, s in zip(outs, shapes))
     return outs if n > 1 else outs[0]
 
 
