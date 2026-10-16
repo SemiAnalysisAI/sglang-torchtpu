@@ -39,8 +39,7 @@ https://github.com/google-pytorch/torchtpu-vllm
 Copyright 2025-2026 Google LLC
 Licensed under the Apache License, Version 2.0
 
-Pallas attention, quantized matmul, FP8 linear and MoE, megablox gmm_v2,
-sparse MLA, DeepSeek V4 and disaggregation code under sglang_tpu/.
+Portions of the TPU kernels under sglang_tpu/.
 
 -------------------------------------------------------------------------------
 Helion
