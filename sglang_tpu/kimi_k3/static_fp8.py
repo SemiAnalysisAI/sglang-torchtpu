@@ -10,7 +10,8 @@ selects which ones:
   merged into one GEMV (they read post_attention_layernorm's output);
 - latent_up: the replicated latent up-proj (reads routed_expert_norm's output);
 - kda_qkvg: the KDA fused [q, k, v, g] projection (reads input_layernorm's);
-- mla_qkv_a: the MLA fused q_a / kv_a projection (reads input_layernorm's).
+- mla_qkv_a: the MLA fused q_a / kv_a projection (reads input_layernorm's);
+  not validated yet, so "all" leaves it out.
 
 The model only holds the bound StaticFp8Weight attributes and calls them; the
 bf16 weights they replace are released. Kimi-K3 on TPU already rejects online
@@ -25,24 +26,11 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_linear import StaticFp8Weight, quantize_rmsnorm_fed_weight
+from sglang_tpu.kimi_k3 import STATIC_FP8_PARTS as PARTS
+from sglang_tpu.kimi_k3 import static_fp8_parts as selected_parts
 
 logger = logging.getLogger(__name__)
-
-PARTS = frozenset({"moe_front", "latent_up", "kda_qkvg", "mla_qkv_a"})
-
-
-def selected_parts() -> frozenset[str]:
-    """The GEMVs SGLANG_TPU_K3_STATIC_FP8 selects; raises on unknown names."""
-    parts = set(tpu_envs.SGLANG_TPU_K3_STATIC_FP8.get())
-    unknown = parts - PARTS - {"all"}
-    if unknown:
-        raise ValueError(
-            f"SGLANG_TPU_K3_STATIC_FP8: unknown {sorted(unknown)}; expected a "
-            f"subset of {sorted(PARTS)} or 'all'"
-        )
-    return PARTS if "all" in parts else frozenset(parts)
 
 
 def _pack(weight_kn: torch.Tensor, norm_weight: torch.Tensor) -> StaticFp8Weight:
@@ -55,17 +43,29 @@ def _pack(weight_kn: torch.Tensor, norm_weight: torch.Tensor) -> StaticFp8Weight
 
 
 def _dense_weight_kn(linear: nn.Module, k: int) -> Optional[torch.Tensor]:
-    """An unquantized linear's weight as [K, N], or None if it is quantized."""
+    """An unquantized linear's weight as [K, N], or None when it is quantized,
+    already released, or does not read a K-wide input.
+
+    Linear weights are stored [out, in] (TPU only re-lays out MoE expert
+    weights), so the input width must match K; the layout is not guessed
+    from the shape.
+    """
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
     if not isinstance(getattr(linear, "quant_method", None), UnquantizedLinearMethod):
         return None
-    w = linear.weight.detach()
-    if w.dim() != 2:  # already released by an earlier bind
+    if getattr(linear, "input_size", k) != k:
         return None
-    if w.shape[1] == k:
-        return w.t()
-    return w if w.shape[0] == k else None
+    w = linear.weight.detach()
+    if w.dim() != 2 or w.shape[1] != k:  # dim != 2: released by an earlier bind
+        return None
+    return w.t()
+
+
+def _plain_rmsnorm(norm: nn.Module) -> bool:
+    """The |y_i| <= sqrt(K) * |g_i| bound holds for a plain RMSNorm over the
+    full width; a partial-width variance breaks it."""
+    return getattr(norm, "variance_size_override", None) is None
 
 
 def _release(*linears: nn.Module) -> int:
@@ -82,15 +82,17 @@ def _release(*linears: nn.Module) -> int:
     return freed
 
 
-def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]:
+def _bind_moe(moe, in_norm: nn.Module, parts) -> tuple[list[str], int]:
     """Returns (parts bound on this layer, bytes freed)."""
     bound: list[str] = []
     freed = 0
     if not moe.use_latent_moe:
         return bound, freed
+    in_norm_weight = in_norm.weight
     hidden = in_norm_weight.shape[0]
     if (
         "moe_front" in parts
+        and _plain_rmsnorm(in_norm)
         and moe.shared_experts is not None
         and not moe._shared_experts_tp_comm
         and not moe._sbo_shared_overlap
@@ -109,7 +111,11 @@ def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]
                 moe.routed_expert_down_proj, moe.shared_experts.gate_up_proj
             )
             bound.append("moe_front")
-    if "latent_up" in parts and moe.routed_expert_norm is not None:
+    if (
+        "latent_up" in parts
+        and moe.routed_expert_norm is not None
+        and _plain_rmsnorm(moe.routed_expert_norm)
+    ):
         up = _dense_weight_kn(moe.routed_expert_up_proj, moe.moe_hidden_size)
         if up is not None:
             moe._static_fp8_latent_up = _pack(up, moe.routed_expert_norm.weight)
@@ -118,11 +124,13 @@ def _bind_moe(moe, in_norm_weight: torch.Tensor, parts) -> tuple[list[str], int]
     return bound, freed
 
 
-def _bind_linear(owner, attr: str, linear: Optional[nn.Module], norm_weight):
-    w = None if linear is None else _dense_weight_kn(linear, norm_weight.shape[0])
+def _bind_linear(owner, attr: str, linear: Optional[nn.Module], norm: nn.Module):
+    if linear is None or not _plain_rmsnorm(norm):
+        return 0, 0
+    w = _dense_weight_kn(linear, norm.weight.shape[0])
     if w is None or w.shape[1] % 16:
         return 0, 0
-    setattr(owner, attr, _pack(w, norm_weight))
+    setattr(owner, attr, _pack(w, norm.weight))
     return 1, _release(linear)
 
 
@@ -153,14 +161,12 @@ def bind_static_fp8(model: nn.Module) -> None:
         if isinstance(layer, PPMissingLayer):
             continue
         if isinstance(layer.mlp, KimiK3MoE):
-            bound, f = _bind_moe(
-                layer.mlp, layer.post_attention_layernorm.weight, parts
-            )
+            bound, f = _bind_moe(layer.mlp, layer.post_attention_layernorm, parts)
             for part in bound:
                 counts[part] += 1
             freed += f
         attn = layer.self_attn
-        norm = layer.input_layernorm.weight
+        norm = layer.input_layernorm
         if (
             "kda_qkvg" in parts
             and isinstance(attn, KimiK3DeltaAttention)
@@ -191,6 +197,26 @@ def bind_static_fp8(model: nn.Module) -> None:
         counts,
         freed / 2**20,
     )
+    unbound = sorted(part for part, n in counts.items() if n == 0)
+    if unbound:
+        logger.warning(
+            "SGLANG_TPU_K3_STATIC_FP8 selected %s, but no layer qualified "
+            "(quantized, wrong layout or a partial-width norm); they stay bf16.",
+            unbound,
+        )
+    if freed:
+        if static_fp8_gemv_pallas.enabled():
+            logger.info(
+                "Static fp8 GEMVs run the Pallas kernel for up to %d tokens; "
+                "larger calls (prefill, bigger decode or spec-verify batches) "
+                "use the XLA fp8 dot.",
+                static_fp8_gemv_pallas.MAX_TOKENS,
+            )
+        else:
+            logger.info(
+                "Static fp8 GEMVs use the XLA fp8 dot for every batch "
+                "(SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV=0)."
+            )
 
 
 __all__ = ["PARTS", "StaticFp8Weight", "bind_static_fp8", "selected_parts"]

@@ -13,8 +13,10 @@ Kimi-K3 serving run.
 """
 
 import unittest
+from unittest import mock
 
 import torch
+from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -197,6 +199,9 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_front,kda_qkvg"):
             self.assertEqual(selected_parts(), {"moe_front", "kda_qkvg"})
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all"):
+            # mla_qkv_a is not validated, so "all" leaves it out.
+            self.assertEqual(selected_parts(), PARTS - {"mla_qkv_a"})
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all,mla_qkv_a"):
             self.assertEqual(selected_parts(), PARTS)
         self.assertEqual(selected_parts(), frozenset())  # unset: everything bf16
 
@@ -206,6 +211,217 @@ class TestKimiK3StaticFp8Selector(CustomTestCase):
         with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_frnt"):
             with self.assertRaises(ValueError):
                 selected_parts()
+
+    def test_unknown_part_fails_at_startup(self):
+        """apply_server_args_defaults validates the selection before any load."""
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        with (
+            tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_frnt"),
+            mock.patch(
+                "sglang.srt.arg_groups.overrides.resolving_view",
+                side_effect=AssertionError("validation must come first"),
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                TpuSRTPlatform().apply_server_args_defaults(mock.Mock())
+
+
+class TestStaticFp8PallasGemvGate(CustomTestCase):
+    def _w(self, n):
+        return mock.Mock(weight=torch.zeros(1024, n))
+
+    def test_batches_up_to_the_padded_tile(self):
+        from sglang_tpu import static_fp8_gemv_pallas as g
+
+        x = lambda m: torch.zeros(m, 1024, dtype=torch.bfloat16)
+        with mock.patch.object(g, "_READY", True):
+            self.assertTrue(g.eligible(x(32), self._w(1536)))
+            self.assertFalse(g.eligible(x(33), self._w(1536)))
+            # An unpadded N keeps the XLA dot.
+            self.assertFalse(g.eligible(x(1), self._w(1500)))
+
+    def test_switch_off_leaves_the_op_unregistered(self):
+        from sglang_tpu import static_fp8_gemv_pallas as g
+
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.override(False),
+            mock.patch.object(g, "_READY", False),
+            mock.patch.object(g, "_build_op") as build,
+        ):
+            g.register()
+            self.assertFalse(g.enabled())
+        build.assert_not_called()
+
+
+H, LATENT, SHARED, QKVG, QKV_A = 256, 128, 128, 192, 96
+
+
+class _Norm(nn.Module):
+    def __init__(self, width, variance_size_override=None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.rand(width) + 0.5)
+        self.variance_size_override = variance_size_override
+
+
+def _linear(n, k, unquantized=True):
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    lin = nn.Module()
+    lin.quant_method = UnquantizedLinearMethod() if unquantized else object()
+    lin.input_size = k
+    lin.weight = nn.Parameter(torch.randn(n, k) * 0.02)  # [out, in]
+    return lin
+
+
+class _FakeMoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_latent_moe = True
+        self.moe_hidden_size = LATENT
+        self._shared_experts_tp_comm = False
+        self._sbo_shared_overlap = False
+        self._eligible_for_fused_front = False
+        self.routed_expert_down_proj = _linear(LATENT, H)
+        self.routed_expert_up_proj = _linear(H, LATENT)
+        self.routed_expert_norm = _Norm(LATENT)
+        self.shared_experts = nn.Module()
+        self.shared_experts.gate_up_proj = _linear(SHARED, H)
+        self._static_fp8_front = None
+        self._static_fp8_latent_up = None
+
+
+class _FakeKDA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_full_rank_gate = True
+        self.fused_qkvg_proj = _linear(QKVG, H)
+        self._static_fp8_qkvg = None
+
+
+class _FakeMLA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fused_qkv_a_proj_with_mqa = _linear(QKV_A, H)
+        self._static_fp8_qkv_a = None
+
+
+def _layer(attn):
+    layer = nn.Module()
+    layer.self_attn = attn
+    layer.mlp = _FakeMoE()
+    layer.input_layernorm = _Norm(H)
+    layer.post_attention_layernorm = _Norm(H)
+    return layer
+
+
+def _model(*layers):
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList(layers)
+    return model
+
+
+class TestKimiK3StaticFp8Binder(CustomTestCase):
+    """bind_static_fp8 on stand-in Kimi-K3 layers (the real classes are
+    patched to these fakes, so isinstance dispatch is the binder's own)."""
+
+    def setUp(self):
+        from sglang.srt.models import kimi_k3
+        from sglang_tpu import static_fp8_gemv_pallas
+
+        patches = [
+            mock.patch.object(kimi_k3, "KimiK3MoE", _FakeMoE),
+            mock.patch.object(kimi_k3, "KimiK3DeltaAttention", _FakeKDA),
+            mock.patch.object(kimi_k3, "KimiK3MLAAttention", _FakeMLA),
+            # No JAX on CPU: the binder would register the Pallas op here.
+            mock.patch.object(static_fp8_gemv_pallas, "register"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _bind(self, model, parts):
+        from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
+
+        with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override(parts):
+            bind_static_fp8(model)
+
+    def test_all_binds_validated_parts_and_releases_weights(self):
+        kda, mla = _layer(_FakeKDA()), _layer(_FakeMLA())
+        model = _model(kda, mla)
+        self._bind(model, "all")
+        for layer in (kda, mla):
+            moe = layer.mlp
+            self.assertIsNotNone(moe._static_fp8_front)
+            self.assertEqual(moe._static_fp8_front_split, [LATENT, SHARED])
+            self.assertIsNotNone(moe._static_fp8_latent_up)
+            self.assertEqual(moe.routed_expert_down_proj.weight.numel(), 0)
+            self.assertEqual(moe.shared_experts.gate_up_proj.weight.numel(), 0)
+            self.assertEqual(moe.routed_expert_up_proj.weight.numel(), 0)
+        self.assertIsNotNone(kda.self_attn._static_fp8_qkvg)
+        self.assertEqual(kda.self_attn.fused_qkvg_proj.weight.numel(), 0)
+        # "all" leaves mla_qkv_a in bf16.
+        self.assertIsNone(mla.self_attn._static_fp8_qkv_a)
+        self.assertEqual(
+            tuple(mla.self_attn.fused_qkv_a_proj_with_mqa.weight.shape), (QKV_A, H)
+        )
+        self.assertIn("Online weight updates", model._derived_weight_cache_error)
+
+    def test_bound_front_matches_the_bf16_gemv(self):
+        layer = _layer(_FakeKDA())
+        moe = layer.mlp
+        ref_w = torch.cat(
+            [moe.routed_expert_down_proj.weight, moe.shared_experts.gate_up_proj.weight]
+        ).detach()
+        self._bind(_model(layer), "moe_front")
+        x = torch.randn(3, H)
+        y = (
+            x
+            * torch.rsqrt(x.pow(2).mean(-1, keepdim=True))
+            * layer.post_attention_layernorm.weight
+        )
+        y = y.detach().to(torch.bfloat16)
+        ref = y.float() @ ref_w.t().float()
+        got = moe._static_fp8_front(y).float()
+        rel = (got - ref).norm() / ref.norm()
+        self.assertLess(float(rel), 0.06)
+
+    def test_second_bind_is_a_no_op(self):
+        layer = _layer(_FakeKDA())
+        model = _model(layer)
+        self._bind(model, "all")
+        bound = layer.mlp._static_fp8_front
+        self._bind(model, "all")
+        self.assertIs(layer.mlp._static_fp8_front, bound)
+
+    def test_skips(self):
+        from sglang.srt.layers.utils import PPMissingLayer
+
+        partial = _layer(_FakeKDA())
+        partial.post_attention_layernorm.variance_size_override = 64
+        partial.input_layernorm.variance_size_override = 64
+        quantized = _layer(_FakeKDA())
+        quantized.self_attn.fused_qkvg_proj = _linear(QKVG, H, unquantized=False)
+        transposed = _layer(_FakeKDA())
+        # [in, out] storage does not read a K-wide input as [out, in].
+        transposed.self_attn.fused_qkvg_proj.weight = nn.Parameter(torch.randn(H, QKVG))
+        model = _model(PPMissingLayer(), partial, quantized, transposed)
+        self._bind(model, "moe_front,kda_qkvg")
+        # A partial-width norm breaks the static bound: nothing it feeds binds.
+        self.assertIsNone(partial.mlp._static_fp8_front)
+        self.assertIsNone(partial.self_attn._static_fp8_qkvg)
+        self.assertIsNone(quantized.self_attn._static_fp8_qkvg)
+        self.assertIsNone(transposed.self_attn._static_fp8_qkvg)
+        # The MoE front of the other layers is unaffected.
+        self.assertIsNotNone(quantized.mlp._static_fp8_front)
+
+    def test_selection_with_no_qualifying_layer_warns(self):
+        layer = _layer(_FakeKDA())
+        layer.self_attn.use_full_rank_gate = False
+        with self.assertLogs("sglang_tpu.kimi_k3.static_fp8", "WARNING") as logs:
+            self._bind(_model(layer), "kda_qkvg")
+        self.assertIn("kda_qkvg", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

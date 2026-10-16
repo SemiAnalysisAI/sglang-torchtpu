@@ -19,10 +19,12 @@ from threading import Lock
 
 import torch
 
-# Decode-sized batches only; larger M keeps the XLA dot.
-MAX_TOKENS = 16
+from sglang_tpu.envs import envs as tpu_envs
+
 # One fp8 sublane tile; the activation is zero-padded to it.
 _ROWS = 32
+# Decode-sized batches only, up to the padded tile; larger M keeps the XLA dot.
+MAX_TOKENS = _ROWS
 _FP8_MAX = 448.0
 # Scoped VMEM the kernel may use: the double-buffered weight block dominates.
 _VMEM_LIMIT = 40 * 1024 * 1024
@@ -123,13 +125,21 @@ def _build_op():
 
 
 def register() -> None:
-    """Register the op; must run before torch.compile traces the model (the
-    static fp8 binder calls it post-load)."""
+    """Register the op when enabled; must run before torch.compile traces the
+    model (the static fp8 binder calls it post-load). Left unregistered, every
+    call keeps the XLA fp8 dot."""
     global _READY
+    if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
+        return
     with _LOCK:
         if not _OP:
             _OP.append(_build_op())
         _READY = True
+
+
+def enabled() -> bool:
+    """Whether the op is registered (the binder logs which path runs)."""
+    return _READY
 
 
 def eligible(x: torch.Tensor, w) -> bool:
@@ -138,6 +148,8 @@ def eligible(x: torch.Tensor, w) -> bool:
         and x.dim() == 2
         and 0 < x.shape[0] <= MAX_TOKENS
         and x.dtype == torch.bfloat16
+        # The binder pads N to a 128 multiple only when the op is registered.
+        and w.weight.shape[1] % 128 == 0
         and block_k(x.shape[1], w.weight.shape[1]) > 0
     )
 
