@@ -606,6 +606,79 @@ def _resolve_num_hidden_layers(server_args) -> int:
         return 0
 
 
+# Architectures whose vision encoder runs under Qwen3VLVisionTpuCompilePolicy.
+_QWEN3_VL_ARCHITECTURES = frozenset(
+    {"Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"}
+)
+
+
+def _vit_bucket_max_pixels(cfg) -> int | None:
+    """The image size cap that keeps every image inside the precompiled ViT.
+
+    None when the cap does not apply: no compiled ViT, not a Qwen3-VL model,
+    precompile disabled, or the user already chose an image size.
+    """
+    if not cfg.enable_torch_compile:
+        return None
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        hf_config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+        )
+    except Exception:
+        # An unloadable model fails later with its real error.
+        return None
+    if not set(hf_config.architectures or []) & _QWEN3_VL_ARCHITECTURES:
+        return None
+    image_config = (cfg.mm_process_config or {}).get("image", {})
+    if "max_pixels" in image_config or "size" in image_config:
+        return None
+    if envs.SGLANG_IMAGE_MAX_PIXELS.is_set():
+        return None
+    from sglang_tpu.graph_runner.vit_patch_buckets import env_patch_buckets
+
+    vision_config = hf_config.vision_config
+    buckets = env_patch_buckets(vision_config.spatial_merge_size)
+    if not buckets:
+        return None
+    # The image processor shrinks an image until height * width <= max_pixels,
+    # and each patch_size x patch_size square is one patch.
+    return max(buckets) * vision_config.patch_size**2
+
+
+def _apply_vit_max_pixels_default(server_args, cfg) -> None:
+    """Shrink images to the top precompiled ViT bucket instead of running them
+    uncompiled.
+
+    The default SGLANG_IMAGE_MAX_PIXELS admits ~50k patches against a 4,900
+    patch ladder, so a 1920x1080 image (8,160 patches) would otherwise take the
+    slower uncompiled fallback in VisionTpuCompilePolicy.run.
+    """
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    max_pixels = _vit_bucket_max_pixels(cfg)
+    if max_pixels is None:
+        return
+    mm_process_config = dict(cfg.mm_process_config or {})
+    mm_process_config["image"] = {
+        **mm_process_config.get("image", {}),
+        "max_pixels": max_pixels,
+    }
+    declare_resolution(
+        server_args,
+        "tpu.apply_server_args_defaults",
+        mm_process_config=mm_process_config,
+    )
+    logger.info(
+        "Capping images at %d pixels, the largest precompiled ViT bucket; set "
+        "max_pixels in --mm-process-config to change it.",
+        max_pixels,
+    )
+
+
 # The attention backend TPU decode context parallelism runs on.
 _DCP_ATTENTION_BACKEND = "pallas_tpu_rpa_batched"
 
@@ -967,6 +1040,7 @@ class TpuSRTPlatform(SRTPlatform):
         # After the page-size default: the DCP chunk check reads the page size.
         _validate_decode_context_parallel(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        _apply_vit_max_pixels_default(server_args, cfg)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods

@@ -540,6 +540,112 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
 
 
+class TestVitMaxPixelsDefault(CustomTestCase):
+    """Qwen3-VL images are capped at the top precompiled ViT bucket by default.
+
+    Past that bucket an image runs through the uncompiled ViT, which is slower.
+    """
+
+    _args = TestTpuPlatformServerDefaults._args
+    _apply = TestTpuPlatformServerDefaults._apply
+    _resolved = TestTpuPlatformServerDefaults._resolved
+
+    # Qwen3-VL: 16-pixel patches, 2x2 merge; the default ladder tops out at
+    # 70 x 70 = 4,900 patches.
+    TOP_BUCKET_MAX_PIXELS = 4900 * 16 * 16
+
+    def setUp(self):
+        super().setUp()
+        # Each test starts from the default ladder and the default pixel cap.
+        for field in (
+            envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES,
+            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES,
+            envs.SGLANG_IMAGE_MAX_PIXELS,
+        ):
+            override = field.override("1")
+            override.__enter__()
+            self.addCleanup(override.__exit__, None, None, None)
+            field.clear()
+
+    def _apply_vl(self, architecture="Qwen3VLForConditionalGeneration", **overrides):
+        fields = dict(
+            enable_torch_compile=True,
+            mm_process_config={},
+            model_path="model",
+            trust_remote_code=False,
+            revision=None,
+        )
+        fields.update(overrides)
+        args = self._args(**fields)
+        hf_config = SimpleNamespace(
+            architectures=[architecture],
+            vision_config=SimpleNamespace(patch_size=16, spatial_merge_size=2),
+        )
+        with patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ):
+            self._apply(args)
+        return self._resolved(args, "mm_process_config")
+
+    def test_qwen3_vl_images_are_capped_at_the_top_bucket(self):
+        # A 1920x1080 image is 8,160 patches; this cap shrinks it to fit.
+        for architecture in (
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                config = self._apply_vl(architecture=architecture)
+                self.assertEqual(
+                    config["image"]["max_pixels"], self.TOP_BUCKET_MAX_PIXELS
+                )
+
+    def test_cap_follows_the_precompile_env_vars(self):
+        # The ladder tops out at the largest square of the merge size under
+        # the cap: 32 x 32 = 1,024 for a cap of 1,100.
+        with envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1100):
+            config = self._apply_vl()
+        self.assertEqual(config["image"]["max_pixels"], 1024 * 16 * 16)
+
+        with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("256,1600"):
+            config = self._apply_vl()
+        self.assertEqual(config["image"]["max_pixels"], 1600 * 16 * 16)
+
+    def test_other_mm_settings_are_kept(self):
+        config = self._apply_vl(
+            mm_process_config={"image": {"min_pixels": 65536}, "video": {"fps": 2}}
+        )
+        self.assertEqual(
+            config,
+            {
+                "image": {
+                    "min_pixels": 65536,
+                    "max_pixels": self.TOP_BUCKET_MAX_PIXELS,
+                },
+                "video": {"fps": 2},
+            },
+        )
+
+    def test_an_explicit_image_size_wins(self):
+        for image_config in ({"max_pixels": 313600}, {"size": {"longest_edge": 1024}}):
+            with self.subTest(image_config=image_config):
+                config = self._apply_vl(mm_process_config={"image": image_config})
+                self.assertEqual(config, {"image": image_config})
+
+        with envs.SGLANG_IMAGE_MAX_PIXELS.override(4 * 1024 * 1024):
+            self.assertEqual(self._apply_vl(), {})
+
+    def test_no_cap_where_nothing_is_precompiled(self):
+        # Eager ViT, a model without the Qwen3-VL ViT policy, and precompile
+        # disabled all leave image sizes alone.
+        self.assertEqual(self._apply_vl(enable_torch_compile=False), {})
+        self.assertEqual(
+            self._apply_vl(architecture="Gemma4ForConditionalGeneration"), {}
+        )
+        with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override(""):
+            self.assertEqual(self._apply_vl(), {})
+
+
 class TestPrefillContextParallelValidation(CustomTestCase):
     """apply_server_args_defaults gates the prefill context-parallel path."""
 
