@@ -36,6 +36,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
 )
+from sglang_tpu.compilation.scoped_cache_guard import allow_tpu_recompilation
 from sglang_tpu.cp_forward import (
     cp_local_embeds,
     cp_token_inputs,
@@ -260,10 +261,7 @@ def _fit_pp_proxy_in_args(
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
     """Zero-pad a tensor along dim 0 to target_size."""
-    if t.shape[0] >= target_size:
-        return t
-    pad_rows = target_size - t.shape[0]
-    return F.pad(t, (0,) * (2 * (t.ndim - 1)) + (0, pad_rows))
+    return _pad_tensor(t, target_size)
 
 
 def _dp_attn_select_bucket_shape(
@@ -562,6 +560,12 @@ def _pad_tensor_on_host(
     return padded.to(t.device)
 
 
+@allow_tpu_recompilation
+def _pad_tensor_on_tpu(t: torch.Tensor, padding: tuple[int, ...]) -> torch.Tensor:
+    """Materialize only the pad whose shape depends on the request length."""
+    return F.pad(t, padding)
+
+
 def _pad_tensor(
     t: torch.Tensor, target_size: int, *, dim: int = 0, on_host: bool = False
 ) -> torch.Tensor:
@@ -572,6 +576,8 @@ def _pad_tensor(
         return _pad_tensor_on_host(t, target_size, dim=dim)
     dim = dim % t.ndim
     padding = (0,) * (2 * (t.ndim - dim - 1)) + (0, target_size - t.shape[dim])
+    if t.device.type == "tpu":
+        return _pad_tensor_on_tpu(t, padding)
     return F.pad(t, padding)
 
 

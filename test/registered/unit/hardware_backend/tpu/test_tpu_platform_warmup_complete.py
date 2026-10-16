@@ -34,8 +34,10 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
             envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(allow_spec_recompile),
             patch(f"{_TPU_MOD}.torch.compiler.set_stance") as set_stance,
             patch(f"{_CHECKER_MOD}.maybe_enable_site_tracing") as site_tracing,
+            patch(f"{_TPU_MOD}.arm_cache_guard") as native_guard,
         ):
             TpuSRTPlatform().on_warmup_complete()
+        native_guard.assert_called_once_with()
         site_tracing.assert_called_once_with()
         return set_stance
 
@@ -58,6 +60,13 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
         self._publish_args(speculative_algorithm=None)
         set_stance = self._warmup_complete(allow_spec_recompile=True)
         set_stance.assert_called_once_with("fail_on_recompile")
+
+    def test_native_guard_runs_without_dynamo(self):
+        override = get_context().override_server_args(enable_torch_compile=False)
+        override.install()
+        self.addCleanup(override.restore)
+        set_stance = self._warmup_complete(allow_spec_recompile=False)
+        set_stance.assert_not_called()
 
     def test_mode_b_inherits_the_override(self):
         self.assertIs(

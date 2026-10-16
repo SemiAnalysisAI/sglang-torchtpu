@@ -263,7 +263,8 @@ class SRTPlatform(DeviceMixin):
 
     def on_warmup_complete(self) -> None:
         """Called once on the scheduler thread, the first time it goes idle after
-        a forward (the server warmup request has drained). Platforms that
+        a forward (the server warmup request has drained), or before the event
+        loop when HTTP warmup is skipped. Platforms that
         compile ahead of serving freeze or monitor compilation here."""
         pass
 

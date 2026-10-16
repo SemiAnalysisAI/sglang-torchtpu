@@ -2047,6 +2047,9 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+        if self.server_args.skip_server_warmup:
+            current_platform.on_warmup_complete()
+            self.recompile_stance_set = True
 
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool. Set it

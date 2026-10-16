@@ -19,6 +19,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.scoped_cache_guard import arm_cache_guard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1285,12 +1286,14 @@ class TpuSRTPlatform(SRTPlatform):
         _register_models()
 
     def on_warmup_complete(self) -> None:
-        """Freeze torch.compile so serving-time recompiles raise."""
+        """Arm native admission and freeze torch.compile after warmup."""
         from sglang.srt.runtime_context import get_exec, get_spec
         from sglang_tpu.compilation.recompilation_checker import (
             maybe_enable_site_tracing,
         )
 
+        # Native admission also covers eager programs outside torch.compile.
+        arm_cache_guard()
         # Dispatch modes are thread-local; this runs on the scheduler thread.
         maybe_enable_site_tracing()
         if not get_exec().graph.enable_torch_compile:
