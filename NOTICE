@@ -34,8 +34,8 @@ Ragged paged attention, MLA attention, fused MoE kernels and tuned block-size
 tables under sglang_tpu/attention/pallas/ and sglang_tpu/moe/pallas/.
 
 -------------------------------------------------------------------------------
-torchtpu-vllm
-https://github.com/google-pytorch/torchtpu-vllm
+vllm-torchtpu
+https://github.com/vllm-project/vllm-torchtpu
 Copyright 2025-2026 Google LLC
 Licensed under the Apache License, Version 2.0
 
