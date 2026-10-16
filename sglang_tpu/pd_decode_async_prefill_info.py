@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Fetch PD prefill parallel info off the decode scheduler thread.
 
 Upstream ``DecodePreallocQueue._ensure_prefill_info`` calls

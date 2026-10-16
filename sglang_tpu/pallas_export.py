@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import inspect
 import threading
 from collections.abc import Callable

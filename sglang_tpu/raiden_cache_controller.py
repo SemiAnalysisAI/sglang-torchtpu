@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """HiCache controller for TPU, transferring KV via raiden instead of CUDA.
 
 ``HiCacheController`` drives KV transfers on device streams and CUDA events,

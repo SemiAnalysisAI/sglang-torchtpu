@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pallas fused-MoE kernels for the TPU torch_tpu platform.
 
 The ``gmm_v2`` kernel is vendored from sglang-jax (which adapts the upstream

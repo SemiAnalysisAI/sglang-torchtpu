@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Launch-time xprof capture, with no /start_profile call.
 
 With SGLANG_TPU_ENABLE_PROFILE_AUTO set, each scheduler arms the upstream

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.moe.pallas.sparse_core.dense_gather_reduce`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

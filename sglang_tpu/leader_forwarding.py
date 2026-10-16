@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Preserve the input leader's serving address after TPU rank normalization."""
 
 import logging

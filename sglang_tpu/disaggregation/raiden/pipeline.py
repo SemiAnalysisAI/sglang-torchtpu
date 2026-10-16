@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Layer-addressed Raiden transfers from a pipeline to DP, TP, or matching PP stages."""
 
 from __future__ import annotations

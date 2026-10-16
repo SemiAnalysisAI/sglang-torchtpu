@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Raiden-backed hybrid HiCache controller for TPU (full + SWA pools).
 
 Hybrid sliding-window models run under the unified cache with a

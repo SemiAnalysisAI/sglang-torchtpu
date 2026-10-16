@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """JAX pytree view of ``PPProxyTensors`` for the direct TPU tracer.
 
 ``direct_compile`` flattens every input and output with ``jax.tree_util``; the

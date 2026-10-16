@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Deferred call primitive shared by TPU compilation policies."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pallas scalar kernel for bs=1 decode MoE routing metadata.
 
 With one real token every routed row is the same activation, so the permute is a

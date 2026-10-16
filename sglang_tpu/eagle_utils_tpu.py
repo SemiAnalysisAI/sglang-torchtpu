@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU helpers for EAGLE verify trees and cache routing."""
 
 from __future__ import annotations

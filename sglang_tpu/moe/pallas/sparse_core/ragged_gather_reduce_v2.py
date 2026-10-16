@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tpu_inference/kernels/sparse_core/ragged_gather_reduce_v2.py @ 4367dcff1 (2026-07-19).
 # Local changes: a group continuing into the next row block is written only

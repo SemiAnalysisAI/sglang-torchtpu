@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """``tpu`` KV transfer backend for P/D disaggregation (host ZMQ-push).
 
 This is the **default** TPU backend. It reuses the device-agnostic control

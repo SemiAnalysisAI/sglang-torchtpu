@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.attention.pallas.batched_rpa.bref_override`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

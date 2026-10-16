@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Typed control and data headers for TPU disaggregated KV transfers."""
 
 from __future__ import annotations

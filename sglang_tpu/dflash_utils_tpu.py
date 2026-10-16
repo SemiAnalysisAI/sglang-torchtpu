@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU helpers shared by the DFlash-family draft loops (DFLASH, DSpark).
 
 Also hosts device-resident verify-block addressing. The host trails device

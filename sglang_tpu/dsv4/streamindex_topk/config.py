@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/config.py
 

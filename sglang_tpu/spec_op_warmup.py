@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Warm-up data recipes for compiled speculative-decoding helpers."""
 
 from __future__ import annotations

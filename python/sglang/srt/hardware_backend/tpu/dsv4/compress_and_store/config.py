@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.dsv4.compress_and_store.config`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

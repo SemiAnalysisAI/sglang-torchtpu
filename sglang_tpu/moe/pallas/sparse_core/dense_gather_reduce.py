@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tpu_inference/kernels/sparse_core/dense_gather_reduce.py @ 4367dcff1 (2026-07-19).
 

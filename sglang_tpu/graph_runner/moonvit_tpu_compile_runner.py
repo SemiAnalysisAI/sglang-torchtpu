@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """MoonViT (Kimi-K2.5) ViT encoder runner + policy for TPU ``torch.compile``.
 
 MoonViT diverges from Qwen3-VL's ViT (complex ``freqs_cis`` RoPE, a temporal-pool

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Join TPU warmups after every model runner has submitted its graph grid."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Emit one ``trace-event`` line to stdout per KV transfer phase (gather / push /
 # receive / scatter).
 """Lightweight Perfetto trace-event instrumentation for TPU P/D KV transfer.

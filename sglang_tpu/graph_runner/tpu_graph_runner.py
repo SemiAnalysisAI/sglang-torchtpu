@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU "graph runner": orchestrates annotated torch.compile boundaries.
 
 Unlike CudaGraphRunner / NPUGraphRunner there is no graph capture or

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from sglang_tpu.disaggregation.raiden.conn import (
     RaidenKVBootstrapServer,
     RaidenKVManager,

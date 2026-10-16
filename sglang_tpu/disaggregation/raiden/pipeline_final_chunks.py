@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Hand each request's KV on this pipeline stage to the Raiden pipeline transfer
 before the stage's result point.
 

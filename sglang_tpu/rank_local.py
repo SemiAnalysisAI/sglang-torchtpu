@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Source-level rank-local operations with an explicit direct-compile input.
 
 Outside a rank-parameterized trace these are ordinary slices of the caller's

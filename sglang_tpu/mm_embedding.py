@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Represent logical multimodal rows without slicing their physical buffers."""
 
 from __future__ import annotations

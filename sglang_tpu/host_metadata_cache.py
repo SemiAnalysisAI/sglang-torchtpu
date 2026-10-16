@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Host-to-device cache for read-only attention metadata."""
 
 from typing import Callable, Hashable

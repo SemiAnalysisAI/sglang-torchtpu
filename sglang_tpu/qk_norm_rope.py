@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Fused QK RMSNorm + RoPE as one TPU Pallas op.
 
 Consumes the raw bf16 QKV projection output and returns normed and rotated

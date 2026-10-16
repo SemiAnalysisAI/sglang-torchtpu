@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pallas kernels for the SGLang TPU attention backend.
 
 These kernels are vendored from sglang-jax (which adapts the upstream

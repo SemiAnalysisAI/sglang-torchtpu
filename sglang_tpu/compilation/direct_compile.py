@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Direct TorchTPU compilation without Dynamo or AOTAutograd."""
 
 from __future__ import annotations

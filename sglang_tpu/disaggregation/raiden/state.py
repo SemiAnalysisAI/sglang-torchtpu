@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Role-specific protocol state for the Raiden disaggregation backend.
 
 These records own no locks. Access remains protected by the manager's existing

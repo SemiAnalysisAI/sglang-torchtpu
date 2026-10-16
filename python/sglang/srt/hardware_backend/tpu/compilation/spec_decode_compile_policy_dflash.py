@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.compilation.spec_decode_compile_policy_dflash`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

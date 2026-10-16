@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pairing math for pulling a prefill chunk before the prefill finishes.
 
 The prefill announces its pages as each chunked-prefill step commits them, so

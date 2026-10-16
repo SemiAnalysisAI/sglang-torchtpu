@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.pd_decode_swa_hicache`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

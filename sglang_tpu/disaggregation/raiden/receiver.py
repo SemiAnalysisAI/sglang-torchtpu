@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Decode-side half of the raiden disaggregation backend.
 
 Everything the decode worker does: asking a prefill worker for a room, taking

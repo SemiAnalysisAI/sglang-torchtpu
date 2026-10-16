@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Framing and validation shared by TPU disaggregation transports."""
 
 from __future__ import annotations

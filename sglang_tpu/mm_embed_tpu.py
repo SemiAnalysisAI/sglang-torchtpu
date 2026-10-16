@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU multimodal row placement using host-built indices and masks."""
 
 from __future__ import annotations

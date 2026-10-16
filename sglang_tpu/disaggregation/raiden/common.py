@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Shared helpers for the raiden prefill/decode disaggregation backend.
 
 Holds what both sides of the transport need: the package logger, the port and

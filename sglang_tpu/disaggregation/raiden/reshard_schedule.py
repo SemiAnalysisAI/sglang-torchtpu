@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Strided KV resharding schedules for heterogeneous attention-TP disaggregation.
 
 When prefill attention-TP > decode attention-TP (e.g. 8TP prefill -> 4TP decode

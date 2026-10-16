@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU embedding scheduling that retains padded buffers through cache and chunks."""
 
 from __future__ import annotations

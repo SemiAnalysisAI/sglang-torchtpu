@@ -135,6 +135,12 @@ repos:
         entry: python3 tools/plugin/check_tpu_branches.py --files
         language: system
         files: ^python/sglang/.*\.py$
+      - id: check-spdx-headers
+        name: SPDX license header on TPU-owned Python files
+        # Scope lives in tools/plugin/check_spdx_headers.py; --fix inserts the header.
+        entry: python3 tools/plugin/check_spdx_headers.py --files
+        language: system
+        files: ^(sglang_tpu|python/sglang/srt/(hardware_backend/tpu|layers/attention/pallas|layers/moe/pallas|disaggregation/raiden))/.*\.py$
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'

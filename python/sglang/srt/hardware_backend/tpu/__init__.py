@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """SGLang TPU platform plugin via torch_tpu (PyTorch privateuse1 backend).
 
 Registered as a setuptools entry_point under ``sglang.srt.platforms``.

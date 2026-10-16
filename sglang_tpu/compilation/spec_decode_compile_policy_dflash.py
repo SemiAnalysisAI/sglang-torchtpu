@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """DFlash speculative-decoding TPU compile policy."""
 
 from __future__ import annotations

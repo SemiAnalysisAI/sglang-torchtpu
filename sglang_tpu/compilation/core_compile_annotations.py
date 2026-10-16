@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Compile policies the plugin attaches to core model classes.
 
 Core model modules must not import ``sglang_tpu`` (the ratchet in

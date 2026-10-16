@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pinned, aligned, reusable host staging buffers for TPU KV transfer (#1/#4).
 
 Why this exists

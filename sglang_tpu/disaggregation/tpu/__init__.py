@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU P/D disaggregation transfer backends.
 
 ``base`` holds the backend-agnostic control-plane scaffolding; ``conn`` is the

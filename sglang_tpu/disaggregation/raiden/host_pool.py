@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Sizing and admission control for raiden's host staging pool.
 
 A raiden engine reserves ``num_slots * max_blocks`` pages of pinned host memory

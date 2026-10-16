@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Bind shared attention rank state to explicit TPU direct-tracing inputs."""
 
 from contextlib import contextmanager

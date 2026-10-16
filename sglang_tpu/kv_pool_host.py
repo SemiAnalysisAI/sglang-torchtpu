@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Host-side KV pool for TPU HiCache, backed by raiden's DMA-pinned pool.
 
 ``MHATokenToKVPoolHost`` (the CUDA host pool) allocates split ``[layer, token,

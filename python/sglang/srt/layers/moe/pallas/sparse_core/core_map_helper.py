@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.moe.pallas.sparse_core.core_map_helper`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

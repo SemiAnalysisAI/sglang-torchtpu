@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Raiden-backed TPU<->host KV transfer substrate for HiCache.
 
 torch_tpu has no real streams and no pinned host memory, so the CUDA HiCache

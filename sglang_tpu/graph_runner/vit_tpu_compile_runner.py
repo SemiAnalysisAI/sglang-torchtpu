@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """ViT TPU compile runner with explicit patch-bucket padding."""
 
 from __future__ import annotations

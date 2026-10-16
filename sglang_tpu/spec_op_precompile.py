@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Decorator-driven precompile for fixed-shape TPU Spec V2 helper ops."""
 
 from __future__ import annotations

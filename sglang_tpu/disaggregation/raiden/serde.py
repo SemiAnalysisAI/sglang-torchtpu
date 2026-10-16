@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Raiden wire messages and auxiliary-buffer serialization.
 
 Each typed Raiden message uses the shared ``[TAG, JSON payload]`` framing.

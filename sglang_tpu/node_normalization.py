@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Normalize TPU node order before the existing Engine launches its workers.
 
 Host ranks, the rendezvous leader, and SliceBuilder endpoints follow physical

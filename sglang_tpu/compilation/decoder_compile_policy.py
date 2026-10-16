@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU decoder compile policies for annotation-driven torch.compile."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Vendored from sglang-jax
 #   python/sgl_jax/srt/kernels/gmm/megablox_gmm_kernel/tuned_block_sizes.py
 # Copyright 2026 Google LLC

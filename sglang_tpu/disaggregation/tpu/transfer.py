@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU KV-cache page transfer primitives for P/D disaggregation.
 
 This module is the *device-specific data plane* for the ``tpu`` transfer

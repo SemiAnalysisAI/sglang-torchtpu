@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm-project/tpu-inference, the megablox gmm_v2 kernel's
 # activation/alignment helpers (``swigluoai`` and ``align_to``):
 #   https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm_v2.py

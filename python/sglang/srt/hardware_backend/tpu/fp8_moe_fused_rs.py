@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Moved to :mod:`sglang_tpu.fp8_moe_fused_rs`; alias kept for in-flight branches, delete once they merge."""
 
 import importlib

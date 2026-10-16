@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Power-of-two row buckets for eager TPU programs.
 
 An eager op compiles once per argument shape, so a batch draining one request

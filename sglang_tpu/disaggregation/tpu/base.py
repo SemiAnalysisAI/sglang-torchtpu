@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Backend-agnostic control-plane base classes for TPU P/D disaggregation.
 
 The TPU disaggregation backends all share one control plane — the

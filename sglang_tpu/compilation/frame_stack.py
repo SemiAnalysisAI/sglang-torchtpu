@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Reduce warmup tracing overhead from CPython 3.12 frame-stack allocation.
 
 Frequent calls at a stack-chunk boundary repeatedly allocate and free memory

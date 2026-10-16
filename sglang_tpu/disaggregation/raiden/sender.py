@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Prefill-side half of the raiden disaggregation backend.
 
 Everything the prefill worker does: answering a decode worker's pull request,

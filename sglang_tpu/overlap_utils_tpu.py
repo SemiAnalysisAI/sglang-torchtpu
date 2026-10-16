@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU device acceptance and FutureMap gather operations."""
 
 from __future__ import annotations

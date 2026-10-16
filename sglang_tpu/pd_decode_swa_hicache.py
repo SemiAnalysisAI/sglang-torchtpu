@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """PD decode prefix cache with host-RAM offload for sliding-window models.
 
 Upstream keeps the PD decode prefix cache of sliding-window models such as

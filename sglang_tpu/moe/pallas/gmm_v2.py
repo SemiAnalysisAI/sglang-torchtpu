@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Uses the latest torchtpu-vllm gmm_v2 kernel
 #   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
