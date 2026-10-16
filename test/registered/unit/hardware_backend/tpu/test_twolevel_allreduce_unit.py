@@ -113,11 +113,12 @@ class TestRegistration(CustomTestCase):
     def test_off_by_default(self):
         self._register(False).assert_not_called()
 
-    def test_measured_topology_registers(self):
+    def test_measured_topologies_register(self):
         self._register(True).assert_called_once_with(32, 8)
+        self._register(True, world=8, nnodes=1).assert_called_once_with(8, 8)
 
     def test_unmeasured_topologies_keep_xla(self):
-        for world, nnodes in ((8, 1), (64, 8), (16, 2)):
+        for world, nnodes in ((64, 8), (16, 2), (4, 1)):
             with self.subTest(world=world, nnodes=nnodes):
                 with self.assertLogs(tl.logger, "WARNING"):
                     reg = self._register(True, world=world, nnodes=nnodes)

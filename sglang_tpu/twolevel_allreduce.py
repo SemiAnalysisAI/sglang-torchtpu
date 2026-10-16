@@ -183,10 +183,13 @@ def _build(world: int, local: int, n: int):
 
 
 # (hosts, ranks per host) the kernel has been measured on and beats XLA's
-# all-reduce: tpu7x 2x2x4, TP32 = 4 hosts x 8 ranks. A one-shot phase with more
-# peers approaches the flat one-shot that measured slower than XLA, so other
-# shapes keep XLA's all-reduce until they are measured.
-VALIDATED_TOPOLOGIES = frozenset({(4, 8)})
+# all-reduce, bf16 [1, 7168]:
+# - tpu7x 2x2x4, TP32 = 4 hosts x 8 ranks: 13.0 vs 21.0 us;
+# - one tpu7x host, TP8 = 1 host x 8 ranks (host-local phase only): 10.2 vs
+#   15.0 us.
+# A one-shot phase with more peers approaches the flat one-shot that measured
+# slower than XLA, so other shapes keep XLA's all-reduce until measured.
+VALIDATED_TOPOLOGIES = frozenset({(4, 8), (1, 8)})
 
 
 def local_size(world: int, nnodes: int) -> int:
