@@ -37,6 +37,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang_tpu.compilation.warmup_queue import collect_warmups
+from sglang_tpu.graph_runner import tpu_graph_runner
 from sglang_tpu.graph_runner.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
@@ -557,6 +558,37 @@ class TestTpuGraphRunner(CustomTestCase):
             self.assertTrue(vision_module.precompiled)
         self.assertEqual(events, ["cache-key", "install", "precompile"] * 2)
         self.mock_compile.assert_not_called()
+
+    def test_warns_when_only_non_decoder_policies_install(self):
+        # A vision-only annotation skips the whole-model fallback, so the
+        # decoder runs eager; the runner must say so instead of staying silent.
+        class _VisionPolicy(CompilePolicy):
+            platform = "tpu"
+
+            def install(self) -> bool:
+                return True
+
+            def precompile(self) -> None:
+                pass
+
+        class _VisionModule:
+            def forward(self):
+                pass
+
+        support_torch_compile(_VisionModule, policy=_VisionPolicy)
+        model = _model_with()
+        model.modules = lambda: (model, _VisionModule())
+        with self.assertLogs(tpu_graph_runner.logger, level="WARNING") as logs:
+            TpuGraphRunner(self._runner_for(model))
+        self.assertTrue(
+            any("decode steps run eager" in line for line in logs.output), logs.output
+        )
+        self.mock_compile.assert_not_called()
+
+    def test_decoder_policy_install_does_not_warn(self):
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with self.assertNoLogs(tpu_graph_runner.logger, level="WARNING"):
+            TpuGraphRunner(self._runner_for(model))
 
     def test_invalid_assignment_prevents_compilation(self):
         self.mock_cache_key.side_effect = RuntimeError("Invalid TPU rank assignment")
