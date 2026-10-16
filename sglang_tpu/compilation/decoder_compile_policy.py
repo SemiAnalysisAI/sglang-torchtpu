@@ -2478,3 +2478,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 # Kimi-K3's multimodal wrapper compiles its language model with the Qwen3-VL
 # policy unchanged.
 KimiK3VLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy
+
+# Bailing/Ling-3's multimodal wrapper does the same; with no deepstack layers
+# the extend warmup stays on the single "text_only" input_embeds variant.
+BailingVLDecoderTpuCompilePolicy = Qwen3VLDecoderTpuCompilePolicy

@@ -41,7 +41,7 @@ from sglang.srt.models.bailing_moe_v3 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_tpu
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,13 @@ _NON_TEXT_PREFIX_MAPPING = (
 
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
     """Bailing MoE V3 language model with Qwen3 vision encoding."""
+
+    # Decode / verify embed inside the compiled language model instead of
+    # an eager general_mm_embed_routine in front of it; prefill keeps the
+    # routine, routing both image and text extends onto the policy-warmed
+    # input_embeds face (the Qwen3-VL boundary -- the text_ids warmup bakes
+    # 1D positions, so a direct mrope-shaped call cannot reuse it).
+    decode_embeds_in_language_model: bool = _is_tpu
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -128,6 +135,31 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         self.is_mrope_enabled = "mrope_section" in text_config.rope_parameters
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+
+        # Compile the language model with its logits processor; the vision
+        # tower and the multimodal embed merge stay eager. The whole-model
+        # fallback fires only when nothing installs, and the vision tower's
+        # class-level annotation already counts -- so the wrapper attaches.
+        if _is_tpu:
+            graph = get_exec().graph
+            if graph.enable_torch_compile and (
+                graph.tpu_compile_tracer == "direct" or get_parallel().pp_size > 1
+            ):
+                # Fail before the weight load: the shared VL policy has no
+                # later-stage warmup and no input_ids-only direct-tracer key.
+                raise ValueError(
+                    "Bailing/Ling-3's multimodal model does not support "
+                    "pipeline parallelism or --tpu-compile-tracer direct "
+                    "with --enable-torch-compile on TPU yet."
+                )
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                BailingVLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(self.model, policy=BailingVLDecoderTpuCompilePolicy)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -241,6 +273,15 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         del input_embeds, get_embedding
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
+        if self.decode_embeds_in_language_model and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Embed in-graph: the compile policy warms decode, verify and
+            # text-only extend as input_ids calls without input_embeds.
+            return self.model(
+                input_ids, positions, forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
