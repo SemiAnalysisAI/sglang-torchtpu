@@ -126,10 +126,6 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
-            patch(
-                "sglang_tpu.moe.router_topk_tpu.register_router_topk_op",
-                side_effect=lambda: calls.append(("router_topk", None)),
-            ),
         ):
             self.platform.init_backend()
 
@@ -144,8 +140,6 @@ class TestTpuPlatformInitialization(CustomTestCase):
                 ),
                 ("cache_key", "--xla_user=1 --xla_override=0"),
                 ("patch", None),
-                # Pallas ops register after torch_tpu is up, before any model.
-                ("router_topk", None),
             ],
         )
 
