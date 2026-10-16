@@ -18,9 +18,14 @@ try:
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 
-# Scaled-down Kimi-K3 shape: EP4, 16 local of 64 experts, top-8, SiTU.
+# Scaled-down Kimi-K3 shape: EP4, 16 local of 64 experts, top-8, SiTU. Not a
+# validated MoE, so these cases force validated() to exercise the kernel math.
 H, N, LOCAL, GLOBAL, K = 512, 256, 16, 64, 8
 ACT = "situ:4.0:25.0"
+# Kimi-K3's validated MoE: latent 3584, intermediate 3072 / 4 per rank (TP32),
+# top-16 of 896. 16 local experts instead of EP8's 112 keep the test small; the
+# gate and the expert offsets do not depend on the local count.
+K3_H, K3_N, K3_LOCAL, K3_GLOBAL, K3_K = 3584, 768, 16, 896, 16
 
 
 def _weights(h, n, local, seed=0):
@@ -62,6 +67,7 @@ class TestSingleTokenMoe(CustomTestCase):
         x=None,
         num_global=GLOBAL,
         threshold=512,
+        force_validated=True,
     ):
         """_fused_moe_jax output, and whether the fused kernel ran."""
         from sglang_tpu.envs import envs as tpu_envs
@@ -80,6 +86,11 @@ class TestSingleTokenMoe(CustomTestCase):
                 "single_token_moe",
                 wraps=single_token_moe.single_token_moe,
             ) as spy,
+            mock.patch.object(
+                single_token_moe,
+                "validated",
+                (lambda *a: True) if force_validated else single_token_moe.validated,
+            ),
         ):
             out = jax.jit(
                 lambda: _fused_moe_jax(
@@ -126,6 +137,44 @@ class TestSingleTokenMoe(CustomTestCase):
         """The kernel reads topk_ids directly, so it also runs with the default
         threshold of 0 (argsort permute on the general path)."""
         self._check(np.arange(K) + 16, 16, "threshold=0", threshold=0)
+
+    def test_unvalidated_moe_keeps_gmm_path(self):
+        """Only VALIDATED_MOE takes the kernel; this scaled-down MoE does not."""
+        _, ran = self._run(np.arange(K) + 16, 16, kernel_on=True, force_validated=False)
+        self.assertFalse(ran)
+
+    def test_kimi_k3_shape(self):
+        """The validated Kimi-K3 MoE takes the kernel and matches gmm_v2."""
+        offset = K3_LOCAL * 2  # this rank owns experts 32..47
+        rng = np.random.default_rng(3)
+        remote = np.setdiff1d(
+            np.arange(K3_GLOBAL), np.arange(offset, offset + K3_LOCAL)
+        )
+        # 4 local hits among the 16, the rest on other ranks.
+        ids = np.r_[
+            offset + rng.choice(K3_LOCAL, 4, replace=False),
+            rng.choice(remote, K3_K - 4, replace=False),
+        ]
+        self._check(
+            rng.permutation(ids),
+            offset,
+            "Kimi-K3 TP32/EP8",
+            weights=_weights(K3_H, K3_N, K3_LOCAL, seed=3),
+            x=_x(K3_H),
+            num_global=K3_GLOBAL,
+            force_validated=False,
+        )
+
+    def test_validated_gate(self):
+        from sglang_tpu.moe.pallas.single_token_moe import validated
+
+        for n in (3072, 1536, 768, 384):  # any TP split of the intermediate
+            self.assertTrue(validated(3584, n, 896, 16, "situ:4.0:25.0"))
+        self.assertFalse(validated(3584, 768, 384, 16, "situ:4.0:25.0"))  # experts
+        self.assertFalse(validated(3584, 768, 896, 8, "situ:4.0:25.0"))  # top-k
+        self.assertFalse(validated(3584, 768, 896, 16, "silu"))  # activation
+        self.assertFalse(validated(7168, 768, 896, 16, "situ:4.0:25.0"))  # width
+        self.assertFalse(validated(3584, 1000, 896, 16, "situ:4.0:25.0"))  # not a split
 
     def test_multiple_intermediate_tiles(self):
         # N=1536 -> two 768-wide tiles; N=640 -> five 128-wide tiles.

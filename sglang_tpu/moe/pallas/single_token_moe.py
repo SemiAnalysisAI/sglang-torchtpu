@@ -150,6 +150,28 @@ def _kernel(
     o_ref[...] = acc_ref[...].astype(o_ref.dtype)
 
 
+# MoE configurations validated against the gmm_v2 path and in serving, as
+# (expert input width K, full expert intermediate, global experts, top-k,
+# activation). Kimi-K3: latent 3584, intermediate 3072, top-16 of 896, SiTU.
+# The kernel's own constraints (eligible below) are generic; this keeps other
+# packed-MXFP4 MoEs on the gmm_v2 path until they are measured.
+VALIDATED_MOE = frozenset({(3584, 3072, 896, 16, "situ")})
+
+
+def validated(k_dim, n, global_num_experts, topk, activation_name) -> bool:
+    """True if this MoE is one of VALIDATED_MOE. ``n`` is this rank's
+    intermediate width, so any TP split of a validated intermediate matches."""
+    act = activation_name.split(":", 1)[0]
+    return any(
+        k_dim == vk
+        and vn % n == 0
+        and global_num_experts == ve
+        and topk == vt
+        and act == va
+        for vk, vn, ve, vt, va in VALIDATED_MOE
+    )
+
+
 def eligible(
     hidden_states,
     w1,

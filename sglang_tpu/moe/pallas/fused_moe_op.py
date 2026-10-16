@@ -522,8 +522,16 @@ def _fused_moe_jax(
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import single_token_moe
 
-        if tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get() and (
-            single_token_moe.eligible(
+        if (
+            tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get()
+            and single_token_moe.validated(
+                hidden_size,
+                w1.shape[2] // 2,
+                global_num_experts or num_experts,
+                topk,
+                activation_name,
+            )
+            and single_token_moe.eligible(
                 hidden_states,
                 w1,
                 w2,
