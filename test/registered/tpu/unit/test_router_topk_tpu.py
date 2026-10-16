@@ -43,7 +43,10 @@ class TestRouterTopk(CustomTestCase):
             (1, 896, 16, True, 2.5, jnp.bfloat16),
             (4, 896, 16, True, 1.0, jnp.bfloat16),
             (16, 256, 8, False, 1.0, jnp.bfloat16),
+            # f32 logits: the sigmoid stays in f32, as it would with an f32 router.
+            (1, 896, 16, True, 2.5, jnp.float32),
             (2, 896, 16, True, 1.0, jnp.float32),
+            (64, 896, 16, True, 2.5, jnp.float32),
         ):
             logits = jnp.asarray(rng.standard_normal((tokens, experts)), dtype)
             bias = rng.standard_normal(experts).astype(np.float32) * 0.1
@@ -63,6 +66,25 @@ class TestRouterTopk(CustomTestCase):
             self.assertEqual(set(got), set(want), f"{tokens=} {experts=} {k=}")
             for key, x in want.items():
                 self.assertAlmostEqual(got[key], x, delta=1e-6 * max(1.0, abs(x)))
+
+    def test_f32_ties_pick_the_lowest_ids(self):
+        """f32 logits quantized to a few values, so many scores tie exactly: the
+        kernel picks the lowest expert ids among ties, as a stable sort does."""
+        from sglang_tpu.moe.router_topk_tpu import router_topk_jax
+
+        rng = np.random.default_rng(1)
+        for tokens in (1, 8):
+            logits = np.round(rng.standard_normal((tokens, 896)) * 2) / 2
+            logits = jnp.asarray(logits, jnp.float32)
+            bias = np.zeros(896, np.float32)  # keep the ties in the biased choice
+            w, ids = router_topk_jax(logits, jnp.asarray(bias), 16, True, EPS, 2.5)
+            want_w, want_ids = _reference(logits, bias, 16, True, 2.5)
+            np.testing.assert_array_equal(
+                np.sort(np.asarray(ids), -1), np.sort(want_ids, -1)
+            )
+            np.testing.assert_allclose(
+                np.sort(np.asarray(w), -1), np.sort(want_w, -1), rtol=1e-6
+            )
 
 
 if __name__ == "__main__":
