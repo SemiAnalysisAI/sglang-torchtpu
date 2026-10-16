@@ -16,6 +16,10 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+    FrozenKVMTPDraftWorker,
+    FrozenKVMTPWorkerV2,
+)
 from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleDraftWorker,
     MultiLayerEagleWorkerV2,
@@ -99,7 +103,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
         self.allocator = TokenToKVPoolAllocator(
             POOL_SIZE, torch.float32, "cpu", self.target, need_sort=False
         )
-        self._alloc_draft_pools()
+        self.draft_kv_pools = self._alloc_draft_pools().retraction_draft_kv_pools
 
         seqlen = PROMPT_LEN + DECODED
         self.req = Req(
@@ -122,7 +126,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
             _seed(draft, self.old, base=9.0 + 100 * step)
             self.drafts_before.append(_snapshot(draft, self.old))
 
-    def _alloc_draft_pools(self) -> None:
+    def _alloc_draft_pools(self) -> EAGLEWorkerV2:
         """Attach the draft pool through EAGLEWorkerV2.alloc_memory_pool, as the
         scheduler does: the draft worker shares the target allocator."""
         draft_tp_worker = SimpleNamespace(
@@ -141,6 +145,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
             worker.alloc_memory_pool(
                 req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
             )
+        return worker
 
     def _retract_and_resume(self) -> None:
         """retract_decode's release_req, slot reuse, then the resume path's
@@ -158,7 +163,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
             },
         )
         batch.hisparse_coordinator = None
-        self.assertTrue(batch.release_req(0, 0))
+        self.assertTrue(batch.release_req(0, 0, draft_kv_pools=self.draft_kv_pools))
 
         _poison(self.target)
         for draft in self.drafts:
@@ -194,7 +199,7 @@ class TestPdEagleRetractionDraftState(CustomTestCase):
 class TestPdMultiLayerEagleRetractionDraftState(TestPdEagleRetractionDraftState):
     NUM_DRAFT_POOLS = 2
 
-    def _alloc_draft_pools(self) -> None:
+    def _alloc_draft_pools(self) -> MultiLayerEagleWorkerV2:
         """Attach one draft pool per step through
         MultiLayerEagleWorkerV2.alloc_memory_pool."""
         draft_worker = object.__new__(MultiLayerEagleDraftWorker)
@@ -211,6 +216,16 @@ class TestPdMultiLayerEagleRetractionDraftState(TestPdEagleRetractionDraftState)
             worker.alloc_memory_pool(
                 req_to_token_pool=Mock(), token_to_kv_pool_allocator=self.allocator
             )
+        return worker
+
+
+class TestFrozenKVMTPCarriesNoDraftKV(CustomTestCase):
+    def test_frozen_kv_mtp_carries_no_draft_kv(self):
+        """FrozenKV MTP subclasses the EAGLE workers but reads the target KV; its
+        64-token dummy draft pool cannot be indexed by the target's token ids."""
+        worker = object.__new__(FrozenKVMTPWorkerV2)
+        worker._draft_worker = object.__new__(FrozenKVMTPDraftWorker)
+        self.assertEqual(worker.retraction_draft_kv_pools, ())
 
 
 if __name__ == "__main__":

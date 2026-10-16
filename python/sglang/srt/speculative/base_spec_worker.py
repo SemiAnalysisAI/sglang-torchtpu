@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_sch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -56,6 +57,8 @@ def _can_pack_hicache_mtp(
 
 
 class EagleDraftWorkerBase(ABC):
+    # Draft pools CPU retraction carries with the target KV; set at allocation.
+    retraction_draft_kv_pools: tuple[KVCache, ...] = ()
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
@@ -103,16 +106,13 @@ class EagleDraftWorkerBase(ABC):
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def _register_draft_kv_pools(self, token_to_kv_pool_allocator) -> None:
-        """Let CPU retraction carry each step's draft KV, which is indexed by the
-        target allocator's token ids."""
+    def _carriable_draft_kv_pools(self) -> tuple[KVCache, ...]:
+        """Each step's draft pool, indexed by the target allocator's token ids."""
         # MHA and SWA only: the paged TPU MLA pools have no CPU copy.
-        token_to_kv_pool_allocator.register_draft_kv_pools(
-            tuple(
-                runner.token_to_kv_pool
-                for runner in self.draft_runners
-                if isinstance(runner.token_to_kv_pool, (MHATokenToKVPool, SWAKVPool))
-            )
+        return tuple(
+            runner.token_to_kv_pool
+            for runner in self.draft_runners
+            if isinstance(runner.token_to_kv_pool, (MHATokenToKVPool, SWAKVPool))
         )
 
     def init_attention_backends(self):
@@ -191,6 +191,13 @@ class BaseSpecWorker(ABC):
         if spec_algorithm.is_dflash_family():
             return (draft_worker.model_runner,)
         return tuple(draft_worker.draft_runners)
+
+    @property
+    def retraction_draft_kv_pools(self) -> tuple[KVCache, ...]:
+        draft_worker = self.draft_worker
+        if isinstance(draft_worker, EagleDraftWorkerBase):
+            return draft_worker.retraction_draft_kv_pools
+        return ()
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
