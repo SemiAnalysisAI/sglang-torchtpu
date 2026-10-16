@@ -517,17 +517,20 @@ def _fused_moe_jax(
     # streams only the hit experts (single_token_moe.py) replaces route
     # metadata + two gmm_v2 calls + activation + combine.
     if m == 1 and not no_combine and permute_dense_threshold > topk:
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import single_token_moe
 
-        if single_token_moe.eligible(
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            w1_channel_scale,
-            w2_channel_scale,
+        if tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get() and (
+            single_token_moe.eligible(
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                w1_channel_scale,
+                w2_channel_scale,
+            )
         ):
             return single_token_moe.single_token_moe(
                 hidden_states,
