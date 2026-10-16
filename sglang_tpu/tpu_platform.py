@@ -612,8 +612,31 @@ _QWEN3_VL_ARCHITECTURES = frozenset(
 )
 
 
-def _vit_bucket_max_pixels(cfg) -> int | None:
-    """The image size cap that keeps every image inside the precompiled ViT.
+def _processor_min_pixels(cfg) -> int | None:
+    """The image processor's own minimum image size, from preprocessor_config.json."""
+    try:
+        from transformers.utils import cached_file
+
+        path = cached_file(
+            cfg.model_path,
+            "preprocessor_config.json",
+            revision=cfg.revision,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if path is None:
+            return None
+        with open(path) as f:
+            processor_config = json.load(f)
+    except Exception:
+        return None
+    return processor_config.get("size", {}).get(
+        "shortest_edge"
+    ) or processor_config.get("min_pixels")
+
+
+def _vit_bucket_image_size(cfg) -> dict | None:
+    """The image processor ``size`` that keeps every image inside the
+    precompiled ViT, as ``{"longest_edge": max pixels, "shortest_edge": min}``.
 
     None when the cap does not apply: no compiled ViT, not a Qwen3-VL model,
     precompile disabled, or the user already chose an image size.
@@ -644,9 +667,15 @@ def _vit_bucket_max_pixels(cfg) -> int | None:
     buckets = env_patch_buckets(vision_config.spatial_merge_size)
     if not buckets:
         return None
-    # The image processor shrinks an image until height * width <= max_pixels,
+    min_pixels = image_config.get("min_pixels") or _processor_min_pixels(cfg)
+    if not min_pixels:
+        return None
+    # The image processor shrinks an image until height * width <= longest_edge,
     # and each patch_size x patch_size square is one patch.
-    return max(buckets) * vision_config.patch_size**2
+    return {
+        "longest_edge": max(buckets) * vision_config.patch_size**2,
+        "shortest_edge": min_pixels,
+    }
 
 
 def _apply_vit_max_pixels_default(server_args, cfg) -> None:
@@ -656,26 +685,26 @@ def _apply_vit_max_pixels_default(server_args, cfg) -> None:
     The default SGLANG_IMAGE_MAX_PIXELS admits ~50k patches against a 4,900
     patch ladder, so a 1920x1080 image (8,160 patches) would otherwise take the
     slower uncompiled fallback in VisionTpuCompilePolicy.run.
+
+    This sets the processor's ``size`` rather than ``max_pixels``: the pinned
+    transformers (5.8) ignores ``max_pixels`` passed at call time.
     """
     from sglang.srt.arg_groups.overrides import declare_resolution
 
-    max_pixels = _vit_bucket_max_pixels(cfg)
-    if max_pixels is None:
+    size = _vit_bucket_image_size(cfg)
+    if size is None:
         return
     mm_process_config = dict(cfg.mm_process_config or {})
-    mm_process_config["image"] = {
-        **mm_process_config.get("image", {}),
-        "max_pixels": max_pixels,
-    }
+    mm_process_config["image"] = {**mm_process_config.get("image", {}), "size": size}
     declare_resolution(
         server_args,
         "tpu.apply_server_args_defaults",
         mm_process_config=mm_process_config,
     )
     logger.info(
-        "Capping images at %d pixels, the largest precompiled ViT bucket; set "
-        "max_pixels in --mm-process-config to change it.",
-        max_pixels,
+        "Capping images at %d pixels, the largest precompiled ViT bucket; set an "
+        "image size in --mm-process-config to change it.",
+        size["longest_edge"],
     )
 
 

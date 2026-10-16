@@ -551,8 +551,10 @@ class TestVitMaxPixelsDefault(CustomTestCase):
     _resolved = TestTpuPlatformServerDefaults._resolved
 
     # Qwen3-VL: 16-pixel patches, 2x2 merge; the default ladder tops out at
-    # 70 x 70 = 4,900 patches.
-    TOP_BUCKET_MAX_PIXELS = 4900 * 16 * 16
+    # 70 x 70 = 4,900 patches. Its preprocessor_config.json minimum is 65,536.
+    TOP_BUCKET_PIXELS = 4900 * 16 * 16
+    PROCESSOR_MIN_PIXELS = 65536
+    DEFAULT_SIZE = {"longest_edge": TOP_BUCKET_PIXELS, "shortest_edge": 65536}
 
     def setUp(self):
         super().setUp()
@@ -567,7 +569,12 @@ class TestVitMaxPixelsDefault(CustomTestCase):
             self.addCleanup(override.__exit__, None, None, None)
             field.clear()
 
-    def _apply_vl(self, architecture="Qwen3VLForConditionalGeneration", **overrides):
+    def _apply_vl(
+        self,
+        architecture="Qwen3VLForConditionalGeneration",
+        processor_min_pixels=PROCESSOR_MIN_PIXELS,
+        **overrides,
+    ):
         fields = dict(
             enable_torch_compile=True,
             mm_process_config={},
@@ -581,9 +588,15 @@ class TestVitMaxPixelsDefault(CustomTestCase):
             architectures=[architecture],
             vision_config=SimpleNamespace(patch_size=16, spatial_merge_size=2),
         )
-        with patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
-            return_value=hf_config,
+        with (
+            patch(
+                "sglang.srt.utils.hf_transformers.config.get_config",
+                return_value=hf_config,
+            ),
+            patch(
+                "sglang_tpu.tpu_platform._processor_min_pixels",
+                return_value=processor_min_pixels,
+            ),
         ):
             self._apply(args)
         return self._resolved(args, "mm_process_config")
@@ -596,34 +609,36 @@ class TestVitMaxPixelsDefault(CustomTestCase):
         ):
             with self.subTest(architecture=architecture):
                 config = self._apply_vl(architecture=architecture)
-                self.assertEqual(
-                    config["image"]["max_pixels"], self.TOP_BUCKET_MAX_PIXELS
-                )
+                self.assertEqual(config, {"image": {"size": self.DEFAULT_SIZE}})
+
+    def test_cap_is_a_processor_size_not_max_pixels(self):
+        # The pinned transformers (5.8) ignores max_pixels at call time; only a
+        # size dict with both edges shrinks the image.
+        image_config = self._apply_vl()["image"]
+        self.assertNotIn("max_pixels", image_config)
+        self.assertEqual(set(image_config["size"]), {"longest_edge", "shortest_edge"})
 
     def test_cap_follows_the_precompile_env_vars(self):
         # The ladder tops out at the largest square of the merge size under
         # the cap: 32 x 32 = 1,024 for a cap of 1,100.
         with envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1100):
             config = self._apply_vl()
-        self.assertEqual(config["image"]["max_pixels"], 1024 * 16 * 16)
+        self.assertEqual(config["image"]["size"]["longest_edge"], 1024 * 16 * 16)
 
         with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("256,1600"):
             config = self._apply_vl()
-        self.assertEqual(config["image"]["max_pixels"], 1600 * 16 * 16)
+        self.assertEqual(config["image"]["size"]["longest_edge"], 1600 * 16 * 16)
+
+    def test_minimum_size_comes_from_the_user_then_the_processor(self):
+        config = self._apply_vl(mm_process_config={"image": {"min_pixels": 4096}})
+        self.assertEqual(config["image"]["size"]["shortest_edge"], 4096)
+        # Without a known minimum the size dict cannot be built, so no cap.
+        self.assertEqual(self._apply_vl(processor_min_pixels=None), {})
 
     def test_other_mm_settings_are_kept(self):
-        config = self._apply_vl(
-            mm_process_config={"image": {"min_pixels": 65536}, "video": {"fps": 2}}
-        )
+        config = self._apply_vl(mm_process_config={"video": {"fps": 2}})
         self.assertEqual(
-            config,
-            {
-                "image": {
-                    "min_pixels": 65536,
-                    "max_pixels": self.TOP_BUCKET_MAX_PIXELS,
-                },
-                "video": {"fps": 2},
-            },
+            config, {"image": {"size": self.DEFAULT_SIZE}, "video": {"fps": 2}}
         )
 
     def test_an_explicit_image_size_wins(self):
@@ -634,6 +649,23 @@ class TestVitMaxPixelsDefault(CustomTestCase):
 
         with envs.SGLANG_IMAGE_MAX_PIXELS.override(4 * 1024 * 1024):
             self.assertEqual(self._apply_vl(), {})
+
+    def test_processor_minimum_is_read_from_the_model_directory(self):
+        # transformers 5.8's get_image_processor_config never reads this file,
+        # so the default reads it directly.
+        import json
+        import tempfile
+
+        from sglang_tpu.tpu_platform import _processor_min_pixels
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            args = SimpleNamespace(model_path=model_dir, revision=None)
+            self.assertIsNone(_processor_min_pixels(args))
+            with open(os.path.join(model_dir, "preprocessor_config.json"), "w") as f:
+                json.dump(
+                    {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}, f
+                )
+            self.assertEqual(_processor_min_pixels(args), 65536)
 
     def test_no_cap_where_nothing_is_precompiled(self):
         # Eager ViT, a model without the Qwen3-VL ViT policy, and precompile
