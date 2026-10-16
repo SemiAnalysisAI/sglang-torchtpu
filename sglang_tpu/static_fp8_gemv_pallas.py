@@ -63,6 +63,12 @@ def _kernel(inv_ref, x_ref, w_ref, s_ref, o_ref, acc_ref, *, nk: int):
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
     x = x_ref[...].astype(jnp.float32)
+    if x.shape[0] != _ROWS:
+        # Pad the activation to the fp8 sublane tile in VMEM; an XLA pad
+        # before the call was a separate ~0.5 us op per GEMV.
+        x = jnp.concatenate(
+            [x, jnp.zeros((_ROWS - x.shape[0], x.shape[1]), x.dtype)], axis=0
+        )
     xq = jnp.clip(x * inv_ref[0], -_FP8_MAX, _FP8_MAX).astype(w_ref.dtype)
     acc_ref[...] += jnp.dot(xq, w_ref[...], preferred_element_type=jnp.float32)
 
@@ -82,14 +88,13 @@ def static_fp8_gemv_jax(x, w, out_scale, inv_x, bk: int):
     m, kdim = x.shape
     n = w.shape[1]
     nk = kdim // bk
-    xp = jnp.pad(x, ((0, _ROWS - m), (0, 0)))
     out = pl.pallas_call(
         functools.partial(_kernel, nk=nk),
         out_shape=jax.ShapeDtypeStruct((_ROWS, n), x.dtype),
         grid=(nk,),
         in_specs=[
             pl.BlockSpec(memory_space=pltpu.SMEM),
-            pl.BlockSpec((_ROWS, bk), lambda i: (0, i)),
+            pl.BlockSpec((m, bk), lambda i: (0, i)),
             pl.BlockSpec((bk, n), lambda i: (i, 0)),
             pl.BlockSpec((1, n), lambda i: (0, 0)),
         ],
@@ -100,7 +105,7 @@ def static_fp8_gemv_jax(x, w, out_scale, inv_x, bk: int):
             vmem_limit_bytes=_VMEM_LIMIT,
         ),
         name=f"static_fp8_gemv_k{kdim}_n{n}_bk{bk}",
-    )(inv_x.astype(jnp.float32), xp, w, out_scale.reshape(1, n).astype(jnp.float32))
+    )(inv_x.astype(jnp.float32), x, w, out_scale.reshape(1, n).astype(jnp.float32))
     return out[:m]
 
 
