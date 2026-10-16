@@ -7,8 +7,10 @@ Why: SGLANG_TPU_K3_STATIC_FP8 replaces RMSNorm-fed bf16 GEMVs with fp8 ones
      it.
 How: AFTER KimiK3LinearForCausalLM.post_load_weights; bind_static_fp8 sets the
      model's _static_fp8_* callables and is a no-op when the variable is unset.
-Upstream PR or issue: TBD (platform post-load seam for model weights).
-Remove when: core exposes a platform post-load seam for model weights.
+Upstream PR or issue: sgl-project/sglang-torchtpu#1443 ([Plugin seam] model
+     post-load: platform hook for model weights after loading).
+Remove when: core calls a platform post-load hook for model weights (or a
+     model-keyed post-load registry), per #1443.
 """
 
 
