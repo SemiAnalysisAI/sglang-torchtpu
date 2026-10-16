@@ -3706,15 +3706,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
 
-        if _is_tpu:
-            # Opt-in static-scale fp8 decode GEMVs (SGLANG_TPU_K3_STATIC_FP8):
-            # binds the _static_fp8_* callables and releases the bf16 weights
-            # they replace. After the weight merges above and before
-            # compilation; a no-op when the variable is unset.
-            from sglang_tpu.kimi_k3.static_fp8 import bind_static_fp8
-
-            bind_static_fp8(self)
-
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
