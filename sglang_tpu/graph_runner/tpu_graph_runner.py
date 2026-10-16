@@ -277,6 +277,19 @@ class TpuGraphRunner:
                 installed_policies.append(policy)
                 pending_warmups.extend(policy.precompile() or ())
 
+        if installed_any and not any(
+            isinstance(policy, DecoderCompilePolicy) for policy in installed_policies
+        ):
+            # A vision-only annotation skips the whole-model fallback below, so
+            # the decoder would run eager with nothing in the log.
+            logger.warning(
+                "enable_torch_compile=True but none of the compile policies "
+                "installed on %s covers its decoder (%s); decode steps run eager. "
+                "Annotate the language model with support_torch_compile(...).",
+                type(self.model).__name__,
+                ", ".join(type(p).__name__ for p in installed_policies),
+            )
+
         if not installed_any:
             server_args = model_runner.server_args
             fallback_cls = _augment_spec_policy(DecoderTpuCompilePolicy, model_runner)
