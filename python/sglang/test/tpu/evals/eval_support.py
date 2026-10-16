@@ -868,8 +868,8 @@ def read_bench_point(out_dir: str, point: dict[str, Any]) -> dict[str, Any] | No
 # The framed-payload egress every TPU perf test shares (the standard set by
 # test_tpu_qwen3_coder_480b_multihost_agentic.py): metrics are dumped per-number
 # via dump_metric when a leg is clean, and the WHOLE measurement summary is also
-# printed once, machine-readable, between these markers. Keel keys on the marker
-# text, so it never changes.
+# printed once, machine-readable, between these markers. The dashboard keys on the
+# marker text, so it never changes.
 RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
 RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
 
@@ -1142,8 +1142,8 @@ def bench_serving_runner(
                     # costs a few hundred bytes a night and cannot be done
                     # retroactively once the job log expires; charting them all
                     # would bury the one number anyone opens the page for under
-                    # forty series. To chart one later, promote it on the keel
-                    # side -- the historical records already carry the data.
+                    # forty series. To chart one later, promote it on the
+                    # dashboard side -- the historical records already carry the data.
                     labels.update(dashboard_labels(point))
                     labels["headline"] = "1"
                 else:
