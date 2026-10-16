@@ -64,10 +64,32 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.layers.utils import copy_or_rebind_param
 
 # block size is always 32 for MXFP4
 MXFP4_BLOCK_SIZE = 32
 PACKING = 2  # two FP4 codes per uint8 byte
+
+
+def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
+    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
+        old.untyped_storage().resize_(0)
+
+
+def _clear_replaced_param(module: torch.nn.Module, name: str) -> None:
+    param = getattr(module, name, None)
+    if not isinstance(param, Parameter):
+        setattr(module, name, None)
+        return
+
+    old = param.data
+    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
+    _free_replaced_storage(old, param.data)
+    setattr(module, name, None)
+
+
+def _own_storage(t: torch.Tensor) -> torch.Tensor:
+    return t if t._base is None else t.clone()
 
 
 # ---------------------------------------------------------------------------
@@ -150,18 +172,18 @@ def _pad_last_axis(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
 def process_mxfp4_moe_weights_bf16(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
-    w13_bias: torch.Tensor,
+    w13_bias: torch.Tensor | None,
     w2_packed: torch.Tensor,
     w2_scale: torch.Tensor,
-    w2_bias: torch.Tensor,
+    w2_bias: torch.Tensor | None,
     *,
     w13_interleaved: bool,
     align_to: int = 128,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, hidden_K_padded, 2*N_int_padded)  bfloat16
-    torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)                fp32
+    torch.Tensor | None,  # w13_bias    (E, 1, 2*N_int_padded)         fp32
     torch.Tensor,  # w2_weight   (E, N_int_padded, hidden_N_padded)    bfloat16
-    torch.Tensor,  # w2_bias     (E, 1, hidden_N_padded)               fp32
+    torch.Tensor | None,  # w2_bias     (E, 1, hidden_N_padded)        fp32
 ]:
     """Dequantize HF GPT-OSS MXFP4 weights to **bf16** in gmm_v2's (g, k, n)
     layout (the torchtpu-vllm "dequant at load" approach). Same layout as
@@ -194,11 +216,16 @@ def process_mxfp4_moe_weights_bf16(
         w13, (0, 0, 0, (-hidden) % 128)
     )  # pad K (axis 1) → (E, hidden_padded, 2*N_padded)
 
-    w13_b = w13_bias
-    if w13_interleaved:
-        w13_b = _deinterleave_axis1(w13_b.unsqueeze(-1)).squeeze(-1)
-    w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(-1)
-    w13_b = w13_b.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, 2*N_padded)
+    if w13_bias is not None:
+        w13_b = w13_bias
+        if w13_interleaved:
+            w13_b = _deinterleave_axis1(w13_b.unsqueeze(-1)).squeeze(-1)
+        w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(-1)
+        w13_b = _own_storage(
+            w13_b.to(torch.float32).unsqueeze(1).contiguous()
+        )  # (E, 1, 2*N_padded)
+    else:
+        w13_b = None
 
     # w2: dequant (along K=intermediate) → pad K to match N_padded → transpose.
     w2 = MXFP4QuantizeUtil.dequantize(
@@ -213,8 +240,11 @@ def process_mxfp4_moe_weights_bf16(
     # pad for irregular shape
     pad_n_out = (-hidden) % 128
     w2 = _pad_last_axis(w2, pad_n_out)  # (E, N_padded, hidden_padded_out)
-    w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
-    w2_b = _pad_last_axis(w2_b, pad_n_out)  # (E, 1, hidden_padded_out)
+    if w2_bias is not None:
+        w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
+        w2_b = _own_storage(_pad_last_axis(w2_b, pad_n_out))  # (E, 1, hidden_padded_out)
+    else:
+        w2_b = None
 
     return w13, w13_b, w2, w2_b
 
@@ -227,20 +257,20 @@ def process_mxfp4_moe_weights_bf16(
 def process_mxfp4_moe_weights_native(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
-    w13_bias: torch.Tensor,
+    w13_bias: torch.Tensor | None,
     w2_packed: torch.Tensor,
     w2_scale: torch.Tensor,
-    w2_bias: torch.Tensor,
+    w2_bias: torch.Tensor | None,
     *,
     w13_interleaved: bool,
     align_to: int = 128,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, K_packed = hidden/2, 2*N_int_padded) uint8
     torch.Tensor,  # w13_scale   (E, num_blocks_K, 1, 2*N_int_padded)    fp32
-    torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)                  fp32
+    torch.Tensor | None,  # w13_bias    (E, 1, 2*N_int_padded)           fp32
     torch.Tensor,  # w2_weight   (E, K_packed = N_int_padded/2, hidden)  uint8
     torch.Tensor,  # w2_scale    (E, num_blocks_K_padded, 1, hidden)     fp32
-    torch.Tensor,  # w2_bias     (E, 1, hidden)                          fp32
+    torch.Tensor | None,  # w2_bias     (E, 1, hidden)                   fp32
 ]:
     """Convert HF GPT-OSS MXFP4 weights to gmm_v2's native packed-FP4 layout.
 
@@ -266,7 +296,8 @@ def process_mxfp4_moe_weights_native(
         f"w13_scale shape mismatch: got {w13_scale.shape}, "
         f"expected {(E_w13, two_N_int, num_blocks_hidden)}"
     )
-    assert w13_bias.shape == (E_w13, two_N_int)
+    if w13_bias is not None:
+        assert w13_bias.shape == (E_w13, two_N_int)
 
     pad_n = (align_to - N_int % align_to) % align_to
     N_int_padded = N_int + pad_n
@@ -297,23 +328,28 @@ def process_mxfp4_moe_weights_native(
     # Transpose to (E, num_blocks, 2*N_padded) and add the size-1 mid dim.
     # Unsqueeze before contiguous: torch_tpu re-materializes a rank-4 view of a
     # rank-3 buffer on every compiled call.
-    w13_s = (
+    w13_s = _own_storage(
         w13_s.permute(0, 2, 1).unsqueeze(2).contiguous()
     )  # (E, num_blocks, 1, 2*N_padded)
     assert w13_s.shape == (E_w13, num_blocks_hidden, 1, two_N_int_padded)
 
     # --- Bias (bf16 → fp32) ---
-    # Deinterleave needs at least one trailing dim; use a temporary unsqueeze.
-    w13_b = (
-        _deinterleave_axis1(w13_bias.unsqueeze(-1)).squeeze(-1)
-        if w13_interleaved
-        else w13_bias
-    )  # (E, 2N)
-    w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(
-        -1
-    )  # (E, 2*N_padded)
-    w13_b = w13_b.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, 2*N_padded)
-    assert w13_b.shape == (E_w13, 1, two_N_int_padded)
+    if w13_bias is not None:
+        # Deinterleave needs at least one trailing dim; use a temporary unsqueeze.
+        w13_b = (
+            _deinterleave_axis1(w13_bias.unsqueeze(-1)).squeeze(-1)
+            if w13_interleaved
+            else w13_bias
+        )  # (E, 2N)
+        w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(
+            -1
+        )  # (E, 2*N_padded)
+        w13_b = _own_storage(
+            w13_b.to(torch.float32).unsqueeze(1).contiguous()
+        )  # (E, 1, 2*N_padded)
+        assert w13_b.shape == (E_w13, 1, two_N_int_padded)
+    else:
+        w13_b = None
 
     # ============================================================
     # w2 (down_proj): K-pad to match w13's intermediate, then transpose
@@ -349,14 +385,19 @@ def process_mxfp4_moe_weights_native(
     # --- Scales ---
     w2_s = _pad_last_axis(w2_scale, pad_k_num_blocks)  # (E, hidden, num_blocks_padded)
     w2_s = _e8m0_to_fp32(w2_s)  # fp32
-    w2_s = (
+    w2_s = _own_storage(
         w2_s.permute(0, 2, 1).unsqueeze(2).contiguous()
     )  # (E, num_blocks_padded, 1, hidden)
     assert w2_s.shape == (E_w2, num_blocks_inter_padded, 1, hidden)
 
     # --- Bias ---
-    w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
-    assert w2_b.shape == (E_w2, 1, hidden)
+    if w2_bias is not None:
+        w2_b = _own_storage(
+            w2_bias.to(torch.float32).unsqueeze(1).contiguous()
+        )  # (E, 1, hidden)
+        assert w2_b.shape == (E_w2, 1, hidden)
+    else:
+        w2_b = None
 
     return w13_w, w13_s, w13_b, w2_w, w2_s, w2_b
 
@@ -369,27 +410,42 @@ _MAX_DEQUANT_ELEMENTS = 2**30
 _EXPERTS_PER_CHUNK = 16
 
 
-def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved: bool):
+def _process_mxfp4_moe_weights_in_chunks(
+    layer: torch.nn.Module,
+    w13_interleaved: bool,
+    *,
+    with_bias: bool = True,
+):
     """``process_mxfp4_moe_weights_bf16`` over expert chunks, concatenated one
     output at a time so the chunks of a finished output are freed before the
     next one is assembled."""
     num_experts = layer.w13_weight.data.shape[0]
+    w13_bias_param = getattr(layer, "w13_weight_bias", None) if with_bias else None
+    w2_bias_param = getattr(layer, "w2_weight_bias", None) if with_bias else None
     outputs = ([], [], [], [])
     for i in range(0, num_experts, _EXPERTS_PER_CHUNK):
         chunk = process_mxfp4_moe_weights_bf16(
             layer.w13_weight.data[i : i + _EXPERTS_PER_CHUNK],
             layer.w13_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
-            layer.w13_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            (
+                w13_bias_param.data[i : i + _EXPERTS_PER_CHUNK]
+                if w13_bias_param is not None
+                else None
+            ),
             layer.w2_weight.data[i : i + _EXPERTS_PER_CHUNK],
             layer.w2_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
-            layer.w2_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            (
+                w2_bias_param.data[i : i + _EXPERTS_PER_CHUNK]
+                if w2_bias_param is not None
+                else None
+            ),
             w13_interleaved=w13_interleaved,
         )
         for parts, part in zip(outputs, chunk):
             parts.append(part)
     results = []
     for parts in outputs:
-        results.append(torch.cat(parts, dim=0))
+        results.append(None if parts[0] is None else torch.cat(parts, dim=0))
         parts.clear()
     return tuple(results)
 
@@ -402,48 +458,85 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) ->
     (:func:`process_mxfp4_moe_weights_native`). Interleaved GPT-OSS (SWIGLUOAI)
     stays on the bf16 dequant-at-load path.
     """
-    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...].
-    w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
+    # Prefer the explicit MoeRunnerConfig.gate_up_interleaved flag; fall back
+    # to activation == "swigluoai" for minimal test stand-ins without it.
+    w13_interleaved = getattr(
+        layer.moe_runner_config,
+        "gate_up_interleaved",
+        layer.moe_runner_config.activation == "swigluoai",
+    )
+    # Without checkpoint biases create_weights zero-fills them; free them before
+    # allocating converted weights and skip the bias conversions/adds.
+    if not with_bias:
+        _clear_replaced_param(layer, "w13_weight_bias")
+        _clear_replaced_param(layer, "w2_weight_bias")
+
+    old_w13 = layer.w13_weight.data
+    old_w13_scale = layer.w13_weight_scale.data
+    old_w2 = layer.w2_weight.data
+    old_w2_scale = layer.w2_weight_scale.data
+    old_w13_bias = (
+        layer.w13_weight_bias.data
+        if with_bias and getattr(layer, "w13_weight_bias", None) is not None
+        else None
+    )
+    old_w2_bias = (
+        layer.w2_weight_bias.data
+        if with_bias and getattr(layer, "w2_weight_bias", None) is not None
+        else None
+    )
+
     # The packed path does not pad K, so it needs a lane-aligned hidden size.
-    hidden_aligned = (layer.w13_weight.shape[-1] * PACKING) % 128 == 0
+    hidden_aligned = (old_w13.shape[-1] * PACKING) % 128 == 0
     w13_scale = w2_scale = None
     if not w13_interleaved and hidden_aligned:
         w13, w13_scale, w13_bias, w2, w2_scale, w2_bias = (
             process_mxfp4_moe_weights_native(
-                layer.w13_weight.data,
-                layer.w13_weight_scale.data,
-                layer.w13_weight_bias.data,
-                layer.w2_weight.data,
-                layer.w2_weight_scale.data,
-                layer.w2_weight_bias.data,
+                old_w13,
+                old_w13_scale,
+                old_w13_bias,
+                old_w2,
+                old_w2_scale,
+                old_w2_bias,
                 w13_interleaved=False,
             )
         )
-        w13_scale = Parameter(w13_scale, requires_grad=False)
-        w2_scale = Parameter(w2_scale, requires_grad=False)
-    elif 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
+    elif 2 * old_w13.numel() > _MAX_DEQUANT_ELEMENTS:
         # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
         # 2.1e9 values before padding) are processed a few at a time.
         w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
-            layer, w13_interleaved
+            layer, w13_interleaved, with_bias=with_bias
         )
     else:
         w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
-            layer.w13_weight.data,
-            layer.w13_weight_scale.data,
-            layer.w13_weight_bias.data,
-            layer.w2_weight.data,
-            layer.w2_weight_scale.data,
-            layer.w2_weight_bias.data,
+            old_w13,
+            old_w13_scale,
+            old_w13_bias,
+            old_w2,
+            old_w2_scale,
+            old_w2_bias,
             w13_interleaved=w13_interleaved,
         )
-    layer.w13_weight = Parameter(w13, requires_grad=False)
-    layer.w13_weight_scale = w13_scale
-    layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
-    layer.w2_weight = Parameter(w2, requires_grad=False)
-    layer.w2_weight_scale = w2_scale
-    layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
-    # Without checkpoint biases create_weights zero-fills them; skip the adds.
-    if not with_bias:
-        layer.w13_weight_bias = None
-        layer.w2_weight_bias = None
+
+    copy_or_rebind_param(layer, "w13_weight", w13)
+    _free_replaced_storage(old_w13, layer.w13_weight.data)
+    copy_or_rebind_param(layer, "w2_weight", w2)
+    _free_replaced_storage(old_w2, layer.w2_weight.data)
+
+    if w13_scale is not None:
+        copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+        _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
+        copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+        _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
+    else:
+        _clear_replaced_param(layer, "w13_weight_scale")
+        _clear_replaced_param(layer, "w2_weight_scale")
+
+    if with_bias and w13_bias is not None and w2_bias is not None:
+        copy_or_rebind_param(layer, "w13_weight_bias", w13_bias)
+        if old_w13_bias is not None:
+            _free_replaced_storage(old_w13_bias, layer.w13_weight_bias.data)
+        copy_or_rebind_param(layer, "w2_weight_bias", w2_bias)
+        if old_w2_bias is not None:
+            _free_replaced_storage(old_w2_bias, layer.w2_weight_bias.data)
+

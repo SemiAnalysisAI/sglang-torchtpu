@@ -41,6 +41,16 @@ class TestKimiK3SpecBackendDefaults(CustomTestCase):
         with override_platform(is_tpu=True, is_sm100=False):
             apply_kimi_k3_spec_backend_defaults(_args(speculative_algorithm=None))
 
+    def test_kimi_k3_linear_arch_registered_in_mamba_cache_sets(self):
+        from sglang.srt.arg_groups.overrides import (
+            _MAMBA_EXTRA_BUFFER_ARCHS,
+            _MAMBA_RADIX_CACHE_ARCHS,
+        )
+
+        for arch in ("KimiK3LinearForCausalLM", "KimiK3ForConditionalGeneration"):
+            self.assertIn(arch, _MAMBA_RADIX_CACHE_ARCHS)
+            self.assertIn(arch, _MAMBA_EXTRA_BUFFER_ARCHS)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -735,6 +735,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             # its formula on host).
             last_loc = _r2t[batch.req_pool_indices_cpu, seq_lens - 1]
             if getattr(batch.req_to_token_pool, "host_resident", False):
+                assert token_per_req == 1, (
+                    "host_resident decode allocator requires token_per_req == 1, "
+                    f"got {token_per_req}"
+                )
                 # The allocator also fills out_cache_loc_host for the
                 # req_to_token write.
                 out_cache_loc_host = torch.empty((bs,), dtype=torch.int32)

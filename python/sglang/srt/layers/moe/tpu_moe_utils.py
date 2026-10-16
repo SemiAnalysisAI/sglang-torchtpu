@@ -54,3 +54,37 @@ def mask_tpu_moe_non_local_experts(
         topk_weights * valid.to(topk_weights.dtype),
         torch.where(valid, local_ids, -1),
     )
+
+
+def resolve_tpu_moe_ep_routing(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    moe_ep_size: int,
+    moe_ep_rank: int,
+    *,
+    default_global_num_experts: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Resolve TPU MoE EP routing parameters, lifting ``moe_ep_rank`` when traced.
+
+    Outside rank-lifted ``direct_compile`` (``get_traced_rank(moe_ep_rank) is None``),
+    global expert IDs and this rank's ``expert_group_offset`` are passed directly
+    to ``fused_moe_call``. Inside a rank-lifted ``direct_compile`` trace,
+    ``expert_group_offset`` is a Python ``int`` custom-op argument and cannot
+    carry the traced rank tensor, so ``topk_ids`` is shifted into
+    ``[0, num_local_experts)`` via the traced rank tensor and
+    ``expert_group_offset`` is set to ``0``.
+    """
+    if moe_ep_size <= 1:
+        return topk_weights, topk_ids, default_global_num_experts, 0
+    if current_platform.get_traced_rank(moe_ep_rank) is not None:
+        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+            topk_weights, topk_ids, num_local_experts, moe_ep_rank
+        )
+        return topk_weights, topk_ids, default_global_num_experts, 0
+    return (
+        topk_weights,
+        topk_ids,
+        num_local_experts * moe_ep_size,
+        num_local_experts * moe_ep_rank,
+    )

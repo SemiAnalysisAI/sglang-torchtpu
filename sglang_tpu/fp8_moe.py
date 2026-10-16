@@ -532,6 +532,8 @@ def apply_tpu_fp8_moe(
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
     swiglu_limit: float | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ):
     """Run TPU FP8 MoE through the Pallas fused grouped-GEMM backend."""
     if apply_router_weight_on_input:
@@ -555,13 +557,18 @@ def apply_tpu_fp8_moe(
     w1_scale = layer.w13_weight_scale_inv if block_quant else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quant else layer.w2_weight_scale
 
-    global_num_experts = 0
-    expert_group_offset = 0
-    ep_size = get_parallel().moe_ep_size
-    ep_rank = get_parallel().moe_ep_rank
-    if ep_size > 1:
-        global_num_experts = layer.num_local_experts * ep_size
-        expert_group_offset = ep_rank * layer.num_local_experts
+    from sglang.srt.layers.moe.tpu_moe_utils import resolve_tpu_moe_ep_routing
+
+    parallel = get_parallel()
+    topk_weights, topk_ids, global_num_experts, expert_group_offset = (
+        resolve_tpu_moe_ep_routing(
+            topk_weights,
+            topk_ids,
+            layer.num_local_experts,
+            parallel.moe_ep_size,
+            parallel.moe_ep_rank,
+        )
+    )
 
     # Imported here, not at module scope: the Pallas chain pulls in JAX, which
     # the hosted CPU CI agents do not have. Keeping it local lets the weight
@@ -591,5 +598,7 @@ def apply_tpu_fp8_moe(
         no_combine=no_combine,
         global_num_experts=global_num_experts,
         expert_group_offset=expert_group_offset,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
     return StandardCombineInput(hidden_states=output)

@@ -64,7 +64,6 @@ def _tiny_config() -> KimiLinearConfig:
     )
 
 
-@unittest.skipIf(torch.cuda.is_available(), "builds on CPU with the TPU flag set")
 class TestKimiK3ConstructOnTpu(CustomTestCase):
     def test_post_load_binds_kernel_layout_and_rejects_weight_updates(self):
         """The KDA kernel reads one packed copy of conv / dt_bias / A_log, so

@@ -1345,6 +1345,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         w2_scale: Optional[torch.Tensor] = None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.tpu_moe_utils import resolve_tpu_moe_ep_routing
         from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
         moe_runner_config = self.moe_runner_config
@@ -1368,10 +1369,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # expert_group_offset + num_local_experts). gmm_v2 only touches the rows
         # of expert groups inside that window, so non-local experts cost nothing
         # and no remapping to local IDs is needed. Under EP1 the offset is 0 and
-        # the window spans every expert, so the window check is a no-op. The
-        # kernel drops IDs outside the global range (TopK's -1 padded tokens).
-        global_num_experts = layer.num_local_experts * get_parallel().moe_ep_size
-        expert_group_offset = layer.num_local_experts * get_parallel().moe_ep_rank
+        # the window spans every expert, so the window check is a no-op. Inside
+        # rank-lifted direct_compile traces, resolve_tpu_moe_ep_routing shifts
+        # topk_ids into [0, num_local_experts) via the traced rank tensor so
+        # expert_group_offset stays 0 across ranks.
+        parallel = get_parallel()
+        kernel_topk_weights, topk_ids, global_num_experts, expert_group_offset = (
+            resolve_tpu_moe_ep_routing(
+                kernel_topk_weights,
+                topk_ids,
+                layer.num_local_experts,
+                parallel.moe_ep_size,
+                parallel.moe_ep_rank,
+                default_global_num_experts=layer.num_local_experts,
+            )
+        )
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in

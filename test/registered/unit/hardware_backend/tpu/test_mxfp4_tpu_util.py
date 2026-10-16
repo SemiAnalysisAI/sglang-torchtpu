@@ -111,6 +111,52 @@ class TestPackedPreparation(CustomTestCase):
         self.assertIsNone(layer.w13_weight_scale)
         self.assertIsNone(layer.w2_weight_scale)
 
+    def test_preserves_parameter_identity_and_frees_replaced_storages(self):
+        """Weight conversion keeps Parameter identity/attrs and frees old buffers."""
+        for hidden, with_bias in ((128, False), (HIDDEN, True)):
+            with self.subTest(hidden=hidden, with_bias=with_bias):
+                layer = _fake_layer(num_experts=4, activation="situ", hidden=hidden)
+                w13_param = layer.w13_weight
+                w2_param = layer.w2_weight
+                w13_param.weight_loader = "sentinel_w13"
+                w2_param.weight_loader = "sentinel_w2"
+                old_storages = [
+                    layer.w13_weight.data.untyped_storage(),
+                    layer.w13_weight_scale.data.untyped_storage(),
+                    layer.w13_weight_bias.data.untyped_storage(),
+                    layer.w2_weight.data.untyped_storage(),
+                    layer.w2_weight_scale.data.untyped_storage(),
+                    layer.w2_weight_bias.data.untyped_storage(),
+                ]
+
+                prepare_tpu_mxfp4_moe_weights(layer, with_bias=with_bias)
+
+                self.assertIs(layer.w13_weight, w13_param)
+                self.assertIs(layer.w2_weight, w2_param)
+                self.assertEqual(layer.w13_weight.weight_loader, "sentinel_w13")
+                self.assertEqual(layer.w2_weight.weight_loader, "sentinel_w2")
+                for storage in old_storages:
+                    self.assertEqual(storage.nbytes(), 0)
+
+    def test_honors_explicit_gate_up_interleaved_with_silu_activation(self):
+        """Standard FusedMoE layers with gate_up_interleaved=True deinterleave w13."""
+        layer = _fake_layer(num_experts=2, activation="silu", hidden=HIDDEN)
+        layer.moe_runner_config.gate_up_interleaved = True
+        expected = process_mxfp4_moe_weights_bf16(
+            layer.w13_weight.data.clone(),
+            layer.w13_weight_scale.data.clone(),
+            layer.w13_weight_bias.data.clone(),
+            layer.w2_weight.data.clone(),
+            layer.w2_weight_scale.data.clone(),
+            layer.w2_weight_bias.data.clone(),
+            w13_interleaved=True,
+        )
+        prepare_tpu_mxfp4_moe_weights(layer, with_bias=True)
+        torch.testing.assert_close(layer.w13_weight.data, expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.w13_weight_bias.data, expected[1], rtol=0, atol=0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

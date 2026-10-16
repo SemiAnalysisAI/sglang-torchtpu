@@ -767,4 +767,6 @@ class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
             activation=cfg.activation,
             apply_router_weight_on_input=cfg.apply_router_weight_on_input,
             no_combine=cfg.no_combine,
+            gemm1_alpha=cfg.gemm1_alpha,
+            gemm1_clamp_limit=cfg.gemm1_clamp_limit,
         )

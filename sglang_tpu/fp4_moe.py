@@ -302,6 +302,8 @@ def apply_tpu_nvfp4_moe(
     no_combine: bool = False,
     use_fused_rs: bool = False,
     swiglu_limit: float | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ):
     """Run TPU NVFP4 MoE through the Pallas grouped-GEMM backend.
 
@@ -427,5 +429,7 @@ def apply_tpu_nvfp4_moe(
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         no_combine=no_combine,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
     return StandardCombineInput(hidden_states=output)

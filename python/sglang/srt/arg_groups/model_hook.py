@@ -223,6 +223,7 @@ def handle_model_specific_adjustments(server_args: Any):
 
     if model_arch in (
         "KimiLinearForCausalLM",
+        "KimiK3LinearForCausalLM",
         "KimiK3ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (

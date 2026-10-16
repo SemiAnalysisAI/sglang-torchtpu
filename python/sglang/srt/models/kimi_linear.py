@@ -56,10 +56,22 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_tpu, is_xpu, make_pp_layers
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_tpu,
+    is_xpu,
+    make_pp_layers,
+)
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
+_is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_tpu = is_tpu()
+_is_xpu = is_xpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
@@ -186,6 +198,15 @@ class KimiMoE(nn.Module):
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _is_xpu
+            and not _use_aiter
+            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+        ):
+            final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output

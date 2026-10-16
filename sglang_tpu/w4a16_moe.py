@@ -163,9 +163,12 @@ def apply_tpu_w4a16_moe(
     activation: str,
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
+    gemm1_alpha: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ):
     """Run TPU W4A16 MoE through the Pallas fused grouped-GEMM backend."""
     # Lazy: the Pallas bridge imports torch_tpu, which the CPU test runner lacks.
+    from sglang.srt.layers.moe.tpu_moe_utils import resolve_tpu_moe_ep_routing
     from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
     if apply_router_weight_on_input:
@@ -184,13 +187,19 @@ def apply_tpu_w4a16_moe(
         )
 
     # Global expert ids + this rank's group window (as the fp8 path does), so
-    # the permute and combine only touch this rank's routed rows.
-    global_num_experts = 0
-    expert_group_offset = 0
-    ep_size = get_parallel().moe_ep_size
-    if ep_size > 1:
-        global_num_experts = layer.num_local_experts * ep_size
-        expert_group_offset = get_parallel().moe_ep_rank * layer.num_local_experts
+    # the permute and combine only touch this rank's routed rows. Under
+    # rank-lifted direct_compile traces, resolve_tpu_moe_ep_routing shifts
+    # topk_ids by the traced rank tensor so expert_group_offset stays 0.
+    parallel = get_parallel()
+    topk_weights, topk_ids, global_num_experts, expert_group_offset = (
+        resolve_tpu_moe_ep_routing(
+            topk_weights,
+            topk_ids,
+            layer.num_local_experts,
+            parallel.moe_ep_size,
+            parallel.moe_ep_rank,
+        )
+    )
 
     output = fused_moe_call(
         hidden_states=x,
@@ -208,5 +217,7 @@ def apply_tpu_w4a16_moe(
         w_quant_bits=4,
         w1_channel_scale=getattr(layer, "w13_vmem_channel_scale", None),
         w2_channel_scale=getattr(layer, "w2_vmem_channel_scale", None),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
     return StandardCombineInput(hidden_states=output)
