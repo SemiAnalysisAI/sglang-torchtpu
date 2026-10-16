@@ -12,7 +12,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -411,8 +411,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self._pp_pd_stage_ready(mb_id, cur_batch, result)
                 if get_parallel().pp_async_batch_depth > 0:
-                    self._pp_send_deferred_output(next_first_rank_mb_id)
+                    self._pp_pd_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -837,11 +838,38 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
+    def _pp_pd_stage_ready(
+        self: Scheduler, mb_id: int, batch: ScheduleBatch, result
+    ) -> None:
+        """Report a launched forward to the prefill KV manager, which may move
+        this stage's KV of the requests it finishes before they sample."""
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_forward_launched(
+            self, mb_id, batch, result
+        )
+
+    def _pp_pd_send_deferred_output(self: Scheduler, mb_id: int) -> None:
+        """_pp_send_deferred_output for the prefill. The wave ships outputs as
+        host copies; the sampled tokens are copied first, so the prefill KV
+        manager gets the same copy once it is sent."""
+        target = self.mbs[mb_id] if self._pp_output_send_deferred() else None
+        if target is None or _pp_can_skip_output_comm(target):
+            self._pp_send_deferred_output(mb_id)
+            return
+        outputs = self.last_rank_comm_queue[0][1].tensors
+        next_token_ids = outputs["next_token_ids"] = outputs["next_token_ids"].cpu()
+        self._pp_send_deferred_output(mb_id)
+        self.disagg_prefill_bootstrap_queue.kv_manager.on_outputs_copied(
+            mb_id, next_token_ids
+        )
+
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
+        # Aborts holding pages until their senders drain vote here too, so
+        # every stage frees them in the same iteration.
+        reqs = self.disagg_prefill_inflight_queue + self._deferred_chunked_sender_aborts
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -852,7 +880,7 @@ class SchedulerPPMixin:
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
+                reqs,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
@@ -1185,7 +1213,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=self._pp_tensor_dict_shard_group(),
                     async_send=async_send,
                 )
             )
@@ -1242,12 +1270,16 @@ class SchedulerPPMixin:
                     (tensor_dict, recv_event)
                 )
 
+    def _pp_tensor_dict_shard_group(self: Scheduler) -> Optional[GroupCoordinator]:
+        # None sends whole dicts: TPU dicts go over host gloo, no device all-gather.
+        return None if self._pp_wave is not None else self.attn_tp_group
+
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
-                all_gather_group=(self.attn_tp_group),
+                all_gather_group=self._pp_tensor_dict_shard_group(),
             )
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
@@ -1259,7 +1291,7 @@ class SchedulerPPMixin:
         # there and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=self._pp_tensor_dict_shard_group(),
             keep_on_host=self._pp_wave is not None,
         )
 
@@ -1375,25 +1407,39 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        draft_state = {
+            key: pp_outputs[key]
+            for key in (
+                "draft_topk_p",
+                "draft_topk_index",
+                "draft_hidden_states",
+                "draft_dsa_topk_indices",
+            )
+            if key in pp_outputs.tensors
+        }
         if self._pp_wave is not None:
-            # The relayed outputs stay on the host; decode reads its input IDs
-            # from a device buffer.
+            # The relayed outputs stay on the host, and pp_outputs is relayed on
+            # as is; decode reads its input IDs and the draft state from device.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
+            draft_state = {
+                key: value.to(batch.device, non_blocking=True)
+                for key, value in draft_state.items()
+            }
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
+        if "draft_topk_p" in draft_state:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+                topk_p=draft_state["draft_topk_p"],
+                topk_index=draft_state["draft_topk_index"],
+                hidden_states=draft_state["draft_hidden_states"],
                 bonus_tokens=next_token_ids,
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
-                dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
+                dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
         elif batch.spec_algorithm.is_dspark():
@@ -1884,7 +1930,7 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        all_gather_group = self.attn_tp_group
+        all_gather_group = self._pp_tensor_dict_shard_group()
 
         # ---- Prepare send dict ----
         # On NPU, always send something (full output or a lightweight skip

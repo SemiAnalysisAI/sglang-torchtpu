@@ -12,8 +12,6 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -35,7 +33,7 @@ from sglang_tpu.disaggregation.raiden.pipeline import (
     source_spans,
     warn_if_staging_exceeds_premapped,
 )
-from sglang_tpu.disaggregation.raiden.serde import MessageTag
+from sglang_tpu.disaggregation.raiden.serde import MessageTag, RoomFailed
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -87,13 +85,14 @@ class Fp8Buffer(Buffer):
         self.shape = (pages, 128, 4, 4, 128)
 
 
-def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer):
+def groups(full=(0, 2), swa=(1, 3), pages=64, buffer=Buffer, draft_full=()):
     return SimpleNamespace(
-        full=[buffer(pages) for _ in full],
+        full=[buffer(pages) for _ in (*full, *draft_full)],
         swa=[buffer(pages) for _ in swa],
-        full_layer_ids=list(full),
+        full_layer_ids=[*full, *draft_full],
         swa_layer_ids=list(swa),
-        has_draft_pool=False,
+        num_draft_full=len(draft_full),
+        num_draft_swa=0,
     )
 
 
@@ -105,6 +104,8 @@ def sent(expires=None, registered=True):
         expires=time.monotonic() + 120 if expires is None else expires,
         registered=registered,
         replied=set(),
+        start=0,
+        parts=0,
     )
 
 
@@ -131,13 +132,20 @@ def transfer(producer=False, pp_size=1, pp_rank=0, attn_tp_size=1, attn_tp_rank=
         attn_tp_size=attn_tp_size,
         attn_tp_rank=attn_tp_rank,
     )
-    for method in ("_poll_engine_status", "_fail_room_locked", "is_aborted"):
+    for method in (
+        "_poll_engine_status",
+        "_fail_room_locked",
+        "is_aborted",
+        "_tombstone_reason_locked",
+        "_reply_room_failed",
+    ):
         setattr(
             pipe.manager,
             method,
             types.MethodType(getattr(RaidenKVManager, method), pipe.manager),
         )
     pipe.producer = producer
+    pipe._init_overlap_state()
     pipe.lock = threading.RLock()
     pipe.engine = SimpleNamespace(poll_stats_with_details=Mock(return_value=_polled()))
     layers = groups(full=(6,), swa=(7,), buffer=Bf16Buffer)
@@ -232,6 +240,12 @@ class TestLayerPools(unittest.TestCase):
             [p["tag"] for p in pools], ["fa.l8", "fa.l10", "swa.l9", "swa.l11"]
         )
         self.assertEqual([p["storage_index"] for p in pools], [0, 1, 2, 3])
+
+    def test_draft_layers_get_their_own_namespace(self):
+        pools = pool_manifest(groups(full=(0, 1), swa=(), draft_full=(0,)))
+        self.assertEqual([p["tag"] for p in pools], ["fa.l0", "fa.l1", "draft.fa.l0"])
+        spans = source_spans(pools, [100, 103], [12])
+        self.assertEqual(spans[2].block_ids, [100, 103])
 
     def test_duplicate_layer_ids_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "distinct global layer IDs"):
@@ -401,6 +415,18 @@ class TestLayerPools(unittest.TestCase):
                 stage.full,
                 lambda tensor: ((4, 3, 2, 1, 0), ((4, 128),), 8),
             ),
+        )
+
+    def test_fingerprint_matches_between_stages_with_and_without_the_draft(self):
+        """Only the last prefill stage and the decode hold the draft pool; every
+        stage must still fingerprint like the decode, or the controller rejects
+        each transfer."""
+        getter = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128),), 8)
+        stage = groups(full=(0, 1), swa=())
+        decode = groups(full=(0, 1, 2), swa=(), draft_full=(0,))
+        self.assertEqual(
+            layout_fingerprint(pool_manifest(stage), stage.full, getter),
+            layout_fingerprint(pool_manifest(decode), decode.full, getter),
         )
 
     def test_pp_ranks_have_distinct_ports_and_share_the_host_budget(self):
@@ -628,6 +654,23 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.finalize_send(8, None)
         self.assertEqual(held, [False, False])
 
+    def test_request_for_a_failed_room_is_answered_with_room_failed(self):
+        """A pipeline request for a room this stage already failed must tell
+        the decode, or the decode holds the room's pages until its waiting
+        timeout."""
+        pipe = transfer(producer=True)
+        pipe.manager._aborted[7] = time.time()
+        pipe.manager._send_multipart_locked = Mock()
+        consumer = b'{"attn_tp_size": 1, "attn_tp_rank": 0}'
+        pipe.on_message(
+            [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", consumer]
+        )
+        pipe.client.register_request_blocks.assert_not_called()
+        self.assertNotIn(7, pipe.replies)
+        endpoint, frames = pipe.manager._send_multipart_locked.call_args.args
+        self.assertEqual(endpoint, "tcp://decode:31000")
+        self.assertEqual(RoomFailed.from_frames(frames).room, 7)
+
     def test_unrequested_room_expires_without_a_native_cancel(self):
         pipe = transfer(producer=True)
         pipe.sent[7] = sent(expires=0, registered=False)
@@ -646,6 +689,7 @@ class TestPipelineLifetimes(unittest.TestCase):
         pipe.receives[7] = receive(rank=3)
         meta = pipe.receives[7].sources[3] | {"pool_tags": ["fa.l12", "swa.l13"]}
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline = pipe
@@ -664,6 +708,28 @@ class TestPipelineLifetimes(unittest.TestCase):
         self.assertIn(7, manager._aborted)
         self.assertEqual(manager.request_status[7], KVPoll.Failed)
         self.assertIn("same layers per stage", manager.failure_records[7])
+
+    def test_dp_destination_takes_aux_from_the_last_stage_only(self):
+        """Stages before the last carry no draft hidden states; their aux must not
+        overwrite the last stage's."""
+        pipe = transfer()
+        pipe.manager.kv_args.aux_data_ptrs = pipe.manager.kv_args.aux_item_lens = []
+        request = receive()
+        request.ranks, request.aux_index = set(range(8)), 5
+        pipe.receives[7] = request
+        with patch("sglang_tpu.disaggregation.raiden.pipeline.write_aux_blob") as write:
+            for rank in (7, 0):
+                meta = receive(rank=rank).sources[rank]
+                pipe.on_message(
+                    [
+                        MessageTag.PIPELINE_READY,
+                        b"7",
+                        json.dumps(meta).encode(),
+                        f"aux{rank}".encode(),
+                    ]
+                )
+        write.assert_called_once()
+        self.assertEqual(write.call_args.args[2:], (5, b"aux7"))
 
     def test_dp_destination_waits_for_every_pipeline_source(self):
         pipe = transfer()
@@ -873,10 +939,9 @@ class TestPipelineInitialization(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_resolved_speculative_mode_is_rejected(self):
+    def test_resolved_speculative_mode_initializes(self):
         get_context().override("test.speculative", speculative_algorithm="EAGLE3")
-        with self.assertRaisesRegex(ValueError, "draft hidden states"):
-            self._initialize()
+        self._initialize()
 
     def test_legacy_host_budget_uses_resolved_node_count(self):
         get_context().override("test.multihost", nnodes=2)
@@ -1000,6 +1065,7 @@ class TestPipelineInitialization(unittest.TestCase):
         from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 
         manager = RaidenKVManager.__new__(RaidenKVManager)
+        manager.attn_tp_rank = 0
         manager._pipeline_enabled = True
         manager._pipeline_init_lock = threading.Lock()
         manager._pipeline_messages = []
@@ -1007,46 +1073,6 @@ class TestPipelineInitialization(unittest.TestCase):
         message = [MessageTag.PIPELINE_REQ, b"7", b"tcp://decode:31000", b"{}"]
         manager._dispatch(message)
         self.assertEqual(manager._pipeline_messages, [message])
-
-
-class TestSpeculativeSupport(unittest.TestCase):
-    PB2 = SimpleNamespace(
-        StartTransferRequest=SimpleNamespace(
-            DESCRIPTOR=SimpleNamespace(fields_by_name={"wire_pool_indices": None})
-        )
-    )
-
-    def check(self, algorithm, producer=False, has_draft_pool=False):
-        pipe = transfer(producer=producer, pp_size=8 if producer else 1)
-        pipe.manager.attn_cp_size = 1
-        spec = SimpleNamespace(speculative_algorithm=algorithm)
-        layers = SimpleNamespace(has_draft_pool=has_draft_pool)
-        with patch(
-            "sglang_tpu.disaggregation.raiden.pipeline.get_spec", return_value=spec
-        ):
-            pipe._check_support(self.PB2, layers)
-
-    def test_no_speculation_is_accepted_on_both_peers(self):
-        self.check(None, producer=True)
-        self.check(None)
-
-    def test_prefill_rejects_any_speculative_algorithm(self):
-        with self.assertRaisesRegex(ValueError, "only on the decode"):
-            self.check("NGRAM", producer=True)
-
-    def test_decode_accepts_a_draft_without_its_own_pool(self):
-        self.check("NGRAM")
-        plugin = CustomSpecAlgo("TARGET_POOL_DRAFT", factory=Mock())
-        with patch.object(SpeculativeAlgorithm, "from_string", return_value=plugin):
-            self.check("TARGET_POOL_DRAFT")
-
-    def test_decode_rejects_a_separate_draft_pool(self):
-        with self.assertRaisesRegex(ValueError, "separate draft KV pool"):
-            self.check("NGRAM", has_draft_pool=True)
-
-    def test_decode_rejects_draft_hidden_states_from_the_prefill(self):
-        with self.assertRaisesRegex(ValueError, "draft hidden"):
-            self.check("EAGLE")
 
 
 class TestDraftPoolGroups(unittest.TestCase):
@@ -1057,13 +1083,15 @@ class TestDraftPoolGroups(unittest.TestCase):
 
     def test_target_pool_alone_has_no_draft_pool(self):
         target = self.pool()
-        self.assertFalse(get_raiden_kv_caches(target).has_draft_pool)
-        self.assertFalse(get_raiden_kv_caches(target, draft_pool=target).has_draft_pool)
+        self.assertEqual(get_raiden_kv_caches(target).num_draft_full, 0)
+        self.assertEqual(
+            get_raiden_kv_caches(target, draft_pool=target).num_draft_full, 0
+        )
 
-    def test_separate_draft_pool_is_appended_and_flagged(self):
+    def test_separate_draft_pool_is_appended_and_counted(self):
         groups = get_raiden_kv_caches(self.pool(), draft_pool=self.pool(layers=1))
-        self.assertTrue(groups.has_draft_pool)
-        self.assertEqual(len(groups.full), 3)
+        self.assertEqual(groups.num_draft_full, 1)
+        self.assertEqual(groups.full_layer_ids, [0, 1, 0])
 
 
 if __name__ == "__main__":

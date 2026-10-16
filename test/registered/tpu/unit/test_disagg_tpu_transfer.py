@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import itertools
@@ -1607,6 +1607,8 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
             need_sort=False,
         )
         allocator.clear()
+        # Hand out pages 1 and 2, which the frees below release.
+        allocator.alloc(2 * 16)
 
         # Freeing CPU tensor should succeed
         cpu_index = torch.tensor([16, 17, 18], dtype=torch.int32, device="cpu")
@@ -1631,6 +1633,8 @@ class TestTpuPagedTokenToKVPoolAllocatorCpuAssertion(CustomTestCase):
             need_sort=False,
         )
         allocator.clear()
+        # Hand out page 1, which the free below releases.
+        allocator.alloc(16)
 
         class FakeDeviceTensor:
             device = SimpleNamespace(type="cuda")

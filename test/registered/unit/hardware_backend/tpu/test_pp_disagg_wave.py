@@ -46,6 +46,7 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     scheduler.device_module = Mock()
     scheduler.waiting_queue = []
     scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=Mock())
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
     scheduler.enable_staging = True
@@ -92,6 +93,7 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
 
     scheduler.get_new_batch_prefill = plan
     scheduler.get_next_disagg_decode_batch_to_run = plan
+    scheduler._pp_pd_stage_ready = Mock()
     for name in (
         "_pp_pd_get_bootstrapped_ids",
         "_pp_pd_get_prefill_transferred_ids",
@@ -135,6 +137,8 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
                 {"hidden_states": torch.ones(2, 4), "residual": torch.zeros(2, 4)}
             ),
         )
+        if rank == 3:
+            queue.append((Mock(), PPProxyTensors({"next_token_ids": torch.zeros(2)})))
         return result, Mock()
 
     scheduler._pp_launch_batch = Mock(side_effect=launch)

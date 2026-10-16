@@ -36,6 +36,7 @@ from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.pp_proxy_pytree import (
     register_pp_proxy_pytree,
 )
+from sglang_tpu.rank_local import trace_rank
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ def direct_compile(
     fn: Callable[..., Any],
     *,
     specialization_key: SpecializationKey,
+    lift_rank: bool = False,
     model: torch.nn.Module | None = None,
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
@@ -151,9 +153,13 @@ def direct_compile(
     Any non-Tensor values are baked directly into the graph; all Tensor
     values are graph inputs.
     Then, it lowers it to MLIR and then compiles it with XLA/PJRT.
+    ``lift_rank`` also passes the logical distributed rank as a tensor input,
+    so rank-local operations can select their data without specializing the graph.
 
     ``CompiledFunction.warmup_async`` submits native asynchronous compilation.
     Its returned ``PendingCall`` executes the warmup when ``wait`` is called.
+    ``CompiledFunction.precompile`` only compiles; waiting on its result never
+    executes the graph or retains its example runtime inputs.
 
     This API is specialized for SGLang inference. A more general API adds
     complexity and can be added when needed.
@@ -225,6 +231,7 @@ def direct_compile(
     compiled = CompiledFunction(
         fn,
         specialization_key=specialization_key,
+        lift_rank=lift_rank,
         model=model,
         model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
@@ -247,6 +254,7 @@ class CompiledFunction:
         fn: Callable[..., Any],
         *,
         specialization_key: SpecializationKey,
+        lift_rank: bool = False,
         model: torch.nn.Module | None = None,
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
@@ -270,6 +278,8 @@ class CompiledFunction:
         self._ignored_argnames = ignored_argnames
         self._prune_unused_inputs = prune_unused_inputs
         self._uses_rng = uses_rng
+        self._lift_rank = lift_rank
+        self._rank_input: torch.Tensor | None = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         artifact = self._get_artifact(args, kwargs)
@@ -278,6 +288,13 @@ class CompiledFunction:
     def warmup_async(self, *args: Any, **kwargs: Any) -> PendingCall:
         artifact = self._get_artifact(args, kwargs, async_compile=True)
         return PendingCall(lambda: artifact((args, kwargs)))
+
+    def precompile(
+        self, *args: Any, async_compile: bool = False, **kwargs: Any
+    ) -> PendingCall:
+        """Compile without executing the helper or retaining example inputs."""
+        artifact = self._get_artifact(args, kwargs, async_compile=async_compile)
+        return PendingCall(artifact.wait_for_compile)
 
     def _get_artifact(
         self,
@@ -360,6 +377,17 @@ class CompiledFunction:
                     model_inputs.append(tensor)
                 extra_model_inputs.append((parent, attr_name, tensor_index))
 
+        rank_input_index = None
+        if self._lift_rank:
+            if self._rank_input is None:
+                self._rank_input = torch.tensor(
+                    [torch.distributed.get_rank()], dtype=torch.int32, device="tpu"
+                )
+                # Resolve the rank buffer's physical layout before tracing it.
+                self._rank_input.cpu()
+            rank_input_index = len(model_inputs)
+            model_inputs.append(self._rank_input)
+
         kv_pool_inputs = self._kv_pool.get_state() if self._kv_pool is not None else []
 
         tensor_leaf_indices: list[int] = []
@@ -441,6 +469,8 @@ class CompiledFunction:
                 "_is_compiling_flag",
                 previous_is_compiling,
             )
+            if rank_input_index is not None:
+                stack.enter_context(trace_rank(graph_inputs[rank_input_index]))
             if self._model is not None:
                 parameters_and_buffers = {
                     name: graph_inputs[input_index]
@@ -591,7 +621,7 @@ class _CompiledArtifact:
     pending_compile: Any | None = None
     rng_device: torch.device | None = None
 
-    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+    def wait_for_compile(self) -> None:
         if self.pending_compile is not None:
             start = time.perf_counter()
             self.executable = self.pending_compile.get()
@@ -600,6 +630,9 @@ class _CompiledArtifact:
                 "[direct_compile] native async resolution %.3fs",
                 time.perf_counter() - start,
             )
+
+    def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
+        self.wait_for_compile()
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.

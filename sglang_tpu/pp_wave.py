@@ -1,43 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline-stage hand-off over ICI as a lockstep wave.
 
-torch_tpu has no device send/recv, and a collective over any subset of the
-slice's devices only runs when every device launches it in the same order.
-So every hand-off is one collective-permute over all pipeline stages at once,
-around one closed cycle: stage r hands the sum of its hidden states and
-residual to stage r+1 and receives stage r-1's, and the last stage's block
-lands on stage 0, which ignores it. The stage after a boundary must add
-hidden states and residual before its first norm, as a pre-norm decoder's
-fused add-norm does, so the sum with a zero residual carries the same
-residual stream at half the bytes. That norm reads the sum rounded to the
-model dtype instead of the float32 sum, a small difference at every stage
-boundary. The closed cycle lets XLA lower the permute to a full-bandwidth
-ring transfer. A batch's activations
-leave stage 0 at some launch k and reach stage r at launch k+r-1, so every
-stage issues launches by one count:
+torch_tpu has no device send/recv, so each hand-off is one collective-permute
+that every device of the slice launches in the same order: each device sends
+the sum of its hidden states and residual to its column's device in the next
+stage, one closed cycle per column. Stage 0 launches once per iteration while
+the wave is active and owes 2 * (stages - 2) zero launches after its last send;
+stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
 
-- Stage 0 launches once per iteration while the wave is active: after its
-  forward, carrying the batch's activations, or a zero launch while it still
-  owes launches after its last send. It owes 2 * (stages - 2): the last batch
-  needs stages-2 more hops to reach the last stage, and the trailing stages,
-  which run up to stages-2 iterations behind stage 0, need as many again so
-  that every launch they issued ahead of stage 0's count is matched before
-  stage 0 goes quiet.
-- Stage r>0 launches at the start of an iteration until its count is
-  stage 0's count plus min(r-1, launches stage 0 still owes): the last launch
-  of an iteration with a batch receives that batch, and the first launch after
-  its forward carries the forward's output.
-
-Stage 0 launches one hop per iteration, never more, because the schedulers'
-hosts are coupled: the last stage's outputs travel last -> 0 -> 1 -> ... one
-hop per iteration over the host channel, and every stage waits on its device
-when it reads a result (the decode allocation, the forward's metadata, the
-ring's outputs) while the device runs launches in order. A stage that
-launched further ahead than the trailing stages can issue before its next
-device wait would block for good.
-
-Every launch runs the same compiled program: one buffer padded to the largest
-batch a forward can hand on.
+Eagle3 also relays its capture slots, whose layers sit on different stages, to
+the draft on the last stage; PPAuxWave moves them as a second buffer of the same
+permute, so the wave without them is unchanged.
 """
 
 import logging
@@ -45,11 +18,39 @@ import os
 from typing import Any, Callable
 
 import torch
+from torch import nn
+
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 _OP_NAME = "sglang_tpu::pp_permute"
 _OPS: dict[tuple[int, ...], Any] = {}
+_PAIR_OP_NAME = "sglang_tpu::pp_permute_pair"
+_PAIR_OPS: dict[tuple[int, ...], Any] = {}
+
+# One launch's buffer: the activation sum, plus the Eagle3 slots on PPAuxWave.
+Payload = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+def pipeline_permutation(
+    *, pp_ranks: tuple[int, ...], stage_ranks: tuple[int, ...], column: int
+) -> tuple[tuple[int, int], ...]:
+    """Source/target rank pairs of the hand-off: each device sends to its
+    column's device in the next stage, the last stage back to stage 0, one
+    closed cycle per column. ``pp_ranks`` are the ranks of this device's column
+    by stage and ``stage_ranks`` those of its stage by column; every stage
+    orders its columns alike, so each device derives the same pairs."""
+    size = len(pp_ranks)
+    return tuple(
+        (pp_ranks[s] + shift, pp_ranks[(s + 1) % size] + shift)
+        for shift in (r - stage_ranks[column] for r in stage_ranks)
+        for s in range(size)
+    )
 
 
 def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
@@ -106,6 +107,57 @@ def launch_now(op: Any, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def build_pp_pair_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
+    """Torch op ``(x_out, a_out) = pp_permute_pair(x, a)``: build_pp_permute_op
+    over two blocks in one collective-permute, each received as its own buffer."""
+    key = tuple(x for pair in perm for x in pair)
+    op = _PAIR_OPS.get(key)
+    if op is not None:
+        return op
+    import jax
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec
+    from torch_tpu._internal.pallas import get_pallas_mesh, jax_op
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    mesh = get_pallas_mesh(("pp",), (world_size,))
+    spec = PartitionSpec()
+
+    def shift(x: jax.Array, a: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return shard_map(
+            lambda xb, ab: (
+                jax.lax.ppermute(xb, "pp", list(perm)),
+                jax.lax.ppermute(ab, "pp", list(perm)),
+            ),
+            mesh=mesh,
+            in_specs=(spec, spec),
+            out_specs=(spec, spec),
+            check_rep=False,
+        )(x, a)
+
+    op = jax_op(
+        f"{_PAIR_OP_NAME}_{len(_PAIR_OPS)}",
+        shift,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=(spec, spec),
+    )
+    _PAIR_OPS[key] = op
+    return op
+
+
+def launch_pair_now(
+    op: Any, x: tuple[torch.Tensor, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """launch_now for build_pp_pair_permute_op."""
+    from torch_tpu._internal.sync.sync import synchronize
+
+    synchronize(None, wait=False)
+    hidden, aux = op(*x)
+    synchronize([hidden, aux], wait=False)
+    return hidden, aux
+
+
 class PPWave:
     """Per-stage bookkeeping of the hand-off wave; see the module docstring.
 
@@ -125,7 +177,7 @@ class PPWave:
         hidden: int,
         dtype: torch.dtype,
         device: torch.device,
-        launcher: Callable[[torch.Tensor], torch.Tensor],
+        launcher: Callable[[Payload], Payload],
     ) -> None:
         if size < 2:
             raise ValueError("the pipeline wave needs at least two stages")
@@ -137,8 +189,9 @@ class PPWave:
         self.dtype = dtype
         self._launcher = launcher
         self.zero = torch.zeros((self.rows, self.hidden), dtype=dtype, device=device)
+        self.zero_payload: Payload = self.zero
         # Output of this stage's last forward, sent at its next launch.
-        self.pending: torch.Tensor | None = None
+        self.pending: Payload | None = None
         self.launches = 0
         # Stage 0's launch count through the current iteration, and the zero
         # launches it still owes after its last send; mirrored on every stage.
@@ -149,7 +202,7 @@ class PPWave:
         self._has_batch = False
 
     # -- launches -------------------------------------------------------------
-    def _launch(self, x: torch.Tensor) -> torch.Tensor:
+    def _launch(self, x: Payload) -> Payload:
         out = self._launcher(x)
         self.launches += 1
         return out
@@ -160,7 +213,7 @@ class PPWave:
             return self.stage0_launches
         return self.stage0_launches + min(self.rank - 1, self.owed)
 
-    def _pad(self, t: torch.Tensor) -> torch.Tensor:
+    def _pad(self, t: torch.Tensor, zero: torch.Tensor) -> torch.Tensor:
         n = int(t.shape[0])
         if n == self.rows:
             return t
@@ -169,9 +222,9 @@ class PPWave:
                 f"pipeline hand-off tensor has {n} rows, above the wave's "
                 f"{self.rows}-row buffer (the largest compiled token bucket)"
             )
-        return torch.cat([t, self.zero[n:]])
+        return torch.cat([t, zero[n:]])
 
-    def _merge(self, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+    def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
         """The padded sum of a forward's outgoing hidden states and residual."""
         if set(tensors) != set(self.KEYS):
             raise ValueError(
@@ -182,7 +235,7 @@ class PPWave:
             raise ValueError(
                 f"the pipeline wave carries {self.dtype}, got a {merged.dtype} sum"
             )
-        return self._pad(merged)
+        return self._pad(merged, self.zero)
 
     # -- protocol -------------------------------------------------------------
     def begin_iteration(self, has_batch: bool) -> None:
@@ -229,7 +282,10 @@ class PPWave:
                 f"pipeline wave stage {self.rank}: receive() outside an "
                 "iteration with a batch"
             )
-        x = self._launch(self._take_pending())
+        return self.unpack(self._launch(self._take_pending()))
+
+    def unpack(self, x: Payload) -> dict[str, torch.Tensor]:
+        """The forward's inputs from one received buffer."""
         return {self.KEYS[0]: x, self.KEYS[1]: self.zero}
 
     def _check_count(self) -> None:
@@ -249,10 +305,10 @@ class PPWave:
             return
         padded = None
         if tensors is not None:
-            padded = self._merge(tensors)
+            padded = self.merge(tensors)
         if self.rank == 0:
             if self.launches < self._target():
-                self._launch(padded if padded is not None else self.zero)
+                self._launch(padded if padded is not None else self.zero_payload)
             self._check_count()
             return
         if padded is not None:
@@ -264,18 +320,19 @@ class PPWave:
             self.pending = padded
         self._check_count()
 
-    def _take_pending(self) -> torch.Tensor:
-        x = self.pending if self.pending is not None else self.zero
+    def _take_pending(self) -> Payload:
+        x = self.pending if self.pending is not None else self.zero_payload
         self.pending = None
         return x
 
     # -- self-test ------------------------------------------------------------
-    def probe(self) -> bool:
-        """One batch iteration and its full drain on every stage, each stage
-        sending its own number plus one; True when this stage received its
-        number (stage 0 receives the last stage's block and ignores it).
+    def probe(self, *, column: int = 0, columns: int = 1) -> bool:
+        """One batch iteration and its full drain on every stage, each device
+        sending its stage-major index plus one; True when this device received
+        the index of the previous stage's device in its own column (stage 0
+        receives the last stage's block and ignores it).
         Every stage's launch count is level again afterwards."""
-        payload = torch.full_like(self.zero, float(self.rank + 1))
+        sent = self.probe_payload(float(self.rank * columns + column + 1))
         got = None
         for it in range(1 + 2 * (self.size - 2)):
             has_batch = it == 0
@@ -284,59 +341,193 @@ class PPWave:
             if has_batch:
                 got = self.receive()
                 if self.rank != self.last:
-                    tensors = {self.KEYS[0]: payload, self.KEYS[1]: self.zero}
+                    tensors = sent
             self.end_iteration(tensors)
         if self.rank == 0:
             return True
-        want = float(self.rank)
-        x = got[self.KEYS[0]]
-        return float(x[0, 0].item()) == want and float(x[-1, -1].item()) == want
+        want = float((self.rank - 1) * columns + column + 1)
+        return all(
+            float(x[0, 0].item()) == want and float(x[-1, -1].item()) == want
+            for x in self.probe_blocks(got)
+        )
+
+    def probe_payload(self, value: float) -> dict[str, torch.Tensor]:
+        """The outgoing tensors of a probe forward, every element ``value``."""
+        return {
+            self.KEYS[0]: torch.full_like(self.zero, value),
+            self.KEYS[1]: self.zero,
+        }
+
+    def probe_blocks(self, got: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+        """The received tensors a probe checks."""
+        return [got[self.KEYS[0]]]
+
+
+class PPAuxWave(PPWave):
+    """PPWave that also relays Eagle3's capture slots as [rows, num_aux * hidden].
+
+    The slots ride as a second buffer rather than columns or rows of the first:
+    torch_tpu hands a view of a shared buffer to an executable as the buffer's
+    base, so every received piece must be its own storage.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        size: int,
+        rows: int,
+        hidden: int,
+        num_aux: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        launcher: Callable[[Payload], Payload],
+    ) -> None:
+        super().__init__(
+            rank=rank,
+            size=size,
+            rows=rows,
+            hidden=hidden,
+            dtype=dtype,
+            device=device,
+            launcher=launcher,
+        )
+        if num_aux < 1:
+            raise ValueError("PPAuxWave relays at least one capture slot")
+        self.num_aux = int(num_aux)
+        self.aux_width = self.hidden * self.num_aux
+        self.aux_zero = torch.zeros(
+            (self.rows, self.aux_width), dtype=self.dtype, device=self.zero.device
+        )
+        self.zero_payload = (self.zero, self.aux_zero)
+
+    def merge(self, tensors: dict[str, torch.Tensor]) -> Payload:
+        if AUX_HIDDEN_STATES_PROXY_KEY not in tensors:
+            raise ValueError(
+                f"the pipeline wave hands on exactly "
+                f"{sorted((*self.KEYS, AUX_HIDDEN_STATES_PROXY_KEY))}, "
+                f"got {sorted(tensors)}"
+            )
+        aux = tensors[AUX_HIDDEN_STATES_PROXY_KEY]
+        if int(aux.shape[-1]) != self.aux_width:
+            raise ValueError(
+                f"the pipeline wave carries {self.aux_width} aux columns, "
+                f"got {int(aux.shape[-1])}"
+            )
+        hidden = super().merge(
+            {k: v for k, v in tensors.items() if k != AUX_HIDDEN_STATES_PROXY_KEY}
+        )
+        return hidden, self._pad(aux, self.aux_zero)
+
+    def unpack(self, x: Payload) -> dict[str, torch.Tensor]:
+        hidden, aux = x
+        return super().unpack(hidden) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
+
+    def probe_payload(self, value: float) -> dict[str, torch.Tensor]:
+        aux = torch.full_like(self.aux_zero, value)
+        return super().probe_payload(value) | {AUX_HIDDEN_STATES_PROXY_KEY: aux}
+
+    def probe_blocks(self, got: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+        return super().probe_blocks(got) + [got[AUX_HIDDEN_STATES_PROXY_KEY]]
+
+
+def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig, model: nn.Module) -> int:
+    """Eagle3 capture slots a pipeline stage hand-off carries; 0 when none."""
+    if not config.eagle_use_aux_hidden_state:
+        return 0
+    if not getattr(model, "relays_pp_aux_hidden_states", False):
+        return 0
+    layer_ids = config.eagle_aux_hidden_state_layer_ids
+    if layer_ids is None:
+        raise NotImplementedError(
+            "Pipeline parallelism sizes its stage hand-off from the draft's "
+            "eagle_aux_hidden_state_layer_ids, which this draft does not declare."
+        )
+    return len(layer_ids)
 
 
 def build_pp_wave(
-    pp_group: Any, *, rows: int, hidden: int, dtype: torch.dtype, device: torch.device
+    pp_group: GroupCoordinator,
+    *,
+    stage_group: GroupCoordinator,
+    world_group: GroupCoordinator,
+    rows: int,
+    hidden: int,
+    num_aux: int = 0,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
     The permute is routed by mesh position, which follows distributed rank
-    order; the cycle closes from the last stage back to the first.
+    order; each column's cycle closes from the last stage back to the first,
+    and every device of the slice launches the same program.
     """
-    rank = int(pp_group.rank_in_group)
-    size = int(pp_group.world_size)
+    rank = pp_group.rank_in_group
+    size = pp_group.world_size
+    columns = stage_group.world_size
+    column = stage_group.rank_in_group
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if size != world_size:
+    if size * columns != world_size:
         raise ValueError(
-            f"the pipeline wave needs the pipeline group to span the whole slice "
-            f"(pp {size}, world {world_size}); run pipeline stages at tp 1"
+            f"the pipeline wave needs the pipeline stages to cover the whole slice "
+            f"(pp {size} stages of {columns} devices, world {world_size})"
         )
-    ranks = tuple(pp_group.ranks)
-    perm = tuple((ranks[r], ranks[(r + 1) % size]) for r in range(size))
-    op = build_pp_permute_op(perm)
-    wave = PPWave(
-        rank=rank,
-        size=size,
-        rows=rows,
-        hidden=hidden,
-        dtype=dtype,
-        device=device,
-        launcher=lambda x: launch_now(op, x),
+    perm = pipeline_permutation(
+        pp_ranks=tuple(pp_group.ranks),
+        stage_ranks=tuple(stage_group.ranks),
+        column=column,
     )
-    ok = wave.probe()
-    # Every stage must agree on the routing, so the verdict is gathered.
-    verdicts: list = [None] * size
-    torch.distributed.all_gather_object(verdicts, bool(ok), group=pp_group.cpu_group)
+    if num_aux:
+        pair_op = build_pp_pair_permute_op(perm)
+        wave = PPAuxWave(
+            rank=rank,
+            size=size,
+            rows=rows,
+            hidden=hidden,
+            num_aux=num_aux,
+            dtype=dtype,
+            device=device,
+            launcher=lambda x: launch_pair_now(pair_op, x),
+        )
+    else:
+        op = build_pp_permute_op(perm)
+        wave = PPWave(
+            rank=rank,
+            size=size,
+            rows=rows,
+            hidden=hidden,
+            dtype=dtype,
+            device=device,
+            launcher=lambda x: launch_now(op, x),
+        )
+    ok = wave.probe(column=column, columns=columns)
+    # Every device must agree on the routing, so the verdict is gathered.
+    verdicts: list = [None] * world_group.world_size
+    torch.distributed.all_gather_object(verdicts, bool(ok), group=world_group.cpu_group)
     if not all(verdicts):
         raise RuntimeError(
-            f"pipeline wave stage {rank}: the hand-off probe failed "
-            f"(stage verdicts {verdicts}, ranks {ranks})"
+            f"pipeline wave stage {rank} column {column}: the hand-off probe "
+            f"failed (rank verdicts {verdicts}, cycles {perm})"
         )
     logger.info(
-        "pipeline wave stage %d/%d: hand-off cycle over ranks %s, buffer [%d, %d] %s",
+        "pipeline wave stage %d/%d column %d/%d: hand-off cycles %s, "
+        "buffer [%d, %d] %s",
         rank,
         size,
-        ranks,
+        column,
+        columns,
+        perm,
         rows,
         hidden,
         dtype,
     )
+    if num_aux:
+        logger.info(
+            "pipeline wave stage %d: %d Eagle3 slot(s) as a second [%d, %d] buffer",
+            rank,
+            num_aux,
+            rows,
+            num_aux * hidden,
+        )
     return wave

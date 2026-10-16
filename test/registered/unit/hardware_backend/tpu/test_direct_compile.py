@@ -1,6 +1,7 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayou
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import dp_attention
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -36,7 +38,7 @@ from sglang_tpu.compilation.decoder_compile_policy import (
 from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.warmup_queue import collect_warmups
 
-register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit", chips=1)
 
 _COMPILE_RESULT = SimpleNamespace(executable="executable")
 _TPU_AVAILABLE = hasattr(torch, "accelerator") and torch.accelerator.is_available()
@@ -215,8 +217,8 @@ class TestDirectCompile(CustomTestCase):
         def compile_helper(fn, **kwargs):
             compiled = MagicMock(side_effect=fn)
             compiled.cache = {}
-            compiled.warmup_async.side_effect = lambda *args: PendingCall(
-                lambda: compiled(*args)
+            compiled.precompile.side_effect = lambda *args, **kwargs: PendingCall(
+                lambda: None
             )
             return compiled
 
@@ -238,6 +240,42 @@ class TestDirectCompile(CustomTestCase):
                         self.assertEqual(queue.calls, [])
                     self.assertIsNone(warmup_compiled_op(op, x))
                     self.assertTrue(torch.equal(op(x), x * 3))
+
+    def test_precompile_releases_inputs_and_joins_without_execution(self):
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous):
+                compiled = direct_compile.direct_compile(
+                    lambda value: value + 1,
+                    specialization_key=lambda value: tuple(value.shape),
+                )
+                artifact = _make_artifact(((2,),))
+                future = MagicMock()
+                if asynchronous:
+                    artifact.executable = None
+                    artifact.pending_compile = future
+
+                def compile_helper(args, kwargs, *, async_compile):
+                    self.assertEqual(async_compile, asynchronous)
+                    return artifact
+
+                with (
+                    patch.object(compiled, "_compile", compile_helper),
+                    patch.object(
+                        direct_compile.tpu_torch_compile, "execute"
+                    ) as execute,
+                ):
+                    inputs = torch.ones(2)
+                    reference = weakref.ref(inputs)
+                    with collect_warmups() as queue:
+                        queue.calls.append(
+                            compiled.precompile(inputs, async_compile=asynchronous)
+                        )
+                        del inputs
+                        self.assertIsNone(reference())
+                        future.get.assert_not_called()
+                    self.assertIsNone(artifact.pending_compile)
+                    self.assertEqual(future.get.call_count, int(asynchronous))
+                    execute.assert_not_called()
 
     def test_compiled_helper_inlines_inside_outer_dynamo_graph(self):
         @compiled_op()
@@ -266,6 +304,30 @@ class TestDirectCompile(CustomTestCase):
             self.assertEqual(compiled("warmup"), "output")
             with self.assertRaisesRegex(RuntimeError, "Detected recompile"):
                 compiled("new specialization")
+
+        compile_fn.assert_called_once()
+
+    def test_compiled_op_keyword_call_reuses_positional_warmup(self):
+        """A keyword-argument call must hit the specialization warmed positionally."""
+        artifact = MagicMock(return_value="output")
+
+        @compiled_op()
+        def op(a, b, scale=2):
+            return a * scale + b
+
+        with (
+            patch("sglang.srt.compilation.compiled_op.is_tpu", return_value=True),
+            patch.object(
+                direct_compile.CompiledFunction, "_compile", return_value=artifact
+            ) as compile_fn,
+            get_context().override_server_args(tpu_compile_tracer="direct"),
+            envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+        ):
+            a, b = torch.ones(16, 6), torch.zeros(16, 6)
+            op(a, b)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                op(a=a, b=b)
+                op(b=b, a=a, scale=2)
 
         compile_fn.assert_called_once()
 
@@ -409,6 +471,46 @@ class TestDirectCompile(CustomTestCase):
             torch.tpu.set_rng_state(original_state)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_precompile_first_call_preserves_rng_without_recompilation(self):
+        value = torch.ones((2, 7), device="tpu")
+        original_state = torch.tpu.get_rng_state()
+
+        def draw(x):
+            return x + torch.rand_like(x)
+
+        try:
+            for asynchronous in (False, True):
+                with (
+                    self.subTest(asynchronous=asynchronous),
+                    torch.no_grad(),
+                    get_context().override_server_args(tpu_compile_tracer="direct"),
+                    envs.SGLANG_ENABLE_TORCH_COMPILE.override(True),
+                    envs.SGLANG_DIRECT_COMPILE_ASYNC.override(asynchronous),
+                ):
+                    op = compiled_op(uses_rng=True)(draw)
+                    before = torch.tpu.get_rng_state()
+                    compiler = direct_compile.tpu_torch_compile
+                    with patch.object(
+                        compiler, "execute", wraps=compiler.execute
+                    ) as execute:
+                        with collect_warmups():
+                            warmup_compiled_op(op, value)
+                        execute.assert_not_called()
+                    self.assertTrue(torch.equal(before, torch.tpu.get_rng_state()))
+                    torch.accelerator.synchronize()
+                    misses = torch.tpu._get_cache_misses()
+                    with torch.compiler.set_stance("fail_on_recompile"):
+                        first = op(value)
+                        torch.accelerator.synchronize()
+                    self.assertEqual(torch.tpu._get_cache_misses(), misses)
+                    after = torch.tpu.get_rng_state()
+                    torch.tpu.set_rng_state(before)
+                    self.assertTrue(torch.equal(first.cpu(), draw(value).cpu()))
+                    self.assertTrue(torch.equal(after, torch.tpu.get_rng_state()))
+        finally:
+            torch.tpu.set_rng_state(original_state)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_registered_helpers_compile_directly_and_match_eager(self):
         from sglang.srt.compilation.compiled_op import (
             get_compiled_ops,
@@ -445,7 +547,11 @@ class TestDirectCompile(CustomTestCase):
                         lambda x: x.cpu() if isinstance(x, torch.Tensor) else x, args
                     )
                     expected = op.__wrapped__(*cpu_args)
+                    torch.accelerator.synchronize()
+                    misses = torch.tpu._get_cache_misses()
                     actual = op(*args)
+                    torch.accelerator.synchronize()
+                    self.assertEqual(torch.tpu._get_cache_misses(), misses, op.__name__)
                     self.assertEqual(
                         tree_util.tree_structure(actual),
                         tree_util.tree_structure(expected),
@@ -460,6 +566,12 @@ class TestDirectCompile(CustomTestCase):
         artifact.pending_compile = MagicMock()
         artifact.pending_compile.get.side_effect = RuntimeError("native compile failed")
         with patch.object(direct_compile.tpu_torch_compile, "execute") as execute:
+            complete = MagicMock()
+            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+                with collect_warmups() as queue:
+                    queue.calls.append(PendingCall(artifact.wait_for_compile))
+                    queue.completions.append(complete)
+            complete.assert_not_called()
             with self.assertRaisesRegex(RuntimeError, "native compile failed"):
                 artifact(((torch.ones(2),), {}))
             execute.assert_not_called()
@@ -1390,23 +1502,33 @@ class TestDirectCompileDpRanks(unittest.TestCase):
             for device in (torch.device("tpu"), value.device)
         }
         values = torch.tensor([2.0, 3.0], device="tpu")
-        backend = SimpleNamespace(forward_metadata=None)
+        backend = AttentionBackend()
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=values,
+            req_pool_indices=None,
+            seq_lens=None,
+            out_cache_loc=None,
+            seq_lens_sum=0,
+        )
+        inputs = (values, None, forward_batch)
         with (
             patch.object(dp_attention, "_RANK_TENSORS", cache),
             forward_context(ForwardContext(attn_backend=backend)),
         ):
             compiled, warmup_async = policy._direct_compile(model.forward)
             torch.testing.assert_close(
-                warmup_async(values, None, None).wait().cpu(),
-                model(values, None, None).cpu(),
+                warmup_async(*inputs).wait().cpu(),
+                model(*inputs).cpu(),
             )
             # Reuse one executable while changing both scalar rank buffers.
             # Constants baked during tracing would return the first rank's result.
             for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
                 ranks["attn_tp"].fill_(tp_rank)
                 ranks["attn_dp"].fill_(dp_rank)
-                expected = model(values, None, None).cpu()
-                actual = compiled(values, None, None).cpu()
+                expected = model(*inputs).cpu()
+                actual = compiled(*inputs).cpu()
                 torch.testing.assert_close(actual, expected)
                 self.assertIs(dp_attention._RANK_TENSORS, cache)
 
