@@ -26,6 +26,11 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Drop Dynamo guards on nn.Module state (attributes, submodules, parameters)
+    # for the decoder graph; input and global guards stay (see
+    # decoder_compile_policy._guard_filter_options). Assumes module state is
+    # fixed after warmup.
+    SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
