@@ -359,29 +359,20 @@ class BailingMLP(nn.Module):
     ):
         x, _ = self.gate_up_proj(x)
 
-        if self.padded_size_per_partition is not None:
-            gate_padded = x[..., : self.padded_size_per_partition]
-            up_padded = x[..., self.padded_size_per_partition :]
-
-            gate_effective = gate_padded[..., : self.effective_size_per_partition]
-            up_effective = up_padded[..., : self.effective_size_per_partition]
-
-            if self.swiglu_limit is not None:
-                x = F.silu(gate_effective).clamp(
-                    max=self.swiglu_limit
-                ) * up_effective.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            else:
-                x = F.silu(gate_effective) * up_effective
-
-            x = F.pad(x, (0, self.pad_size_per_partition))
+        # A padded intermediate size uses the append-at-end convention of the
+        # weight loaders (pad_or_narrow_weight / _pad_block_scale_tail in
+        # linear.py): each rank holds a contiguous
+        # [rank * padded_size_per_partition, ...) slice of the checkpoint,
+        # zero-padded at the global tail. Zero channels are inert under
+        # SiLU*Up and the row-parallel matmul, so padded channels flow through
+        # the activation unchanged instead of being sliced out and re-padded.
+        if self.swiglu_limit is not None:
+            d = x.shape[-1] // 2
+            gate = F.silu(x[..., :d]).clamp(max=self.swiglu_limit)
+            up = x[..., d:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            x = gate * up
         else:
-            if self.swiglu_limit is not None:
-                d = x.shape[-1] // 2
-                gate = F.silu(x[..., :d]).clamp(max=self.swiglu_limit)
-                up = x[..., d:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-                x = gate * up
-            else:
-                x = self.act_fn(x)
+            x = self.act_fn(x)
 
         x, _ = self.down_proj(x)
         return x
