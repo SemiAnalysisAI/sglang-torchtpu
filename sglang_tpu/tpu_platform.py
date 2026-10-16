@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_exec
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.recompilation_checker import (
     snapshot_recompilation_baseline,
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
+
+# Platform discovery runs before worker bootstrap configures torch_tpu.
+rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
+traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -342,11 +347,14 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
             )
-    if cfg.speculative_algorithm is not None:
+    # PD prefill only exports the target's hidden states for the decode node;
+    # the draft loop itself never runs here, so the stage relay stays spec-free.
+    if cfg.speculative_algorithm is not None and cfg.disaggregation_mode != "prefill":
         raise NotImplementedError(
             "Speculative decoding "
             f"(--speculative-algorithm {cfg.speculative_algorithm}) "
-            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp}) "
+            "outside --disaggregation-mode prefill."
         )
     if cfg.enable_dynamic_chunking:
         raise NotImplementedError(
@@ -499,6 +507,16 @@ def _validate_dsa(server_args) -> None:
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
         )
+    # The direct tracer gets the KV cache buffers from the pool's get_state and
+    # set_state. TpuSplitMLATokenToKVPool does not implement them for its own
+    # buffers, so the first compile would fail.
+    # TODO(sglang-torchtpu#1072): implement them and run DSA with the direct
+    # tracer.
+    if cfg.tpu_compile_tracer != "dynamo":
+        raise ValueError(
+            "DSA on TPU needs --tpu-compile-tracer dynamo, got "
+            f"{cfg.tpu_compile_tracer!r}."
+        )
 
 
 def _register_attention_backends() -> None:
@@ -514,6 +532,12 @@ def _register_attention_backends() -> None:
         )
 
         return TpuPallasSparseMlaAttnBackend(runner)
+
+    @register_attention_backend("dsv4")
+    def create_tpu_dsv4_backend(runner):
+        from sglang_tpu.dsv4 import DSV4TPUAttnBackend
+
+        return DSV4TPUAttnBackend(runner)
 
 
 def _resolve_num_hidden_layers(server_args) -> int:
@@ -686,6 +710,16 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        return rank_slice(tensor, dim, parts, rank)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -1069,9 +1103,9 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
-        from sglang_tpu.kv_pool import TpuFusedDSATokenToKVPool
+        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
-        return TpuFusedDSATokenToKVPool
+        return TpuSplitMLATokenToKVPool
 
     def get_zigzag_cp_strategy_cls(self) -> type:
         from sglang_tpu.cp_strategy import TpuZigzagCPStrategy
@@ -1153,12 +1187,6 @@ class TpuSRTPlatform(SRTPlatform):
                 "Initialize it from the scheduler worker bootstrap."
             )
 
-        from sglang_tpu.compile_cache import (
-            add_pallas_kernel_sources_to_compile_cache_key,
-        )
-
-        add_pallas_kernel_sources_to_compile_cache_key()
-
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
@@ -1191,9 +1219,19 @@ class TpuSRTPlatform(SRTPlatform):
         # topology discovery is therefore confined to the worker.
         _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
 
+        from sglang_tpu.compile_cache import (
+            add_tpu_kernel_inputs_to_compile_cache_key,
+        )
+
+        # After _prepare_tpu_env: the key must see the final LIBTPU_INIT_ARGS.
+        add_tpu_kernel_inputs_to_compile_cache_key()
+
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
         _register_attention_backends()
         self._backend_initialized = True
 
@@ -1223,6 +1261,13 @@ class TpuSRTPlatform(SRTPlatform):
             "[tpu] Warmup complete; froze torch.compile via "
             "set_stance('fail_on_recompile')."
         )
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return tier-1 misses, including compiles and persistent-cache loads."""
+        get_cache_misses = getattr(
+            getattr(torch, "tpu", None), "_get_cache_misses", None
+        )
+        return None if get_cache_misses is None else int(get_cache_misses())
 
     def prepare_model_parallel_groups(self) -> None:
         from sglang.srt.runtime_context import get_parallel

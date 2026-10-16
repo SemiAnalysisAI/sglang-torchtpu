@@ -19,13 +19,13 @@ import msgspec
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
 )
+from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
     head_bytes,
@@ -62,21 +62,32 @@ def _kv_rank(tensor) -> int:
     return rank
 
 
+def pool_kind(tag: str) -> str:
+    return tag.rsplit(".l", 1)[0]
+
+
+def is_swa_pool(tag: str) -> bool:
+    return pool_kind(tag).endswith("swa")
+
+
 def pool_manifest(groups: Any) -> list[dict]:
     """Name each local full-attention or sliding-window tensor by model layer."""
     pools = []
-    for kind, tensors, layer_ids in (
-        ("fa", groups.full, groups.full_layer_ids),
-        ("swa", groups.swa, groups.swa_layer_ids),
+    for kind, tensors, layer_ids, num_draft in (
+        ("fa", groups.full, groups.full_layer_ids, groups.num_draft_full),
+        ("swa", groups.swa, groups.swa_layer_ids, groups.num_draft_swa),
     ):
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
-        for tensor, layer in zip(tensors, layer_ids):
+        num_target = len(tensors) - num_draft
+        for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
+            # Draft layer IDs restart at 0, so they need their own namespace.
+            tag_kind = kind if index < num_target else f"draft.{kind}"
             _kv_rank(tensor)
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
-                    tag=f"{kind}.l{int(layer)}",
+                    tag=f"{tag_kind}.l{int(layer)}",
                     storage_index=len(pools),
                     base_offset_bytes=0,
                     block_stride_bytes=size,
@@ -148,7 +159,9 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             tiles=[[int(n) for n in tile] for tile in tiles],
             element_bits=int(bits or tensor.element_size() * 8),
         )
-        kind = pool["tag"].split(".l")[0]
+        # A draft page matches its target class, so a stage without the draft
+        # fingerprints like one with it.
+        kind = pool_kind(pool["tag"]).removeprefix("draft.")
         if kind in classes and classes[kind] != signature:
             raise ValueError(f"Raiden {kind} layers have differing page layouts")
         classes[kind] = signature
@@ -160,7 +173,7 @@ def source_spans(pools: Sequence[dict], full: list[int], swa: list[int]) -> list
     """Describe whole pages in destination byte space for each locally owned layer."""
     result = []
     for pool in pools:
-        blocks = swa if pool["tag"].startswith("swa.") else full
+        blocks = swa if is_swa_pool(pool["tag"]) else full
         stride = pool["block_stride_bytes"]
         spans = [
             SimpleNamespace(
@@ -199,7 +212,7 @@ def head_slice_spans(
     page: one strided span per page and rank, routed to that rank only."""
     result = []
     for pool, tensor in zip(pools, tensors):
-        blocks = swa if pool["tag"].startswith("swa.") else full
+        blocks = swa if is_swa_pool(pool["tag"]) else full
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
@@ -263,7 +276,7 @@ def destination_blocks(
     """Clip a cached prefix and omit the decode-only trailing token page."""
     tags, blocks, counts, skips = [], [], [], []
     for pool in pools:
-        is_swa = pool["tag"].startswith("swa.")
+        is_swa = is_swa_pool(pool["tag"])
         local = list(swa if is_swa else full)
         remote_count = source_swa_count if is_swa else source_full_count
         if len(local) > remote_count:
@@ -386,7 +399,7 @@ def part_spans(
     keep = [
         index
         for index, pool in enumerate(pools)
-        if with_swa or not pool["tag"].startswith("swa.")
+        if with_swa or not is_swa_pool(pool["tag"])
     ]
     pools = [pools[i] for i in keep]
     tensors = [tensors[i] for i in keep]
@@ -412,7 +425,7 @@ def part_destination_blocks(
     for pool in pools:
         if only_tags is not None and pool["tag"] not in only_tags:
             continue
-        is_swa = pool["tag"].startswith("swa.")
+        is_swa = is_swa_pool(pool["tag"])
         if is_swa and source_swa_count is None:
             continue
         if is_swa:
@@ -556,7 +569,7 @@ class PipelineTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
-        self._check_support(raiden_service_pb2, groups)
+        self._check_support(raiden_service_pb2)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
         self.pools = pool_manifest(groups)
@@ -619,6 +632,22 @@ class PipelineTransfer:
         )
         self.stage_group_size = max(1, envs.SGLANG_RAIDEN_PIPELINE_STAGE_GROUP.get())
         self.coord_workers = max(1, envs.SGLANG_RAIDEN_PIPELINE_COORD_WORKERS.get())
+        self.early_close = (
+            envs.SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE.get() and self.producer
+        )
+        if self.early_close and self.stage_parts:
+            raise ValueError(
+                "SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE moves each stage's share in the "
+                "closing transfer, which stage groups replace; unset "
+                "SGLANG_RAIDEN_PIPELINE_STAGE_PARTS"
+            )
+        if self.early_close and get_parallel().pp_async_batch_depth < 1:
+            raise ValueError(
+                "SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE needs --pp-async-batch-depth 1: "
+                "the last stage closes its share on the deferred output send"
+            )
+        # Producer: this stage's final chunks until their KV is handed off.
+        self.final_chunks = FinalChunks(self) if self.producer else None
         # A ReshardClient owns one socket, so each coordinating thread has its own.
         self._thread_clients = threading.local()
         # Producer: a room's early parts, and this stage's closing part.
@@ -632,7 +661,7 @@ class PipelineTransfer:
             else None
         )
 
-    def _check_support(self, raiden_service_pb2, groups) -> None:
+    def _check_support(self, raiden_service_pb2) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
         if manager.attn_cp_size != 1:
@@ -646,19 +675,6 @@ class PipelineTransfer:
             raise ValueError(
                 "Raiden pipeline transfer takes attention TP>1 only on a decode "
                 "without pipeline stages"
-            )
-        # The transfer moves target-pool pages and the prefill's aux blob only.
-        # A decode can speculate if its draft keeps no pool of its own and needs
-        # no draft state from the prefill (e.g. NGRAM, or a plugin draft that
-        # writes into the target pool).
-        spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-        if spec.is_speculative() and (
-            self.producer or groups.has_draft_pool or spec.carries_draft_hidden_states()
-        ):
-            raise ValueError(
-                "Raiden pipeline transfer supports speculative decoding only on "
-                "the decode, without a separate draft KV pool or draft hidden "
-                "states from the prefill"
             )
         if (
             "wire_pool_indices"
@@ -713,7 +729,7 @@ class PipelineTransfer:
             options=dict(
                 staging_leases=slots,
                 staging_blocks_per_pool=[
-                    swa_blocks if p["tag"].startswith("swa.") else full_blocks
+                    swa_blocks if is_swa_pool(p["tag"]) else full_blocks
                     for p in self.pools
                 ],
             ),
@@ -1129,9 +1145,52 @@ class PipelineTransfer:
 
     # ----- producer: closing transfer --------------------------------------
 
+    def _closing_entry(self, room, full: list[int], swa: list[int], aux: bytes):
+        """The room's closing transfer: the pages its early parts left, the
+        window and the first-token metadata. Hold the manager's state lock."""
+        state = self.early.get(room)
+        start = state["offered"] if state else 0
+        if full and start >= len(full):
+            # Keep the full-attention page the decode's completion
+            # is keyed on in the closing transfer.
+            start = len(full) - 1
+        # The pages register with the consumer's head geometry, so
+        # registration waits for the first consumer request.
+        return dict(
+            full=full[start:],
+            start=start,
+            parts=len(state["parts"]) if state else 0,
+            swa=swa,
+            aux=aux,
+            expires=time.monotonic() + self.manager._timeout_s,
+            registered=False,
+            replied=set(),
+        )
+
+    def close_early(
+        self, room: int, full: list[int], swa: list[int], aux: bytes = b""
+    ) -> None:
+        """SGLANG_RAIDEN_PIPELINE_EARLY_CLOSE: register and announce this
+        stage's share of the closing transfer before its result point. Its
+        pages may still be written: tpu-sync reads registered pages only when
+        the decode coordinates the transfer (request_block_registry.cc), which
+        it does once every stage has announced."""
+        self._validate_room(room)
+        mgr = self.manager
+        with self.lock:
+            with mgr._state_lock:
+                if room in mgr._aborted or room in self.sent or room in self.failed:
+                    return
+                self.sent[room] = self._closing_entry(
+                    room, [int(b) for b in full], [int(b) for b in swa], aux
+                )
+            self._reply(room)
+
     def finalize_send(self, room: int, aux_index: int | None) -> bool:
         self._validate_room(room)
         mgr = self.manager
+        late_aux = False
+        mismatch = None
         with self.lock:
             with mgr._state_lock:
                 if room in mgr._aborted:
@@ -1154,33 +1213,66 @@ class PipelineTransfer:
                     # The forward has certainly completed at the result point.
                     entry["fence"] = None
                     entry["aux"] = aux
+                elif room in self.sent:
+                    # Closed early: check its pages, and give a last-stage share
+                    # sent without first-token metadata the result point's.
+                    item = self.sent[room]
+                    if item["full"] != full[item["start"] :] or item["swa"] != swa:
+                        mismatch = (
+                            f"the pages registered before the result point "
+                            f"({len(item['full'])} full, {len(item['swa'])} window) "
+                            f"differ from the result point's "
+                            f"({len(full) - item['start']}, {len(swa)})"
+                        )
+                        self._abort_room(room, mismatch)
+                    elif not item["aux"] and aux and mgr.pp_rank == mgr.pp_size - 1:
+                        item["aux"] = aux
+                        late_aux = True
                 else:
-                    state = self.early.get(room)
-                    start = state["offered"] if state else 0
-                    if full and start >= len(full):
-                        # Keep the full-attention page the decode's completion
-                        # is keyed on in the closing transfer.
-                        start = len(full) - 1
-                    # The pages register with the consumer's head geometry, so
-                    # registration waits for the first consumer request.
-                    self.sent[room] = dict(
-                        full=full[start:],
-                        start=start,
-                        parts=len(state["parts"]) if state else 0,
-                        swa=swa,
-                        aux=aux,
-                        expires=time.monotonic() + mgr._timeout_s,
-                        registered=False,
-                        replied=set(),
-                    )
+                    self.sent[room] = self._closing_entry(room, full, swa, aux)
                 mgr.update_status(room, KVPoll.Transferring)
+            if mismatch is not None:
+                for endpoint in self.replies.get(room, {}):
+                    mgr._reply_room_failed(
+                        room=room, endpoint=endpoint, reason=mismatch
+                    )
+                return False
             # Registration calls the controller, so it runs outside the
             # manager's state lock.
             if self.stage_parts:
                 self._advance_stage(room)
             else:
+                if late_aux:
+                    self._announce_aux(room)
                 self._reply(room)
             return room not in self.failed
+
+    def _abort_room(self, room, reason: str) -> None:
+        """Fail a room as an abort does: the producer poll cancels its closing
+        transfer if unclaimed, and a claimed one keeps the room's pages until
+        it settles. Hold the manager's state lock."""
+        mgr = self.manager
+        logger.error("Raiden pipeline rank%d room %s: %s", self.rank, room, reason)
+        mgr._mark_aborted_locked(room)
+        mgr._fail_room_locked(room, reason, preserve_reason=True)
+        mgr.update_status(room, KVPoll.Failed)
+
+    def _announce_aux(self, room) -> None:
+        """Send the first-token metadata alone to every decode already told of
+        the room's closing share; later ones get it with the share."""
+        item = self.sent[room]
+        mgr = self.manager
+        meta = json.dumps(dict(rank=mgr.pp_rank, pp_size=mgr.pp_size, aux_only=True))
+        for endpoint in item["replied"]:
+            self._send(
+                endpoint,
+                [
+                    MessageTag.PIPELINE_READY,
+                    str(room).encode(),
+                    meta.encode(),
+                    item["aux"],
+                ],
+            )
 
     def _fail_room(self, room, reason: str) -> None:
         """Fail one room and record why; its sender or receiver concludes it on
@@ -1308,7 +1400,10 @@ class PipelineTransfer:
                 part["sources"][rank] = meta
             else:
                 request.sources[rank] = meta
-                self._write_aux(request, msg[3])
+                # A DP/TP decode hears every stage; only the last one holds the
+                # sampled token and the draft hidden states.
+                if mgr.pp_size > 1 or rank == pp_size - 1:
+                    self._write_aux(request, msg[3])
 
     def _write_aux(self, request, blob: bytes) -> None:
         mgr = self.manager

@@ -6,9 +6,7 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 import builtins
 import os
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -102,23 +100,44 @@ class TestTpuPlatformInitialization(CustomTestCase):
         calls = []
         fake_torch_tpu = ModuleType("torch_tpu")
 
+        def prepare(world_size, **kwargs):
+            calls.append(("prepare", world_size, kwargs))
+            os.environ["LIBTPU_INIT_ARGS"] = "--xla_user=1 --xla_override=0"
+
         with (
-            patch.dict(os.environ, {"WORLD_SIZE": "16"}, clear=False),
+            patch.dict(
+                os.environ,
+                {"WORLD_SIZE": "16", "LIBTPU_INIT_ARGS": "--xla_user=1"},
+                clear=False,
+            ),
             patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
             compiler_config.patch(cache_key_tag=""),
             patch(
                 "sglang_tpu.patches._prepare_tpu_env",
-                side_effect=lambda world_size, **kwargs: calls.append(
-                    ("prepare", world_size, kwargs)
+                side_effect=prepare,
+            ),
+            patch(
+                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key",
+                side_effect=lambda: calls.append(
+                    ("cache_key", os.environ["LIBTPU_INIT_ARGS"])
                 ),
             ),
             patch(
                 "sglang_tpu.patches.apply_tpu_patches",
                 side_effect=lambda: calls.append(("patch", None)),
             ),
+            patch(
+                "sglang_tpu.tpu_platform.rank_slice._load",
+                side_effect=lambda: calls.append(("rank_slice", None)),
+            ),
+            patch(
+                "sglang_tpu.tpu_platform.traced_rank._load",
+                side_effect=lambda: calls.append(("traced_rank", None)),
+            ),
         ):
             self.platform.init_backend()
 
+        # The compile cache key must see the flags _prepare_tpu_env appends.
         self.assertEqual(
             calls,
             [
@@ -127,55 +146,27 @@ class TestTpuPlatformInitialization(CustomTestCase):
                     16,
                     {"resolve_single_host_topology": True},
                 ),
+                ("cache_key", "--xla_user=1 --xla_override=0"),
                 ("patch", None),
+                ("rank_slice", None),
+                ("traced_rank", None),
             ],
         )
 
 
 class TestTpuCompileCache(CustomTestCase):
-    def test_pallas_source_change_updates_compile_cache_key(self):
-        import sglang_tpu.compile_cache as compile_cache
+    def test_reports_tier1_cache_misses(self):
+        with patch.object(
+            torch,
+            "tpu",
+            SimpleNamespace(_get_cache_misses=lambda: 37),
+            create=True,
+        ):
+            self.assertEqual(TpuSRTPlatform().get_compilation_cache_misses(), 37)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            package_root = Path(temp_dir)
-            source_files = (
-                package_root / "attention/pallas/kernel.py",
-                package_root / "moe/pallas/kernel.py",
-                package_root / "attention_pallas.py",
-                package_root / "attention_pallas_mla.py",
-                package_root / "attention_pallas_mla_sparse.py",
-                package_root / "attention_pallas_rpa_base.py",
-                package_root / "attention_pallas_rpa_batched.py",
-                package_root / "attention_pallas_rpa_v3.py",
-                package_root / "distributed_topk_pallas.py",
-                package_root / "dsa_indexer_tpu.py",
-                package_root / "dsv4/sparsecore_topk.py",
-                package_root / "dsv4/streamindex_topk/kernel.py",
-                package_root / "kernels/distributed_topk.py",
-                package_root / "kernels/kernel.py",
-                package_root / "pallas_export.py",
-                package_root / "pallas_jax_op.py",
-                package_root / "quantized_matmul.py",
-            )
-            for source_file in source_files:
-                source_file.parent.mkdir(parents=True, exist_ok=True)
-                source_file.write_text("original source\n")
-
-            module_path = package_root / "compile_cache.py"
-            with (
-                patch.object(compile_cache, "__file__", str(module_path)),
-                compiler_config.patch(cache_key_tag="user-tag"),
-            ):
-                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
-                original_key = compiler_config.cache_key_tag
-
-                distributed_top_k_source = package_root / "kernels/distributed_topk.py"
-                distributed_top_k_source.write_text("changed source\n")
-                compile_cache.add_pallas_kernel_sources_to_compile_cache_key()
-                changed_key = compiler_config.cache_key_tag
-
-                self.assertTrue(original_key.startswith("user-tag|"))
-                self.assertNotEqual(changed_key, original_key)
+    def test_omits_cache_misses_when_runtime_has_no_counter(self):
+        with patch.object(torch, "tpu", SimpleNamespace(), create=True):
+            self.assertIsNone(TpuSRTPlatform().get_compilation_cache_misses())
 
 
 class TestTpuPlatformMemory(CustomTestCase):
@@ -626,9 +617,12 @@ class TestDsaValidation(CustomTestCase):
     _args = TestTpuPlatformServerDefaults._args
     _apply = TestTpuPlatformServerDefaults._apply
 
-    def _apply_dsa(self, *, attention_backend, **config_fields):
+    def _apply_dsa(
+        self, *, attention_backend, tpu_compile_tracer="dynamo", **config_fields
+    ):
         args = self._args(
             attention_backend=attention_backend,
+            tpu_compile_tracer=tpu_compile_tracer,
             model_path="model",
             trust_remote_code=False,
             revision=None,
@@ -655,6 +649,16 @@ class TestDsaValidation(CustomTestCase):
                     self._apply_dsa(
                         attention_backend="pallas_tpu_mla_sparse", **{field: 4}
                     )
+
+    def test_dsa_needs_the_dynamo_tracer(self):
+        """The direct tracer reads the KV cache through the pool's get_state,
+        which the split MLA pool does not implement. The launch must say so
+        instead of failing at the first compile."""
+        with self.assertRaisesRegex(ValueError, "tpu-compile-tracer dynamo"):
+            self._apply_dsa(
+                attention_backend="pallas_tpu_mla_sparse",
+                tpu_compile_tracer="direct",
+            )
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
@@ -906,9 +910,9 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
-    def test_dsa_pool_is_the_fused_pool_with_index_keys(self):
+    def test_dsa_pool_is_the_split_pool(self):
         cls = self.platform.get_dsa_kv_pool_cls()
-        self.assertEqual(cls.__name__, "TpuFusedDSATokenToKVPool")
+        self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):

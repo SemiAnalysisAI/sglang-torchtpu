@@ -15,8 +15,9 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.pp_wave import PPWave, pipeline_permutation
+from sglang_tpu.pp_wave import PPAuxWave, PPWave, pipeline_permutation
 
 ROWS, HIDDEN = 8, 4
 
@@ -37,7 +38,9 @@ class _FakeIci:
         def launch(x):
             with self.cond:
                 k = self.count[rank]
-                self.sent[(k, rank)] = x.clone()
+                self.sent[(k, rank)] = (
+                    tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone()
+                )
                 self.count[rank] += 1
                 self.cond.notify_all()
                 ok = self.cond.wait_for(
@@ -56,7 +59,19 @@ class _FakeIci:
         return launch
 
 
-def _wave(rank, size, ici=None):
+def _wave(rank, size, ici=None, num_aux=0):
+    launcher = ici.launcher(rank) if ici else (lambda x: x)
+    if num_aux:
+        return PPAuxWave(
+            rank=rank,
+            size=size,
+            rows=ROWS,
+            hidden=HIDDEN,
+            num_aux=num_aux,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            launcher=launcher,
+        )
     return PPWave(
         rank=rank,
         size=size,
@@ -64,7 +79,7 @@ def _wave(rank, size, ici=None):
         hidden=HIDDEN,
         dtype=torch.float32,
         device=torch.device("cpu"),
-        launcher=ici.launcher(rank) if ici else (lambda x: x),
+        launcher=launcher,
     )
 
 
@@ -315,6 +330,94 @@ class TestWaveGuards(CustomTestCase):
             pipeline_permutation(pp_ranks=(2, 0, 1), stage_ranks=(2,), column=0),
             ((2, 0), (0, 1), (1, 2)),
         )
+
+
+class TestWaveAuxSlots(CustomTestCase):
+    """Eagle3's capture layers sit on different stages, so their slots ride the
+    same permute as the activation sum and must stay in their own columns."""
+
+    def test_every_stage_slot_reaches_the_last_stage(self):
+        size, num_aux = 3, 2
+        schedule = _drained(size, [True])
+        ici = _FakeIci(size)
+        waves = [_wave(r, size, ici, num_aux=num_aux) for r in range(size)]
+        arrived = [None] * size
+        errors = []
+
+        def run(rank):
+            wave = waves[rank]
+            try:
+                for has_batch in schedule:
+                    wave.begin_iteration(has_batch)
+                    tensors = None
+                    if has_batch:
+                        incoming = wave.receive()
+                        aux = (
+                            torch.zeros((ROWS, HIDDEN * num_aux))
+                            if rank == 0
+                            else incoming[AUX_HIDDEN_STATES_PROXY_KEY].clone()
+                        )
+                        if rank < num_aux:
+                            aux[:, rank * HIDDEN : (rank + 1) * HIDDEN] = float(
+                                rank + 1
+                            )
+                        arrived[rank] = aux
+                        if rank < size - 1:
+                            hidden = torch.full((ROWS, HIDDEN), 7.0)
+                            tensors = {
+                                "hidden_states": hidden,
+                                "residual": torch.zeros_like(hidden),
+                                AUX_HIDDEN_STATES_PROXY_KEY: aux,
+                            }
+                    wave.end_iteration(tensors)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((rank, exc))
+                with ici.cond:
+                    ici.failed = True
+                    ici.cond.notify_all()
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        slots = torch.split(arrived[size - 1], HIDDEN, dim=-1)
+        self.assertEqual([float(slot[0, 0]) for slot in slots], [1.0, 2.0])
+
+    def test_a_payload_of_the_wrong_width_is_rejected(self):
+        """The model and the wave derive the slot count separately; a mismatch
+        would otherwise land as silently misaligned columns."""
+        wave = _wave(0, 3, num_aux=2)
+        tensors = {
+            "hidden_states": torch.zeros((ROWS, HIDDEN)),
+            "residual": torch.zeros((ROWS, HIDDEN)),
+            AUX_HIDDEN_STATES_PROXY_KEY: torch.zeros((ROWS, HIDDEN)),
+        }
+        with self.assertRaisesRegex(ValueError, "carries 8 aux columns, got 4"):
+            wave.merge(tensors)
+
+    def test_received_pieces_are_their_own_buffers(self):
+        """torch_tpu hands a view of a shared buffer to an executable as the
+        buffer's base, so a piece sliced out of one hand-off buffer fails at the
+        first forward that reads it."""
+        wave = _wave(1, 3, num_aux=2)
+        wave.begin_iteration(True)
+        got = wave.receive()
+        for key, piece in got.items():
+            head = piece[: ROWS // 2]
+            self.assertTrue(head.is_contiguous(), key)
+            self.assertEqual(head.storage_offset(), 0, key)
+        self.assertEqual(got[AUX_HIDDEN_STATES_PROXY_KEY].shape, (ROWS, 2 * HIDDEN))
+
+    def test_a_payload_without_the_aux_slots_is_rejected(self):
+        wave = _wave(0, 3, num_aux=2)
+        tensors = {
+            "hidden_states": torch.zeros((ROWS, HIDDEN)),
+            "residual": torch.zeros((ROWS, HIDDEN)),
+        }
+        with self.assertRaisesRegex(ValueError, "hands on exactly"):
+            wave.merge(tensors)
 
 
 if __name__ == "__main__":

@@ -171,6 +171,19 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        """Return the traced rank, optionally within a contiguous parallel group."""
+        return None
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        """Select one evenly divided tensor shard for this rank."""
+        assert tensor.shape[dim] % parts == 0
+        return tensor.split(tensor.shape[dim] // parts, dim=dim)[rank].contiguous()
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
@@ -258,6 +271,14 @@ class SRTPlatform(DeviceMixin):
         a forward (the server warmup request has drained). Platforms that
         compile ahead of serving freeze or monitor compilation here."""
         pass
+
+    def get_compilation_cache_misses(self) -> Optional[int]:
+        """Return a monotonic platform compilation-cache miss counter.
+
+        A platform may return ``None`` when its runtime exposes no such
+        counter. Implementations should not synchronize device execution.
+        """
+        return None
 
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
