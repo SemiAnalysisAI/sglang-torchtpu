@@ -7,17 +7,21 @@ all_reduce
        host-then-cross-host one-shot Pallas exchange takes 13 us.
   How: AROUND GroupCoordinator.all_reduce; the TP group's eligible tensors go
        to sglang_tpu.twolevel_allreduce when SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE
-       registered the op, everything else calls the original.
-  Upstream PR or issue: not filed.
-  Remove when: GroupCoordinator exposes a platform all-reduce backend seam.
+       registered the op (every rank on, a measured topology), everything else
+       calls the original.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1444 (platform all-reduce
+       provider).
+  Remove when: GroupCoordinator takes a platform all-reduce provider, per #1444.
 
 merged_moe_all_reduce
   Why: Kimi-K3's latent MoE reduces the routed latent and the shared-expert
        output; with SGLANG_K3_MERGE_MOE_ALLREDUCE core calls one function for
        both, which the TPU op serves as one packed exchange (no concat/split).
   How: AROUND sglang.srt.models.kimi_k3.merged_moe_all_reduce.
-  Upstream PR or issue: not filed.
-  Remove when: the GroupCoordinator seam above takes several tensors.
+  Upstream PR or issue: sgl-project/sglang-torchtpu#1444 (coalesced
+       all-reduce).
+  Remove when: core has a coalesced TP all-reduce routed through that
+       provider, per #1444.
 """
 
 
