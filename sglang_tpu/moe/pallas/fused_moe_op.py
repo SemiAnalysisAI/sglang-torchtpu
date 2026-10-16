@@ -515,13 +515,16 @@ def _fused_moe_jax(
 
     # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
     # streams only the hit experts (single_token_moe.py) replaces route
-    # metadata + two gmm_v2 calls + activation + combine.
-    if m == 1 and not no_combine and permute_dense_threshold > topk:
+    # metadata + two gmm_v2 calls + activation + combine. It reads topk_ids
+    # directly, so it does not depend on the permute path chosen below
+    # (permute_dense_threshold).
+    if m == 1 and not no_combine:
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import single_token_moe
 
         if tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get() and (
             single_token_moe.eligible(
+                hidden_states,
                 w1,
                 w2,
                 w1_scale,

@@ -33,6 +33,30 @@ _ROWS = 8
 # Intermediate tile widths, largest first; whole 768-wide expert slices
 # measured fastest on Kimi-K3 shapes.
 _TILE_N = (768, 512, 384, 256, 128)
+_VMEM_LIMIT = 48 * 1024 * 1024
+# Headroom in the limit for the hit-weight scratch, x, the accumulator and
+# Mosaic's own temporaries, which _vmem_bytes does not count.
+_VMEM_HEADROOM = 4 * 1024 * 1024
+
+
+def _vmem_bytes(k_dim: int, tn: int, h_out: int, scale_bytes: int) -> int:
+    """Approximate per-step working set for intermediate tile width ``tn``:
+    the double-buffered packed weight and scale tiles plus their bf16
+    dequantized copies."""
+    w13 = 2 * (k_dim // 2) * tn + 2 * (k_dim // 32) * tn * scale_bytes
+    w2 = (tn // 2) * h_out + (tn // 32) * h_out * scale_bytes
+    dequant = 2 * (2 * k_dim * tn + tn * h_out)
+    return 2 * (w13 + w2) + dequant
+
+
+def _tile_n(k_dim: int, n: int, h_out: int, scale_bytes: int):
+    """Largest tile width that divides n and fits the VMEM limit, else None."""
+    for tn in _TILE_N:
+        if n % tn == 0 and (
+            _vmem_bytes(k_dim, tn, h_out, scale_bytes) + _VMEM_HEADROOM <= _VMEM_LIMIT
+        ):
+            return tn
+    return None
 
 
 def _dequant(w_ref, s_ref, rows: int):
@@ -100,6 +124,9 @@ def _kernel(
             _dequant(w2, s2, tn),
             preferred_element_type=jnp.float32,
         )
+        # Experts accumulate in f32 and round to the output dtype once. The
+        # gmm_v2 path rounds each expert's down-proj output to bf16 before the
+        # combine, so bs=1 and bs>=2 differ by bf16 rounding.
         acc_ref[...] += wt[0, :, :1] * y
 
     hit = lambda i: hit_ids_ref[i]
@@ -124,10 +151,20 @@ def _kernel(
 
 
 def eligible(
-    w1, w2, w1_scale, w2_scale, w1_bias, w2_bias, w1_channel_scale, w2_channel_scale
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    w1_channel_scale,
+    w2_channel_scale,
 ) -> bool:
     """Packed MXFP4 (one scale per 32 along K, per-column scales), no biases,
-    no VMEM-FP8 channel scales, and a 128-aligned intermediate width."""
+    no VMEM-FP8 channel scales, a 128-aligned intermediate width, a bf16
+    activation exactly K wide, and a tile that fits VMEM. Anything else keeps
+    the gmm_v2 path instead of casting or truncating the activation."""
     if w1.dtype != jnp.uint8 or w2.dtype != jnp.uint8:
         return False
     if w1_scale is None or w2_scale is None:
@@ -139,12 +176,16 @@ def eligible(
     k_dim = w1.shape[1] * 2
     n = w1.shape[2] // 2
     return (
-        w1_scale.shape[1] * 32 == k_dim
+        hidden_states.dtype == jnp.bfloat16
+        and hidden_states.shape[1] == k_dim
+        and w1_scale.shape[1] * 32 == k_dim
         and w2_scale.shape[1] * 32 == n
         and w1_scale.shape[-1] == w1.shape[2]
         and w2_scale.shape[-1] == w2.shape[2]
         and n % 128 == 0
         and k_dim % 256 == 0
+        and _tile_n(k_dim, n, w2.shape[2], jnp.dtype(w1_scale.dtype).itemsize)
+        is not None
     )
 
 
@@ -170,11 +211,10 @@ def single_token_moe(
     k_dim = w1.shape[1] * 2
     n = w1.shape[2] // 2
     h_out = w2.shape[2]
-    tn = next(t for t in _TILE_N if n % t == 0)
+    tn = _tile_n(k_dim, n, h_out, jnp.dtype(w1_scale.dtype).itemsize)
     k = topk_ids.shape[1]
-    x = jnp.pad(
-        hidden_states[:1, :k_dim].astype(jnp.bfloat16), ((0, _ROWS - 1), (0, 0))
-    )
+    # eligible() guarantees a bf16 activation exactly k_dim wide.
+    x = jnp.pad(hidden_states[:1], ((0, _ROWS - 1), (0, 0)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
         functools.partial(
@@ -201,7 +241,7 @@ def single_token_moe(
                 pltpu.VMEM((k, 8, 128), jnp.float32),
             ],
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 * 1024 * 1024),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=_VMEM_LIMIT),
         name=f"single_token_moe_e{num_experts}_n{n}",
     )(
         topk_ids[0].astype(jnp.int32),
