@@ -155,6 +155,16 @@ def sample_draft_tokens(original, model, hidden_states, input_ids):
     return sample(model, hidden_states, input_ids)
 
 
+def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    if not experimental_spec_enabled():
+        return original(model, hidden_states, input_ids)
+    from sglang_tpu.experimental.models.dflash2 import sample_draft_tokens as sample
+
+    return sample(model, hidden_states, input_ids)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
@@ -163,6 +173,11 @@ def hook_specs():
         (
             "sglang.srt.models.dspark.DSparkDraftModel.sample_draft_tokens_tpu",
             sample_draft_tokens,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.dflash.DFlash2DraftModel.sample_draft_tokens_tpu",
+            sample_dflash2_draft_tokens,
             HookType.AROUND,
         ),
         (schedule + "init_new", initialize_host_batch, HookType.AFTER),

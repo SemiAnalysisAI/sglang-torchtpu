@@ -109,7 +109,7 @@ def accept_drafts_greedy(
     target_argmax = torch.argmax(target_logits.view(bs, n + 1, -1), dim=-1)
     ok = (draft_tokens == target_argmax[:, :n]) & _verify_mask(num_verify_drafts, n)
     num_correct_drafts = _leading_true(ok)
-    return num_correct_drafts, _pick(target_argmax, num_correct_drafts)
+    return num_correct_drafts, pick(target_argmax, num_correct_drafts)
 
 
 @compiled_op(warmup=lambda ctx: _accept_warmup_args(ctx, sampled=True), uses_rng=True)
@@ -136,7 +136,7 @@ def accept_drafts_sampled(
     target_argmax = torch.argmax(target_logits, dim=-1)
     greedy_ok = (draft_tokens == target_argmax[:, :n]) & verify_mask
     greedy_num_correct = _leading_true(greedy_ok)
-    greedy_bonus = _pick(target_argmax, greedy_num_correct)
+    greedy_bonus = pick(target_argmax, greedy_num_correct)
 
     temps = temperatures.view(-1).float().clamp_min(1e-5)[:, None, None]
     p = torch.softmax(target_logits.float() / temps, dim=-1)
@@ -151,8 +151,8 @@ def accept_drafts_sampled(
     sample_ok = (u * q_draft <= p_draft) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
 
-    p_at = _pick(p, sample_num_correct)
-    q_at = _pick(q, sample_num_correct.clamp_max(n - 1))
+    p_at = pick(p, sample_num_correct)
+    q_at = pick(q, sample_num_correct.clamp_max(n - 1))
     residual = (p_at - q_at).clamp_min(0)
     # All-zero residual only arises from rounding when p == q; p is exact there.
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
@@ -261,7 +261,7 @@ def _leading_true(mask: torch.Tensor) -> torch.Tensor:
     return torch.where(mask.all(dim=-1), mask.shape[-1], first_false)
 
 
-def _pick(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+def pick(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     """values[b, index[b], ...] via a one-hot mask, [bs, ...]."""
     onehot = (
         torch.arange(values.shape[1], device=values.device)[None, :] == index[:, None]
