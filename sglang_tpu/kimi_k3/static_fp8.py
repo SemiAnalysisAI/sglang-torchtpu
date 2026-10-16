@@ -65,7 +65,8 @@ def _dense_weight_kn(linear: nn.Module, k: int) -> Optional[torch.Tensor]:
 def _g_spread(norm_weight: torch.Tensor) -> float:
     """max|g| / median|g|: how much the max|g| input scale over-provisions the
     typical channel (1 means no headroom is wasted)."""
-    g = norm_weight.detach().float().abs()
+    # Load-time log on a [K] vector: compute on host, TPU has no aten::median.
+    g = norm_weight.detach().float().abs().cpu()
     return float(g.max() / g.median().clamp_min(1e-12))
 
 
