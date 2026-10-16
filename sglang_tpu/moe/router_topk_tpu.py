@@ -21,6 +21,10 @@ import torch
 
 # Batch sizes the kernel serves; larger batches keep the sort.
 MAX_TOKENS = 64
+# Expert counts validated against biased_topk_impl on TPU: Kimi-K3 (top-16 of
+# 896). Other sigmoid routers (e.g. Kimi-K2.x with 384) keep the sort until
+# they are measured.
+VALIDATED_NUM_EXPERTS = frozenset({896})
 
 _OP: list = []
 _OP_LOCK = Lock()
@@ -66,6 +70,9 @@ def _topk_kernel(
         bits = jax.lax.bitcast_convert_type(scores, jnp.int32) >> 16
         key = lane * 65536 + (bits & 0xFFFF)
         no_key = jnp.int32(experts * 65536)
+    # Router logits are finite here (padded rows hold finite values and are
+    # masked by the caller afterwards). A NaN logit would make `choice == m`
+    # false across its row, so every id there would come out as `experts`.
     for r in range(k):
         m = jnp.max(choice, axis=-1, keepdims=True)
         if packed:
@@ -169,9 +176,13 @@ def _eligible(gating_output, correction_bias, topk, num_fused_shared_experts) ->
         and num_fused_shared_experts == 0
         and correction_bias is not None
         and correction_bias.dim() == 1
+        # The kernel adds scores + bias in f32, as torch does for an f32 bias
+        # (Kimi-K3 casts its bias to f32 post-load). A bf16 bias would round
+        # the sum to bf16 in torch, so it keeps the sort.
+        and correction_bias.dtype == torch.float32
         and gating_output.dim() == 2
         and 0 < gating_output.shape[0] <= MAX_TOKENS
-        and gating_output.shape[1] % 128 == 0
+        and gating_output.shape[1] in VALIDATED_NUM_EXPERTS
         and topk <= 128
     )
 
