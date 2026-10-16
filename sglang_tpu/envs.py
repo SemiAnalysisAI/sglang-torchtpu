@@ -81,6 +81,11 @@ class TpuEnvs:
     # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
     SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
 
+    # P/D /health_generate: maximum gap in completed work while requests wait.
+    # Must stay below the disaggregation transport timeouts (300 s by default);
+    # 0 uses only the core probe and confirmed worker crashes.
+    SGLANG_TPU_PD_HEALTH_WINDOW_S = EnvFloat(200.0)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
