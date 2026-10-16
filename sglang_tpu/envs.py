@@ -30,6 +30,8 @@ class TpuEnvs:
     # (twolevel_allreduce.py): host-local exchange, then cross-host. Applies
     # when TP spans the whole world; everything else keeps XLA's all-reduce.
     SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
+    # Ranks per host for that split; 0 derives TP size / nnodes.
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:

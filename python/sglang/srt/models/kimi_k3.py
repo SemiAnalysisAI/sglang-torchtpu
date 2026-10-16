@@ -124,7 +124,6 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
     get_platform,
 )
@@ -390,16 +389,18 @@ class KimiK3MLP(nn.Module):
         return hidden_states
 
 
-def _tpu_twolevel_all_reduce():
-    """The TPU plugin's two-level Pallas all-reduce module when it is built for
-    the TP group (SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE), else None. Read at
-    construction: the plugin builds it with the parallel groups, before the
-    model. Its calls return None for tensors they do not take."""
-    if not _is_tpu:
-        return None
-    from sglang_tpu import twolevel_allreduce
-
-    return twolevel_allreduce if twolevel_allreduce.enabled() else None
+def merged_moe_all_reduce(
+    latent: torch.Tensor, shared: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TP all-reduce of the routed latent and the shared-expert output with
+    one collective (SGLANG_K3_MERGE_MOE_ALLREDUCE). The default concatenates
+    them; a platform may replace this function with a multi-tensor collective
+    that avoids the concat / split copies."""
+    latent_dim = latent.shape[-1]
+    reduced = tensor_model_parallel_all_reduce(
+        torch.cat([latent, shared.to(latent.dtype)], dim=-1)
+    )
+    return reduced[:, :latent_dim], reduced[:, latent_dim:]
 
 
 def _add3(
@@ -682,13 +683,6 @@ class KimiK3MoE(nn.Module):
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
-
-        # TPU two-level all-reduce: the routed latent and the shared-expert
-        # output reduced in one packed exchange (see _can_merge_moe_all_reduce).
-        twolevel = _tpu_twolevel_all_reduce()
-        self._merged_tp_all_reduce = (
-            None if twolevel is None else twolevel.merged_moe_all_reduce
-        )
 
         # Static eligibility for fusing the latent all-reduce with the RMSNorm
         # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
@@ -1032,12 +1026,11 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
-    def _can_merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
-        """Both the routed latent and a synchronous TP-sharded shared-expert
-        output still need a TP reduce, so one collective can serve both (TPU
-        two-level all-reduce only)."""
+    def _merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
+        """SGLANG_K3_MERGE_MOE_ALLREDUCE applies: both the routed latent and a
+        synchronous TP-sharded shared-expert output still need a TP reduce."""
         return (
-            self._merged_tp_all_reduce is not None
+            envs.SGLANG_K3_MERGE_MOE_ALLREDUCE.get()
             and shared_output is not None
             and shared_event is None
             and self.tp_size > 1
@@ -1281,15 +1274,12 @@ class KimiK3MoE(nn.Module):
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            merged = (
-                self._merged_tp_all_reduce(expert_output, shared_output)
-                if self._can_merge_moe_all_reduce(shared_output, shared_event)
-                else None
-            )
-            if merged is not None:
+            if self._merge_moe_all_reduce(shared_output, shared_event):
                 # One collective for the TP-partial latent and shared output;
                 # the norm only needs the reduced latent.
-                latent, shared_output = merged
+                latent, shared_output = merged_moe_all_reduce(
+                    expert_output, shared_output
+                )
                 latent = self._latent_norm(latent)
                 shared_reduced = True
             else:
@@ -2646,25 +2636,6 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        # TPU two-level all-reduce: o_proj emits TP-partial sums and the
-        # attention-residual forward completes the reduce at the same point as
-        # the fused all-reduce above (which it never coexists with), so
-        # single-token decode takes the plugin's kernel.
-        twolevel = None
-        if (
-            self.use_attn_residuals
-            and not self._sp_moe
-            and not self.all_reduce_fusion
-            and attn_tp_size > 1
-            # attn TP == TP means no attention DP / CP, so o_proj's reduce
-            # group is the TP group (and CP decode attention TP is off).
-            and attn_tp_size == get_parallel().tp_size
-        ):
-            twolevel = _tpu_twolevel_all_reduce()
-        self._attn_tp_all_reduce = None if twolevel is None else twolevel.tp_all_reduce
-        if self._attn_tp_all_reduce is not None:
-            self.self_attn.o_proj.reduce_results = False
-
         if self._sp_moe:
             # o_proj emits TP-partial sums; _finish_attn_reduce completes the
             # reduction (RS on the clean attn-res path, AR on fallbacks).
@@ -2910,9 +2881,8 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
-        # otherwise the fused all-reduce when enabled; otherwise the TPU
-        # two-level all-reduce when enabled; otherwise o_proj already reduced
-        # itself (use_dp_attention_reduce, on when none of these is active).
+        # otherwise the fused all-reduce when enabled; otherwise o_proj already
+        # reduced itself (use_dp_attention_reduce, on when neither is active).
         rows = None
         shard_lo = -1
         agg2_fused = False
@@ -2962,14 +2932,6 @@ class KimiK3DecoderLayer(nn.Module):
             # (normed, new_prefix) with new_prefix = prefix + attn_out).
             hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
             prefix_sum = None
-        elif self._attn_tp_all_reduce is not None and not get_forward().sp_active:
-            # Under sequence parallelism o_proj reduce-scatters on its own.
-            reduced = self._attn_tp_all_reduce(hidden_states)
-            hidden_states = (
-                tensor_model_parallel_all_reduce(hidden_states)
-                if reduced is None
-                else reduced
-            )
 
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
         if not agg2_fused:
