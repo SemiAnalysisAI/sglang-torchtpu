@@ -182,15 +182,42 @@ def _build(world: int, local: int, n: int):
     )
 
 
+# (hosts, ranks per host) the kernel has been measured on and beats XLA's
+# all-reduce: tpu7x 2x2x4, TP32 = 4 hosts x 8 ranks. A one-shot phase with more
+# peers approaches the flat one-shot that measured slower than XLA, so other
+# shapes keep XLA's all-reduce until they are measured.
+VALIDATED_TOPOLOGIES = frozenset({(4, 8)})
+
+
 def local_size(world: int, nnodes: int) -> int:
     """Ranks per host for a host-major TP group of ``world`` ranks, or 0 when
-    the two-level split does not apply. SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE
-    overrides the derived value (0 = derive)."""
-    override = tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE.get()
-    local = override or (world // nnodes if nnodes > 0 else 0)
+    the two-level split does not apply."""
+    local = world // nnodes if nnodes > 0 else 0
     if local <= 0 or world % local:
         return 0
     return local
+
+
+def _check_ranks_agree(enabled: bool) -> None:
+    """Every rank must take the same path: if one host missed the switch, its
+    ranks would stay on XLA's all-reduce while the others wait in the Pallas
+    barrier, and the first single-token decode would hang. Fail at startup
+    instead."""
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if world_group.world_size <= 1:
+        return
+    seen = [None] * world_group.world_size
+    dist.all_gather_object(seen, bool(enabled), group=world_group.cpu_group)
+    if len(set(seen)) > 1:
+        on = [rank for rank, flag in enumerate(seen) if flag]
+        raise RuntimeError(
+            "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE must be set the same on every "
+            f"rank; it is on for ranks {on} only."
+        )
 
 
 def register(world: int, local: int) -> None:
@@ -207,7 +234,9 @@ def register(world: int, local: int) -> None:
 def register_from_parallel_state() -> None:
     """Called from TpuPlatform.prepare_model_parallel_groups (every rank, after
     the groups exist, before the first collective)."""
-    if not tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.get():
+    enabled = tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.get()
+    _check_ranks_agree(enabled)
+    if not enabled:
         return
     import torch.distributed as dist
 
@@ -225,17 +254,36 @@ def register_from_parallel_state() -> None:
             dist.get_world_size(),
         )
         return
-    local = local_size(world, get_server_args().nnodes)
+    server_args = get_server_args()
+    local = local_size(world, server_args.nnodes)
     if not local:
         logger.info("Two-level Pallas all-reduce off: no host split for TP %d.", world)
         return
+    if (world // local, local) not in VALIDATED_TOPOLOGIES:
+        logger.warning(
+            "Two-level Pallas all-reduce off: %d hosts x %d ranks is not a "
+            "measured topology (%s); XLA's all-reduce stays.",
+            world // local,
+            local,
+            sorted(VALIDATED_TOPOLOGIES),
+        )
+        return
     register(world, local)
     logger.info(
-        "Two-level Pallas all-reduce on: TP %d = %d hosts x %d ranks.",
+        "Two-level Pallas all-reduce on: TP %d = %d hosts x %d ranks. It takes "
+        "single-token bf16 TP all-reduces (and Kimi-K3's merged MoE reduce); "
+        "everything else keeps XLA's all-reduce.",
         world,
         world // local,
         local,
     )
+    compile_bs = getattr(server_args, "tpu_compile_bs", None)
+    if compile_bs and 1 not in compile_bs:
+        logger.warning(
+            "Two-level Pallas all-reduce is on but --tpu-compile-bs %s has no "
+            "batch size 1, so no compiled decode step takes it.",
+            compile_bs,
+        )
 
 
 def eligible(t: torch.Tensor) -> bool:
@@ -270,7 +318,6 @@ def merged_moe_all_reduce_around(original, latent, shared):
         get_tensor_model_parallel_world_size,
     )
 
-    shared = shared.to(latent.dtype)
     if not (
         _READY
         and get_tensor_model_parallel_world_size() == _WORLD

@@ -28,12 +28,6 @@ class TestHostSplit(CustomTestCase):
         self.assertEqual(tl.local_size(30, 4), 0)
         self.assertEqual(tl.local_size(32, 0), 0)
 
-    def test_override(self):
-        with tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE.override(4):
-            self.assertEqual(tl.local_size(8, 1), 4)
-        with tpu_envs.SGLANG_TPU_TWOLEVEL_ALLREDUCE_LOCAL_SIZE.override(3):
-            self.assertEqual(tl.local_size(8, 1), 0)
-
 
 class TestEligibility(CustomTestCase):
     def test_single_token_bf16_lane_aligned(self):
@@ -69,10 +63,77 @@ class TestFallbacks(CustomTestCase):
                 tl.merged_moe_all_reduce_around(original, latent, shared), ("a", "b")
             )
 
-    def test_registration_off_by_default(self):
-        with mock.patch.object(tl, "register") as reg:
+    def test_merged_falls_back_on_mixed_dtypes(self):
+        """A non-bf16 shared output is not cast into the packed exchange."""
+        original = mock.Mock(return_value=("a", "b"))
+        latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
+        shared = torch.zeros(1, 7168, dtype=torch.float32)
+        with (
+            mock.patch.object(tl, "_READY", True),
+            mock.patch.object(tl, "_WORLD", 32),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=32,
+            ),
+        ):
+            self.assertEqual(
+                tl.merged_moe_all_reduce_around(original, latent, shared), ("a", "b")
+            )
+        original.assert_called_once_with(latent, shared)
+
+
+class TestRegistration(CustomTestCase):
+    def _register(self, enabled, world=32, nnodes=4, seen=None, compile_bs=(1, 4)):
+        def gather(out, value, group=None):
+            out[:] = seen if seen is not None else [value] * len(out)
+
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE.override(enabled),
+            mock.patch.object(tl, "register") as reg,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=mock.Mock(world_size=world, cpu_group="cpu"),
+            ),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            mock.patch("torch.distributed.get_world_size", return_value=world),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=world,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=mock.Mock(nnodes=nnodes, tpu_compile_bs=list(compile_bs)),
+            ),
+        ):
             tl.register_from_parallel_state()
-        reg.assert_not_called()
+        return reg
+
+    def test_off_by_default(self):
+        self._register(False).assert_not_called()
+
+    def test_measured_topology_registers(self):
+        self._register(True).assert_called_once_with(32, 8)
+
+    def test_unmeasured_topologies_keep_xla(self):
+        for world, nnodes in ((8, 1), (64, 8), (16, 2)):
+            with self.subTest(world=world, nnodes=nnodes):
+                with self.assertLogs(tl.logger, "WARNING"):
+                    reg = self._register(True, world=world, nnodes=nnodes)
+                reg.assert_not_called()
+
+    def test_ranks_must_agree(self):
+        seen = [True] * 31 + [False]
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                with self.assertRaisesRegex(RuntimeError, "same on every rank"):
+                    self._register(enabled, seen=seen)
+
+    def test_warns_without_a_bs1_compile_bucket(self):
+        with self.assertLogs(tl.logger, "WARNING") as logs:
+            self._register(True, compile_bs=(4, 8))
+        self.assertIn("no batch size 1", "\n".join(logs.output))
 
 
 class TestMergedMoeAllReduceDefault(CustomTestCase):
