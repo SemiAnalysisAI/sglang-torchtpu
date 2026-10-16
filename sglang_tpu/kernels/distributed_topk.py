@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# The bitonic Top-K network below is adapted from Helion,
+# Copyright (c) Meta Platforms, Inc. and affiliates. See NOTICE.
 """Pure JAX/Pallas TopK reduction for TP8 and TP16 TPU meshes.
 
 The Pallas kernel selects each shard's exact Top64 and exchanges only those
