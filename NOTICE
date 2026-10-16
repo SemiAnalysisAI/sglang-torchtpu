@@ -8,23 +8,6 @@ below. Each adapted file keeps its original copyright header and names its
 source in a comment near the top of the file.
 
 -------------------------------------------------------------------------------
-tpu-inference
-https://github.com/vllm-project/tpu-inference
-Copyright 2025 The tpu-inference Authors
-Licensed under the Apache License, Version 2.0
-
-Pallas attention, GDN, sampling, MoE and MXFP4 kernels and helpers under
-sglang_tpu/ and python/sglang/srt/layers/quantization/mxfp4_tpu_util.py.
-
--------------------------------------------------------------------------------
-T5X (via tpu-inference)
-https://github.com/google-research/t5x
-Copyright 2024 The T5X Authors
-Licensed under the Apache License, Version 2.0
-
-Binary search used by sglang_tpu/sampling_mask.py.
-
--------------------------------------------------------------------------------
 sglang-jax
 https://github.com/sgl-project/sglang-jax
 Copyright 2025 The SGLang Team
@@ -32,14 +15,6 @@ Licensed under the Apache License, Version 2.0
 
 Ragged paged attention, MLA attention, fused MoE kernels and tuned block-size
 tables under sglang_tpu/attention/pallas/ and sglang_tpu/moe/pallas/.
-
--------------------------------------------------------------------------------
-vllm-torchtpu
-https://github.com/vllm-project/vllm-torchtpu
-Copyright 2025-2026 Google LLC
-Licensed under the Apache License, Version 2.0
-
-Portions of the TPU kernels under sglang_tpu/.
 
 -------------------------------------------------------------------------------
 Helion
@@ -76,3 +51,27 @@ license:
   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE.
+
+-------------------------------------------------------------------------------
+tpu-inference
+https://github.com/vllm-project/tpu-inference
+Copyright 2025 The tpu-inference Authors
+Licensed under the Apache License, Version 2.0
+
+Portions of the TPU kernels under sglang_tpu/.
+
+-------------------------------------------------------------------------------
+T5X (via tpu-inference)
+https://github.com/google-research/t5x
+Copyright 2024 The T5X Authors
+Licensed under the Apache License, Version 2.0
+
+Binary search used by sglang_tpu/sampling_mask.py.
+
+-------------------------------------------------------------------------------
+vllm-torchtpu
+https://github.com/vllm-project/vllm-torchtpu
+Copyright 2025-2026 Google LLC
+Licensed under the Apache License, Version 2.0
+
+Portions of the TPU kernels under sglang_tpu/.
