@@ -62,6 +62,13 @@ def _dense_weight_kn(linear: nn.Module, k: int) -> Optional[torch.Tensor]:
     return w.t()
 
 
+def _g_spread(norm_weight: torch.Tensor) -> float:
+    """max|g| / median|g|: how much the max|g| input scale over-provisions the
+    typical channel (1 means no headroom is wasted)."""
+    g = norm_weight.detach().float().abs()
+    return float(g.max() / g.median().clamp_min(1e-12))
+
+
 def _plain_rmsnorm(norm: nn.Module) -> bool:
     """The |y_i| <= sqrt(K) * |g_i| bound holds for a plain RMSNorm over the
     full width; a partial-width variance breaks it."""
@@ -156,6 +163,7 @@ def bind_static_fp8(model: nn.Module) -> None:
     )
 
     counts = dict.fromkeys(sorted(parts), 0)
+    spreads = {part: [] for part in counts}
     freed = 0
     for layer in model.model.layers:
         if isinstance(layer, PPMissingLayer):
@@ -164,6 +172,12 @@ def bind_static_fp8(model: nn.Module) -> None:
             bound, f = _bind_moe(layer.mlp, layer.post_attention_layernorm, parts)
             for part in bound:
                 counts[part] += 1
+                norm_w = (
+                    layer.post_attention_layernorm.weight
+                    if part == "moe_front"
+                    else layer.mlp.routed_expert_norm.weight
+                )
+                spreads[part].append(_g_spread(norm_w))
             freed += f
         attn = layer.self_attn
         norm = layer.input_layernorm
@@ -176,6 +190,8 @@ def bind_static_fp8(model: nn.Module) -> None:
                 attn, "_static_fp8_qkvg", getattr(attn, "fused_qkvg_proj", None), norm
             )
             counts["kda_qkvg"] += n
+            if n:
+                spreads["kda_qkvg"].append(_g_spread(norm.weight))
             freed += f
         if "mla_qkv_a" in parts and isinstance(attn, KimiK3MLAAttention):
             n, f = _bind_linear(
@@ -185,6 +201,8 @@ def bind_static_fp8(model: nn.Module) -> None:
                 norm,
             )
             counts["mla_qkv_a"] += n
+            if n:
+                spreads["mla_qkv_a"].append(_g_spread(norm.weight))
             freed += f
     if freed and not getattr(model, "_derived_weight_cache_error", None):
         model._derived_weight_cache_error = (
@@ -197,6 +215,17 @@ def bind_static_fp8(model: nn.Module) -> None:
         counts,
         freed / 2**20,
     )
+    spread_summary = {
+        part: f"median {sorted(v)[len(v) // 2]:.1f}, max {max(v):.1f}"
+        for part, v in spreads.items()
+        if v
+    }
+    if spread_summary:
+        logger.info(
+            "Static fp8 input-scale headroom, max|g| / median|g| per part over "
+            "the bound layers: %s",
+            spread_summary,
+        )
     unbound = sorted(part for part, n in counts.items() if n == 0)
     if unbound:
         logger.warning(

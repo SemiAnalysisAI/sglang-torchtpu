@@ -387,6 +387,14 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
         rel = (got - ref).norm() / ref.norm()
         self.assertLess(float(rel), 0.06)
 
+    def test_logs_the_input_scale_headroom(self):
+        layer = _layer(_FakeKDA())
+        with self.assertLogs("sglang_tpu.kimi_k3.static_fp8", "INFO") as logs:
+            self._bind(_model(layer), "moe_front,kda_qkvg")
+        text = "\n".join(logs.output)
+        self.assertIn("max|g| / median|g|", text)
+        self.assertIn("moe_front", text)
+
     def test_second_bind_is_a_no_op(self):
         layer = _layer(_FakeKDA())
         model = _model(layer)
