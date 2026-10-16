@@ -1,55 +1,76 @@
-"""Pallas kernel for bs=1 decode MoE routing metadata.
+"""Pallas scalar kernel for bs=1 decode MoE routing metadata.
 
 With one real token every routed row is the same activation, so the permute is a
 broadcast and only the expert-major metadata is needed. XLA emits that (plus the
-pad / mask / local-id glue) as ~10 small ops; this is one kernel.
-
-It runs on the vector unit: a slot's sorted position is the number of local
-slots that sort before it (smaller expert id, or the same expert and an
-earlier slot, which keeps the sort stable), and a group's size is a masked
-count. A scalar SMEM version walked every local expert twice and took ~4 us at
-224 local experts.
+pad / mask / local-id glue) as ~10 small ops; this is one SMEM counting sort.
 """
 
 import functools
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 
 def _route_meta_kernel(
-    ids_row_ref,
-    ids_col_ref,
-    w_col_ref,
+    ids_ref,
+    w_ref,
     ws_ref,
     gs_ref,
+    cur_ref,
     *,
     k: int,
     n: int,
     offset: int,
     num_experts: int,
 ) -> None:
-    e_row = ids_row_ref[...] - offset  # [1, k]: slot j along lanes
-    e_col = ids_col_ref[...] - offset  # [k, 1]: slot i along sublanes
-    ok_row = (e_row >= 0) & (e_row < num_experts)
-    ok_col = (e_col >= 0) & (e_col < num_experts)
-    j = jax.lax.broadcasted_iota(jnp.int32, (k, k), 1)
-    i = jax.lax.broadcasted_iota(jnp.int32, (k, k), 0)
-    ej = jnp.broadcast_to(e_row, (k, k))
-    ei = jnp.broadcast_to(e_col, (k, k))
-    before = jnp.broadcast_to(ok_row, (k, k)) & ((ej < ei) | ((ej == ei) & (j < i)))
-    pos = jnp.sum(before.astype(jnp.int32), axis=1, keepdims=True)  # [k, 1]
-    # ws[p] = w_i for the local slot i at sorted position p; zeros past them.
-    p = jax.lax.broadcasted_iota(jnp.int32, (k, n), 1)
-    place = (jnp.broadcast_to(pos, (k, n)) == p) & jnp.broadcast_to(ok_col, (k, n))
-    w = jnp.broadcast_to(w_col_ref[...], (k, n))
-    ws_ref[...] = jnp.sum(jnp.where(place, w, 0.0), axis=0, keepdims=True)
-    e = jax.lax.broadcasted_iota(jnp.int32, (k, num_experts), 1)
-    member = (jnp.broadcast_to(e_col, (k, num_experts)) == e) & jnp.broadcast_to(
-        ok_col, (k, num_experts)
-    )
-    gs_ref[...] = jnp.sum(member.astype(jnp.int32), axis=0, keepdims=True)
+    def zero_rows(r, carry):
+        ws_ref[r] = 0.0
+        return carry
+
+    def zero_groups(e, carry):
+        gs_ref[e] = 0
+        return carry
+
+    lax.fori_loop(0, n, zero_rows, 0)
+    lax.fori_loop(0, num_experts, zero_groups, 0)
+
+    def local_id(i):
+        e = ids_ref[0, i] - offset
+        return e, (e >= 0) & (e < num_experts)
+
+    def count(i, carry):
+        e, ok = local_id(i)
+
+        @pl.when(ok)
+        def _():
+            gs_ref[e] = gs_ref[e] + 1
+
+        return carry
+
+    lax.fori_loop(0, k, count, 0, unroll=True)
+
+    def prefix(e, acc):
+        cur_ref[e] = acc
+        return acc + gs_ref[e]
+
+    lax.fori_loop(0, num_experts, prefix, 0)
+
+    # Slot order within a group keeps the sort stable.
+    def place(i, carry):
+        e, ok = local_id(i)
+
+        @pl.when(ok)
+        def _():
+            pos = cur_ref[e]
+            ws_ref[pos] = w_ref[0, i]
+            cur_ref[e] = pos + 1
+
+        return carry
+
+    lax.fori_loop(0, k, place, 0, unroll=True)
 
 
 @functools.partial(jax.jit, static_argnames=("n", "offset", "num_experts"))
@@ -70,18 +91,17 @@ def single_token_route_meta(
     i32[num_experts] group sizes.
     """
     k = topk_ids.shape[1]
-    ids = topk_ids.astype(jnp.int32)
-    full = lambda shape: pl.BlockSpec(shape, lambda: (0,) * len(shape))
-    ws, gs = pl.pallas_call(
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    return pl.pallas_call(
         functools.partial(
             _route_meta_kernel, k=k, n=n, offset=offset, num_experts=num_experts
         ),
         out_shape=(
-            jax.ShapeDtypeStruct((1, n), jnp.float32),
-            jax.ShapeDtypeStruct((1, num_experts), jnp.int32),
+            jax.ShapeDtypeStruct((n,), jnp.float32),
+            jax.ShapeDtypeStruct((num_experts,), jnp.int32),
         ),
-        in_specs=[full((1, k)), full((k, 1)), full((k, 1))],
-        out_specs=(full((1, n)), full((1, num_experts))),
+        in_specs=[smem, smem],
+        out_specs=(smem, smem),
+        scratch_shapes=[pltpu.SMEM((num_experts,), jnp.int32)],
         name=f"moe_route_meta_{k}_{n}_{num_experts}",
-    )(ids, ids.reshape(k, 1), topk_weights.astype(jnp.float32).reshape(k, 1))
-    return ws.reshape(n), gs.reshape(num_experts)
+    )(topk_ids.astype(jnp.int32), topk_weights.astype(jnp.float32))
