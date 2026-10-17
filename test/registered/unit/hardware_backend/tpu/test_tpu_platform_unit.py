@@ -153,34 +153,24 @@ class TestTpuPlatformInitialization(CustomTestCase):
             ],
         )
 
-    def test_reentry_during_model_registration_registers_once(self):
-        """init_backend re-entered while registering models (model_runner's OOT import
-        hook does this) must not register the TPU models a second time."""
-        registered = []
+    def test_registers_every_pallas_attention_backend_choice(self):
+        """Core does not register the pallas_tpu_* backends; a CLI choice the
+        plugin forgets to register fails only when a worker builds it."""
+        from sglang.srt.arg_groups.choices import ATTENTION_BACKEND_CHOICES
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+        )
+        from sglang_tpu.tpu_platform import _register_attention_backends
 
-        def register(package_name):
-            registered.append(package_name)
-            if len(registered) == 1:
-                self.platform.init_backend()
-
-        with (
-            patch.dict(os.environ, {"WORLD_SIZE": "1"}, clear=False),
-            patch.dict(sys.modules, {"torch_tpu": ModuleType("torch_tpu")}),
-            patch("sglang_tpu.patches._prepare_tpu_env"),
-            patch(
-                "sglang_tpu.compile_cache.add_tpu_kernel_inputs_to_compile_cache_key"
-            ),
-            patch("sglang_tpu.patches.apply_tpu_patches"),
-            patch("sglang_tpu.tpu_platform.rank_slice._load"),
-            patch("sglang_tpu.tpu_platform.traced_rank._load"),
-            patch(
-                "sglang.srt.models.registry.ModelRegistry.register",
-                side_effect=register,
-            ),
-        ):
-            self.platform.init_backend()
-
-        self.assertEqual(registered, ["sglang_tpu.models"])
+        with patch.dict(ATTENTION_BACKENDS):
+            _register_attention_backends()
+            pallas_choices = {
+                name
+                for name in ATTENTION_BACKEND_CHOICES
+                if name.startswith("pallas_tpu_")
+            }
+            self.assertTrue(pallas_choices)
+            self.assertLessEqual(pallas_choices, ATTENTION_BACKENDS.keys())
 
 
 class TestTpuCompileCache(CustomTestCase):

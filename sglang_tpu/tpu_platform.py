@@ -566,6 +566,32 @@ def _register_attention_backends() -> None:
             runner, topk, speculative_num_steps, TpuPallasSparseMlaAttnBackend
         )
 
+    @register_attention_backend("pallas_tpu_flash")
+    def create_pallas_tpu_flash_backend(runner):
+        from sglang_tpu.attention_pallas import TpuPallasAttnBackend
+
+        return TpuPallasAttnBackend(runner)
+
+    @register_attention_backend("pallas_tpu_rpa_v3")
+    def create_pallas_tpu_rpa_v3_backend(runner):
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        return TpuPallasRpaV3AttnBackend(runner)
+
+    @register_attention_backend("pallas_tpu_rpa_batched")
+    def create_pallas_tpu_rpa_batched_backend(runner):
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return TpuPallasRpaBatchedAttnBackend(runner)
+
+    @register_attention_backend("pallas_tpu_mla")
+    def create_pallas_tpu_mla_backend(runner):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+
+        return TpuPallasMlaAttnBackend(runner)
+
     @register_attention_backend("pallas_tpu_mla_sparse")
     def create_pallas_tpu_mla_sparse_backend(runner):
         from sglang_tpu.attention_pallas_mla_sparse import (
@@ -996,9 +1022,7 @@ class TpuSRTPlatform(SRTPlatform):
         #     Original implementation from PR #5, works against the flat
         #     `MHATokenToKVPool` layout (no fused-pool swap required).
         # All are listed in `server_args.ATTENTION_BACKEND_CHOICES` and
-        # registered in `layers.attention.attention_registry` (same place as
-        # `ascend` / `intel_xpu`). Factories use lazy imports so non-TPU runs
-        # don't pull in jax/torch_tpu.
+        # registered by `_register_attention_backends()` from `init_backend()`.
         # Override to the reference path with `--attention-backend torch_native`.
         return "pallas_tpu_rpa_v3"
 
