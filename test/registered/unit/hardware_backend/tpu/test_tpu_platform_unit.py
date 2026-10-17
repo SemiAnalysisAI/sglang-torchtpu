@@ -915,6 +915,42 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
+    def test_draft_backends_run_their_target_backend_per_step(self):
+        from sglang.srt.configs.linear_attn_model_registry import (
+            import_backend_class,
+        )
+        from sglang.srt.layers.attention import attention_registry as registry
+        from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+        from sglang_tpu.tpu_platform import (
+            _DRAFT_ATTENTION_BACKEND_CLASSES,
+            _register_attention_backends,
+        )
+
+        with (
+            patch.dict(registry.ATTENTION_BACKENDS),
+            patch.dict(registry.DRAFT_ATTENTION_BACKENDS),
+        ):
+            _register_attention_backends()
+            for name, cls_name in _DRAFT_ATTENTION_BACKEND_CLASSES.items():
+                with self.subTest(backend=name):
+                    # The draft extend builds the target backend of the same name.
+                    self.assertIn(name, registry.ATTENTION_BACKENDS)
+                    attn_backend_cls = import_backend_class(cls_name)
+                    self.assertTrue(
+                        issubclass(attn_backend_cls, BaseTpuPallasRpaAttnBackend)
+                    )
+                    with patch.object(
+                        attn_backend_cls, "__init__", return_value=None
+                    ) as init:
+                        container = registry.DRAFT_ATTENTION_BACKENDS[name](
+                            runner="runner", topk=1, speculative_num_steps=4
+                        )
+                    self.assertEqual(len(container.attn_backends), 3)
+                    self.assertEqual(
+                        [c.kwargs["speculative_step_id"] for c in init.call_args_list],
+                        [0, 1, 2],
+                    )
+
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
