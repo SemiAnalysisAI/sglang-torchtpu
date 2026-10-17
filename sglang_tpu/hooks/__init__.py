@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.moe_topk import (
     biased_grouped_topk,
@@ -22,6 +23,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +46,20 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
+        select_experimental_spec_worker,
+        HookType.AFTER,
+    ),
+    (
         "sglang.srt.layers.moe.topk.TopK.__init__",
         register_router_topk,
         HookType.AFTER,
     ),
-    ("sglang.srt.layers.moe.topk.biased_topk_impl", biased_topk, HookType.AROUND),
+    (
+        "sglang.srt.layers.moe.topk.biased_topk_impl",
+        biased_topk,
+        HookType.AROUND,
+    ),
     (
         "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
         biased_grouped_topk,
@@ -57,6 +68,8 @@ HOOKS: list[tuple] = [
 ]
 
 HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hook_specs())
 
 _registered = False
 

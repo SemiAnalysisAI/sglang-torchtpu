@@ -30,6 +30,10 @@ class TpuEnvs:
     # batches (moe/router_topk_tpu.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
 
+    # Speculative decoding
+    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
