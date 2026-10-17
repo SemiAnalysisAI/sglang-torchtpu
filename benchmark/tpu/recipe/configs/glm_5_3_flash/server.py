@@ -50,6 +50,10 @@ CONFIG["server_args"].update(
         "mem_fraction_static": 0.9,
         "disable_shared_experts_fusion": True,
         "watchdog_timeout": 1800,
+        # Prefill keeps the mHC residual streams sequence-parallel over TP: each
+        # rank runs the per-token mHC seam on 1/tp of the tokens, and a
+        # reduce-scatter + all-gather replace the all-reduce.
+        "enable_attn_tp_input_scattered": True,
     }
 )
 if DENSE_MAX_CONTEXT:

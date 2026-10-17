@@ -36,10 +36,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward, get_parallel, get_spec
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, is_tpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 class AttentionInputs:
@@ -91,7 +92,7 @@ class AttnTpContext:
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_parallel().enable_attn_tp_input_scattered
-            and (_is_cuda or _is_npu)
+            and (_is_cuda or _is_npu or _is_tpu)
             and q_lora_rank is not None
             and (is_mhc or not is_dsa)
             and get_parallel().tp_size > 1
