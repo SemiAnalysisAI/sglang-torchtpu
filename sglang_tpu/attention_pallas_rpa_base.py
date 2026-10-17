@@ -1481,6 +1481,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
+    def _kv_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        # The fused draft loop runs every step on step 0's metadata and passes
+        # each step's KV length in-graph.
+        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
+        if draft_kv_lens is not None:
+            return draft_kv_lens
+        return self.forward_metadata.kv_lens
+
     def _forward(
         self,
         q: torch.Tensor,
@@ -1587,12 +1595,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 quantize=quantize_kv,
             )
 
-        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
-        kv_lens = (
-            draft_kv_lens
-            if draft_kv_lens is not None
-            else self.forward_metadata.kv_lens
-        )
+        kv_lens = self._kv_lens(forward_batch)
         if self._dcp > 1:
             if not use_causal_mask:
                 raise NotImplementedError(
