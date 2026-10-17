@@ -4,7 +4,6 @@
 """TPU FP8 dense linear helpers."""
 
 import logging
-from threading import Lock
 from typing import Callable
 
 import torch
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 _SMALL_M_ENABLED = tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
 _SMALL_M_OP: Callable | None = None
-_SMALL_M_LOCK = Lock()
 
 
 def compute_tpu_fp8_linear_scale_shape(
@@ -361,27 +359,23 @@ def _get_fp8_linear_small_m_op() -> Callable:
     if _SMALL_M_OP is not None:
         return _SMALL_M_OP
 
-    with _SMALL_M_LOCK:
-        if _SMALL_M_OP is not None:
-            return _SMALL_M_OP
+    import jax
 
-        import jax
+    from sglang_tpu.kernels.fp8_linear_small_m import fp8_linear_small_m
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
-        from sglang_tpu.kernels.fp8_linear_small_m import fp8_linear_small_m
-        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+    def _op(x: jax.Array, weight: jax.Array, weight_scale: jax.Array) -> jax.Array:
+        return fp8_linear_small_m(x, weight, weight_scale)
 
-        def _op(x: jax.Array, weight: jax.Array, weight_scale: jax.Array) -> jax.Array:
-            return fp8_linear_small_m(x, weight, weight_scale)
+    op = cpu_export_jax_op("sglang_tpu_pallas::fp8_linear_small_m", _op)
 
-        op = cpu_export_jax_op("sglang_tpu_pallas::fp8_linear_small_m", _op)
+    def _fake(x, weight, weight_scale):
+        del weight_scale
+        return x.new_empty((x.shape[0], weight.shape[1]))
 
-        def _fake(x, weight, weight_scale):
-            del weight_scale
-            return x.new_empty((x.shape[0], weight.shape[1]))
-
-        op.register_fake(_fake)
-        _SMALL_M_OP = op
-        return op
+    op.register_fake(_fake)
+    _SMALL_M_OP = op
+    return op
 
 
 def register_fp8_linear_small_m_op() -> None:
