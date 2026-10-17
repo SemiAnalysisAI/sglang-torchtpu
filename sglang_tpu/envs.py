@@ -52,8 +52,9 @@ class TpuEnvs:
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
-    # DFLASH draft linears as fp8 weight-only (fp8_weight_linear.py) for decode-sized
-    # calls; prefill-sized calls keep the bf16 weights.
+    # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
+    # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
+    # keep the bf16 weights. Changes the draft's proposals, not verification.
     SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
 
     @classmethod
