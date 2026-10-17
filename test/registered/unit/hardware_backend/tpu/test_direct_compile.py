@@ -254,8 +254,12 @@ class TestDirectCompile(CustomTestCase):
                     artifact.executable = None
                     artifact.pending_compile = future
 
-                def compile_helper(args, kwargs, *, async_compile):
+                def compile_helper(
+                    args, kwargs, *, async_compile, spmd_compiler, graph
+                ):
                     self.assertEqual(async_compile, asynchronous)
+                    self.assertIsNone(spmd_compiler)
+                    self.assertIsNone(graph)
                     return artifact
 
                 with (
@@ -987,7 +991,7 @@ class TestDirectCompile(CustomTestCase):
         compiler = direct_compile.tpu_torch_compile
         value = compiler.placeholder([2], torch.int64, False)
         with direct_compile.execution_mode.set_eager_mode(
-            direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+            direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
         ):
             result = torch.isnan(value)
 
@@ -1005,7 +1009,7 @@ class TestDirectCompile(CustomTestCase):
                 weight = compiler.placeholder([2, 8], torch.float32, False)
                 value = compiler.placeholder([2, 8], torch.float32, False)
                 with direct_compile.execution_mode.set_eager_mode(
-                    direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                    direct_compile.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
                 ):
                     scores = value + weight
                     outputs = (

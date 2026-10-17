@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -479,6 +480,7 @@ def _validate_dsa(server_args) -> None:
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
@@ -697,6 +699,13 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _experimental_spec_enabled() -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    return experimental_spec_enabled()
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -855,20 +864,23 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Builtin TPU speculative decoding currently supports EAGLE3 only.
+        # Builtin TPU speculative decoding supports linear EAGLE/MTP and DFLASH.
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if spec_algo == "EAGLE3":
+            if spec_algo in ("EAGLE", "EAGLE3", "NEXTN"):
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
-                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                        "EAGLE-family rejection sampling is not supported on TPU yet."
                     )
                 if (cfg.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
-                        "EAGLE3 topk > 1 is not supported on TPU yet."
+                        "EAGLE-family topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
+                pass
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+                # Served by sglang_tpu.experimental.TpuDsparkWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -879,7 +891,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
                     )
 
         # Attention DP is declared by width (--attn-dp-size); the deprecated
@@ -1165,6 +1177,9 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
+        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+        # synchronize) called by SGLang's generic runtime bootstrap.
+        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
         # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
         # read by libtpu at init, so it MUST be set before `import torch_tpu`.

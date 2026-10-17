@@ -254,6 +254,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_prefill_cp=False,
             enable_hierarchical_cache=False,
             tpu_compile_tracer="dynamo",
+            json_model_override_args=None,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -413,7 +414,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):

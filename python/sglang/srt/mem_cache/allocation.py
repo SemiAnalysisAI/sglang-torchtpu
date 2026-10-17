@@ -216,6 +216,8 @@ def get_last_loc(
         "torch_native",
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
+        "pallas_tpu_mla",
+        "pallas_tpu_flash",
     )
     uses_triton_dispatch = (
         prefill_backend not in non_triton and decode_backend not in non_triton
@@ -294,6 +296,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
     out_cache_loc_host: Optional[torch.Tensor] = None,
+    return_host: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page
     # (one page per CLASS per request under sharding — the min-class
@@ -320,6 +323,9 @@ def alloc_paged_token_slots_extend(
         # Per-call per-req table for the C128 KV last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
+    if return_host:
+        # Opt-in allocators may defer the upload until forward-input padding.
+        extra_alloc_kwargs["return_host"] = True
     if out_cache_loc_host is not None:
         extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
@@ -496,7 +502,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = req_pool_indices_cpu.to(
+        batch.metadata_device(), non_blocking=True
+    )
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)

@@ -1124,6 +1124,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=8,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=model_runner, owner=model_runner.model
@@ -1141,6 +1142,14 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(len(args), 3)
         self.assertIs(args[0], forward_batch.input_ids)
         self.assertIs(args[2], forward_batch)
+
+        # Direct compilation must accept this exact positional call too, and
+        # must not reuse its token-ID artifact for an embedding-input program.
+        ids_key = policy._direct_compile_specialization_key(None, *args, **kwargs)
+        embeds_key = policy._direct_compile_specialization_key(
+            None, None, args[1], forward_batch, input_embeds=torch.zeros(8, 4)
+        )
+        self.assertNotEqual(ids_key, embeds_key)
 
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -1414,6 +1423,7 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
             out_cache_loc=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             spec_info=spec_info,
+            sampling_info=None,
         )
 
         with (
@@ -2352,14 +2362,12 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
 
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
 
-    def test_non_eagle3_algorithm_raises(self):
-        # The spec policy enforces the supported algorithm at construction (only
-        # EAGLE3 today); an unsupported algorithm fails loudly rather than
-        # silently degrading to a non-spec policy.
+    def test_non_eagle_family_algorithm_raises(self):
+        # Unsupported algorithms must fail instead of running a non-spec policy.
         mr = _spec_model_runner()
         # The algorithm is read from get_spec() as the policy is constructed.
         self.publish_config(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(ValueError, "only supports EAGLE3"):
+        with self.assertRaisesRegex(ValueError, "supports EAGLE, EAGLE3 and NEXTN"):
             _make_spec_policy(mr)
 
 
@@ -4479,6 +4487,63 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertTrue(torch.all(logits[LOGICAL_TOKENS:] == 0))
         finalized, _ = policy.finalize_spec_verify(padding, result, (None, None))
         self.assertEqual(finalized[1].shape, (BS,))
+
+
+class TestDraftRankInputVocabBounds(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.layers import vocab_parallel_embedding
+
+        # TPU backend initialization unwraps this dynamic CPU/CUDA compile wrapper.
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            patch.object(
+                vocab_parallel_embedding,
+                "get_masked_input_and_mask",
+                vocab_parallel_embedding.get_masked_input_and_mask.__wrapped__,
+            )
+        )
+
+    def _embedding(self, tp_rank):
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+        embedding = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        torch.nn.Module.__init__(embedding)
+        embedding.tp_rank = tp_rank
+        embedding.tp_size = 4
+        embedding.org_vocab_size = 15
+        embedding.org_vocab_size_padded = 16
+        embedding.num_embeddings = 18
+        embedding.num_embeddings_padded = 24
+        embedding.shard_indices = VocabParallelEmbedding._get_indices(
+            24, 16, 18, 15, tp_rank, 4
+        )
+        embedding.weight = torch.nn.Parameter(torch.zeros(6, 2))
+        return embedding
+
+    def test_rank_input_bounds_match_the_shard_constants(self):
+        for tp_rank in range(4):
+            with self.subTest(tp_rank=tp_rank):
+                embedding = self._embedding(tp_rank)
+                ids = torch.arange(18)
+                constant = embedding._get_masked_input_and_mask(ids)
+                embedding.lift_rank_to_input()
+                lifted = embedding._get_masked_input_and_mask(ids)
+                for got, want in zip(lifted, constant):
+                    torch.testing.assert_close(got, want)
+                self.assertNotIn("_rank_input", embedding.state_dict())
+
+    def test_lifting_is_idempotent_and_skips_unsharded(self):
+        embedding = self._embedding(1)
+        embedding.lift_rank_to_input()
+        rank = embedding._rank_input
+        embedding.lift_rank_to_input()
+        self.assertIs(embedding._rank_input, rank)
+        unsharded = self._embedding(0)
+        unsharded.tp_size = 1
+        unsharded.lift_rank_to_input()
+        self.assertEqual(list(unsharded.buffers()), [])
 
 
 if __name__ == "__main__":

@@ -21,11 +21,23 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # MoE: one fused kernel for single-token packed-MXFP4 decode
+    # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
+    SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Kimi-K3: run attention-residual aggregation for decode-sized batches as
+    # one Pallas kernel (pending add + mix + out norm) instead of the torch
+    # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
+    # bit-exact with it: the kernel scores in f32, the torch path in bf16.
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
+
+    # Speculative decoding
+    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
