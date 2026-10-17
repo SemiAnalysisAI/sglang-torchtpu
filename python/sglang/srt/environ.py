@@ -1927,6 +1927,19 @@ class Envs:
     # Also attribute eager compiles to sglang source lines. ~9 us per eager op.
     SGLANG_TPU_CHECK_RECOMPILATION_SITES = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+    # Arm the post-warmup fail_on_recompile stance with skip_guard_eval_unsafe
+    # to cut per-call guard cost. Dynamo then checks only global-state guards,
+    # guards on non-Parameter tensors and guards that failed before the
+    # frame's last compile. UNSAFE: an input that differs from every warmed
+    # variant only in a skipped guard runs a stale graph without error, and an
+    # input that matches one warmed variant can run another's graph when the
+    # guard telling them apart never failed before that frame's last compile
+    # (e.g. a module global only one variant reads). SGLANG_TPU_CHECK_RECOMPILATION
+    # sees neither. Applies to every Dynamo region in the process; frames
+    # restored from a torch.compile bundle keep full guards, and the
+    # --tpu-compile-tracer direct decoder has none. Ignored with speculative
+    # decoding and DP attention.
+    SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill
     # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the

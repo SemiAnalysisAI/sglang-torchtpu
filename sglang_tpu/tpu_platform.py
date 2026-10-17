@@ -1267,8 +1267,12 @@ class TpuSRTPlatform(SRTPlatform):
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:
-        """Freeze torch.compile so serving-time recompiles raise."""
-        from sglang.srt.runtime_context import get_exec, get_spec
+        """Freeze torch.compile so serving-time recompiles raise.
+
+        SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP also skips most guard checks (see
+        environ.py), except with speculative decoding or DP attention.
+        """
+        from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
         from sglang_tpu.compilation.recompilation_checker import (
             maybe_enable_site_tracing,
         )
@@ -1277,14 +1281,35 @@ class TpuSRTPlatform(SRTPlatform):
         maybe_enable_site_tracing()
         if not get_exec().graph.enable_torch_compile:
             return
-        if (
-            get_spec().speculative_algorithm is not None
-            and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get()
-        ):
+        speculative = get_spec().speculative_algorithm is not None
+        skip_guard_eval = envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.get()
+        if skip_guard_eval and speculative:
+            # Draft / verify warmups have diverged from serving before; an
+            # unchecked divergence would run a stale graph silently.
+            logger.warning(
+                "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with speculative "
+                "decoding."
+            )
+            skip_guard_eval = False
+        if skip_guard_eval and get_parallel().enable_dp_attention:
+            # Its traced code reads global state (gathered buffers, batch mode),
+            # whose guards need not tell the warmed variants apart.
+            logger.warning(
+                "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP with DP attention."
+            )
+            skip_guard_eval = False
+        if speculative and envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.get():
             logger.info(
                 "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
                 "for speculative decoding because "
                 "SGLANG_TPU_ALLOW_SPEC_RECOMPILE is enabled."
+            )
+            return
+        if skip_guard_eval:
+            torch.compiler.set_stance("fail_on_recompile", skip_guard_eval_unsafe=True)
+            logger.warning(
+                "[tpu] Warmup complete; froze torch.compile via "
+                "set_stance('fail_on_recompile', skip_guard_eval_unsafe=True)."
             )
             return
         torch.compiler.set_stance("fail_on_recompile")
