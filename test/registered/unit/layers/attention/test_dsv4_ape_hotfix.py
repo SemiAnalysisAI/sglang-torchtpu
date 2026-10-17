@@ -1,5 +1,7 @@
 """The DSV4 compressor's APE re-layout must follow its forward dispatch."""
 
+import sys
+
 import pytest
 import torch
 from torch import nn
@@ -52,3 +54,7 @@ def test_ape_is_relaid_out_only_for_the_native_forward(
     expected = torch.cat(halves, dim=0).view(4, -1) if relayout else original
     torch.testing.assert_close(compressor.ape.data, expected)
     assert compressor.ape_converted
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
