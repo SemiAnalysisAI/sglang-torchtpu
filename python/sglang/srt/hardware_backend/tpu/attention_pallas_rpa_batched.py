@@ -397,6 +397,7 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
             k_scale=k_scale,
             v_scale=v_scale,
             sinks=kwargs.get("sinks"),
+            page_size=self.page_size,
         )
         out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)

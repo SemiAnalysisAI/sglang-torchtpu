@@ -401,6 +401,9 @@ class PcpBatchedMetadata:
     pcp_cache_lens: torch.Tensor
     c_per_req: int = 1
     is_active: bool = True
+    # Any request in the batch has cached (prefix) tokens: selects the
+    # program that runs the ring / cache phase. Host value (trace-time).
+    has_prefix: bool = False
 
     @classmethod
     def create_empty(cls, device=None) -> "PcpBatchedMetadata":
@@ -618,6 +621,7 @@ def build_batched_rpa_cp_op():
                 configs.AttentionScope.FULL,
                 configs.AttentionScope.CACHE_ONLY,
                 configs.AttentionScope.NEW_TOKENS_ONLY,
+                configs.AttentionScope.STRIPED,
             ]
             scope_enum = _scopes[attention_scope]
         elif isinstance(attention_scope, str):
@@ -910,7 +914,9 @@ def build_pcp_batched_metadata(
     else:
         striped_page_indices = owned_pages.reshape(-1)
 
-    total_cache_pages = int(torch.sum(prefix_lens).item()) // page_size
+    prefix_list = [int(x) for x in prefix_lens_np] if prefix_lens_np is not None else []
+    has_prefix = any(x > 0 for x in prefix_list)
+    total_cache_pages = sum(prefix_list) // page_size
     pcp_cache_lens_t = prefix_lens.to(dtype=torch.int32, device=device)
 
     return PcpBatchedMetadata(
@@ -924,6 +930,7 @@ def build_pcp_batched_metadata(
         num_reqs=num_reqs,
         pcp_cache_lens=pcp_cache_lens_t,
         c_per_req=c_per_req,
+        has_prefix=has_prefix,
     )
 
 
@@ -1040,32 +1047,36 @@ def batched_rpa_pcp_forward(
         k_reordered = k_reordered.contiguous()
         v_reordered = v_reordered.contiguous()
 
-    # 1. Cache Phase (Ring Attention over ICI)
-    # Always executed unconditionally to keep the Dynamo graph static across
-    # batches with and without cached prefix tokens. When prefix_lens == 0,
-    # ring_op returns context_lse = -inf and merge_attn_states masks it out cleanly.
-    ring_op = _GLOBAL_RING_OP
-    if ring_op is None:
-        ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
-    context_out, context_lse = ring_op(
-        q_op,
-        k_logical,
-        v_logical,
-        kv_cache,
-        cache_lens_2x,
-        curr_page_indices,
-        pcp_meta.pcp_cu_q_lens,
-        curr_distribution,
-        pcp_meta.q_positions,
-        zeros_2x,
-        cp_rank_tensor,
-        zeros_2x,
-        float(layer.scaling),
-        sliding_window,
-        float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
-        k_scale,
-        v_scale,
-    )
+    # 1. Cache Phase (Ring Attention over ICI), only when some request has a
+    # cached prefix. `cache_pages` is a host int, so this is a trace-time
+    # branch; the compile policy keys the program on `cp_has_prefix`
+    # (decoder_compile_policy._batch_has_prefix) and warms both variants, so
+    # the two shapes never share a Dynamo cache entry.
+    has_prefix = bool(getattr(pcp_meta, "has_prefix", True))
+    context_out = context_lse = None
+    if has_prefix:
+        ring_op = _GLOBAL_RING_OP
+        if ring_op is None:
+            ring_op = build_batched_rpa_pcp_ring_op(cp_size, get_parallel().attn_tp_size)
+        context_out, context_lse = ring_op(
+            q_op,
+            k_logical,
+            v_logical,
+            kv_cache,
+            cache_lens_2x,
+            curr_page_indices,
+            pcp_meta.pcp_cu_q_lens,
+            curr_distribution,
+            pcp_meta.q_positions,
+            zeros_2x,
+            cp_rank_tensor,
+            zeros_2x,
+            float(layer.scaling),
+            sliding_window,
+            float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
+            k_scale,
+            v_scale,
+        )
 
     # Each virtual sequence's KV is the cached prefix plus the whole
     # all-gathered new KV of its request; causality is enforced by q_positions.
@@ -1109,8 +1120,11 @@ def batched_rpa_pcp_forward(
             sliding_window, float(layer.scaling), cp_size, forward_batch,
         )
 
-    # 3. Softmax State Merge
-    out, lse = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
+    # 3. Softmax State Merge (no prefix: the new-token phase is the whole result)
+    if has_prefix:
+        out, lse = merge_attn_states(context_out, context_lse, curr_out, curr_lse)
+    else:
+        out, lse = curr_out, curr_lse
 
     # Fold in attention sinks if present (e.g. GPT-OSS-120B)
     if sinks is None:
@@ -1120,6 +1134,9 @@ def batched_rpa_pcp_forward(
         out = out.to(q.dtype)
 
     return out
+
+
+_DCP_FUSED_DECODE = __import__("os").environ.get("SGLANG_DCP_FUSED_DECODE", "1") == "1"
 
 
 def batched_rpa_dcp_forward(
@@ -1134,17 +1151,23 @@ def batched_rpa_dcp_forward(
     k_scale: float | None = None,
     v_scale: float | None = None,
     sinks: torch.Tensor | None = None,
+    page_size: int | None = None,
 ) -> torch.Tensor:
     """Executes Decode Context Parallelism (DCP) on Batched RPA.
 
-    Each CP rank owns a page-striped portion of the KV cache:
-    1. Cache Phase (CACHE_ONLY):
-       Attends query against this rank's local striped pages -> (context_out, context_lse).
-    2. Current Phase (NEW_TOKENS_ONLY):
-       Attends query against the new token and writes it to the owning CP rank
+    Each CP rank owns a page-striped portion of the KV cache. Per layer:
+
+    Fused (default, full-attention layers): one STRIPED launch attends this
+    rank's stripe plus the new token when this rank owns its page (and writes
+    it there) -> (out, lse) partial state.
+
+    Two-phase (sliding-window layers, or SGLANG_DCP_FUSED_DECODE=0):
+    1. Cache Phase (CACHE_ONLY): this rank's striped pages -> (context_out, context_lse).
+    2. Current Phase (NEW_TOKENS_ONLY): the new token, written by its owner
        -> (curr_out, curr_lse).
-    3. Multi-Rank Softmax Merge:
-       All-gathers context_lse, all-reduces scaled context_out, and merges with curr_out.
+
+    Then one all-gather of every rank's partial (lse, out) and a local
+    softmax-state merge, identical on every rank.
     """
     dcp_size = get_parallel().attn_dcp_size
     if dcp_size > 1:
@@ -1191,6 +1214,41 @@ def batched_rpa_dcp_forward(
     # schedule skips them via `distribution`, but the metadata is still read).
     q_positions = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
     kv_new_lens = torch.ones_like(seq_lens, dtype=torch.int32)
+    cache_lens = torch.clamp(seq_lens - 1, min=0).to(torch.int32)
+
+    fused = _DCP_FUSED_DECODE and sliding_window is None and page_size is not None
+    if fused:
+        # The new token (position seq_len - 1) lives on page p = pos // page;
+        # rank p % cp owns it and is the only rank that attends and writes it.
+        own = ((cache_lens // page_size) % cp_size == cp_rank) & (seq_lens > 0)
+        own_i32 = own.to(torch.int32)
+        out_p, lse_p = cp_op(
+            q,
+            k,
+            v,
+            kv_cache,
+            cache_lens + own_i32,  # wrapper: global cache len = kv_lens - kv_new_lens
+            striped_page_indices,
+            base_meta.cu_q_lens,
+            base_meta.distribution,
+            q_positions,
+            own_i32,
+            cp_rank_tensor,
+            None,
+            own_i32,
+            float(layer.scaling),
+            None,
+            layer.logit_cap if getattr(layer, "logit_cap", 0) else None,
+            k_scale,
+            v_scale,
+            3,  # STRIPED
+            cp_size,
+            None,
+            True,
+        )
+        return _dcp_merge_partials(
+            [(out_p, lse_p)], cp_group, cp_size, q.dtype, layer, sinks
+        )
 
     # 1. Cache Phase (CACHE_ONLY)
     # The cached prefix is [0, seq_len - 1); the current token's slot is not
@@ -1250,45 +1308,85 @@ def batched_rpa_dcp_forward(
         True,
     )
 
-    # 3. DCP State Merge
-    # Every rank holds a partial softmax state over its page stripe. Gather all
-    # of them (plus the local new-token state) and merge locally under one
-    # global max; with decode-sized T the gathered [cp, T, H, D] is tiny.
-    #
-    # The gather moves the f32 payload as bit-exact bf16 pairs: the in-graph
-    # f32 all-gather aborts in torch_tpu's lowering
-    # (`tensor_to_buffer.cc: result_buf.element_type() == tpu_layout.element_type`),
-    # while the bf16 / fp8 row gathers of the prefill path lower fine.
-    num_tok, num_heads = context_lse.shape[0], context_lse.shape[1]
-    head_dim = context_out.shape[-1]
+    # 3. DCP State Merge: the cache-phase partial is gathered across ranks;
+    # the new-token partial is already complete on every rank (every rank
+    # attends the new token), so it enters the merge once, locally.
+    return _dcp_merge_partials(
+        [(context_out, context_lse)],
+        cp_group,
+        cp_size,
+        q.dtype,
+        layer,
+        sinks,
+        local_partials=[(curr_out, curr_lse)],
+    )
+
+
+def _dcp_merge_partials(
+    gathered_partials,
+    cp_group,
+    cp_size: int,
+    out_dtype,
+    layer,
+    sinks,
+    local_partials=(),
+) -> torch.Tensor:
+    """Merge per-rank softmax partial states ``(out [T,H,D], lse [T,H])``.
+
+    ``gathered_partials`` are all-gathered over the CP group (every rank holds
+    a different partial); ``local_partials`` are identical on every rank and
+    are merged once.
+
+    The gather payload is one lane-dense bf16 row per partial: ``out`` as
+    bf16 (its final dtype anyway) and ``lse`` split arithmetically into a bf16
+    hi part and a bf16 residual (~16 mantissa bits, ample for exp(lse - max)).
+    No dtype bitcasts: an f32 all-gather aborts in torch_tpu's lowering
+    (`tensor_to_buffer.cc` element-type check), and `view(bf16)` of an f32
+    buffer lowered to as_strided/slice/broadcast chains costing ~100 us per
+    layer, more than the attention kernel itself.
+    """
+    out0, lse0 = gathered_partials[0]
+    num_tok, num_heads = lse0.shape[0], lse0.shape[1]
+    head_dim = out0.shape[-1]
     n_lse = num_tok * num_heads
+    # The payload is moved as lane-dense f32 rows of 128, concatenated along
+    # 8-aligned rows: [out (T*H rows) | lse (padded rows)]. Earlier variants
+    # failed in the TPU toolchain: an f32 all-gather of a [1, N] row aborted in
+    # torch_tpu's lowering (tensor_to_buffer element-type check), bitcast
+    # packing to bf16 cost ~100 us/layer of as_strided/slice chains, and bf16
+    # arithmetic packing crashed the fusion emitter (EmitPackedBf16Chunk) /
+    # hung the compiler at bs=32. Lane-dense f32 rows gather cleanly.
+    lanes = 128
+    assert head_dim == lanes, head_dim
+    lse_rows = -(-n_lse // (lanes * 8)) * 8
+    out_rows = n_lse  # [T*H, D] rows
+    rows_per_partial = out_rows + lse_rows
 
-    context_lse_safe = torch.nan_to_num(
-        context_lse.to(torch.float32), nan=-float("inf")
-    )
-    context_out_safe = torch.nan_to_num(context_out.to(torch.float32), nan=0.0)
-    packed = torch.cat(
-        [context_lse_safe.reshape(1, -1), context_out_safe.reshape(1, -1)], dim=1
-    ).contiguous()
-    packed_bits = packed.view(torch.bfloat16)
-    gathered_bits = packed_bits.new_empty((cp_size, packed_bits.shape[1]))
-    cp_group.all_gather_into_tensor(gathered_bits, packed_bits)
-    gathered = gathered_bits.view(torch.float32)
-    all_context_lse = gathered[:, :n_lse].reshape(cp_size, num_tok, num_heads)
-    all_context_out = gathered[:, n_lse:].reshape(
-        cp_size, num_tok, num_heads, head_dim
-    )
+    def _pack(out, lse):
+        lse = torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).reshape(1, -1)
+        lse = torch.nn.functional.pad(lse, (0, lse_rows * lanes - n_lse)).reshape(lse_rows, lanes)
+        out = torch.nan_to_num(out.to(torch.float32), nan=0.0).reshape(out_rows, lanes)
+        return torch.cat([out, lse], dim=0)
 
-    curr_lse_safe = torch.nan_to_num(curr_lse.to(torch.float32), nan=-float("inf"))
-    curr_out_safe = torch.nan_to_num(curr_out.to(torch.float32), nan=0.0)
+    packed = torch.cat([_pack(o, l) for o, l in gathered_partials], dim=0).contiguous()
+    n_part = len(gathered_partials)
+    gathered = packed.new_empty((cp_size * packed.shape[0], lanes))
+    cp_group.all_gather_into_tensor(gathered, packed)
+    g = gathered.reshape(cp_size * n_part, rows_per_partial, lanes)
+    outs = [g[:, :out_rows, :].reshape(-1, num_tok, num_heads, head_dim)]
+    lse_g = g[:, out_rows:, :].reshape(cp_size * n_part, -1)[:, :n_lse]
+    lses = [lse_g.reshape(-1, num_tok, num_heads)]
+    for out, lse in local_partials:
+        lses.append(torch.nan_to_num(lse.to(torch.float32), nan=-float("inf")).unsqueeze(0))
+        outs.append(torch.nan_to_num(out.to(torch.float32), nan=0.0).unsqueeze(0))
 
-    stacked_lses = torch.cat([curr_lse_safe.unsqueeze(0), all_context_lse], dim=0)
-    stacked_outs = torch.cat([curr_out_safe.unsqueeze(0), all_context_out], dim=0)
+    stacked_lses = torch.cat(lses, dim=0)
+    stacked_outs = torch.cat(outs, dim=0)
     global_max_lse = torch.amax(stacked_lses, dim=0)
     global_max_lse_safe = torch.where(
         torch.isinf(global_max_lse), torch.zeros_like(global_max_lse), global_max_lse
     )
-    # A rank with no tokens in scope reports lse = -inf; give it weight 0.
+    # A partial with no tokens in scope reports lse = -inf; give it weight 0.
     weights = torch.where(
         torch.isinf(stacked_lses),
         torch.zeros_like(stacked_lses),
@@ -1306,4 +1404,4 @@ def batched_rpa_dcp_forward(
         merged_lse = torch.log(sum_exp_safe) + global_max_lse_safe
         merged_out = merged_out * torch.sigmoid(merged_lse - sinks.to(torch.float32))[..., None]
 
-    return merged_out.to(q.dtype)
+    return merged_out.to(out_dtype)

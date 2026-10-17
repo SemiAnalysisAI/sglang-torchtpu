@@ -1841,6 +1841,9 @@ class Envs:
     # Opt in to host padding for small prefill metadata tensors to avoid
     # per-length XLA compilations.
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
+    # TPU prefill CP: also precompile the extend program that runs the
+    # cache-phase (ring) attention for batches with a cached prefix.
+    SGLANG_TPU_CP_WARMUP_PREFIX_VARIANT = EnvBool(True)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it

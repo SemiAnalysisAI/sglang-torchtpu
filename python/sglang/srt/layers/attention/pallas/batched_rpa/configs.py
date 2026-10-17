@@ -67,11 +67,26 @@ class AttentionScope(enum.StrEnum):
     FULL:            attend all positions (default).
     CACHE_ONLY:      attend only cached tokens, skip new tokens.
     NEW_TOKENS_ONLY: attend only new tokens, skip cached tokens.
+    STRIPED:         decode under decode context parallelism in one launch:
+                     attend this rank's page stripe of the cache plus the
+                     sequence's new token when this rank owns its page. The
+                     caller passes ``kv_new_lens`` / ``update_kv_cache`` as 1
+                     on the owner and 0 elsewhere; the new token is stitched
+                     and written at the end of the stripe, which is exactly
+                     its slot because the owner's stripe ends on that page.
+                     Decode-only (one query per sequence); the mask attends
+                     every key of the stripe, so no causal offset is needed.
     """
 
     FULL = enum.auto()
     CACHE_ONLY = enum.auto()
     NEW_TOKENS_ONLY = enum.auto()
+    STRIPED = enum.auto()
+
+    @property
+    def walks_cache_stripe(self) -> bool:
+        """Whether the KV index space of this call is one rank's page stripe."""
+        return self in (AttentionScope.CACHE_ONLY, AttentionScope.STRIPED)
 
 
 class KVLayout(enum.StrEnum):
@@ -161,7 +176,7 @@ class ServingConfigs:
         """
         return (
             self.cp_group_size is not None
-            and self.attention_scope == AttentionScope.CACHE_ONLY
+            and self.attention_scope.walks_cache_stripe
             and self.pcp_ring_axis_name is None
         )
 
@@ -276,7 +291,7 @@ class RpaConfigs:
         """
         if (
             self.serve.cp_group_size is None
-            or self.serve.attention_scope != AttentionScope.CACHE_ONLY
+            or not self.serve.attention_scope.walks_cache_stripe
         ):
             return global_kv_cache_len
         return utils.cp_local_cache_len(
@@ -665,6 +680,16 @@ class RpaConfigs:
                 raise ValueError(
                     "Context Parallel does not support AttentionScope.FULL"
                     " where cache is sharded but current tokens is sequential"
+                )
+        elif self.serve.attention_scope == AttentionScope.STRIPED:
+            raise ValueError("AttentionScope.STRIPED requires cp_group_size.")
+        if self.serve.attention_scope == AttentionScope.STRIPED:
+            if self.mode != RpaCase.DECODE:
+                raise ValueError("AttentionScope.STRIPED is decode-only.")
+            if self.model.sliding_window is not None:
+                raise ValueError(
+                    "AttentionScope.STRIPED does not support sliding-window layers;"
+                    " use the CACHE_ONLY + NEW_TOKENS_ONLY pair."
                 )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:

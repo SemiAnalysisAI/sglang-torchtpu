@@ -355,6 +355,7 @@ def fetch_compute_metadata(
     cp_rank_ref: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
+    kv_new_lens_ref: jax.Ref | None = None,
 ) -> ComputeMetadata:
     """Fetches the scalars consumed by the QK mask.
 
@@ -365,6 +366,8 @@ def fetch_compute_metadata(
       global_kv_cache_lens_ref: Cached KV length per sequence.
       cp_rank_ref: Rank within the CP mesh axis.
       cfgs: Kernel configs.
+      kv_new_lens_ref: New KV length per sequence; STRIPED extends the
+        attended stripe by it (the owner's new token sits at the stripe end).
 
     Returns:
       The mask intervals for every batch element in this step.
@@ -378,8 +381,9 @@ def fetch_compute_metadata(
         else None
     )
     local_k_end_list = (
-        [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
+        [] if cfgs.serve.attention_scope.walks_cache_stripe else None
     )
+    striped_scope = cfgs.serve.attention_scope == configs.AttentionScope.STRIPED
 
     striped = (
         cfgs.serve.cp_group_size is not None
@@ -410,7 +414,11 @@ def fetch_compute_metadata(
         if local_k_start_list is not None:
             local_k_start_list.append(kv_cache_len_val - k_id)
         if local_k_end_list is not None:
-            local_k_end_list.append(kv_cache_len_val - k_id)
+            k_end = kv_cache_len_val
+            if striped_scope:
+                assert kv_new_lens_ref is not None
+                k_end = k_end + jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
+            local_k_end_list.append(k_end - k_id)
         if striped:
             stripe_rank_list.append(cp_rank)
             stripe_k_id_list.append(k_id)
@@ -508,12 +516,14 @@ def generate_mask(
 
     masks = []
     if (
-        cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY
+        cfgs.serve.attention_scope.walks_cache_stripe
         and cfgs.model.sliding_window is None
     ):
         # In CACHE_ONLY without sliding window, all queries attend to all prior
         # cached tokens, making causal masking (q_kv_diff >= offset) always True.
         # We only need to mask keys that exceed the sequence cache length.
+        # STRIPED (decode) likewise attends its whole stripe, whose end
+        # already includes the owner's new token (see fetch_compute_metadata).
         kv_iota = lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
         assert step_meta.local_k_end is not None
         for b_idx in range(b):
@@ -836,15 +846,25 @@ def rpa_body(
 
     # Step 2a: Fetch mask metadata after the fence to overlap with compute and
     # in-flight writeback.
-    fetch = ring_fetch_compute_metadata if cfgs.ring_enabled else fetch_compute_metadata
-    step_meta = fetch(
-        step,
-        schedule_ref,
-        q_positions_ref,
-        global_kv_cache_lens_ref,
-        cp_rank_ref,
-        cfgs=cfgs,
-    )
+    if cfgs.ring_enabled:
+        step_meta = ring_fetch_compute_metadata(
+            step,
+            schedule_ref,
+            q_positions_ref,
+            global_kv_cache_lens_ref,
+            cp_rank_ref,
+            cfgs=cfgs,
+        )
+    else:
+        step_meta = fetch_compute_metadata(
+            step,
+            schedule_ref,
+            q_positions_ref,
+            global_kv_cache_lens_ref,
+            cp_rank_ref,
+            cfgs=cfgs,
+            kv_new_lens_ref=kv_new_lens_ref,
+        )
 
     # Step 2b: Take this step's rotated KV block and forward it to the next rank,
     # so the hop overlaps the attention math below.

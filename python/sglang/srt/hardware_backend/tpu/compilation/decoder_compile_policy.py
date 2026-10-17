@@ -317,6 +317,20 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         )
 
 
+def _batch_has_prefix(forward_batch: Any) -> bool:
+    """Whether any request of an extend batch has cached (prefix) tokens."""
+    lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if lens is None:
+        t = getattr(forward_batch, "extend_prefix_lens", None)
+        if t is None:
+            return False
+        try:
+            lens = t.tolist()
+        except Exception:  # noqa: BLE001 - traced proxy; treat as no prefix
+            return False
+    return any(int(x) > 0 for x in lens)
+
+
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
@@ -766,6 +780,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             get_parallel().attn_cp_size > 1
             and getattr(forward_batch, "attn_cp_metadata", None) is not None
         )
+        # A CP extend with a cached prefix runs the ring (cache-phase)
+        # attention; one without skips it. Two static programs, no runtime
+        # branch on a data-dependent value inside the graph.
+        cp_has_prefix = bool(is_cp) and _batch_has_prefix(forward_batch)
         key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
@@ -773,6 +791,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
             is_cp,
+            cp_has_prefix,
         )
         return key
 
@@ -1014,10 +1033,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
+        cp_prefix_variants = (
+            (False, True)
+            if get_parallel().attn_cp_size > 1
+            and envs.SGLANG_TPU_CP_WARMUP_PREFIX_VARIANT.get()
+            else (False,)
+        )
         compile_items = [
-            (num_tokens, bs, mode, logits_output_mode)
+            (num_tokens, bs, mode, logits_output_mode, cp_prefix)
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
+            for cp_prefix in (cp_prefix_variants if mode.is_context_parallel_extend() else (False,))
         ]
         # Input (prompt) logprobs need every prefill row, so they warm the
         # FULL-capture variant instead of the NULL one -- a replacement, not an
@@ -1046,7 +1072,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else compile_items
         )
         pending = []
-        for num_tokens, bs, mode, logits_output_mode in compile_range:
+        for num_tokens, bs, mode, logits_output_mode, cp_prefix in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
@@ -1055,6 +1081,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 mode=mode,
                 logits_output_mode=logits_output_mode,
                 capture_hidden_mode=extend_capture_hidden_mode,
+                cp_with_prefix=cp_prefix,
             )
             elapsed = time.perf_counter() - start
             warmup = self._record_compile_step(
@@ -1072,7 +1099,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 status, elapsed, hbm_str = _warmup_progress(warmup, start, hbm_before)
                 compile_range.set_description(
                     f"{status} {mode.name} (tokens={num_tokens}, bs={bs}, "
-                    f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
+                    f"logits={logits_output_mode.name}"
+                    f"{', cp_prefix' if cp_prefix else ''}) in {elapsed:.1f}s{hbm_str}"
                 )
         return pending
 
@@ -1164,6 +1192,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
         profile_prefix: int | None = None,
+        cp_with_prefix: bool = False,
     ) -> PendingCall | float | None:
         """Run one warmup, defer async execution, or time synchronous profiling."""
         args, kwargs = self._make_warmup_inputs(
@@ -1209,7 +1238,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if is_dp_attention_enabled():
             self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         if get_parallel().attn_cp_size > 1 and mode.is_context_parallel_extend():
-            self._set_cp_attention_metadata(forward_batch, num_tokens, bs, mode)
+            self._set_cp_attention_metadata(
+                forward_batch, num_tokens, bs, mode, with_prefix=cp_with_prefix
+            )
         model.prepare_forward_batch(forward_batch)
         forward_batch.logits_output_mode = logits_output_mode
         if "forward_batch" in kwargs:
@@ -1301,9 +1332,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
     def _set_cp_attention_metadata(
-        self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
+        self,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        with_prefix: bool = False,
     ) -> None:
-        """Set CP metadata on dummy batch so precompile traces the CP extend graph."""
+        """Set CP metadata on dummy batch so precompile traces the CP extend graph.
+
+        ``with_prefix`` gives every request one cached page (the ring /
+        cache-phase program); otherwise the batch has no prefix (the program
+        that skips the ring). Serving selects between the two through the
+        ``cp_has_prefix`` component of the specialization key.
+        """
         from sglang.srt.layers.cp.utils import get_cp_strategy, prepare_cp_forward
 
         strategy = get_cp_strategy()
@@ -1335,16 +1377,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.seq_lens = torch.tensor(
             lens, dtype=torch.int64, device=device
         )
+        prefix = int(self.model_runner.page_size) if with_prefix else 0
+        if prefix:
+            seq_lens = [l + prefix for l in lens]
+            forward_batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+            forward_batch.seq_lens = torch.tensor(
+                seq_lens, dtype=torch.int64, device=device
+            )
         forward_batch.orig_seq_lens = forward_batch.seq_lens
-        forward_batch.extend_prefix_lens_cpu = [0] * bs
-        forward_batch.extend_prefix_lens = torch.zeros(
-            (bs,), dtype=torch.int32, device=device
+        forward_batch.extend_prefix_lens_cpu = [prefix] * bs
+        forward_batch.extend_prefix_lens = torch.full(
+            (bs,), prefix, dtype=torch.int32, device=device
         )
         forward_batch.extend_start_loc = torch.tensor(
             start_loc, dtype=torch.int32, device=device
         )
         forward_batch.extend_num_tokens = global_tokens
-        forward_batch.seq_lens_sum = global_tokens
+        forward_batch.seq_lens_sum = global_tokens + prefix * bs
 
         if forward_batch.input_ids.shape[0] < global_tokens:
             forward_batch.input_ids = torch.zeros(

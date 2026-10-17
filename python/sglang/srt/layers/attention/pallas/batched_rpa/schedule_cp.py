@@ -309,6 +309,29 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         new_tokens_only = (
             cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY
         )
+        striped_scope = cfgs.serve.attention_scope == configs.AttentionScope.STRIPED
+
+        def new_kv_dest(tok_idx, dma_sz):
+            """Local page slot and writeback size of a new-KV token.
+
+            NEW_TOKENS_ONLY indexes tokens globally: page `p` of the sequence
+            lives on rank `p % cp` in slot `p // cp`, and only the owner
+            writes. STRIPED already indexes this rank's stripe: the slot is
+            the stripe page itself and ownership was decided by the caller
+            (`update_kv_cache`, folded into `do_writeback`).
+            """
+            if striped_scope:
+                local_slot = jnp.minimum(
+                    tok_idx >> cfgs.serve.page_size_log2,
+                    cfgs.serve.pages_per_seq - 1,
+                )
+                return local_slot, dma_sz
+            p_idx = jnp.minimum(
+                tok_idx >> cfgs.serve.page_size_log2,
+                cfgs.serve.pages_per_seq * cp_group_size - 1,
+            )
+            owned = p_idx % cp_group_size == self.rank
+            return p_idx // cp_group_size, jnp.where(owned, dma_sz, jnp.int32(0))
 
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
@@ -393,10 +416,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
 
                     tok_idx = kv_len_start + dst_vmem
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_group_size - 1,
-                    )
+                    local_slot, owned_sz = new_kv_dest(tok_idx, dma_sz)
                     p_off = tok_idx & cfgs.serve.page_size_mask
                     dst, lead, wb_val = utils.align_span(
                         p_off, dma_sz, cfgs.kv_token_align
@@ -404,17 +424,12 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     dma_entry.fetch_hbm[...] = new_page_start
                     dma_entry.fetch_vmem[...] = fetch_vmem
                     dma_entry.wb_hbm[...] = (
-                        (s_idx * cfgs.serve.pages_per_seq + p_idx // cp_group_size)
+                        (s_idx * cfgs.serve.pages_per_seq + local_slot)
                         << cfgs.serve.page_size_log2
                     ) | dst
                     dma_entry.wb_vmem[...] = dst_vmem - lead
                     dma_entry.set_flags(
-                        fetch_val,
-                        jnp.where(
-                            (dma_sz > 0) & (p_idx % cp_group_size == self.rank),
-                            wb_val,
-                            0,
-                        ),
+                        fetch_val, jnp.where(owned_sz > 0, wb_val, 0)
                     )
                 else:
                     align = cfgs.kv_token_align
@@ -432,40 +447,25 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     # Writeback: one DMA per page, since page_indices scatters them, and
                     # only for the pages this rank owns.
                     tok_idx = kv_len_start + dst_vmem
-                    p_idx = jnp.minimum(
-                        tok_idx >> cfgs.serve.page_size_log2,
-                        cfgs.serve.pages_per_seq * cp_group_size - 1,
-                    )
+                    local_slot, owned_sz = new_kv_dest(tok_idx, dma_sz)
                     p_off = tok_idx & cfgs.serve.page_size_mask
                     dst, lead, wb_val = utils.align_span(p_off, dma_sz, align)
                     dma_entry.wb_hbm[...] = (
-                        (s_idx * cfgs.serve.pages_per_seq + p_idx // cp_group_size)
+                        (s_idx * cfgs.serve.pages_per_seq + local_slot)
                         << cfgs.serve.page_size_log2
                     ) | dst
                     dma_entry.wb_vmem[...] = dst_vmem - lead
                     dma_entry.set_flags(
-                        fetch_val,
-                        jnp.where(
-                            (dma_sz > 0) & (p_idx % cp_group_size == self.rank),
-                            wb_val,
-                            0,
-                        ),
+                        fetch_val, jnp.where(owned_sz > 0, wb_val, 0)
                     )
             else:
                 tok_idx = kv_len_start + dst_vmem
-                p_idx = jnp.minimum(
-                    tok_idx >> cfgs.serve.page_size_log2,
-                    cfgs.serve.pages_per_seq * cp_group_size - 1,
-                )
+                local_slot, wb_val = new_kv_dest(tok_idx, dma_sz)
                 p_off = tok_idx & cfgs.serve.page_size_mask
-                local_slot = p_idx // cp_group_size
                 dst_hbm = (
                     (s_idx * cfgs.serve.pages_per_seq + local_slot)
                     << cfgs.serve.page_size_log2
                 ) | p_off
-                wb_val = jnp.where(
-                    p_idx % cp_group_size == self.rank, dma_sz, jnp.int32(0)
-                )
 
                 fetch_hbm = src_hbm
                 if cfgs.serve.paged_new_kv:
