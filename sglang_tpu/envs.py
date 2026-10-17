@@ -34,6 +34,11 @@ class TpuEnvs:
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
     # bit-exact with it: the kernel scores in f32, the torch path in bf16.
     SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
+    # Drop Dynamo guards on nn.Module state (attributes, submodules, parameters)
+    # for the decoder graph; input and global guards stay (see
+    # decoder_compile_policy._guard_filter_options). Assumes module state is
+    # fixed after warmup.
+    SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
