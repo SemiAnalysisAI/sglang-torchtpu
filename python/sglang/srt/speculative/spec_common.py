@@ -15,8 +15,13 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 def adjust_verify_logits(
@@ -130,3 +135,87 @@ def verify_coins(
         (candidates.shape[0],), dtype=torch.float32, device=device
     )
     return coins, coins_for_final_sampling
+
+
+def build_dp_idle_draft_batch(batch: ScheduleBatch) -> ScheduleBatch:
+    """An empty idle batch for the draft pass of a DP-attention prefill step.
+
+    Host. It carries ``batch``'s per-rank token counts, so the draft forward
+    enters the same DP collectives as the peer ranks drafting a decode batch.
+    """
+    draft_batch = ScheduleBatch.init_new(
+        [],
+        batch.req_to_token_pool,
+        batch.token_to_kv_pool_allocator,
+        batch.tree_cache,
+        batch.model_config,
+        batch.enable_overlap,
+        batch.spec_algorithm,
+    )
+    draft_batch.prepare_for_idle()
+    draft_batch.global_num_tokens = batch.global_num_tokens
+    draft_batch.global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+    return draft_batch
+
+
+def build_trivial_verify_input(
+    *,
+    batch: ScheduleBatch,
+    topk: int,
+    device,
+    target_attn_backend: AttentionBackend,
+) -> EagleVerifyInput:
+    """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
+
+    Host. Used when ``speculative_num_steps == 0`` to skip drafting while still
+    routing through the existing TARGET_VERIFY graph captured at
+    ``draft_token_num=1``: the kernel always accepts the root and samples
+    one new bonus token from target logits -- functionally a plain decode.
+    """
+    # Function-local: eagle_info imports eagle_utils, which imports this module.
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+    if batch.forward_mode.is_idle():
+        return EagleVerifyInput.create_idle_input(
+            topk=topk, spec_steps=0, num_verify_tokens=1, device=device
+        )
+
+    draft_input = batch.spec_info
+    bs = batch.seq_lens.shape[0]
+
+    retrieve_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
+    retrieve_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+    retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+
+    verify_mask = target_attn_backend.verify_mask
+    # Every position in a 1-node tree is visible, so an all-True fill is
+    # correct under either layout.
+    if verify_mask is not None and verify_mask.fits(bs):
+        custom_mask = verify_mask.buffer
+        custom_mask.fill_(True)
+    else:
+        if batch.seq_lens_sum is not None:
+            seq_lens_sum = batch.seq_lens_sum
+        elif batch.seq_lens_cpu is not None:
+            seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        else:
+            seq_lens_sum = bs * target_attn_backend.max_context_len
+        custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
+
+    positions = batch.seq_lens.to(torch.int64)
+
+    return EagleVerifyInput(
+        draft_token=draft_input.bonus_tokens,
+        custom_mask=custom_mask,
+        positions=positions,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_cum_len=None,
+        spec_steps=0,
+        topk=topk,
+        draft_token_num=1,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        seq_lens_sum=None,
+        seq_lens_cpu=None,
+    )
