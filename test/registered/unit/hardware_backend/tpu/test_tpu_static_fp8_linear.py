@@ -432,5 +432,51 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
         self.assertIn("kda_qkvg", "\n".join(logs.output))
 
 
+class TestKimiK3HostSplitSlices(CustomTestCase):
+    """Every rank of a host must bind the same kind of tensor: a per-rank view
+    (storage offset) or a zeros constant made torch_tpu compile a different
+    decode program per rank, and the ranks then hung in a collective."""
+
+    def test_every_rank_gets_a_fresh_base_tensor_of_one_shape(self):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
+
+        w_kn = torch.randn(3584, 64).t()  # [64, 3584] view, like _dense_weight_kn
+        used = sf._split_ranks(w_kn.shape[1], 8)
+        self.assertEqual(used, 7)  # 3584 = 7 x 512
+        slices = [sf._column_slice(w_kn, used, index) for index in range(8)]
+        for index, t in enumerate(slices):
+            self.assertIsNone(t._base, f"rank {index}")
+            self.assertTrue(t.is_contiguous())
+            self.assertEqual(t.shape, slices[0].shape)
+        torch.testing.assert_close(slices[3], w_kn[:, 1536:2048], rtol=0, atol=0)
+        # Past the used ranks: a copy of slice 0 (dropped by the exchange), not zeros.
+        torch.testing.assert_close(slices[7], slices[0], rtol=0, atol=0)
+
+    def test_host_split_needs_moe_front_and_latent_up(self):
+        from sglang_tpu.kimi_k3 import static_fp8_parts
+
+        with tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.override(True):
+            with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("moe_front,kda_qkvg"):
+                with self.assertRaises(ValueError):
+                    static_fp8_parts()
+            with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all"):
+                self.assertIn("latent_up", static_fp8_parts())
+
+    def test_local_size(self):
+        from sglang_tpu.host_split_gemv import local_size
+
+        self.assertEqual(local_size(32, 4), 8)  # tpu7x 2x2x4, TP32
+        self.assertEqual(local_size(8, 1), 8)  # one host
+        self.assertEqual(local_size(32, 3), 0)  # uneven
+        self.assertEqual(local_size(32, 0), 0)
+
+    def test_split_ranks_needs_128_multiples(self):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
+
+        self.assertEqual(sf._split_ranks(7168, 8), 8)
+        self.assertEqual(sf._split_ranks(896, 8), 7)
+        self.assertEqual(sf._split_ranks(100, 8), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
