@@ -514,6 +514,25 @@ TUNED_BLOCK_SIZES = {
 }
 
 
+# gmm_v2 tile_m measured faster than calculate_tiling's default. tile_k and
+# tile_n still come from calculate_tiling's VMEM budget.
+# Key: (m, k, n, num_groups, lhs_dtype, rhs_dtype). Value: tile_m.
+TUNED_TILE_M = {
+    # GLM-5.3-Flash TP8 EP1 prefill, 8192 tokens x top-8 over 288 experts.
+    # 256 vs 128 rows: 0.490 vs 0.657 ms; 512 and 1024 are slower.
+    (65536, 4096, 512, 288, "float8_e4m3fn", "float8_e4m3fn"): 256,
+    # 256 vs 128 rows: 0.456 vs 0.578 ms.
+    (65536, 256, 4096, 288, "float8_e4m3fn", "float8_e4m3fn"): 256,
+}
+
+
+def get_tuned_tile_m(
+    m: int, k: int, n: int, num_groups: int, lhs_dtype: str, rhs_dtype: str
+) -> int | None:
+    """Tuned gmm_v2 tile_m for this shape, or None to keep the default."""
+    return TUNED_TILE_M.get((m, k, n, num_groups, lhs_dtype, rhs_dtype))
+
+
 # TODO (jacobplatin): make this more generic
 def round_up_to_multiple_of_128_within_limit(x: int, limit: int) -> int:
     """

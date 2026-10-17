@@ -32,6 +32,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.environ import envs
+from sglang_tpu.moe.pallas.tuned_block_sizes import get_tuned_tile_m
 
 _FP32_MOE_SCALES = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()
 
@@ -1066,10 +1067,6 @@ def kernel_main(
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
 
 
-# Row count from which 8-bit GMMs use 256-row tiles (see calculate_tiling).
-_LARGE_M_ROWS = 16384
-
-
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1098,14 +1095,16 @@ def calculate_tiling(
     lhs_mod = min(pl.cdiv(16, lhs_bits), 2)
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
-    if (
-        lhs_bits == 8
-        and jax.dtypes.itemsize_bits(rhs_dtype) == 8
-        and dims.size_m >= _LARGE_M_ROWS
-    ):
-        # Prefill-sized 8-bit x 8-bit GMMs: 128-row tiles stream each expert's
-        # weights more than once.
-        tile_m = 256
+    tuned_tile_m = get_tuned_tile_m(
+        dims.size_m,
+        dims.size_k,
+        dims.size_n,
+        dims.size_group,
+        jnp.dtype(lhs_dtype).name,
+        jnp.dtype(rhs_dtype).name,
+    )
+    if tuned_tile_m is not None:
+        tile_m = tuned_tile_m
     tile_m = min(tile_m, dims.size_m)
 
     # Per-buffer VMEM target for triple-buffered RHS.
