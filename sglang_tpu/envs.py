@@ -26,6 +26,11 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Kimi-K3: run attention-residual aggregation for decode-sized batches as
+    # one Pallas kernel (pending add + mix + out norm) instead of the torch
+    # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
+    # bit-exact with it: the kernel scores in f32, the torch path in bf16.
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
 
     # Speculative decoding
     # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
