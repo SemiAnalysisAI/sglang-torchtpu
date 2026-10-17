@@ -374,9 +374,12 @@ def _get_fp8_linear_small_m_op() -> Callable:
             return fp8_linear_small_m(x, weight, weight_scale)
 
         op = cpu_export_jax_op("sglang_tpu_pallas::fp8_linear_small_m", _op)
-        op.register_fake(
-            lambda x, weight, weight_scale: x.new_empty((x.shape[0], weight.shape[1]))
-        )
+
+        def _fake(x, weight, weight_scale):
+            del weight_scale
+            return x.new_empty((x.shape[0], weight.shape[1]))
+
+        op.register_fake(_fake)
         _SMALL_M_OP = op
         return op
 
