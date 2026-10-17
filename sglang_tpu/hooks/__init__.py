@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.moe_topk import (
     biased_grouped_topk,
     biased_topk,
@@ -54,6 +55,8 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
 ]
+
+HOOKS.extend(host_padding_hooks())
 
 _registered = False
 
