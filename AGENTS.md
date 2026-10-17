@@ -91,7 +91,9 @@ does not move backwards.
   the in-tree default byte-for-byte, gates differing behavior on
   `is_out_of_tree()`, stays under ~300 lines, and ships a CPU unit test with a
   fake platform. Flag a PR that bundles the seam with the feature using it;
-  ask for the split.
+  ask for the split. That rule targets upstream seam PRs: a fork-local wave-1
+  refactor PR may bundle a seam with its TPU adoption when each sits in its
+  own commit.
 - Cleanup: once a seam has merged upstream and arrived through the sync, the
   follow-up must delete the hook and the core branch. A pin bump that leaves
   them in place is incomplete.
