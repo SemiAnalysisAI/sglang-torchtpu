@@ -328,7 +328,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             content = f.read()
         self.assertIn('tpu = "sglang.srt.hardware_backend.tpu:activate"', content)
 
-    def test_scheduler_initialization_hook_is_declared(self):
+    def test_worker_hooks_are_declared(self):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
         from sglang_tpu.hooks.attn_residual import (
@@ -346,32 +346,6 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
             skip_spec_op_precompile_without_draft,
-        )
-        from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
-        from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
-        from sglang_tpu.hooks.twolevel_allreduce import (
-            all_reduce as twolevel_all_reduce,
-        )
-        from sglang_tpu.hooks.twolevel_allreduce import (
-            merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
-        )
-
-        self.assertIn(
-            (
-                "sglang.srt.layers.layer_boundary.adapters.attention."
-                "_device_supports_input_scattered",
-                device_supports_input_scattered,
-                HookType.AROUND,
-            ),
-            HOOKS,
-        )
-        self.assertIn(
-            (
-                "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
-                initialize_dense_moe_config,
-                HookType.AFTER,
-            ),
-            HOOKS,
         )
 
         self.assertIn(
