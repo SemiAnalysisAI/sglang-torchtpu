@@ -1219,6 +1219,9 @@ class TpuSRTPlatform(SRTPlatform):
         rank_slice._load()
         traced_rank._load()
         _register_attention_backends()
+        from sglang_tpu.mhc import register_mhc_overrides
+
+        register_mhc_overrides()
         self._backend_initialized = True
 
     def on_warmup_complete(self) -> None:
