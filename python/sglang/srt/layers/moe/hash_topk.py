@@ -177,9 +177,8 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids[:, :] = self.tid2eid[input_ids]
-            topk_weights[:, :] = scores.gather(
-                1, topk_ids[:, :].to(torch.int64) if _is_tpu else topk_ids[:, :]
-            )
+            # int64 is torch.gather's documented index dtype; torch_tpu rejects int32.
+            topk_weights[:, :] = scores.gather(1, topk_ids[:, :].to(torch.int64))
             if self.score_func != "softmax":
                 topk_weights[:, :] /= (
                     topk_weights[:, :].sum(dim=-1, keepdim=True)
