@@ -68,10 +68,12 @@ def _build_pallas_sparse_mla_kernel_op():
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.mla_sparse_fused import (
+        GATHER_CHUNK_TOKENS,
         sparse_mla_attention_fused,
     )
 
-    op_name = "sglang_tpu_pallas::sparse_mla_attention_fused"
+    # The chunk size changes the op body; naming it keeps cached graphs apart.
+    op_name = f"sglang_tpu_pallas::sparse_mla_attention_fused_g{GATHER_CHUNK_TOKENS}"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
