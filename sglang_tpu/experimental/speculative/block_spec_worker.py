@@ -8,8 +8,6 @@ commit: project target features of the committed rows into the draft context
         KV; root := bonus.
 extend: target forward on new prompt tokens, inject every row's target feature
         into the draft context KV, root := first sampled token.
-
-Not ported yet: hybrid (mamba) targets.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ from dataclasses import fields
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
-from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -94,10 +91,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 "TpuBlockSpecWorker only supports SGLANG_RAGGED_VERIFY_MODE=static."
             )
         target_runner = target_worker.model_runner
-        if mambaish_config(target_runner.model_config) is not None:
-            raise NotImplementedError(
-                "TpuBlockSpecWorker does not support mamba targets."
-            )
         self._spec_algorithm = target_runner.spec_algorithm
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)

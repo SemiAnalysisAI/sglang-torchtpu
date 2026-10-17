@@ -31,6 +31,10 @@ from collections.abc import Callable
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -84,6 +88,7 @@ from sglang_tpu.experimental.speculative.spec_utils import (
     apply_verify_logits_adjustments,
     pad_rows,
 )
+from sglang_tpu.mamba_pool import TpuMambaPool
 
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
 _SIMULATED_TOKEN = 100
@@ -115,6 +120,9 @@ class TpuSpecWorker(BaseSpecWorker):
         self.num_verify_rows = num_drafts + 1
         self.device = target_worker.device
         self._tp_sync = SpecTpSync(parallel.tp_group)
+        self._target_has_linear_attn = (
+            mambaish_config(target_worker.model_runner.model_config) is not None
+        )
         self._bucket: BucketState | None = None
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
@@ -132,6 +140,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        if self._target_has_linear_attn:
+            self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
             self._simulated_drafts = {
                 pbs: torch.full(
@@ -323,8 +333,26 @@ class TpuSpecWorker(BaseSpecWorker):
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
         )
+        if self._target_has_linear_attn:
+            self._commit_linear_attn_states(batch=batch, accept=accept)
         next_state = self.commit(batch, bucket.state, rows, logits_output, accept)
         return next_state, logits_output, accept
+
+    def _commit_linear_attn_states(
+        self, *, batch: ScheduleBatch, accept: AcceptResult
+    ) -> None:
+        """Select each slot's verify checkpoint at its last accepted token."""
+        runner = self.target_worker.model_runner
+        attn_backend = runner.attn_backend
+        assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
+        # Slots come from the verify forward's bucket metadata; padded rows accept 0,
+        # so their -1 step leaves the slot untouched.
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=accept.accept_lens.to(torch.int64) - 1,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=None,
+            model=runner.model,
+        )
 
     def forward_batch_generation(
         self,
@@ -496,6 +524,19 @@ class TpuSpecWorker(BaseSpecWorker):
                 torch.zeros((padded_bs,), dtype=torch.int32, device=self.device)[
                     :bs
                 ].cpu()
+
+    def _warmup_linear_attn_commit(self) -> None:
+        """_commit_linear_attn_states' eager ops at every batch bucket."""
+        mamba_pool = self.target_worker.model_runner.req_to_token_pool.mamba_pool
+        assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+        with torch.no_grad():
+            for pbs in self._b_bucketer().buckets:
+                # int32 like the GDN metadata slots; the null slot 0 is never written.
+                slots = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
+                accept_lens = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
+                mamba_pool.select_checkpoints(
+                    slots.clamp(min=0), accept_lens.to(torch.int64) - 1
+                )
 
     def _warmup_sampling_info(
         self, padded_bs: int, vocab_size: int, *, greedy: bool, top_k: bool
