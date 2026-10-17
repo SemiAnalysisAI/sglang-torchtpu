@@ -29,6 +29,9 @@ class TpuEnvs:
     # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
     # (static_fp8_gemv_pallas.py); False keeps the XLA fp8 dot for every batch.
     SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
+    # MoE: one fused kernel for single-token packed-MXFP4 decode
+    # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
+    SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
