@@ -217,7 +217,8 @@ def _query_blocks(cu_q_lens, kv_lens, distribution, *, query_block, num_blocks, 
     the number of blocks holding real queries, and per token its row in the
     block layout (``-1`` for padding tokens).
     """
-    max_num_seqs = kv_lens.shape[0]
+    # The page table has one row per cu_q_lens slot, as in the per-query kernel.
+    max_num_seqs = cu_q_lens.shape[0] - 1
     real = jnp.arange(max_num_seqs) < distribution[2]
     q_lens = jnp.where(real, cu_q_lens[1:] - cu_q_lens[:-1], 0)
     seq_blocks = _cdiv(q_lens, query_block)
