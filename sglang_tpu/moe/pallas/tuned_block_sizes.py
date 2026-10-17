@@ -511,12 +511,6 @@ TUNED_BLOCK_SIZES = {
         256 * 8,
         256 * 16,
     ),
-    # GLM-5.3-Flash TP8 EP1 prefill (8192 tokens x top-8, 288 experts): 256-row
-    # tiles vs calculate_tiling's 128 take 0.490 vs 0.657 ms (GMM1) and 0.456 vs
-    # 0.578 ms (GMM2); 512 and 1024 rows are slower. tk / tn are the full K / N
-    # calculate_tiling picks.
-    (65536, 4096, 512, 288, 288, "bfloat16", "float8_e4m3fn", 4096): (256, 4096, 512),
-    (65536, 256, 4096, 288, 288, "bfloat16", "float8_e4m3fn", 256): (256, 256, 4096),
 }
 
 
@@ -597,11 +591,9 @@ def get_tuned_block_sizes(
     lhs_dtype: str,
     rhs_dtype: str,
     quant_block_size: int,
-    use_default: bool = True,
 ):
     """
     Retrieves optimized (TM, TK, TN) tiling parameters for the GMM kernel.
-    On a miss returns the heuristic default, or None without ``use_default``.
     """
     # GMM inputs must align to tile sizes; however, tile sizes themselves
     # are often powers of 2 or mxu multiples.
@@ -617,8 +609,6 @@ def get_tuned_block_sizes(
     )
 
     if key not in TUNED_BLOCK_SIZES:
-        if not use_default:
-            return None
         default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
         logger.debug(
             "[GMM kernel] using default block sizes for key: %s: %s", key, default_val
