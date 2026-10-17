@@ -868,18 +868,18 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Builtin TPU speculative decoding currently supports EAGLE3 only.
+        # Builtin TPU speculative decoding supports linear EAGLE/MTP and DFLASH.
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if spec_algo == "EAGLE3":
+            if spec_algo in ("EAGLE", "EAGLE3", "NEXTN"):
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
-                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                        "EAGLE-family rejection sampling is not supported on TPU yet."
                     )
                 if (cfg.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
-                        "EAGLE3 topk > 1 is not supported on TPU yet."
+                        "EAGLE-family topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
                 pass
@@ -895,7 +895,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
                     )
 
         # Attention DP is declared by width (--attn-dp-size); the deprecated
@@ -1181,6 +1181,9 @@ class TpuSRTPlatform(SRTPlatform):
         os.environ.setdefault(
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
+        # Allow legacy torch.tpu device APIs (e.g. set_device, is_available,
+        # synchronize) called by SGLang's generic runtime bootstrap.
+        os.environ.setdefault("TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS", "1")
 
         # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
         # read by libtpu at init, so it MUST be set before `import torch_tpu`.
