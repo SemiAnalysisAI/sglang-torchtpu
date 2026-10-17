@@ -22,8 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 # [1, VEC_WIDTH] f32 parameter row: hc_base in [0, mix), hc_scale in [mix, mix + 3).
 VEC_WIDTH = 128
-# Prefill token block; decode buckets below this run as one block. 128 fills
-# the tokens-on-lanes Sinkhorn rows; 256 overflows VMEM at d = 4096.
+# Prefill token block; smaller batches run as one block.
 _MAX_BLOCK_TOKENS = 128
 _PREFILL_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
@@ -75,9 +74,7 @@ def _gates_and_collapse(
     )
     rms = jax.lax.rsqrt(sq / (hc * d) + rms_eps)
     dims = (((1,), (1,)), ((), ()))
-    # The streams hold bf16 values and fn is the checkpoint's bf16 weight, so
-    # one bf16 MXU pass with f32 accumulation forms the exact products a
-    # HIGHEST f32 dot would (its extra passes multiply zero low halves).
+    # bf16 streams and weights: one bf16 pass with f32 accumulation is exact.
     mixes = (
         functools.reduce(
             jnp.add,
@@ -106,10 +103,7 @@ def _gates_and_collapse(
         mixes[:, hc : 2 * hc] * s1 + base[:, hc : 2 * hc]
     )
 
-    # Sinkhorn with tokens on lanes: c[i][j] is a [1, bt] row, so every row and
-    # column sum is an elementwise add of hc rows. With tokens on sublanes each
-    # row sum was a cross-lane reduction, and 20 rounds of them form one serial
-    # chain (about 6 of the seam's ~10 us at decode).
+    # Tokens on lanes: row and column sums are elementwise adds of hc rows.
     logits = (mixes[:, 2 * hc :] * s2 + base[:, 2 * hc :]).T  # [hc * hc, bt]
     c = [[logits[i * hc + j : i * hc + j + 1] for j in range(hc)] for i in range(hc)]
 
@@ -136,8 +130,7 @@ def _gates_and_collapse(
         jnp.add, [pre[:, i : i + 1] * s for i, s in enumerate(streams)]
     ).astype(layer_ref.dtype)
     if norm_ref is not None:
-        # RMSNorm.forward_native on the bf16 collapse: f32 variance, rsqrt,
-        # f32 multiply by the weight, then round.
+        # Matches RMSNorm.forward_native on the bf16 collapse.
         x = layer.astype(jnp.float32)
         x = x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + norm_eps)
         layer = (x * norm_ref[...]).astype(layer_ref.dtype)
@@ -243,7 +236,6 @@ def mhc_site(
         operands.append(pad(res))
         in_specs.append(rows_spec(width))
     if has_pre:
-        # bf16 weight (the checkpoint dtype); see _gates_and_collapse.
         operands += [fn.astype(jnp.bfloat16), vec]
         in_specs += [full_spec((mix, width)), full_spec((1, VEC_WIDTH))]
         if norm_weight is not None:

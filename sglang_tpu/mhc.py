@@ -12,10 +12,8 @@ from typing import Callable, Optional
 
 import torch
 
-# The kernel was validated at hc_mult = 4 only. One prefill block of 128 tokens
-# fits VMEM up to d = 4096; the lane slices need d % 128 == 0. post_mult = 2.0
-# is fixed in the kernel, and the bf16 projection pass is exact only for an hc_fn
-# holding bf16 values, which a folded hc_norm_weight breaks.
+# Kernel limits: hc_mult = 4, d % 128 == 0 and d <= 4096, post_mult = 2.0, and
+# an unfolded bf16 hc_fn.
 _HC_MULT = 4
 _MAX_HIDDEN = 4096
 _LANES = 128
