@@ -172,7 +172,7 @@ def _validate_prefill_context_parallel(server_args: ServerArgs) -> None:
         )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(f"{feature} does not support speculative decoding.")
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise NotImplementedError(f"{feature} does not support DP attention.")
     if cfg.moe_dp_size != attn_cp_size:
         raise NotImplementedError(
@@ -304,7 +304,7 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     stage_is_tp_pair = (
         cfg.tp_size == 2
         and cfg.attn_cp_size == 1
-        and not cfg.enable_dp_attention
+        and cfg.attn_dp_size == 1
         and cfg.ep_size == 1
     )
     if cfg.tp_size > 1 and cfg.attn_cp_size != cfg.tp_size and not stage_is_tp_pair:
@@ -608,9 +608,9 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention runs "
             "plain decode and extend batches only."
         )
-    if cfg.enable_dp_attention:
+    if cfg.attn_dp_size > 1:
         raise ValueError(
-            "--enable-dp-attention is not supported with "
+            "DP attention (--attn-dp-size > 1) is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
     if cfg.attn_cp_size > 1:
@@ -894,11 +894,10 @@ class TpuSRTPlatform(SRTPlatform):
                         "yet (only EAGLE, EAGLE3, NEXTN and DFLASH among builtin algorithms)."
                     )
 
-        # Attention DP is declared by width (--attn-dp-size); the deprecated
-        # --dp-size N --enable-dp-attention spelling may not have resolved yet here.
+        # Platform defaults run after handle_deprecated_dp_attention, so the
+        # deprecated --dp-size N --enable-dp-attention spelling has already
+        # resolved to attn_dp_size=N here.
         attn_dp_size = cfg.attn_dp_size
-        if attn_dp_size == 1 and cfg.enable_dp_attention:
-            attn_dp_size = cfg.dp_size
         if attn_dp_size > 1:
             attn_tp_size = cfg.tp_size // attn_dp_size
             if attn_tp_size > 1 and not cfg.enable_dp_lm_head:
