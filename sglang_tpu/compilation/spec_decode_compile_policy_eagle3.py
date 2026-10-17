@@ -196,9 +196,13 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._draft_eager_model_forward: Callable[..., Any] | None = None
         self._draft_eager_logits_forward: Callable[..., Any] | None = None
 
-        if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
+        if self.speculative_algorithm and self.speculative_algorithm not in (
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+        ):
             raise ValueError(
-                f"TPU torch.compile precompilation only supports EAGLE3, "
+                f"TPU EAGLE-family precompilation supports EAGLE, EAGLE3 and NEXTN, "
                 f"got {self.speculative_algorithm!r}."
             )
 
@@ -223,6 +227,11 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     def install(self) -> bool:
         """Capture EAGLE's eager regions before the base policy replaces them."""
         if self.is_draft_worker and self.owner is not None:
+            from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+            from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+
+            if isinstance(self.owner, (Qwen3_5ForCausalLMMTP, LlamaForCausalLMEagle3)):
+                self.owner.model.embed_tokens.lift_rank_to_input()
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward

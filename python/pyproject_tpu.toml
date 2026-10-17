@@ -77,13 +77,13 @@ dependencies = [
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1+release.2026.9.22.20260927223741",
+  "torch-tpu==0.2.0rc4",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
   # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
   "tpu-sync-torch==0.0.1.dev20261013083150",
-  "libtpu==0.0.47",
+  "libtpu==0.0.50",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",
@@ -213,9 +213,9 @@ keyring-provider = "subprocess"
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"
-# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
+# torch-tpu-release-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
 # and the PyPI index. It prioritizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+url = "https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
 
 [[tool.uv.index]]
 name = "pypi"

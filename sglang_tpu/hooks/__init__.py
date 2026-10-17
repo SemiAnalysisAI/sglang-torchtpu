@@ -11,6 +11,12 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.attn_residual import (
+    aggregate,
+    aggregate_fused_add,
+    prepare_attn_residual_kernel,
+    register_attn_residual_ops,
+)
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.pipeline_parallel import (
@@ -44,6 +50,26 @@ HOOKS: list[tuple] = [
         "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
         select_experimental_spec_worker,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
+        register_attn_residual_ops,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        prepare_attn_residual_kernel,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.attn_residual._aggregate",
+        aggregate,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.attn_residual._aggregate_fused_add",
+        aggregate_fused_add,
+        HookType.AROUND,
     ),
 ]
 
