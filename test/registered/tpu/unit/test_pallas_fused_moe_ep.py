@@ -4,7 +4,6 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
-import contextlib
 import unittest
 
 import numpy as np
@@ -192,60 +191,6 @@ class TestFusedMoEExpertParallel(CustomTestCase):
                     full_range,
                     context=f"attempt={attempt} rank={rank}",
                 )
-
-    def test_ep_row_window_matches_full_body(self):
-        """Prefill-sized EP calls gather, compute and combine only this rank's
-        row window; the result must be bit-identical to the full body, both when
-        the window fits its capacity and when a rank overflows it."""
-        from sglang_tpu.envs import envs as tpu_envs
-        from sglang_tpu.moe.pallas.fused_moe_op import (
-            _ep_window_capacity,
-            _fused_moe_jax,
-        )
-
-        stack = contextlib.ExitStack()
-        self.addCleanup(stack.close)
-        stack.enter_context(tpu_envs.SGLANG_TPU_ENABLE_MOE_EP_ROW_WINDOW.override(True))
-        tokens = 2048  # 8192 routed rows, above the windowing threshold
-        local = self.GLOBAL_EXPERTS // self.EP_SIZE
-        self.assertGreater(
-            _ep_window_capacity(
-                tokens, self.TOPK, local, self.GLOBAL_EXPERTS, False, 0
-            ),
-            0,
-        )
-        x, w1, w2, topk_weights, topk_ids = self.make_inputs(tokens=tokens, seed=3)
-        # Every slot on rank 1's experts: more rows than the window holds.
-        overflow_ids = local + topk_ids % local
-        rank = 1
-        offset = rank * local
-        for name, ids in (("balanced", topk_ids), ("overflow", overflow_ids)):
-            for use_sc_gather in (0, 1):
-                args = (
-                    x,
-                    w1[offset : offset + local],
-                    w2[offset : offset + local],
-                    topk_weights,
-                    ids,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                kw = dict(
-                    topk=self.TOPK,
-                    activation_name="silu",
-                    global_num_experts=self.GLOBAL_EXPERTS,
-                    expert_group_offset=offset,
-                    use_sc_gather=use_sc_gather,
-                )
-                with self.subTest(routing=name, use_sc_gather=use_sc_gather):
-                    np.testing.assert_array_equal(
-                        np.asarray(_fused_moe_jax(*args, **kw), np.float32),
-                        np.asarray(
-                            _fused_moe_jax(*args, **kw, _ep_window=-1), np.float32
-                        ),
-                    )
 
     def test_rank_without_tokens(self):
         """A rank whose expert window receives no routed tokens contributes

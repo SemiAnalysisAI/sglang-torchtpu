@@ -27,8 +27,6 @@ class TpuEnvs:
     # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
     # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
-    # MoE: under EP, gather, compute and combine only this rank's row window.
-    SGLANG_TPU_ENABLE_MOE_EP_ROW_WINDOW = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
