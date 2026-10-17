@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+    from sglang.srt.speculative.spec_worker_contract import SpecWorkerContract
 
 
 class SpeculativeAlgorithm(Enum):
@@ -323,7 +324,7 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker] | None:
+    ) -> type[SpecWorkerContract | TpModelWorker] | None:
         from sglang.srt.platforms import current_platform
 
         assert not self.is_none(), (

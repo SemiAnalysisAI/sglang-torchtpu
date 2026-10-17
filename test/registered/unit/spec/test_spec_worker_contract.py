@@ -13,6 +13,7 @@ import inspect
 import unittest
 from pathlib import Path
 
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.speculative import spec_info
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -102,6 +103,37 @@ def _keyword_callable(function, names) -> list[str]:
     ]
 
 
+def _signature_mismatches(cls: type, protocol: type) -> list[str]:
+    """Protocol members ``cls`` does not implement with a compatible shape.
+
+    A Protocol property must not be a plain method on ``cls``; every parameter a
+    Protocol method declares must be accepted by the implementation (by keyword,
+    or by position where the Protocol makes it positional-only).
+    """
+    problems = []
+    for name in sorted(_protocol_members(protocol)):
+        declared = inspect.getattr_static(protocol, name, None)
+        implemented = inspect.getattr_static(cls, name, None)
+        if isinstance(declared, property):
+            if inspect.isfunction(implemented):
+                problems.append(f"{name}: a method where core reads a property")
+            continue
+        if not inspect.isfunction(declared) or not inspect.isfunction(implemented):
+            continue
+        accepted = inspect.signature(implemented).parameters
+        if any(p.kind is p.VAR_KEYWORD for p in accepted.values()):
+            continue
+        for param in list(inspect.signature(declared).parameters.values())[1:]:
+            if param.kind is param.POSITIONAL_ONLY:
+                continue
+            if (
+                param.name not in accepted
+                or accepted[param.name].kind is param.POSITIONAL_ONLY
+            ):
+                problems.append(f"{name}: does not accept {param.name!r}")
+    return problems
+
+
 def _default_worker_class_names() -> set[str]:
     """Worker classes ``SpeculativeAlgorithm._default_worker_cls`` can return."""
     tree = ast.parse(Path(spec_info.__file__).read_text(encoding="utf-8"))
@@ -132,20 +164,26 @@ class TestSpecWorkerContract(CustomTestCase):
                 missing = sorted(name for name in members if not _class_has(cls, name))
                 self.assertEqual(missing, [])
 
-    def test_workers_take_the_calls_the_scheduler_makes(self):
+    def test_workers_match_the_contract_signatures(self):
         for cls in CORE_WORKERS + PLUGIN_WORKERS:
             with self.subTest(worker=cls.__name__):
                 if cls not in NOT_CONSTRUCTED_BY_SCHEDULER:
                     self.assertEqual(
                         _keyword_callable(cls.__init__, SPEC_WORKER_INIT_KWARGS), []
                     )
-                forward_kwargs = ("on_publish", "grammar_barrier")
-                if cls not in PP_INCAPABLE_WORKERS:
-                    forward_kwargs += ("pp_proxy_tensors",)
-                self.assertEqual(
-                    _keyword_callable(cls.forward_batch_generation, forward_kwargs),
-                    [],
-                )
+                problems = _signature_mismatches(cls, SpecWorkerContract)
+                if cls in PP_INCAPABLE_WORKERS:
+                    problems = [p for p in problems if "pp_proxy_tensors" not in p]
+                self.assertEqual(problems, [])
+
+    def test_core_tells_spec_workers_from_plain_drafts(self):
+        # scheduler.py and batch_result_processor.py branch on this isinstance.
+        for cls in CORE_WORKERS + PLUGIN_WORKERS:
+            if cls in NOT_CONSTRUCTED_BY_SCHEDULER:
+                continue
+            with self.subTest(worker=cls.__name__):
+                self.assertIsInstance(object.__new__(cls), SpecWorkerContract)
+        self.assertNotIsInstance(object.__new__(TpModelWorker), SpecWorkerContract)
 
 
 class TestRelayedDraftInputContract(CustomTestCase):
@@ -157,15 +195,10 @@ class TestRelayedDraftInputContract(CustomTestCase):
                 missing = sorted(name for name in members if not _class_has(cls, name))
                 self.assertEqual(missing, [])
 
-    def test_draft_inputs_take_the_filter_call_schedule_batch_makes(self):
+    def test_draft_inputs_match_the_contract_signatures(self):
         for cls in DRAFT_INPUTS:
             with self.subTest(draft_input=cls.__name__):
-                self.assertEqual(
-                    _keyword_callable(
-                        cls.filter_batch, ("new_indices", "new_indices_cpu")
-                    ),
-                    [],
-                )
+                self.assertEqual(_signature_mismatches(cls, RelayedDraftInput), [])
 
 
 if __name__ == "__main__":

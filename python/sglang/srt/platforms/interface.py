@@ -248,7 +248,8 @@ class SRTPlatform(DeviceMixin):
         """Return the worker class for a builtin speculative algorithm.
 
         ``default`` is the class core selects for ``algorithm``. A platform may
-        return a different ``BaseSpecWorker`` that serves the same algorithm.
+        return a different class satisfying ``SpecWorkerContract``
+        (``speculative/spec_worker_contract.py``) that serves the same algorithm.
         """
         return default
 

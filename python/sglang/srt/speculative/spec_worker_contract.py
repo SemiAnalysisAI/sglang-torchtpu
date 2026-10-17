@@ -1,5 +1,10 @@
 """What core reads from a speculative worker and from the draft input it relays.
 
+These Protocols are the interface; ``BaseSpecWorker`` is one optional
+implementation that also carries reusable defaults. Core depends on the
+Protocol, so a platform worker can satisfy it by composition instead of
+inheriting behaviour it never reads.
+
 The scheduler, its components, FutureMap and P/D touch a spec worker and its
 ``next_draft_input`` only through the members named here. A worker returned by
 ``SRTPlatform.get_spec_worker_cls`` is safe to swap in when it exposes all of
@@ -16,12 +21,13 @@ NGRAM relay fields read by ``RelayPayload.from_ngram``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import torch
 
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -35,8 +41,13 @@ if TYPE_CHECKING:
 SPEC_WORKER_INIT_KWARGS = ("server_args", "gpu_id", "nccl_port", "target_worker")
 
 
+@runtime_checkable
 class SpecWorkerContract(Protocol):
-    """The spec-worker members core reads (``BaseSpecWorker`` supplies most)."""
+    """The spec-worker members core reads.
+
+    ``isinstance(worker, SpecWorkerContract)`` is how core tells a spec worker from
+    a plain ``TpModelWorker`` draft; ``BaseSpecWorker`` implements every member.
+    """
 
     # ---- Scheduler init: memory, backends, graphs (scheduler.py) ----
     def alloc_memory_pool(
@@ -71,6 +82,10 @@ class SpecWorkerContract(Protocol):
     # Read through getattr with a target-only fallback (scheduler.py).
     @property
     def spec_v2_attn_backends(self) -> tuple: ...
+
+    # The scheduler builds the DP-attention adapter on the target model.
+    @property
+    def target_worker(self) -> TpModelWorker: ...
 
     # ---- Startup accounting and metrics (scheduler.py) ----
     @property
