@@ -660,13 +660,13 @@ class RaidenKVManager(
         self, *, sent: Iterable[str], received: Iterable[str]
     ) -> None:
         for rid in sent:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d prefill read served | req_id=%s",
                 self.attn_tp_rank,
                 rid,
             )
         for rid in received:
-            logger.info(
+            logger.debug(
                 "RaidenKVManager rank%d decode pull done | req_id=%s",
                 self.attn_tp_rank,
                 rid,
