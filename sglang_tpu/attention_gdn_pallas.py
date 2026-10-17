@@ -30,7 +30,9 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -404,6 +406,18 @@ def build_gdn_pallas_op():
     return custom_op
 
 
+class GdnTracedMetadata(NamedTuple):
+    """Per-forward tensors the GDN/KDA layers read; direct compile lifts them as inputs."""
+
+    distribution: torch.Tensor
+    seq_lens: torch.Tensor
+    state_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    track_indices: Optional[torch.Tensor]
+    track_end: Optional[torch.Tensor]
+    read_offsets: Optional[torch.Tensor]
+
+
 class TpuGDNAttnBackend(MambaAttnBackendBase):
     """TPU GDN linear-attention backend backed by the fused Pallas kernel.
 
@@ -445,6 +459,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._seq_lens: Optional[torch.Tensor] = None
         self._state_indices: Optional[torch.Tensor] = None
         self._query_start_loc: Optional[torch.Tensor] = None
+        self._track_indices: Optional[torch.Tensor] = None
+        self._track_end: Optional[torch.Tensor] = None
         # Pure decode / verify has no PER_SEQ rows and extend no BATCHED rows
         # (see _get_distribution), so each runs one kernel pass instead of both.
         self._is_decode = False
@@ -576,6 +592,36 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             self._read_offsets_pool.index_fill_(
                 0, self._state_indices.clamp(min=0).long(), 0
             )
+
+    def traced_metadata(self) -> GdnTracedMetadata:
+        return GdnTracedMetadata(
+            distribution=self._distribution,
+            seq_lens=self._seq_lens,
+            state_indices=self._state_indices,
+            query_start_loc=self._query_start_loc,
+            track_indices=self._track_indices,
+            track_end=self._track_end,
+            read_offsets=self._read_offsets,
+        )
+
+    @contextmanager
+    def bind_traced_metadata(self, metadata: GdnTracedMetadata) -> Iterator[None]:
+        """Install graph inputs in place of the eager metadata while tracing."""
+        previous = self.traced_metadata()
+        self._set_traced_metadata(metadata)
+        try:
+            yield
+        finally:
+            self._set_traced_metadata(previous)
+
+    def _set_traced_metadata(self, metadata: GdnTracedMetadata) -> None:
+        self._distribution = metadata.distribution
+        self._seq_lens = metadata.seq_lens
+        self._state_indices = metadata.state_indices
+        self._query_start_loc = metadata.query_start_loc
+        self._track_indices = metadata.track_indices
+        self._track_end = metadata.track_end
+        self._read_offsets = metadata.read_offsets
 
     def commit_verified_states(
         self,
