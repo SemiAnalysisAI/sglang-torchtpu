@@ -32,3 +32,6 @@ _args.update(
         "json_model_override_args": json.dumps(_overrides),
     }
 )
+# Every draft / verify / draft-extend shape is warmed and recompiles are frozen;
+# evaluating only the distinguishing guards cuts ~1.3 ms of host time per round.
+CONFIG["runtime_env"]["SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP"] = "1"
