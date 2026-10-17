@@ -17,8 +17,7 @@ from jax.experimental.pallas import tpu as pltpu
 # Rows handled by the kernel; larger batches keep the XLA path.
 MAX_TOKENS = 16
 _TILE_N = (1024, 512, 256, 128)
-# Double-buffered FP8 weight tile bytes. Arbitrary margin under the default
-# scoped VMEM limit; larger shapes keep the XLA path instead of failing Mosaic.
+# Double-buffered FP8 weight tile bytes; larger shapes keep the XLA path.
 _WEIGHT_TILE_BUDGET = 24 * 1024 * 1024
 
 
@@ -52,7 +51,7 @@ def fp8_linear_small_m(
     tokens, k = x.shape
     n = weight.shape[1]
     tile_n = _tile_n(k, n)
-    # The row block spans the whole token dim (Mosaic accepts any size), so no pad op.
+    # The row block spans the whole token dim, so no pad op.
     ws = jnp.broadcast_to(weight_scale.astype(jnp.float32).reshape(-1), (n,)).reshape(
         1, n
     )

@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import fp8_linear
 from sglang_tpu.kernels import fp8_linear_small_m
 
-# GLM-5.3-Flash TP8 dense FP8 linears: shared experts, MLA, dense MLP.
+# Representative (K, N) shapes of dense FP8 linears.
 SHAPES = [(4096, 512), (256, 4096), (4096, 2048), (2048, 4096), (1536, 4096)]
 
 

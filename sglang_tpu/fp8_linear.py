@@ -16,8 +16,7 @@ from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
 
 logger = logging.getLogger(__name__)
 
-# Set by register_fp8_linear_small_m_op() before tracing; the op cannot be built
-# inside a torch.compile trace.
+# Built before tracing; the op cannot be built inside a torch.compile trace.
 _SMALL_M_OP: Callable | None = None
 _SMALL_M_LOCK = Lock()
 
