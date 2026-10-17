@@ -9,7 +9,9 @@ bind_glm5_next_kda_weights
        packed f32 operand post-load (kimi_k3._bind_tpu_attn_weights).
   How: AFTER Glm5NextForConditionalGeneration.load_weights, each KDA layer's
        attention takes the [dim, 1, K] parameter and the packed weights
-       (kda_layout.pack_kda_weights), as Kimi-K3 does.
+       (kda_layout.pack_kda_weights), as Kimi-K3 does. The conv and batched
+       f/g up-projection weights, built through views at load, are re-homed
+       through the host so torch_tpu does not relay them out on every call.
   Upstream PR or issue: none yet (model-side binding, as in kimi_k3.py).
   Remove when: glm5_next.py binds its TPU kernel weights post-load.
 """
@@ -29,6 +31,12 @@ def bind_glm5_next_kda_weights(result: None, model: Any, *args, **kwargs) -> Non
         attn = module.attn
         if attn.bias is not None:
             continue  # the packed operand carries no conv bias
+        # Weights reshaped or filled through views after load: re-home them
+        # through the host, or torch_tpu relays them out at every compiled call.
+        for name in ("qkv_conv1d", "fused_fg_b_proj"):
+            proj = getattr(module, name, None)
+            if proj is not None:
+                proj.weight.data = proj.weight.data.cpu().to(proj.weight.device)
         attn.conv_weights = module.qkv_conv1d.weight
         attn.packed_kernel_weights = pack_kda_weights(
             module.qkv_conv1d.weight,
