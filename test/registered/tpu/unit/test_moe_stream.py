@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The streaming one-token MoE must equal the route-meta + gmm_v2 fused-MoE path."""
+"""The streaming MoE kernels must match the route-meta + gmm_v2 fused-MoE path."""
 
 import unittest
 from unittest import mock
@@ -127,7 +127,7 @@ class TestMoeStreamBs1(CustomTestCase):
             np.asarray(self.routed(x, ids, wts), np.float32),
         )
 
-    def test_declines_outside_one_token_ep1(self):
+    def test_dispatch_declines_outside_its_case(self):
         from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
 
         x, ids, wts = self.inputs(0)
@@ -138,7 +138,7 @@ class TestMoeStreamBs1(CustomTestCase):
                 x, *args, no_combine=False, use_group_offset=False, **common
             )
         )
-        # Expert parallelism, no_combine and multi-token batches keep the gmm path.
+        # Expert parallelism and no_combine keep the gmm path.
         self.assertIsNone(
             maybe_moe_stream(
                 x, *args, no_combine=False, use_group_offset=True, **common
@@ -194,12 +194,59 @@ class TestMoeStreamBs1(CustomTestCase):
                 **common,
             )
         )
-        x2 = jnp.concatenate([x, x])
-        self.assertIsNone(
-            maybe_moe_stream(
-                x2, *args, no_combine=False, use_group_offset=False, **common
+        # A verify window takes the few-token kernel; wider batches keep gmm.
+        for tokens, expect in ((2, True), (8, True), (9, False)):
+            out = maybe_moe_stream(
+                jnp.tile(x, (tokens, 1)),
+                self.w1,
+                self.w2,
+                jnp.tile(wts, (tokens, 1)),
+                jnp.tile(ids, (tokens, 1)),
+                self.s1,
+                self.s2,
+                None,
+                None,
+                no_combine=False,
+                use_group_offset=False,
+                **common,
             )
-        )
+            self.assertEqual(out is not None, expect, tokens)
+
+    def test_few_tokens_match_route_meta_path(self):
+        """Verify windows (2..8 tokens) match the routed path up to the f32
+        combine order, including shared experts and padding rows."""
+        from sglang_tpu.moe.pallas.moe_stream import moe_stream_few_tokens
+
+        for tokens, seed, pad in ((2, 10, False), (6, 11, False), (8, 12, True)):
+            with self.subTest(tokens=tokens, pad=pad):
+                k1, k2, k3 = jax.random.split(jax.random.PRNGKey(seed), 3)
+                x = (jax.random.normal(k1, (tokens, HIDDEN)) * 3).astype(jnp.bfloat16)
+                # A narrow expert range so tokens share experts.
+                ids = jnp.stack(
+                    [
+                        jax.random.permutation(k, 24)[:TOPK]
+                        for k in jax.random.split(k2, tokens)
+                    ]
+                ).astype(jnp.int32)
+                wts = jax.nn.softmax(jax.random.normal(k3, (tokens, TOPK))).astype(
+                    jnp.bfloat16
+                )
+                if pad:
+                    # A padding row routes to an invalid id and must come out zero.
+                    ids = ids.at[-1].set(-1)
+                expected = self.routed(x, ids, wts)
+                actual = moe_stream_few_tokens(
+                    x, ids, wts, self.w1, self.s1, self.w2, self.s2, LIMIT
+                )
+                rows = tokens - 1 if pad else tokens
+                np.testing.assert_allclose(
+                    np.asarray(actual[:rows], np.float32),
+                    np.asarray(expected[:rows], np.float32),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+                if pad:
+                    np.testing.assert_array_equal(np.asarray(actual[-1], np.float32), 0)
 
 
 if __name__ == "__main__":
