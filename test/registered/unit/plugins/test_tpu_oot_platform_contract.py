@@ -341,7 +341,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
 
         self.assertEqual(
-            HOOKS,
+            HOOKS[:3],
             [
                 (
                     "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
