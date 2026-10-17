@@ -57,6 +57,13 @@ class TpuEnvs:
     # keep the bf16 weights. Changes the draft's proposals, not verification.
     SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
 
+    # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
+    # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
+    SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
