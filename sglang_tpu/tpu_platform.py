@@ -7,7 +7,6 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
-import functools
 import json
 import os
 from contextlib import AbstractContextManager, contextmanager
@@ -517,48 +516,52 @@ def _validate_dsa(server_args) -> None:
         )
 
 
-# Draft backends: each EAGLE draft step runs its own instance of the target backend.
-_DRAFT_ATTENTION_BACKEND_CLASSES = {
-    "pallas_tpu_rpa_v3": "sglang_tpu.attention_pallas_rpa_v3.TpuPallasRpaV3AttnBackend",
-    "pallas_tpu_rpa_batched": (
-        "sglang_tpu.attention_pallas_rpa_batched.TpuPallasRpaBatchedAttnBackend"
-    ),
-    "pallas_tpu_mla": "sglang_tpu.attention_pallas_mla.TpuPallasMlaAttnBackend",
-    "pallas_tpu_mla_sparse": (
-        "sglang_tpu.attention_pallas_mla_sparse.TpuPallasSparseMlaAttnBackend"
-    ),
-}
-
-
-def _create_multi_step_draft_backend(
-    runner, topk, speculative_num_steps, *, attn_backend_cls_name: str
-):
-    from sglang.srt.configs.linear_attn_model_registry import import_backend_class
-    from sglang_tpu.attention_pallas_rpa_base import (
-        TpuPallasRpaMultiStepDraftBackend,
-    )
-
-    return TpuPallasRpaMultiStepDraftBackend(
-        model_runner=runner,
-        topk=topk,
-        speculative_num_steps=speculative_num_steps,
-        attn_backend_cls=import_backend_class(attn_backend_cls_name),
-    )
-
-
 def _register_attention_backends() -> None:
     """Add the attention backends that only this package knows to the registry."""
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
         register_draft_attention_backend,
     )
+    from sglang_tpu.attention_pallas_rpa_base import (
+        TpuPallasRpaMultiStepDraftBackend,
+    )
 
-    for name, attn_backend_cls_name in _DRAFT_ATTENTION_BACKEND_CLASSES.items():
-        register_draft_attention_backend(name)(
-            functools.partial(
-                _create_multi_step_draft_backend,
-                attn_backend_cls_name=attn_backend_cls_name,
-            )
+    @register_draft_attention_backend("pallas_tpu_rpa_v3")
+    def create_pallas_tpu_rpa_v3_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaV3AttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_batched")
+    def create_pallas_tpu_rpa_batched_draft_backend(
+        runner, topk, speculative_num_steps
+    ):
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaBatchedAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla")
+    def create_pallas_tpu_mla_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasMlaAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasSparseMlaAttnBackend
         )
 
     @register_attention_backend("pallas_tpu_mla_sparse")
