@@ -50,6 +50,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 # jax.Array`` at registration time; PEP 563 would turn those into
 # strings and validation would reject them.
 
+import functools
 import logging
 import math
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -105,6 +106,35 @@ def _padded_token_count(m: int, topk: int, sublane: int) -> int:
     m_pad = ((m + token_align - 1) // token_align) * token_align
 
     return m_pad
+
+
+# Windowed EP applies from this many routed rows (prefill sizes); its capacity
+# is this multiple of the even share, rounded to the GMM row tile.
+_EP_WINDOW_MIN_ROWS = 4096
+_EP_WINDOW_SLACK = 2
+_EP_WINDOW_ALIGN = 512
+
+
+def _ep_window_capacity(
+    m, topk, local_experts, global_experts, no_combine, permute_dense_threshold
+):
+    """Static row capacity of this rank's expert window, or 0 to skip windowing.
+
+    The dense permute / un-permute paths read every routed row, so they keep
+    the full body.
+    """
+    routed_rows = m * topk
+    if (
+        no_combine
+        or global_experts <= local_experts
+        or routed_rows < _EP_WINDOW_MIN_ROWS
+        or m < permute_dense_threshold
+    ):
+        return 0
+    ep = global_experts // local_experts
+    cap = -(-routed_rows * _EP_WINDOW_SLACK // ep)
+    cap = -(-cap // _EP_WINDOW_ALIGN) * _EP_WINDOW_ALIGN
+    return cap if cap < routed_rows else 0
 
 
 def _shard_row_window(topk_ids_flat, expert_group_offset, local_num_experts):
@@ -490,6 +520,7 @@ def _fused_moe_jax(
     permute_dense_threshold=0,
     w1_channel_scale=None,
     w2_channel_scale=None,
+    _ep_window=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -612,6 +643,54 @@ def _fused_moe_jax(
     if out is not None:
         return out
 
+    ep_window = _ep_window_capacity(
+        int(m),
+        int(topk),
+        num_experts,
+        global_num_experts,
+        no_combine,
+        permute_dense_threshold,
+    )
+    if ep_window and not _ep_window:
+        # Rows are expert-sorted, so this rank's experts own one contiguous
+        # window of about routed_rows / ep rows. Gather, compute and combine a
+        # fixed-capacity window instead of every routed row; a rank routed
+        # more rows than the capacity takes the full body, so results match.
+        local = (topk_ids >= expert_group_offset) & (
+            topk_ids < expert_group_offset + num_experts
+        )
+        body = functools.partial(
+            _fused_moe_jax,
+            topk=topk,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            global_num_experts=global_num_experts,
+            expert_group_offset=expert_group_offset,
+            use_sc_gather=use_sc_gather,
+            w_quant_bits=w_quant_bits,
+            permute_dense_threshold=permute_dense_threshold,
+            w1_channel_scale=w1_channel_scale,
+            w2_channel_scale=w2_channel_scale,
+        )
+        operands = (
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+        )
+        return jax.lax.cond(
+            jnp.sum(local) <= ep_window,
+            lambda ops: body(*ops, _ep_window=ep_window),
+            lambda ops: body(*ops, _ep_window=-1),
+            operands,
+        )
+    windowed = _ep_window > 0
+
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
     # the *input* tokens here keeps the permute/gather operating on an
@@ -683,7 +762,25 @@ def _fused_moe_jax(
                 topk_ids_flat, expert_group_offset, num_experts
             )
 
-    if single_token:
+    if windowed:
+        # Pad so a window near the end never clamps back into earlier rows.
+        window_ids = jax.lax.dynamic_slice(
+            jnp.pad(sorted_token_ids, (0, _ep_window)), (row_start,), (_ep_window,)
+        )
+        if use_sc_gather:
+            from sglang_tpu.moe.pallas.sparse_core.ragged_gather_v2 import (
+                ragged_gather_v2,
+            )
+
+            x_sorted = ragged_gather_v2(
+                hidden_states,
+                window_ids,
+                jnp.array([0], dtype=jnp.int32),
+                jnp.array([_ep_window], dtype=jnp.int32),
+            )
+        else:
+            x_sorted = hidden_states[window_ids]  # [window, k]
+    elif single_token:
         x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
     elif use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
@@ -791,6 +888,12 @@ def _fused_moe_jax(
             if use_group_offset
             else None
         )
+        if windowed:
+            # The window starts at this rank's first row: its local groups.
+            group_sizes = jax.lax.dynamic_slice(
+                group_sizes, (expert_group_offset,), (num_experts,)
+            )
+            group_offset = None
 
     # The TensorCore path requires zero-initializing, while the SparseCore
     # combine does not: the masked EP combine skips masked rows entirely, and
@@ -917,7 +1020,17 @@ def _fused_moe_jax(
                 ragged_gather_reduce,
             )
 
-            if use_group_offset:
+            if windowed:
+                combined = ragged_gather_reduce(
+                    gmm2_out,
+                    jnp.clip(unsort_idx - row_start, 0, _ep_window - 1).astype(
+                        jnp.int32
+                    ),
+                    topk_weights.reshape(-1),
+                    _valid_rows_mask(row_start, row_end, unsort_idx),
+                    topk,
+                )
+            elif use_group_offset:
                 combined = ragged_gather_reduce(
                     gmm2_out,
                     unsort_idx.astype(jnp.int32),
@@ -949,6 +1062,11 @@ def _fused_moe_jax(
             unsort_idx.astype(jnp.int32),
             jnp.array([0], dtype=jnp.int32),
             jnp.array([n_sorted], dtype=jnp.int32),
+        )
+    elif windowed:
+        valid = _valid_rows_mask(row_start, row_end, unsort_idx)[:, None]
+        unsorted = jnp.where(
+            valid, gmm2_out[jnp.clip(unsort_idx - row_start, 0, _ep_window - 1)], 0
         )
     else:
         # Gather on the TensorCore.
