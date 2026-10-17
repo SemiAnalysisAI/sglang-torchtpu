@@ -57,7 +57,6 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
-from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import is_experimental_dspark
 from sglang_tpu.experimental.compilation.dspark_compile_policy import (
     TpuDsparkSpecDecodeCompilePolicyMixin,
@@ -208,11 +207,6 @@ class TpuGraphRunner:
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
-        if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():
-            # The op cannot be built inside a torch.compile trace.
-            from sglang_tpu.fp8_linear import register_fp8_linear_small_m_op
-
-            register_fp8_linear_small_m_op()
 
         # TODO: remove — TPU does not support CP decode-attn-TP; this only
         # keeps the singleton's first-call init out of the dynamo trace.
