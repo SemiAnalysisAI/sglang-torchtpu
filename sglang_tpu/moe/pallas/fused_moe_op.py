@@ -123,9 +123,12 @@ def _ep_window_capacity(
     The dense permute / un-permute paths read every routed row, so they keep
     the full body.
     """
+    from sglang_tpu.envs import envs as tpu_envs
+
     routed_rows = m * topk
     if (
-        no_combine
+        not tpu_envs.SGLANG_TPU_ENABLE_MOE_EP_ROW_WINDOW.get()
+        or no_combine
         or global_experts <= local_experts
         or routed_rows < _EP_WINDOW_MIN_ROWS
         or m < permute_dense_threshold

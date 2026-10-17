@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
+import contextlib
 import unittest
 
 import numpy as np
@@ -196,11 +197,15 @@ class TestFusedMoEExpertParallel(CustomTestCase):
         """Prefill-sized EP calls gather, compute and combine only this rank's
         row window; the result must be bit-identical to the full body, both when
         the window fits its capacity and when a rank overflows it."""
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas.fused_moe_op import (
             _ep_window_capacity,
             _fused_moe_jax,
         )
 
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(tpu_envs.SGLANG_TPU_ENABLE_MOE_EP_ROW_WINDOW.override(True))
         tokens = 2048  # 8192 routed rows, above the windowing threshold
         local = self.GLOBAL_EXPERTS // self.EP_SIZE
         self.assertGreater(

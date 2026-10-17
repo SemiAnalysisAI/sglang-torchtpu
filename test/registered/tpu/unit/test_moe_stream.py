@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The streaming MoE kernels must match the route-meta + gmm_v2 fused-MoE path."""
 
+import contextlib
 import unittest
 from unittest import mock
 
@@ -26,6 +27,13 @@ HIDDEN, INTER, EXPERTS, TOPK, LIMIT = 4096, 256, 288, 8, 10.0
 class TestMoeStreamBs1(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        stack = contextlib.ExitStack()
+        cls.addClassCleanup(stack.close)
+        stack.enter_context(
+            tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.override(True)
+        )
         keys = iter(jax.random.split(jax.random.PRNGKey(0), 8))
         f8 = jnp.float8_e4m3fn
         cls.w1 = (
