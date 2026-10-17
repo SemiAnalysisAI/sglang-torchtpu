@@ -172,6 +172,18 @@ class TestTpuPlatformInitialization(CustomTestCase):
             self.assertTrue(pallas_choices)
             self.assertLessEqual(pallas_choices, ATTENTION_BACKENDS.keys())
 
+    def test_default_vision_attention_backend_is_registered(self):
+        from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
+        from sglang_tpu.tpu_platform import _register_attention_backends
+        from sglang_tpu.vision_attention import VisionTpuAttention
+
+        with patch.dict(QKV_BACKEND_IMPL):
+            _register_attention_backends()
+            self.assertIs(
+                QKV_BACKEND_IMPL[self.platform.get_default_vision_attention_backend()],
+                VisionTpuAttention,
+            )
+
 
 class TestTpuCompileCache(CustomTestCase):
     def test_reports_tier1_cache_misses(self):

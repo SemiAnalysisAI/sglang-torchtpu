@@ -7,10 +7,6 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vision import (
-    VisionTpuAttention,
-    _build_tpu_segment_ids,
-)
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang_tpu.compilation import direct_compile
@@ -23,6 +19,7 @@ from sglang_tpu.graph_runner.vit_tpu_compile_runner import (
     _cu_seqlens_to_segment_ids,
     _Qwen3VLRunContext,
 )
+from sglang_tpu.vision_attention import VisionTpuAttention, _build_tpu_segment_ids
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
@@ -559,9 +556,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_shared_tpu_attention_supports_batched_flattened_callers(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
         with (
-            patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang_tpu.vision_attention._get_vision_flash_op",
                 return_value=flash_op,
             ),
         ):
@@ -583,9 +579,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_shared_tpu_attention_delegates_explicit_masks_to_sdpa(self):
         with (
-            patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang_tpu.vision_attention._get_vision_flash_op",
                 return_value=MagicMock(),
             ),
         ):
@@ -622,9 +617,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_shared_tpu_attention_uses_pallas_for_fp32_softmax(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
         with (
-            patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang_tpu.vision_attention._get_vision_flash_op",
                 return_value=flash_op,
             ),
         ):
@@ -647,9 +641,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
     def test_shared_tpu_attention_expands_kv_heads(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
         with (
-            patch("sglang.srt.layers.attention.vision._is_tpu", True),
             patch(
-                "sglang.srt.layers.attention.vision._get_vision_flash_op",
+                "sglang_tpu.vision_attention._get_vision_flash_op",
                 return_value=flash_op,
             ),
         ):
