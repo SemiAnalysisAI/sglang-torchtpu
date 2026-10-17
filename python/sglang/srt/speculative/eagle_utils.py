@@ -1234,9 +1234,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # page>1 topk>1 row-width assert has nothing to guard: nothing is written.
     # Eviction, penalties, per-request iteration counters and the device-accept
     # routing prepared at the end of this function all still run.
-    skip_allocation = (
-        num_needed_tokens == 0 and _is_tpu and batch.req_to_token_pool.host_resident
-    )
+    skip_allocation = num_needed_tokens == 0 and batch.req_to_token_pool.host_resident
 
     if not skip_allocation:
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -1256,7 +1254,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
                 f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
             )
 
-        if _is_tpu and batch.req_to_token_pool.host_resident:
+        if batch.req_to_token_pool.host_resident:
             # TPU: req_to_token lives on the host, so allocate and write the page
             # table through the host mirrors instead of the device alloc path.
             allocate_and_assign_decode_cache(

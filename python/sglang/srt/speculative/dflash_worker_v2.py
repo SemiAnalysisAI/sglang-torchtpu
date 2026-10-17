@@ -1072,9 +1072,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
 
+    @property
+    def _pads_to_batch_buckets(self) -> bool:
+        """Whether the target's compile policy pads batches to compile buckets."""
+        return self.model_runner.compile_policy.b_bucketer is not None
+
     def _maybe_pad_draft_bs(self, bs: int) -> int:
-        """Round bs up to the TPU compile bucket; identity on other backends."""
-        if _is_tpu:
+        """Round bs up to the compile bucket; identity without batch buckets."""
+        if self._pads_to_batch_buckets:
             b_bucketer = self.model_runner.compile_policy.b_bucketer
             return int(b_bucketer.next_bucket(int(bs)))
         return int(bs)
@@ -1134,12 +1139,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if cap >= int(bs):
             return
 
-        # On TPU the capacity must itself be a bucket, so _maybe_pad_draft_bs(bs)
-        # stays <= cap for every later bs <= cap and buf[:pad_bs] never overruns;
-        # the ladder bounds regrowth. Elsewhere double to amortize it.
+        # With batch buckets the capacity must itself be a bucket, so
+        # _maybe_pad_draft_bs(bs) stays <= cap for every later bs <= cap and
+        # buf[:pad_bs] never overruns; the ladder bounds regrowth. Elsewhere
+        # double to amortize it.
         new_cap = (
             self._maybe_pad_draft_bs(int(bs))
-            if _is_tpu
+            if self._pads_to_batch_buckets
             else max(int(bs), cap * 2 if cap > 0 else int(bs))
         )
         device = self.device
@@ -2763,7 +2769,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        if not _is_tpu:
+        if current_platform.supports_overlap_streams():
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -2868,15 +2874,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=device,
             )
 
-        if fused_block is None:
-            if _is_tpu:
-                # Feed the bucket-padded buffer so the compiled artifact stays on a
-                # static shape, then trim the ghost rows back off.
-                input_embeds = self.embed_draft_block_ids(
-                    block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
-                )[: bs * block_size]
-            else:
-                input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
+        if self._pads_to_batch_buckets:
+            # Feed the bucket-padded buffer so the compiled artifact stays on a
+            # static shape, then trim the ghost rows back off.
+            input_embeds = self.embed_draft_block_ids(
+                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
+            )[: bs * block_size]
+        else:
+            input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -2987,9 +2992,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     bs=bs, sampling_info=batch.sampling_info
                 )
 
-        grad_context = torch.no_grad if _is_tpu else torch.inference_mode
         with (
-            grad_context(),
+            current_platform.inference_mode(),
             draft_tp_context(self.draft_owns_attention),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
@@ -3207,10 +3211,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Penalties, logit bias and grammar stay logical: both apply in place, so a
         # prefix view writes through to the real rows. Must run before
         # prepare_spec_verify, which widens sampling_info and so len(sampling_info).
-        # Only TPU pads the verify outputs; elsewhere the rows are already logical.
+        # Only a batch-bucketing policy pads the verify outputs; elsewhere the
+        # rows are already logical.
         logical_logits = (
             logits_output.next_token_logits[: bs * block_size]
-            if _is_tpu
+            if self._pads_to_batch_buckets
             else logits_output.next_token_logits
         )
         if sampling_info is not None:
