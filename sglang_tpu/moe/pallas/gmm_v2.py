@@ -1103,9 +1103,8 @@ def calculate_tiling(
         and jax.dtypes.itemsize_bits(rhs_dtype) == 8
         and dims.size_m >= _LARGE_M_ROWS
     ):
-        # Prefill-sized 8-bit x 8-bit GMMs: with ~200+ rows per expert, 128-row
-        # tiles stream each expert's weights twice. 256 measured 21-25% faster
-        # on GLM-5.3-Flash's 288-expert FP8 shapes (bit-identical); 512 is slower.
+        # Prefill-sized 8-bit x 8-bit GMMs: 128-row tiles stream each expert's
+        # weights more than once.
         tile_m = 256
     tile_m = min(tile_m, dims.size_m)
 

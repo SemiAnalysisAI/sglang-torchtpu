@@ -27,8 +27,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _LHS_QUANT_BLOCK = 512
-# One expert's FP8 w1 + w2 blocks, double-buffered. Arbitrary margin under the
-# default scoped VMEM limit; larger experts keep the route-meta + gmm_v2 path.
+# One expert's FP8 w1 + w2 blocks, double-buffered; larger experts keep gmm_v2.
 _EXPERT_BLOCK_BUDGET = 24 * 1024 * 1024
 
 
@@ -107,8 +106,7 @@ def _kernel(
 
 
 def supports_few_tokens(tokens: int, hidden: int, two_n: int) -> bool:
-    # A verify window (DFlash block 8, MTP up to 8). Arbitrary cap: every grid
-    # step computes all rows, so wider batches waste MXU work on routed-off rows.
+    # Every grid step computes all rows, so wider batches waste MXU work.
     return 1 < tokens <= 8 and supports(1, hidden, two_n)
 
 

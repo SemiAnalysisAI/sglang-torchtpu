@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - non-TPU host
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit", chips=1)
 
-# GLM-5.3-Flash at TP8 with tensor-parallel experts: 288 experts of width 256.
+# 288 tensor-parallel experts of width 256.
 HIDDEN, INTER, EXPERTS, TOPK, LIMIT = 4096, 256, 288, 8, 10.0
 
 
