@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -130,7 +132,7 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
     """Flush any pending handoff, then defer this store when the next step can
     consume the payload directly. Returns True when the store was deferred.
 
-    Only EAGLE3 top-k-1 payloads stashed right after a publish qualify.
+    Only EAGLE/EAGLE3 top-k-1 payloads stashed right after a publish qualify.
     """
     # Take the publish before flushing: the flush re-enters stash and must fall
     # through to the normal store.
@@ -145,8 +147,13 @@ def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> boo
         # No paired publish (prefill seed, beam tail slice): nothing to hand off.
         published is None
         or published.indices is not indices
-        # Only the EAGLE3 topk-1 decode path keeps acceptance on device.
-        or not future_map.spec_algo.is_eagle3()
+        # Only the EAGLE/EAGLE3 (incl. NEXTN MTP) topk-1 decode path keeps
+        # acceptance on device; FROZEN_KV_MTP is not scheduled this way.
+        or future_map.spec_algo
+        not in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+        )
         or payload.topk_index is None
         or payload.topk_index.shape[1] != 1
         # DP idle stub: an empty payload has nothing to relay.
