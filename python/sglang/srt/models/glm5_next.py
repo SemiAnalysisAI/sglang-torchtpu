@@ -8,9 +8,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.kernels.ops.layernorm.mhc import get_mhc_overrides, hc_contract
+from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
-from sglang.kernels.ops.layernorm.mhc import hc_post_pre as _hc_post_pre_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
@@ -789,7 +788,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_ffn_post_pre=(
                     self.hc_ffn_post_pre
                     if is_cross_layer_mhc_fusion_enabled()
-                    or get_mhc_overrides().hc_post_pre is not None
                     else None
                 ),
                 is_last_layer=terminal,
@@ -859,29 +857,10 @@ class Glm5NextDecoderLayer(nn.Module):
         # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
         # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
-        hc_mult = self.config.hc_mult
-        # A platform override takes every batch size it supports.
-        fused = _hc_post_pre_fn(
-            x=hidden_states,
-            residual=residual,
-            h_post=h_post,
-            h_res=h_res,
-            hc_fn=self.hc_ffn_fn,
-            hc_scale=self.hc_ffn_scale,
-            hc_base=self.hc_ffn_base,
-            hc_mult=hc_mult,
-            rms_eps=self.config.rms_norm_eps,
-            hc_eps=self.config.hc_eps,
-            sinkhorn_iters=self.config.hc_sinkhorn_iters,
-            post_mult_value=_MHC_POST_MULT_VALUE,
-            out_norm_weight=out_norm_weight,
-            out_norm_eps=out_norm_eps,
-        )
-        if fused is not None:
-            return fused
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
             return None
+        hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(
             layer_input=hidden_states,
             residual=residual.view(num_tokens, hc_mult, hidden_size),

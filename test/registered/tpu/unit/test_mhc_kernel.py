@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The fused TPU mHC site kernel, reached through the shared hc_pre / hc_post /
-hc_post_pre, vs the same functions' torch path on CPU.
+"""The fused TPU mHC site kernel (sglang_tpu.mhc) vs the shared hc_pre / hc_post
+torch path on CPU.
 
 The reference runs in fp32 on CPU: torch_tpu evaluates its fp32 projection at
 bf16 precision (gate errors ~3e-3), while the kernel's single bf16 pass is exact
@@ -12,20 +12,15 @@ from contextlib import ExitStack
 
 import torch
 
-from sglang.kernels.ops.layernorm.mhc import (
-    get_mhc_overrides,
-    hc_post,
-    hc_post_pre,
-    hc_pre,
-    set_mhc_overrides,
-)
+from sglang.kernels.ops.layernorm.mhc import hc_post, hc_pre
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 
 try:
     import torch_tpu  # noqa: F401
 
-    from sglang_tpu.mhc import register_mhc_overrides, supports_mhc_site
+    import sglang_tpu.mhc as kernel
+    from sglang_tpu.mhc import supports_mhc_site
 except ImportError:
     torch_tpu = None
 
@@ -34,6 +29,7 @@ register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit", chips=1)
 HC, HIDDEN = 4, 4096
 RMS_EPS, HC_EPS, ITERS = 1e-5, 1e-6, 20
 SITE = dict(hc_mult=HC, rms_eps=RMS_EPS, hc_eps=HC_EPS, sinkhorn_iters=ITERS)
+KERNEL_SITE = dict(SITE, post_mult_value=2.0)
 
 
 def tpu(t):
@@ -50,10 +46,8 @@ class TestMhcKernel(unittest.TestCase):
             envs.SGLANG_OPT_FUSE_MHC_POST_PRE,
         ):
             self.stack.enter_context(env.override(False))
-        saved = get_mhc_overrides()
-        self.addCleanup(set_mhc_overrides, saved)
         self.addCleanup(self.stack.close)
-        register_mhc_overrides()
+        kernel.register_ops()
 
         self.gen = torch.Generator().manual_seed(7)
         mix = (2 + HC) * HC
@@ -71,6 +65,11 @@ class TestMhcKernel(unittest.TestCase):
 
     def params(self, to=lambda t: t):
         return to(self.fn), to(self.scale), to(self.base)
+
+    def kernel_params(self):
+        return dict(
+            hc_fn=tpu(self.fn), hc_scale=tpu(self.scale), hc_base=tpu(self.base)
+        )
 
     def ref_norm(self, layer_in):
         x = layer_in.float()
@@ -95,8 +94,12 @@ class TestMhcKernel(unittest.TestCase):
                     res, *self.params(), **SITE
                 )
                 self.assertFalse(ref_fused)
-                layer_in, comb, post, fused = hc_pre(
-                    tpu(res), *self.params(tpu), **SITE, **norm
+                layer_in, comb, post, fused = kernel.hc_pre(
+                    x=tpu(res),
+                    **self.kernel_params(),
+                    **KERNEL_SITE,
+                    hc_norm_weight=None,
+                    **norm,
                 )
                 self.assertTrue(fused)
                 # Normalized collapsed inputs are bf16: one rounding step of error.
@@ -109,8 +112,14 @@ class TestMhcKernel(unittest.TestCase):
                 ref_in2, ref_comb2, ref_post2, _ = hc_pre(
                     ref_res, *self.params(), **SITE
                 )
-                seam = hc_post_pre(
-                    tpu(out), tpu(res), *gates, *self.params(tpu), **SITE, **norm
+                seam = kernel.hc_post_pre(
+                    x=tpu(out),
+                    residual=tpu(res),
+                    h_post=gates[0],
+                    h_res=gates[1],
+                    **self.kernel_params(),
+                    **KERNEL_SITE,
+                    **norm,
                 )
                 self.assertIsNotNone(seam)
                 layer_in2, new_res, comb2, post2, fused2 = seam
@@ -120,7 +129,13 @@ class TestMhcKernel(unittest.TestCase):
                 self.assertClose(post2, ref_post2, 1e-4)
                 self.assertClose(comb2, ref_comb2, 1e-4)
 
-                last = hc_post(tpu(out), tpu(res), *gates, hc_mult=HC)
+                last = kernel.hc_post(
+                    x=tpu(out),
+                    residual=tpu(res),
+                    h_post=gates[0],
+                    h_res=gates[1],
+                    hc_mult=HC,
+                )
                 self.assertClose(last, ref_res, 4e-3)
 
     def test_unsupported_sites_take_the_torch_path(self):
@@ -132,16 +147,17 @@ class TestMhcKernel(unittest.TestCase):
         self.assertFalse(
             supports_mhc_site(res, HC, hc_norm_weight=tpu(self.norm_weight))
         )
-        # A declined call still answers, through the torch path.
-        _, _, _, fused = hc_pre(
-            res,
-            *self.params(tpu),
-            **SITE,
-            post_mult_value=1.0,
-            out_norm_weight=tpu(self.norm_weight),
-            out_norm_eps=RMS_EPS,
+        # A declined site returns None and takes the torch path.
+        self.assertIsNone(
+            kernel.hc_pre(
+                x=res,
+                **self.kernel_params(),
+                **dict(KERNEL_SITE, post_mult_value=1.0),
+                hc_norm_weight=None,
+                out_norm_weight=tpu(self.norm_weight),
+                out_norm_eps=RMS_EPS,
+            )
         )
-        self.assertFalse(fused)
 
 
 if __name__ == "__main__":

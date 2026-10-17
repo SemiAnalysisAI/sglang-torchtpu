@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The fused mHC site kernel behind the shared hc_pre / hc_post / hc_post_pre.
+"""The fused mHC site kernel: hc_pre, hc_post and hc_post fused with the next
+hc_pre, reached through hooks/mhc.py.
 
-``register_mhc_overrides()`` runs from ``init_backend()``, before torch.compile
-traces a model: building a custom op inside the dynamo trace fails in
-inspect.signature. Each override declines (returns None) a call the kernel was
-not validated for, which then takes the shared torch path.
+``register_ops()`` runs before torch.compile traces the model: building a custom
+op inside the dynamo trace fails in inspect.signature. Each entry point declines
+(returns None) a call the kernel was not validated for, which then takes the
+torch path.
 """
 
 from threading import Lock
@@ -57,7 +58,7 @@ def supports_mhc_site(
     return out_norm_weight is None or out_norm_weight.shape == (d,)
 
 
-def _register_ops() -> None:
+def register_ops() -> None:
     global _OPS
     with _OPS_LOCK:
         if _OPS is not None:
@@ -170,7 +171,7 @@ def _register_ops() -> None:
 
 
 def _ops() -> tuple[Callable, Callable, Callable]:
-    assert _OPS is not None, "register_mhc_overrides() must run at backend init"
+    assert _OPS is not None, "register_ops() must run before the model is traced"
     return _OPS
 
 
@@ -180,7 +181,7 @@ def _norm_eps(out_norm_weight, out_norm_eps, rms_eps) -> float:
     return float(rms_eps if out_norm_eps is None else out_norm_eps)
 
 
-def _hc_pre(
+def hc_pre(
     *,
     x,
     hc_fn,
@@ -220,7 +221,7 @@ def _hc_pre(
     return layer_input, comb, post, out_norm_weight is not None
 
 
-def _hc_post(*, x, residual, h_post, h_res, hc_mult):
+def hc_post(*, x, residual, h_post, h_res, hc_mult):
     if not supports_mhc_site(residual, hc_mult, x=x):
         return None
     _, _, post = _ops()
@@ -234,7 +235,7 @@ def _hc_post(*, x, residual, h_post, h_res, hc_mult):
     )
 
 
-def _hc_post_pre(
+def hc_post_pre(
     *,
     x,
     residual,
@@ -278,13 +279,3 @@ def _hc_post_pre(
         _norm_eps(out_norm_weight, out_norm_eps, rms_eps),
     )
     return layer_input, new_residual, comb, post, out_norm_weight is not None
-
-
-def register_mhc_overrides() -> None:
-    """Route the shared hc_pre / hc_post / hc_post_pre to the fused kernel."""
-    from sglang.kernels.ops.layernorm.mhc import MhcOverrides, set_mhc_overrides
-
-    _register_ops()
-    set_mhc_overrides(
-        MhcOverrides(hc_pre=_hc_pre, hc_post=_hc_post, hc_post_pre=_hc_post_pre)
-    )

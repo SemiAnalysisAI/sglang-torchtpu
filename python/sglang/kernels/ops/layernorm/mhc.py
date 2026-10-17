@@ -3,8 +3,7 @@ import importlib
 import logging
 import math
 import threading
-from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
@@ -1892,33 +1891,6 @@ def mhc_fused_post_pre(
     )
 
 
-@dataclass(frozen=True)
-class MhcOverrides:
-    """Fused mHC implementations a platform plugin installs from its init.
-
-    Each slot takes the keyword arguments of the public function it overrides
-    (``hc_pre``, ``hc_post``, ``hc_post_pre``) and returns that function's
-    result, or ``None`` to decline the call, which then takes the default
-    dispatch (aiter, TileLang, then torch). Nothing is installed in-tree.
-    """
-
-    hc_pre: Optional[Callable[..., Optional[tuple]]] = None
-    hc_post: Optional[Callable[..., Optional[torch.Tensor]]] = None
-    hc_post_pre: Optional[Callable[..., Optional[tuple]]] = None
-
-
-_mhc_overrides = MhcOverrides()
-
-
-def set_mhc_overrides(overrides: MhcOverrides) -> None:
-    global _mhc_overrides
-    _mhc_overrides = overrides
-
-
-def get_mhc_overrides() -> MhcOverrides:
-    return _mhc_overrides
-
-
 def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.repeat(1, n)
 
@@ -2090,25 +2062,6 @@ def hc_pre(
         empty_h_post = torch.zeros((s, hc_mult), device=x.device, dtype=torch.float32)
         return empty_layer_input, empty_h_res, empty_h_post, False
 
-    override = _mhc_overrides.hc_pre
-    if override is not None:
-        result = override(
-            x=x,
-            hc_fn=hc_fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            hc_mult=hc_mult,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-            sinkhorn_iters=sinkhorn_iters,
-            post_mult_value=post_mult_value,
-            hc_norm_weight=hc_norm_weight,
-            out_norm_weight=out_norm_weight,
-            out_norm_eps=out_norm_eps,
-        )
-        if result is not None:
-            return result
-
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
     post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
@@ -2142,58 +2095,11 @@ def hc_post(
     s, hidden_size = x.shape
     if s == 0:
         return x.new_zeros((s, hc_mult * hidden_size))
-    override = _mhc_overrides.hc_post
-    if override is not None:
-        result = override(
-            x=x, residual=residual, h_post=h_post, h_res=h_res, hc_mult=hc_mult
-        )
-        if result is not None:
-            return result
     residual = residual.view(s, hc_mult, hidden_size)
     h_post = h_post.view(s, hc_mult, 1)
     h_res = h_res.view(s, hc_mult, hc_mult)
     out = _mhc_post_dispatch(x, residual, h_post, h_res)
     return out.view(s, -1)
-
-
-def hc_post_pre(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    h_post: torch.Tensor,
-    h_res: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    post_mult_value: float = 2.0,
-    out_norm_weight: torch.Tensor | None = None,
-    out_norm_eps: float | None = None,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
-    """hc_post of x into residual fused with the next sublayer's hc_pre:
-    (layer_input, new_residual, h_res, h_post, norm_fused). Only a platform
-    override implements it; None tells the caller to run hc_post then hc_pre."""
-    override = _mhc_overrides.hc_post_pre
-    if override is None or x.shape[0] == 0:
-        return None
-    return override(
-        x=x,
-        residual=residual,
-        h_post=h_post,
-        h_res=h_res,
-        hc_fn=hc_fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        hc_mult=hc_mult,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        post_mult_value=post_mult_value,
-        out_norm_weight=out_norm_weight,
-        out_norm_eps=out_norm_eps,
-    )
 
 
 def npu_hc_pre(
