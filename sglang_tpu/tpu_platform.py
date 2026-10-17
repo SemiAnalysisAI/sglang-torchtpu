@@ -1024,6 +1024,33 @@ class TpuSRTPlatform(SRTPlatform):
                 "TPU GDN prefix caching requires mamba_chunk_size=64."
             )
 
+    def get_speculative_draft_backend_cls(
+        self, backend: str, *, multi_step: bool
+    ) -> Optional[type]:
+        if backend == "pallas_tpu_mla":
+            from sglang_tpu.attention_pallas_mla import (
+                TpuPallasMlaAttnBackend,
+                TpuPallasMlaMultiStepDraftBackend,
+            )
+
+            return (
+                TpuPallasMlaMultiStepDraftBackend
+                if multi_step
+                else TpuPallasMlaAttnBackend
+            )
+        if backend == "pallas_tpu_mla_sparse":
+            from sglang_tpu.attention_pallas_mla_sparse import (
+                TpuPallasSparseMlaAttnBackend,
+                TpuPallasSparseMlaMultiStepDraftBackend,
+            )
+
+            return (
+                TpuPallasSparseMlaMultiStepDraftBackend
+                if multi_step
+                else TpuPallasSparseMlaAttnBackend
+            )
+        return None
+
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.

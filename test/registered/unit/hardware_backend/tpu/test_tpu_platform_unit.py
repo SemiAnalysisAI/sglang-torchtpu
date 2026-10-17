@@ -915,6 +915,27 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         cls = self.platform.get_dsa_kv_pool_cls()
         self.assertEqual(cls.__name__, "TpuSplitMLATokenToKVPool")
 
+    def test_mla_draft_backends(self):
+        for backend, prefix in (
+            ("pallas_tpu_mla", "TpuPallasMla"),
+            ("pallas_tpu_mla_sparse", "TpuPallasSparseMla"),
+        ):
+            with self.subTest(backend=backend):
+                step = self.platform.get_speculative_draft_backend_cls(
+                    backend, multi_step=True
+                )
+                extend = self.platform.get_speculative_draft_backend_cls(
+                    backend, multi_step=False
+                )
+                self.assertEqual(step.__name__, f"{prefix}MultiStepDraftBackend")
+                self.assertEqual(extend.__name__, f"{prefix}AttnBackend")
+                self.assertIs(step.attn_backend_cls, extend)
+        self.assertIsNone(
+            self.platform.get_speculative_draft_backend_cls(
+                "pallas_tpu_rpa_v3", multi_step=True
+            )
+        )
+
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
