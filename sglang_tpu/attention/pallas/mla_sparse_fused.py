@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
+from sglang_tpu.attention.pallas.mla_sparse_qblock import sparse_mla_prefill_qblock
 from sglang_tpu.attention.pallas.mla_sparse.kernel import (
     TENSORCORE_CACHE_LAYOUT,
     sparse_ragged_paged_attention,
@@ -40,6 +41,9 @@ from sglang_tpu.attention.pallas.mla_sparse.kv_cache_utils import (
 # loop at trace time, one SparseCore gather program per chunk; the default (64)
 # builds 128 per layer at an 8192-token prefill, 256 builds 32.
 GATHER_CHUNK_TOKENS = 256
+# With qblock_kpool set, batches of at least this many rows take the
+# query-blocked kernel; decode and verify batches stay on the per-query kernel.
+QBLOCK_MIN_TOKENS = 512
 
 # The sparse kernels only support these two sizes.
 NOPE_DIM = 512
@@ -79,6 +83,7 @@ def sparse_mla_attention_fused(
     *,
     sm_scale: float,
     k_scale: float,
+    qblock_kpool: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run one step: store the new tokens in the cache, then attend.
 
@@ -116,6 +121,25 @@ def sparse_mla_attention_fused(
         nope_spec=nope_spec,
         rope_spec=rope_spec,
     )
+
+    if qblock_kpool and ql_nope.shape[0] >= QBLOCK_MIN_TOKENS:
+        # Rows from the pooled indexer (pool size qblock_kpool): one program per
+        # block of queries reads the union of their pages once.
+        out = sparse_mla_prefill_qblock(
+            ql_nope,
+            q_pe,
+            cache_nope,
+            cache_rope,
+            topk_indices,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            kpool=qblock_kpool,
+        )
+        return out, cache_nope, cache_rope
 
     # out: bf16[max_num_tokens, num_q_heads, 576].
     out = sparse_ragged_paged_attention(

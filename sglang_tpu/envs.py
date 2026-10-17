@@ -30,6 +30,10 @@ class TpuEnvs:
     # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
     # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
+    # Sparse MLA: pooled-DSA batches of 512+ tokens (prefill) through the
+    # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
+    # each block's union of selected pages once; False keeps the per-query kernel.
+    SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
