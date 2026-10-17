@@ -21,6 +21,7 @@ from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
+    from sglang.srt.compilation.helper_compile import HelperCompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
@@ -1210,6 +1211,11 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_torch_compile(self) -> bool:
         return True
+
+    def get_helper_compile_policy(self) -> HelperCompilePolicy:
+        from sglang_tpu.compilation.helper_compile import TPU_HELPER_COMPILE_POLICY
+
+        return TPU_HELPER_COMPILE_POLICY
 
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")

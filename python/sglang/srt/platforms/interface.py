@@ -22,6 +22,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.compilation.helper_compile import HelperCompilePolicy
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -216,6 +217,12 @@ class SRTPlatform(DeviceMixin):
     def supports_torch_compile(self) -> bool:
         """Whether this platform consumes annotation-driven compile policies."""
         return False
+
+    def get_helper_compile_policy(self) -> HelperCompilePolicy:
+        """How standalone tensor helpers compile; the default is torch.compile."""
+        from sglang.srt.compilation.helper_compile import DEFAULT_HELPER_COMPILE_POLICY
+
+        return DEFAULT_HELPER_COMPILE_POLICY
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None
