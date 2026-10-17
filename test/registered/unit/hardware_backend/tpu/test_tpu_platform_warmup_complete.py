@@ -1,3 +1,5 @@
+import contextlib
+import logging
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,12 @@ _CHECKER_MOD = "sglang_tpu.compilation.recompilation_checker"
 
 
 class TestTpuWarmupCompleteStance(unittest.TestCase):
+    def setUp(self):
+        # ExitStack rather than enterContext, which is 3.11+.
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(False))
+
     def _publish_args(self, *, speculative_algorithm, enable_dp_attention=False):
         # on_warmup_complete reads the exec and spec bags; publish both.
         override = get_context().override_server_args(
@@ -58,6 +66,52 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
         self._publish_args(speculative_algorithm=None)
         set_stance = self._warmup_complete(allow_spec_recompile=True)
         set_stance.assert_called_once_with("fail_on_recompile")
+
+    def test_unsafe_guard_skip_is_opt_in_and_logged(self):
+        self._publish_args(speculative_algorithm=None)
+        with (
+            envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(True),
+            self.assertLogs(_TPU_MOD, level="WARNING") as logs,
+        ):
+            set_stance = self._warmup_complete(allow_spec_recompile=False)
+        set_stance.assert_called_once_with(
+            "fail_on_recompile", skip_guard_eval_unsafe=True
+        )
+        self.assertIn("skip_guard_eval_unsafe=True", logs.records[-1].getMessage())
+
+    def test_unsafe_guard_skip_is_ignored_with_dp_attention(self):
+        self._publish_args(speculative_algorithm=None, enable_dp_attention=True)
+        with (
+            envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(True),
+            self.assertLogs(_TPU_MOD, level="INFO") as logs,
+        ):
+            set_stance = self._warmup_complete(allow_spec_recompile=False)
+        set_stance.assert_called_once_with("fail_on_recompile")
+        warnings = [r for r in logs.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("DP attention", warnings[0].getMessage())
+
+    def test_unsafe_guard_skip_is_ignored_with_speculative_decoding(self):
+        self._publish_args(speculative_algorithm="EAGLE3")
+        for allow_spec_recompile in (False, True):
+            with self.subTest(allow_spec_recompile=allow_spec_recompile):
+                with (
+                    envs.SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP.override(True),
+                    self.assertLogs(_TPU_MOD, level="INFO") as logs,
+                ):
+                    set_stance = self._warmup_complete(
+                        allow_spec_recompile=allow_spec_recompile
+                    )
+                if allow_spec_recompile:
+                    set_stance.assert_not_called()
+                else:
+                    set_stance.assert_called_once_with("fail_on_recompile")
+                warnings = [r for r in logs.records if r.levelno == logging.WARNING]
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(
+                    "Ignoring SGLANG_TPU_ENABLE_UNSAFE_GUARD_SKIP",
+                    warnings[0].getMessage(),
+                )
 
     def test_mode_b_inherits_the_override(self):
         self.assertIs(
