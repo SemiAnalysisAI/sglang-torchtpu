@@ -32,6 +32,10 @@ class TpuEnvs:
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
+    # Speculative decoding
+    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
