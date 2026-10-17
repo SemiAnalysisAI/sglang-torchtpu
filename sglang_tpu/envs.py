@@ -38,7 +38,7 @@ class TpuEnvs:
     # Speculative decoding
     # Route DSPARK / EAGLE3 to the sglang_tpu.experimental TpuSpecWorker
     # (TpuDsparkWorker / TpuEagle3Worker); SGLANG_TPU_HOST_PADDING_NO_D2H also does.
-    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(True)
 
     @classmethod
     def names(cls) -> list[str]:
