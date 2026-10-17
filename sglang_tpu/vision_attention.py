@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.vision import (
     VisionSdpaAttention,
     resolve_seqlens,
 )
-from sglang_tpu.attention_pallas import _get_vision_flash_op
 
 
 def _build_tpu_segment_ids(
@@ -76,6 +75,9 @@ class VisionTpuAttention(nn.Module):
         self.scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
+        # Lazy: the Pallas kernel module imports jax, which CPU-only hosts lack.
+        from sglang_tpu.attention_pallas import _get_vision_flash_op
+
         self._flash_op = _get_vision_flash_op(float(self.scale))
         self._sdpa_fallback = VisionSdpaAttention(
             head_dim=head_dim,
