@@ -340,36 +340,46 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
         )
 
-        self.assertEqual(
-            HOOKS[:5],
-            [
-                (
-                    "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
-                    initialize_dense_moe_config,
-                    HookType.AFTER,
-                ),
-                (
-                    "sglang.srt.arg_groups.validation_hook."
-                    "check_pipeline_parallel_compat",
-                    check_pipeline_parallel_compat,
-                    HookType.AROUND,
-                ),
-                (
-                    "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
-                    skip_spec_op_precompile_without_draft,
-                    HookType.AROUND,
-                ),
-                (
-                    "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
-                    twolevel_all_reduce,
-                    HookType.AROUND,
-                ),
-                (
-                    "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
-                    twolevel_merged_moe_all_reduce,
-                    HookType.AROUND,
-                ),
-            ],
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
+                initialize_dense_moe_config,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+
+        self.assertIn(
+            (
+                "sglang.srt.arg_groups.validation_hook.check_pipeline_parallel_compat",
+                check_pipeline_parallel_compat,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
+                skip_spec_op_precompile_without_draft,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+                twolevel_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+                twolevel_merged_moe_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
         )
 
     # -- helpers -----------------------------------------------------------

@@ -11,12 +11,14 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
@@ -43,6 +45,11 @@ HOOKS: list[tuple] = [
         HookType.AROUND,
     ),
     (
+        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
+        select_experimental_spec_worker,
+        HookType.AFTER,
+    ),
+    (
         "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
         twolevel_all_reduce,
         HookType.AROUND,
@@ -55,6 +62,8 @@ HOOKS: list[tuple] = [
 ]
 
 HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hook_specs())
 
 _registered = False
 

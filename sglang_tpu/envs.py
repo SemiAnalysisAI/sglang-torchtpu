@@ -31,6 +31,10 @@ class TpuEnvs:
     # when TP spans the whole world; everything else keeps XLA's all-reduce.
     SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
 
+    # Speculative decoding
+    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
