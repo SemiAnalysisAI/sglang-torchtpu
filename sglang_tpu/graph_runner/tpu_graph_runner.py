@@ -57,6 +57,10 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
 from sglang_tpu.compile_cache import (
     add_tpu_rank_assignment_to_compile_cache_key,
 )
+from sglang_tpu.experimental import is_experimental_dspark
+from sglang_tpu.experimental.compilation.dspark_compile_policy import (
+    TpuDsparkSpecDecodeCompilePolicyMixin,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,6 +73,7 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     return (
         model_runner.spec_algorithm.is_eagle3()
         or model_runner.spec_algorithm.is_dflash()
+        or is_experimental_dspark(model_runner.spec_algorithm)
     )
 
 
@@ -78,6 +83,8 @@ def _resolve_spec_compile_policy_mixin(
     """Resolve speculative compile policy mixin class based on algorithm."""
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
+    if is_experimental_dspark(spec_algorithm):
+        return TpuDsparkSpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 
@@ -216,16 +223,17 @@ class TpuGraphRunner:
         # sglang_tpu) get it here, so the discovery below sees them.
         annotate_core_compile_boundaries()
         modules = (
-            self.model.modules()
-            if callable(getattr(self.model, "modules", None))
-            else (self.model,)
+            self.model.named_modules()
+            if callable(getattr(self.model, "named_modules", None))
+            else (("", self.model),)
         )
         warmup_start = time.perf_counter()
         installed_any = False
         installed_policies: list[CompilePolicy] = []
         compile_timing_recorder = getattr(model_runner, "compile_timing", None)
         pending_warmups = []
-        for module in modules:
+        role = "draft" if model_runner.is_draft_worker else "target"
+        for module_name, module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
                 continue
@@ -263,6 +271,7 @@ class TpuGraphRunner:
                 owner=module,
                 method_name=method_name,
                 method=method,
+                name=f"{role}/{module_name + '.' if module_name else ''}{method_name}",
                 label=type(module).__name__,
                 compile_timing_recorder=compile_timing_recorder,
             )
@@ -274,6 +283,19 @@ class TpuGraphRunner:
                 installed_any = True
                 installed_policies.append(policy)
                 pending_warmups.extend(policy.precompile() or ())
+
+        if installed_any and not any(
+            isinstance(policy, DecoderCompilePolicy) for policy in installed_policies
+        ):
+            # A vision-only annotation skips the whole-model fallback below, so
+            # the decoder would run eager with nothing in the log.
+            logger.warning(
+                "enable_torch_compile=True but none of the compile policies "
+                "installed on %s covers its decoder (%s); decode steps run eager. "
+                "Annotate the language model with support_torch_compile(...).",
+                type(self.model).__name__,
+                ", ".join(type(p).__name__ for p in installed_policies),
+            )
 
         if not installed_any:
             server_args = model_runner.server_args
@@ -289,6 +311,7 @@ class TpuGraphRunner:
                 owner=self.model,
                 method_name="forward",
                 method=getattr(self.model, "forward", None),
+                name=f"{role}/forward",
                 label=type(self.model).__name__,
                 tracer=server_args.tpu_compile_tracer,
                 compile_timing_recorder=compile_timing_recorder,

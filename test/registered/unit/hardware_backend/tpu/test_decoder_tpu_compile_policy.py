@@ -19,6 +19,7 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -350,12 +351,24 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compiled = compile_module.direct_compile.return_value
         compiled.side_effect = trace_forward
         compiled.warmup_async.side_effect = trace_forward
-        backend = SimpleNamespace(forward_metadata=object())
-        inputs = (torch.ones(2), None, None)
+        backend = AttentionBackend()
+        metadata = object()
+        backend.forward_metadata = metadata
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        inputs = (torch.ones(2), None, forward_batch)
         with forward_context(ForwardContext(attn_backend=backend)):
             for invoke in (call, warmup_async):
-                with self.subTest(invoke=invoke.__name__):
+                with (
+                    self.subTest(invoke=invoke.__name__),
+                    patch.object(
+                        backend,
+                        "bind_forward_metadata",
+                        wraps=backend.bind_forward_metadata,
+                    ) as bind_metadata,
+                ):
                     self.assertIs(invoke(*inputs), model.forward.return_value)
+                    bind_metadata.assert_called_once_with(metadata, ForwardMode.DECODE)
+                    self.assertIs(backend.forward_metadata, metadata)
         self.assertEqual(model.forward.call_count, 2)
 
         compile_module.direct_compile.assert_called_once()
@@ -1111,6 +1124,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             batch_size=8,
+            logits_output_mode=LogitsOutputMode.FULL_VOCAB,
         )
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=model_runner, owner=model_runner.model
@@ -1128,6 +1142,14 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(len(args), 3)
         self.assertIs(args[0], forward_batch.input_ids)
         self.assertIs(args[2], forward_batch)
+
+        # Direct compilation must accept this exact positional call too, and
+        # must not reuse its token-ID artifact for an embedding-input program.
+        ids_key = policy._direct_compile_specialization_key(None, *args, **kwargs)
+        embeds_key = policy._direct_compile_specialization_key(
+            None, None, args[1], forward_batch, input_embeds=torch.zeros(8, 4)
+        )
+        self.assertNotEqual(ids_key, embeds_key)
 
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -1401,6 +1423,7 @@ class TestDpIdleDecodeMaterializationScope(_SpecPolicyTestCase):
             out_cache_loc=torch.empty((0,), dtype=torch.int32),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             spec_info=spec_info,
+            sampling_info=None,
         )
 
         with (

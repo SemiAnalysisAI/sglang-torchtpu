@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -16,6 +17,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -23,6 +25,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
+
+# Platform discovery runs before worker bootstrap configures torch_tpu.
+rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
+traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -474,6 +480,7 @@ def _validate_dsa(server_args) -> None:
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
@@ -692,6 +699,13 @@ def _validate_decode_context_parallel(server_args) -> None:
         )
 
 
+def _experimental_spec_enabled() -> bool:
+    # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    return experimental_spec_enabled()
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -700,6 +714,16 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+
+    def get_traced_rank(
+        self, rank: int, *, group_size: int | None = None
+    ) -> torch.Tensor | None:
+        return traced_rank(rank, group_size=group_size)
+
+    def slice_tensor_for_rank(
+        self, tensor: torch.Tensor, dim: int, parts: int, rank: int
+    ) -> torch.Tensor:
+        return rank_slice(tensor, dim, parts, rank)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -854,6 +878,9 @@ class TpuSRTPlatform(SRTPlatform):
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
             elif spec_algo == "DFLASH":
+                pass
+            elif spec_algo == "DSPARK" and _experimental_spec_enabled():
+                # Served by sglang_tpu.experimental.TpuDsparkWorker.
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1185,6 +1212,9 @@ class TpuSRTPlatform(SRTPlatform):
         import torch_tpu  # noqa: F401
 
         apply_tpu_patches()
+        # Resolve after worker setup, before Dynamo can trace either helper.
+        rank_slice._load()
+        traced_rank._load()
         _register_attention_backends()
         self._backend_initialized = True
 
