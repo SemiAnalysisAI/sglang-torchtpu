@@ -32,9 +32,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
-from sglang_tpu.attention_pallas_rpa_base import (
-    BaseTpuPallasRpaMultiStepDraftBackend,
-)
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
     build_dsa_kpool_topk_op,
@@ -322,9 +319,3 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # has one. The op takes them in this order.
         pool = self.token_to_kv_pool
         return (pool.get_nope_cache(layer_id), pool.get_rope_cache(layer_id))
-
-
-class TpuPallasSparseMlaMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
-    """One sparse-MLA backend per EAGLE draft decode step."""
-
-    attn_backend_cls = TpuPallasSparseMlaAttnBackend

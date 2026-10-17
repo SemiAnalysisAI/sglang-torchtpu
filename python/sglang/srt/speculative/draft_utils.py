@@ -60,15 +60,19 @@ class DraftBackendFactory:
         )
         backend_type = self.draft_attn_backend or configured
 
+        from sglang.srt.layers.attention.attention_registry import (
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
         if backend_type in backend_map:
             stamp, backend = backend_map[backend_type]()
-        else:
-            stamp, backend = (
-                backend_type,
-                self._create_platform_backend(backend_type, multi_step=stamps_children),
+        elif backend_type in DRAFT_ATTENTION_BACKENDS:
+            stamp = backend_type
+            backend = self._create_registered_backend(
+                backend_type, multi_step=stamps_children
             )
-            if backend is None:
-                raise ValueError(error_template.format(backend_type=backend_type))
+        else:
+            raise ValueError(error_template.format(backend_type=backend_type))
         if backend is not None:
             if stamps_children:
                 from sglang.srt.layers.attention.attention_registry import (
@@ -86,19 +90,19 @@ class DraftBackendFactory:
                     child.decode_attention_backend_str = stamp
         return backend
 
-    def _create_platform_backend(self, backend_type: str, *, multi_step: bool):
-        from sglang.srt.platforms import current_platform
-
-        backend_cls = current_platform.get_speculative_draft_backend_cls(
-            backend_type, multi_step=multi_step
+    def _create_registered_backend(self, backend_type: str, *, multi_step: bool):
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+            DRAFT_ATTENTION_BACKENDS,
         )
-        if backend_cls is None:
-            return None
+
         if multi_step:
-            return backend_cls(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
+            return DRAFT_ATTENTION_BACKENDS[backend_type](
+                runner=self.draft_model_runner,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
             )
-        return backend_cls(self.draft_model_runner)
+        return ATTENTION_BACKENDS[backend_type](self.draft_model_runner)
 
     def create_decode_backend(self):
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
@@ -128,10 +132,6 @@ class DraftBackendFactory:
             "dsa": self._create_dsa_decode_backend,
             "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
-            "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_decode_backend,
-            "pallas_tpu_rpa_batched": (
-                self._create_tpu_pallas_rpa_batched_decode_backend
-            ),
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
         }
@@ -164,10 +164,6 @@ class DraftBackendFactory:
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
-            "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_prefill_backend,
-            "pallas_tpu_rpa_batched": (
-                self._create_tpu_pallas_rpa_batched_prefill_backend
-            ),
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
         }
@@ -589,50 +585,6 @@ class DraftBackendFactory:
         )
 
         return ("ascend", AscendAttnBackend(self.draft_model_runner))
-
-    def _create_tpu_pallas_rpa_v3_decode_backend(self):
-        from sglang_tpu.attention_pallas_rpa_v3 import (
-            TpuPallasRpaV3MultiStepDraftBackend,
-        )
-
-        return (
-            "tpu_pallas_rpa_v3",
-            TpuPallasRpaV3MultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
-        )
-
-    def _create_tpu_pallas_rpa_v3_prefill_backend(self):
-        from sglang_tpu.attention_pallas_rpa_v3 import (
-            TpuPallasRpaV3AttnBackend,
-        )
-
-        return (
-            "tpu_pallas_rpa_v3",
-            TpuPallasRpaV3AttnBackend(self.draft_model_runner),
-        )
-
-    def _create_tpu_pallas_rpa_batched_decode_backend(self):
-        from sglang_tpu.attention_pallas_rpa_batched import (
-            TpuPallasRpaBatchedMultiStepDraftBackend,
-        )
-
-        return (
-            "tpu_pallas_rpa_batched",
-            TpuPallasRpaBatchedMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
-        )
-
-    def _create_tpu_pallas_rpa_batched_prefill_backend(self):
-        from sglang_tpu.attention_pallas_rpa_batched import (
-            TpuPallasRpaBatchedAttnBackend,
-        )
-
-        return (
-            "tpu_pallas_rpa_batched",
-            TpuPallasRpaBatchedAttnBackend(self.draft_model_runner),
-        )
 
     def _create_flashmla_prefill_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend

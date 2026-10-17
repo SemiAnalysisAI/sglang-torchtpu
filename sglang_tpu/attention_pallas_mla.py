@@ -45,7 +45,6 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_rpa_base import (
-    BaseTpuPallasRpaMultiStepDraftBackend,
     _quantize_kv_to_fp8,
 )
 from sglang_tpu.attention_pallas_rpa_v3 import (
@@ -368,9 +367,3 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         """
         # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
         return (self.token_to_kv_pool.get_fused_kv_buffer(layer_id),)
-
-
-class TpuPallasMlaMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
-    """One MLA backend per EAGLE draft decode step."""
-
-    attn_backend_cls = TpuPallasMlaAttnBackend

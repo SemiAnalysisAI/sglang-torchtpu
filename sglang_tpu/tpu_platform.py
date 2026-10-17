@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from contextlib import AbstractContextManager, contextmanager
@@ -516,11 +517,49 @@ def _validate_dsa(server_args) -> None:
         )
 
 
+# Draft backends: each EAGLE draft step runs its own instance of the target backend.
+_DRAFT_ATTENTION_BACKEND_CLASSES = {
+    "pallas_tpu_rpa_v3": "sglang_tpu.attention_pallas_rpa_v3.TpuPallasRpaV3AttnBackend",
+    "pallas_tpu_rpa_batched": (
+        "sglang_tpu.attention_pallas_rpa_batched.TpuPallasRpaBatchedAttnBackend"
+    ),
+    "pallas_tpu_mla": "sglang_tpu.attention_pallas_mla.TpuPallasMlaAttnBackend",
+    "pallas_tpu_mla_sparse": (
+        "sglang_tpu.attention_pallas_mla_sparse.TpuPallasSparseMlaAttnBackend"
+    ),
+}
+
+
+def _create_multi_step_draft_backend(
+    runner, topk, speculative_num_steps, *, attn_backend_cls_name: str
+):
+    from sglang.srt.configs.linear_attn_model_registry import import_backend_class
+    from sglang_tpu.attention_pallas_rpa_base import (
+        TpuPallasRpaMultiStepDraftBackend,
+    )
+
+    return TpuPallasRpaMultiStepDraftBackend(
+        model_runner=runner,
+        topk=topk,
+        speculative_num_steps=speculative_num_steps,
+        attn_backend_cls=import_backend_class(attn_backend_cls_name),
+    )
+
+
 def _register_attention_backends() -> None:
     """Add the attention backends that only this package knows to the registry."""
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
+        register_draft_attention_backend,
     )
+
+    for name, attn_backend_cls_name in _DRAFT_ATTENTION_BACKEND_CLASSES.items():
+        register_draft_attention_backend(name)(
+            functools.partial(
+                _create_multi_step_draft_backend,
+                attn_backend_cls_name=attn_backend_cls_name,
+            )
+        )
 
     @register_attention_backend("pallas_tpu_mla_sparse")
     def create_pallas_tpu_mla_sparse_backend(runner):
@@ -1023,33 +1062,6 @@ class TpuSRTPlatform(SRTPlatform):
             assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
                 "TPU GDN prefix caching requires mamba_chunk_size=64."
             )
-
-    def get_speculative_draft_backend_cls(
-        self, backend: str, *, multi_step: bool
-    ) -> Optional[type]:
-        if backend == "pallas_tpu_mla":
-            from sglang_tpu.attention_pallas_mla import (
-                TpuPallasMlaAttnBackend,
-                TpuPallasMlaMultiStepDraftBackend,
-            )
-
-            return (
-                TpuPallasMlaMultiStepDraftBackend
-                if multi_step
-                else TpuPallasMlaAttnBackend
-            )
-        if backend == "pallas_tpu_mla_sparse":
-            from sglang_tpu.attention_pallas_mla_sparse import (
-                TpuPallasSparseMlaAttnBackend,
-                TpuPallasSparseMlaMultiStepDraftBackend,
-            )
-
-            return (
-                TpuPallasSparseMlaMultiStepDraftBackend
-                if multi_step
-                else TpuPallasSparseMlaAttnBackend
-            )
-        return None
 
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state

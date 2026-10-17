@@ -215,17 +215,6 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
-    def get_speculative_draft_backend_cls(
-        self, backend: str, *, multi_step: bool
-    ) -> Optional[type]:
-        """Return this platform's draft attention backend class, or None.
-
-        With ``multi_step`` the class is the per-step draft-decode container,
-        built as ``cls(model_runner, topk, speculative_num_steps)``; otherwise
-        the draft-extend backend, built as ``cls(model_runner)``.
-        """
-        return None
-
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.

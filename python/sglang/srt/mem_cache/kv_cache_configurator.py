@@ -1899,7 +1899,7 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
-            # A NextN draft layer always runs its own indexer.
+            # A draft computes its own top-k: TPU rejects DSA index sharing.
             index_key_layers=[
                 self.is_draft_worker
                 or not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
