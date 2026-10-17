@@ -12,11 +12,12 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
 
 logger = logging.getLogger(__name__)
 
-# Built before tracing; the op cannot be built inside a torch.compile trace.
+_SMALL_M_ENABLED = tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
 _SMALL_M_OP: Callable | None = None
 _SMALL_M_LOCK = Lock()
 
@@ -259,11 +260,12 @@ def apply_tpu_fp8_linear(
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
     if (
-        _SMALL_M_OP is not None
+        _SMALL_M_ENABLED
         and bias is None
         and _small_m_supports(num_tokens, weight.shape[0], weight.shape[1])
     ):
-        return _SMALL_M_OP(x_2d, weight, weight_scale).reshape(out_shape)
+        out = _get_fp8_linear_small_m_op()(x_2d, weight, weight_scale)
+        return out.reshape(out_shape)
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
@@ -354,12 +356,15 @@ def _small_m_supports(tokens: int, k: int, n: int) -> bool:
     return supports(tokens, k, n)
 
 
-def register_fp8_linear_small_m_op() -> None:
-    """Route decode-sized dense FP8 linears to the single-kernel W8A8 op."""
+def _get_fp8_linear_small_m_op() -> Callable:
     global _SMALL_M_OP
+    if _SMALL_M_OP is not None:
+        return _SMALL_M_OP
+
     with _SMALL_M_LOCK:
         if _SMALL_M_OP is not None:
-            return
+            return _SMALL_M_OP
+
         import jax
 
         from sglang_tpu.kernels.fp8_linear_small_m import fp8_linear_small_m
@@ -373,3 +378,10 @@ def register_fp8_linear_small_m_op() -> None:
             lambda x, weight, weight_scale: x.new_empty((x.shape[0], weight.shape[1]))
         )
         _SMALL_M_OP = op
+        return op
+
+
+def register_fp8_linear_small_m_op() -> None:
+    """Register the op before torch.compile traces a model."""
+
+    _get_fp8_linear_small_m_op()
