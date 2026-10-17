@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_common import adjust_verify_logits
 from sglang.srt.speculative.spec_utils import fill_bonus_tokens_func
 from sglang.srt.utils import (
     is_cpu,
@@ -968,9 +969,6 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -991,30 +989,11 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        additive_penalties = torch.repeat_interleave(
-            sampling_info.acc_additive_penalties,
-            verify_input.draft_token_num,
-            dim=0,
-        )
-        next_token_logits[: additive_penalties.shape[0]].add_(additive_penalties)
-    if sampling_info.acc_scaling_penalties is not None:
-        scaling_penalties = torch.repeat_interleave(
-            sampling_info.acc_scaling_penalties,
-            verify_input.draft_token_num,
-            dim=0,
-        )
-        apply_scaling_penalties(
-            next_token_logits[: scaling_penalties.shape[0]],
-            scaling_penalties,
-        )
-    if sampling_info.logit_bias is not None:
-        logit_bias = torch.repeat_interleave(
-            sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-        )
-        next_token_logits[: logit_bias.shape[0]].add_(logit_bias)
+    adjust_verify_logits(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=verify_input.draft_token_num,
+    )
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
