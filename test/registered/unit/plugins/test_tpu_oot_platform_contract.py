@@ -336,7 +336,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 
         self.assertEqual(
-            HOOKS[:3],
+            HOOKS[:4],
             [
                 (
                     "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
