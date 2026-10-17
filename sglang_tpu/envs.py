@@ -26,6 +26,11 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Kimi-K3: run attention-residual aggregation for decode-sized batches as
+    # one Pallas kernel (pending add + mix + out norm) instead of the torch
+    # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
+    # bit-exact with it: the kernel scores in f32, the torch path in bf16.
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (moe/router_topk_tpu.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)

@@ -328,6 +328,12 @@ class TestTpuOOTPlatformContract(CustomTestCase):
     def test_scheduler_initialization_hook_is_declared(self):
         from sglang.srt.plugins.hook_registry import HookType
         from sglang_tpu.hooks import HOOKS
+        from sglang_tpu.hooks.attn_residual import (
+            aggregate,
+            aggregate_fused_add,
+            prepare_attn_residual_kernel,
+            register_attn_residual_ops,
+        )
         from sglang_tpu.hooks.moe_topk import (
             biased_grouped_topk,
             biased_topk,
@@ -384,6 +390,38 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             (
                 "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
                 biased_grouped_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
+                register_attn_residual_ops,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+                prepare_attn_residual_kernel,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.attn_residual._aggregate",
+                aggregate,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.attn_residual._aggregate_fused_add",
+                aggregate_fused_add,
                 HookType.AROUND,
             ),
             HOOKS,
