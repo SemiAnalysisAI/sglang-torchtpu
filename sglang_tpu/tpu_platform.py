@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Optional, Type
@@ -479,6 +480,7 @@ def _validate_dsa(server_args) -> None:
             cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args or "{}"),
         )
     except Exception:
         # A model that cannot be loaded here fails later with its real error.
