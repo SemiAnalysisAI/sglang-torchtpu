@@ -75,15 +75,14 @@ def _build_pallas_mla_kernel_op():
     if _PALLAS_MLA_OP is not None:
         return _PALLAS_MLA_OP
 
+    from pathlib import Path
+
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.mla_ragged_paged_attention_v2 import (
         mla_ragged_paged_attention as _jax_mla,
     )
-
-    from pathlib import Path
-
     from sglang_tpu.pallas_export import source_fingerprint
 
     # The kernel reads its block sizes from the tuned tables at trace time, so
