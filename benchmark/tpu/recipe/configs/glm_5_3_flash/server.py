@@ -67,6 +67,7 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC": "1",
         "SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL": "1",
         "SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL": "1",
+        "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL": "1",
         # f32 MoE scales skip a per-step scale relayout in gmm_v2.
         "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
         # Route-meta permute (single-token SMEM counting sort) for small batches.

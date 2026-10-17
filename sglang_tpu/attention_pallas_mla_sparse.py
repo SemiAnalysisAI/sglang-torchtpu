@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_mtp_topk_width,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
@@ -48,10 +49,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-_PALLAS_SPARSE_MLA_OP = None
+_PALLAS_SPARSE_MLA_OPS = {}
 
 
-def _build_pallas_sparse_mla_kernel_op():
+def _build_pallas_sparse_mla_kernel_op(qblock_kpool: int = 0):
     """Register the sparse MLA step as a torch custom op, once per process.
 
     The op takes the same arguments as the ``pallas_tpu_mla`` op, with the two
@@ -60,9 +61,8 @@ def _build_pallas_sparse_mla_kernel_op():
     kernels find pages with a fixed stride, and they use one scale for both
     keys and values.
     """
-    global _PALLAS_SPARSE_MLA_OP
-    if _PALLAS_SPARSE_MLA_OP is not None:
-        return _PALLAS_SPARSE_MLA_OP
+    if qblock_kpool in _PALLAS_SPARSE_MLA_OPS:
+        return _PALLAS_SPARSE_MLA_OPS[qblock_kpool]
 
     import jax  # noqa: F401  (force loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
@@ -74,6 +74,10 @@ def _build_pallas_sparse_mla_kernel_op():
 
     # The chunk size changes the op body; naming it keeps cached graphs apart.
     op_name = f"sglang_tpu_pallas::sparse_mla_attention_fused_g{GATHER_CHUNK_TOKENS}"
+    if qblock_kpool:
+        # qblock_kpool > 0 sends prefill batches through the query-blocked kernel
+        # (sparse_mla_attention_fused); it changes the body, so it is in the name.
+        op_name += f"_qblock{qblock_kpool}"
 
     # custom_jax_kernel reads this function's signature: every tensor has to
     # be a positional parameter annotated ``jax.Array``. The JAX step cannot be
@@ -110,6 +114,7 @@ def _build_pallas_sparse_mla_kernel_op():
             topk_indices,
             sm_scale=sm_scale,
             k_scale=k_scale,
+            qblock_kpool=qblock_kpool,
         )
 
     nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
@@ -177,7 +182,7 @@ def _build_pallas_sparse_mla_kernel_op():
 
     custom_op.register_fake(_fake_impl)
 
-    _PALLAS_SPARSE_MLA_OP = custom_op
+    _PALLAS_SPARSE_MLA_OPS[qblock_kpool] = custom_op
     return custom_op
 
 
@@ -187,10 +192,11 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
     ) -> None:
-        super().__init__(model_runner, speculative_step_id)
         hf_config = model_runner.model_config.hf_config
-        self._topk = get_dsa_index_topk(hf_config)
+        # Set before super().__init__(), which calls _build_kernel_op().
         self._kpool = get_dsa_index_kpool(hf_config)
+        super().__init__(model_runner, speculative_step_id)
+        self._topk = get_dsa_index_topk(hf_config)
         if self._kpool > 1:
             # Pooled tokens plus the open pool's tail, padded with -1 to whole
             # lanes for the sparse kernel's gather (SparseCore RoPE packing).
@@ -200,8 +206,13 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_topk_op = build_dsa_index_topk_op()
 
     def _build_kernel_op(self):
-        # The base class constructor calls this to set self._op.
-        return _build_pallas_sparse_mla_kernel_op()
+        # The base class constructor calls this to set self._op. The q-block
+        # kernel reads pooled selections only.
+        qblock = (
+            self._kpool > 1
+            and tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get()
+        )
+        return _build_pallas_sparse_mla_kernel_op(self._kpool if qblock else 0)
 
     def forward_indexer(
         self,
