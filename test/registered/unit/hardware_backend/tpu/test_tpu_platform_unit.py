@@ -316,6 +316,29 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
         return resolution_result(args, field)
 
+    def test_unset_backend_follows_the_checkpoint_attention(self):
+        """MLA checkpoints get the MLA kernel; the RPA default cannot read a latent
+        KV cache. An explicit --attention-backend is left alone."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        mla = SimpleNamespace(attention_arch=AttentionArch.MLA)
+        mha = SimpleNamespace(attention_arch=AttentionArch.MHA)
+        cases = (
+            (dict(return_value=mla), None, "pallas_tpu_mla"),
+            (dict(return_value=mha), None, "pallas_tpu_rpa_v3"),
+            (dict(return_value=mla), "pallas_tpu_rpa_v3", "pallas_tpu_rpa_v3"),
+            (dict(side_effect=OSError("no config")), None, "pallas_tpu_rpa_v3"),
+        )
+        for model_config, backend, expected in cases:
+            with self.subTest(model_config=model_config, backend=backend):
+                args = self._args(attention_backend=backend)
+                with patch(
+                    "sglang.srt.configs.model_config.ModelConfig.from_server_args",
+                    **model_config,
+                ):
+                    self._apply(args)
+                self.assertEqual(self._resolved(args, "attention_backend"), expected)
+
     def test_rejects_optimistic_prefill_on_raiden_pd(self):
         """Optimistic prefill on raiden parks KV for requests the decode has
         no pages for, and deadlocked the PD pools under burst load."""
