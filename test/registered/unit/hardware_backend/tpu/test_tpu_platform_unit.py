@@ -1110,5 +1110,53 @@ class TestTpuKvPoolBytesPerToken(CustomTestCase):
             self.assertEqual(platform.get_mha_kv_bytes_per_token(**shape), 4096)
 
 
+class TestTpuMlaKvPoolBytesPerToken(CustomTestCase):
+    """The fused MLA pool pads the latent and rope segments to 128 separately;
+    the KV budget must be drawn at that padded price."""
+
+    def _built(self, *, kv_lora_rank, qk_rope_head_dim, dtype):
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        page_size = 16
+        pool = TpuFusedMLATokenToKVPool(
+            size=4 * page_size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        buf = pool.kv_buffer[0]
+        return buf.numel() * buf.element_size() // (pool.num_pages * page_size)
+
+    def test_segments_are_priced_at_their_padded_widths(self):
+        """Bug regression: sizing priced kv_lora_rank + qk_rope_head_dim (576 for
+        Kimi-K3 / DeepSeek) while the pool stores 512 + 128 = 640 per token."""
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        # qk_rope_head_dim 0 (NoPE MLA) still stores a padded rope segment.
+        for rope in (64, 0):
+            for dtype, itemsize in ((torch.bfloat16, 2), (torch.float8_e4m3fn, 1)):
+                with self.subTest(qk_rope_head_dim=rope, dtype=dtype):
+                    shape = dict(kv_lora_rank=512, qk_rope_head_dim=rope)
+                    per_token = TpuFusedMLATokenToKVPool.kv_bytes_per_token_per_layer(
+                        **shape, store_dtype=dtype
+                    )
+                    self.assertEqual(per_token, 640 * itemsize)
+                    self.assertEqual(per_token, self._built(**shape, dtype=dtype))
+
+    def test_platform_prices_only_the_fused_mla_pool(self):
+        platform = TpuSRTPlatform()
+        shape = dict(
+            kv_lora_rank=512, qk_rope_head_dim=64, kv_cache_dtype=torch.bfloat16
+        )
+        with get_context().override_server_args(attention_backend="torch_native"):
+            self.assertIsNone(platform.get_mla_kv_bytes_per_token(**shape))
+        with get_context().override_server_args(attention_backend="pallas_tpu_mla"):
+            self.assertEqual(platform.get_mla_kv_bytes_per_token(**shape), 1280)
+
+
 if __name__ == "__main__":
     unittest.main()

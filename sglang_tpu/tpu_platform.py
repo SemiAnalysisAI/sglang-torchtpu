@@ -1155,6 +1155,24 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MLATokenToKVPool
 
+    def get_mla_kv_bytes_per_token(
+        self,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> Optional[int]:
+        from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        pool_cls = self.get_mla_kv_pool_cls()
+        if not issubclass(pool_cls, TpuFusedMLATokenToKVPool):
+            return None
+        return pool_cls.kv_bytes_per_token_per_layer(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            store_dtype=kv_cache_dtype,
+        )
+
     def get_dsa_kv_pool_cls(self) -> type:
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
