@@ -45,7 +45,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
-    mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -81,6 +80,9 @@ from sglang.srt.speculative.lilicorr_utils import (
     publish_anchor,
     resolve_sampling_enabled,
     target_input_embeddings,
+)
+from sglang.srt.speculative.spec_common import (
+    update_target_recurrent_state_after_verify,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -2336,39 +2338,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
-        attn_backend = self.target_worker.model_runner.attn_backend
-
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
-        mamba_steps_to_track = None
-
-        if batch.mamba_track_indices is not None:
-            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
-            )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
-
         model_runner = self.target_worker.model_runner
-        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=model_runner.model,
-                req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
-            )
+        update_target_recurrent_state_after_verify(
+            attn_backend=model_runner.attn_backend,
+            model=model_runner.model,
+            mamba_track_indices=batch.mamba_track_indices,
+            tree_page_size=batch.tree_cache.page_size,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens_pre_verify=seq_lens_pre_verify,
+            seq_lens_post_verify=seq_lens_post_verify,
+            commit_lens=commit_lens,
+        )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):

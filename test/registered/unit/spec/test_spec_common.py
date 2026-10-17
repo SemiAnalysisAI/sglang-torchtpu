@@ -11,6 +11,7 @@ from sglang.srt.speculative.spec_common import (
     adjust_verify_logits,
     build_dp_idle_draft_batch,
     build_trivial_verify_input,
+    update_target_recurrent_state_after_verify,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -113,6 +114,53 @@ class TestDpIdleDraftBatch(CustomTestCase):
         idle.prepare_for_idle.assert_called_once_with()
         self.assertEqual(draft_batch.global_num_tokens, [0, 7])
         self.assertEqual(draft_batch.global_num_tokens_for_logprob, [0, 1])
+
+
+class TestRecurrentStateAfterVerify(CustomTestCase):
+    def commit(self, *, pre, commit_lens, track):
+        calls = []
+        backend = SimpleNamespace(
+            update_mamba_state_after_mtp_verify=lambda **kwargs: calls.append(kwargs)
+        )
+        pre = torch.tensor(pre)
+        commit_lens = torch.tensor(commit_lens, dtype=torch.int32)
+        with patch(
+            "sglang.srt.speculative.spec_common.mamba_track_grid", return_value=4
+        ):
+            update_target_recurrent_state_after_verify(
+                attn_backend=backend,
+                model="model",
+                mamba_track_indices=torch.arange(4) if track else None,
+                tree_page_size=1,
+                # One bucket-padding row past the committed requests.
+                req_pool_indices=torch.tensor([10, 11, 12, 13, 99]),
+                seq_lens_pre_verify=pre,
+                seq_lens_post_verify=pre + commit_lens,
+                commit_lens=commit_lens,
+            )
+        (kwargs,) = calls
+        return kwargs
+
+    def test_commits_last_accepted_step_and_the_step_that_crosses_a_track_boundary(
+        self,
+    ):
+        kwargs = self.commit(pre=[6, 6, 3, 7], commit_lens=[3, 1, 2, 1], track=True)
+        torch.testing.assert_close(
+            kwargs["last_correct_step_indices"], torch.tensor([2, 0, 1, 0])
+        )
+        # Interval 4: 6->9 crosses 8 at step 1; 6->7 crosses nothing;
+        # 3->5 crosses 4 at step 0; 7->8 lands on 8 at its only step.
+        torch.testing.assert_close(
+            kwargs["mamba_steps_to_track"], torch.tensor([1, -1, 0, 0])
+        )
+        torch.testing.assert_close(
+            kwargs["req_pool_indices"], torch.tensor([10, 11, 12, 13])
+        )
+
+    def test_without_checkpoint_tracking_nothing_extra_is_saved(self):
+        kwargs = self.commit(pre=[6], commit_lens=[3], track=False)
+        self.assertIsNone(kwargs["mamba_steps_to_track"])
+        self.assertIsNone(kwargs["mamba_track_indices"])
 
 
 if __name__ == "__main__":

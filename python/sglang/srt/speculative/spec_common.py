@@ -11,14 +11,17 @@ calling it. Each docstring names its trace class:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import mamba_track_grid
 
 if TYPE_CHECKING:
+    import torch.nn as nn
+
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -219,3 +222,54 @@ def build_trivial_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
     )
+
+
+def update_target_recurrent_state_after_verify(
+    *,
+    attn_backend: AttentionBackend,
+    model: nn.Module,
+    mamba_track_indices: Optional[torch.Tensor],
+    tree_page_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens_pre_verify: torch.Tensor,
+    seq_lens_post_verify: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Commit the target's recurrent (Mamba) state for each request's last accepted step.
+
+    Traceable. TARGET_VERIFY runs the recurrent kernels with
+    ``disable_state_update=True`` and caches one intermediate state per verify
+    step; this commits the state at step ``commit_lens - 1``. When the radix
+    cache tracks checkpoints, the step that crosses a track boundary inside the
+    committed span is also saved (-1 where none is crossed).
+    """
+    last_correct_step_indices = commit_lens.to(torch.int64) - 1
+    mamba_steps_to_track = None
+
+    if mamba_track_indices is not None:
+        mamba_track_interval = mamba_track_grid(tree_page_size)
+        to_track_mask = (
+            seq_lens_pre_verify // mamba_track_interval
+            != seq_lens_post_verify // mamba_track_interval
+        )
+        tracking_point = (
+            seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+        )
+        to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+        can_track_mask = to_track_mask & (
+            to_track_ith < commit_lens.to(to_track_ith.dtype)
+        )
+        mamba_steps_to_track = torch.where(
+            can_track_mask,
+            to_track_ith.to(torch.int64),
+            torch.full_like(to_track_ith, -1, dtype=torch.int64),
+        )
+
+    if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=model,
+            req_pool_indices=req_pool_indices[: commit_lens.shape[0]],
+        )
