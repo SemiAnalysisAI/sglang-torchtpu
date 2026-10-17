@@ -16,7 +16,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
 
@@ -766,6 +766,17 @@ class TpuSRTPlatform(SRTPlatform):
     device_type: str = "tpu"
 
     supported_quantization: list[str] = []
+    # The upstream fields (Triton, graph capture, HiCache kernels) stay False.
+    capabilities = PlatformCapabilities(
+        kv_index_tables_on_host=True,
+        static_shapes=True,
+        uniform_dp_padding=True,
+        rank_uniform_graphs=True,
+        device_p2p=False,
+        traces_raw_collectives=False,
+        boolean_mask_assignment=False,
+        fp8_bmm=False,
+    )
 
     def get_traced_rank(
         self, rank: int, *, group_size: int | None = None

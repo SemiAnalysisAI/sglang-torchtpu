@@ -15,6 +15,8 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
+import msgspec
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -23,7 +25,47 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["PlatformCapabilities", "SRTPlatform", "PlatformEnum"]
+
+
+class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
+    """What the platform can do.
+
+    Core reads these before it constructs anything and picks a code path
+    the platform can serve, instead of announcing a decision and asking the
+    platform to honor it. Every field defaults to the conservative answer.
+
+    ``supports_triton``: Triton kernels can launch on this device. When
+    False, core uses the torch-native allocator and req-to-token writers.
+    ``graph_capture``: the decode graph runner (``get_graph_runner_cls``)
+    runs. ``piecewise_graph``: the prefill piecewise compilation backend
+    runs.
+    ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
+    kernels are available; otherwise the host pools skip their staging
+    buffers.
+    """
+
+    supports_triton: bool = False
+    graph_capture: bool = False
+    piecewise_graph: bool = False
+    hicache_device_kernels: bool = False
+    # Fork-local fields below; each default is today's non-TPU behaviour.
+    # req_to_token, the SWA index mapping and decode out_cache_loc live on the host.
+    kv_index_tables_on_host: bool = False
+    # Every new tensor shape compiles a program; core keeps shapes bucketed and static.
+    static_shapes: bool = False
+    # DP gather/scatter supports only equal per-rank blocks (DpPaddingMode.MAX_LEN).
+    uniform_dp_padding: bool = False
+    # Compiled programs must be identical on every rank; no rank-dependent branches.
+    rank_uniform_graphs: bool = False
+    # Device tensors can be sent point-to-point without a host copy.
+    device_p2p: bool = True
+    # Dynamo can trace raw torch.distributed (c10d functional) collectives.
+    traces_raw_collectives: bool = True
+    # In-place boolean-mask index assignment (x[mask] = v) lowers on the device.
+    boolean_mask_assignment: bool = True
+    # An fp8 x fp8 batched matmul kernel exists (MLA weight-absorb paths).
+    fp8_bmm: bool = True
 
 
 class SRTPlatform(DeviceMixin):
@@ -37,8 +79,9 @@ class SRTPlatform(DeviceMixin):
     relevant to their hardware.
     """
 
-    # SRT-specific class-level attribute
+    # SRT-specific class-level attributes
     supported_quantization: list[str] = []
+    capabilities: PlatformCapabilities = PlatformCapabilities()
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
