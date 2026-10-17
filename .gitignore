@@ -304,3 +304,11 @@ internal-docs/
 
 # Candidate wheel override files
 wheel_override/*.whl
+
+# Personal scratch files that should never be committed: handoff notes,
+# local PR reviews, scratch diagrams, squashed commit messages.
+/HANDOFF-*
+/PR*-review.md
+/TPU-CI-STACK.md
+*.mermaid
+.squashed_commit_msg.tmp
