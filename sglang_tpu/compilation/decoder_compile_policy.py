@@ -22,6 +22,7 @@ from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -787,6 +788,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang_tpu.compilation.direct_compile import (
             direct_compile,
         )
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            bind_traced_attention_metadata,
+            bind_traced_conv_weights,
+            traced_attention_metadata,
+        )
 
         fn = torch.no_grad()(fn)
         model = self.model_runner.model
@@ -802,9 +808,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ) -> Any:
             backend = get_forward_context().attn_backend
             with (
-                backend.bind_forward_metadata(
-                    attention_metadata, forward_batch.forward_mode
+                bind_traced_attention_metadata(
+                    backend, attention_metadata, forward_batch.forward_mode
                 ),
+                bind_traced_conv_weights(model),
                 use_attention_rank_tensors(attention_rank_tensors),
             ):
                 return fn(input_ids, positions, forward_batch, *args, **kwargs)
@@ -829,7 +836,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def call(*args: Any, **kwargs: Any) -> Any:
             backend = get_forward_context().attn_backend
             return compiled(
-                backend.forward_metadata,
+                traced_attention_metadata(backend),
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(
                     torch.device(self.model_runner.device)
@@ -840,7 +847,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         def warmup_async(*args: Any, **kwargs: Any) -> PendingCall:
             backend = get_forward_context().attn_backend
             return compiled.warmup_async(
-                backend.forward_metadata,
+                traced_attention_metadata(backend),
                 *args,
                 attention_rank_tensors=get_attention_rank_tensors(
                     torch.device(self.model_runner.device)
@@ -851,7 +858,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return call, warmup_async
 
     def get_direct_compile_kv_pool(self):
-        return self.model_runner.token_to_kv_pool
+        kv_pool = self.model_runner.token_to_kv_pool
+        if not isinstance(kv_pool, HybridLinearKVPool):
+            return kv_pool
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            hybrid_linear_kv_pool_state,
+        )
+
+        return hybrid_linear_kv_pool_state(
+            kv_pool=kv_pool, req_to_token_pool=self.model_runner.req_to_token_pool
+        )
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (
