@@ -23,7 +23,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
-from sglang_tpu.experimental import register_host_batch_padder
+from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
@@ -120,7 +120,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             stack.callback(restore)
 
-    def batch(self, rows, experimental=True):
+    def batch(self, rows, spec_algorithm=SpeculativeAlgorithm.DSPARK):
         batch = ScheduleBatch.init_new(
             [_req(0.1 * (i + 1)) for i in range(len(rows))],
             SimpleNamespace(device="cpu"),
@@ -128,9 +128,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             None,
             SimpleNamespace(is_encoder_decoder=False, vocab_size=32),
             enable_overlap=True,
-            spec_algorithm=SpeculativeAlgorithm.DSPARK
-            if experimental
-            else SpeculativeAlgorithm.NONE,
+            spec_algorithm=spec_algorithm,
         )
         batch.req_pool_indices_cpu = torch.tensor(rows)
         batch.req_pool_indices = torch.tensor(rows)
@@ -138,7 +136,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         batch.orig_seq_lens = batch.seq_lens.clone()
         batch.seq_lens_cpu = batch.seq_lens.clone()
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
-        if experimental:
+        if uses_host_batch(batch):
             batch.spec_info = _state(rows)
         return batch
 
@@ -176,8 +174,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
 
-    def test_unselected_batches_keep_default_sampling_and_device_rows(self):
-        batch = self.batch([2, 5, 8], experimental=False)
+    def test_host_padding_follows_the_worker_not_the_algorithm(self):
+        """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
+        with one, every algorithm's batches are host padded."""
+        with patch("sglang_tpu.experimental._host_batch_padder", None):
+            batch = self.batch([2, 5, 8])
         self.assertIs(type(batch.sampling_info), SamplingBatchInfo)
         self.assertFalse(hasattr(batch, "host_pad_bs"))
         batch.input_ids = torch.tensor([20, 50, 80])
@@ -185,10 +186,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(batch.seq_lens.tolist(), [10, 12])
         self.assertEqual(batch.input_ids.tolist(), [20, 80])
         self.assertEqual(batch.sampling_info.temperatures.shape, (2, 1))
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
-            dspark = self.batch([1])
-        self.assertFalse(hasattr(dspark, "host_pad_bs"))
-        self.assertIs(type(dspark.sampling_info), SamplingBatchInfo)
+        for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3):
+            served = self.batch([1], spec_algorithm=algorithm)
+            self.assertIs(served.host_pad_bs, _pad)
+            self.assertIsInstance(served.sampling_info, HostPaddedSamplingInfo)
 
     def test_prefill_staging_and_allocation_remain_on_host(self):
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
@@ -205,7 +206,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertIs(batch.input_ids, prompt)
         self.assertIsNone(batch.prefill_input_ids_cpu)
         self.assertEqual(_extend_metadata_device(batch, "meta"), "cpu")
-        plain = self.batch([2], experimental=False)
+        with patch("sglang_tpu.experimental._host_batch_padder", None):
+            plain = self.batch([2])
         self.assertEqual(_extend_metadata_device(plain, "meta"), "meta")
         captured = {}
 

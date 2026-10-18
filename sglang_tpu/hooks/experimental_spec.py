@@ -17,18 +17,19 @@ from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
-    is_experimental_spec,
     uses_host_batch,
 )
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    if is_experimental_spec(result.spec_algorithm):
+    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
+    padder = get_host_batch_padder()
+    if padder is not None:
         if not result.enable_overlap:
             raise ValueError(
                 "The experimental TPU spec worker requires overlap scheduling"
             )
-        result.host_pad_bs = get_host_batch_padder()
+        result.host_pad_bs = padder
     return result
 
 
