@@ -105,7 +105,7 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> None:
         super().__init__()
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_size > 1:
             raise NotImplementedError("TpuSpecWorker does not support DP attention.")
         if parallel.pp_size > 1:
             raise NotImplementedError("TpuSpecWorker does not support PP.")
