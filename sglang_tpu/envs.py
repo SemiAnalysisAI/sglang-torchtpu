@@ -27,7 +27,7 @@ class TpuEnvs:
     # all but mla_qkv_a). Empty keeps bf16.
     SGLANG_TPU_K3_STATIC_FP8 = EnvTuple(())
     # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
-    # (static_fp8_gemv_pallas.py); False keeps the XLA fp8 dot for every batch.
+    # (kernels/static_fp8_gemv.py); False keeps the XLA fp8 dot for every batch.
     SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.

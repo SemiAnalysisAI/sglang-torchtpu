@@ -31,7 +31,7 @@ def _reference(x, w, out_scale, inv_x):
 @unittest.skipUnless(_HAS_TPU, "requires a TPU backend")
 class TestStaticFp8GemvPallas(CustomTestCase):
     def _case(self, m, k, n, seed):
-        from sglang_tpu.static_fp8_gemv_pallas import block_k, static_fp8_gemv_jax
+        from sglang_tpu.kernels.static_fp8_gemv import block_k, static_fp8_gemv_jax
 
         rng = np.random.default_rng(seed)
         # An RMSNorm-like activation within the static scale's range.

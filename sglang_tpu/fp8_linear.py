@@ -13,10 +13,14 @@ from torch.nn.parameter import Parameter
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.fp8_moe import _clear_replaced_param, _get_tpu_fp8_runtime
+from sglang_tpu.kernels import static_fp8_gemv as _static_fp8_gemv
 
 logger = logging.getLogger(__name__)
 
 _SMALL_M_OP: Callable | None = None
+_STATIC_FP8_GEMV_OP: Callable | None = None
+# Plain bool, not a None check on the op: Dynamo traces the eligibility check.
+_STATIC_FP8_GEMV_READY = False
 
 
 def compute_tpu_fp8_linear_scale_shape(
@@ -349,10 +353,9 @@ def quantize_rmsnorm_fed_weight(
 
 def apply_tpu_static_fp8_linear(x: torch.Tensor, w: StaticFp8Weight) -> torch.Tensor:
     """x [M, K] @ w with the static input scale; returns x.dtype [M, N]."""
-    from sglang_tpu import static_fp8_gemv_pallas
-
-    if static_fp8_gemv_pallas.eligible(x, w):
-        return static_fp8_gemv_pallas.run(x, w)
+    if _static_fp8_gemv_eligible(x, w):
+        out = _STATIC_FP8_GEMV_OP(x, w.weight, w.out_scale, w.inv_x)
+        return out[:, : w.n_out] if w.n_out else out
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     x_2d, pad = _pad_rows_to_scaled_mm_alignment(x.float())
     # The clamp is free in the quantize fusion and guards the cast, which
@@ -464,3 +467,69 @@ def register_fp8_linear_small_m_op() -> None:
     """Register the op before torch.compile traces a model."""
 
     _get_fp8_linear_small_m_op()
+
+
+def register_static_fp8_gemv_op() -> None:
+    """Register the static fp8 Pallas GEMV when enabled; must run before
+    torch.compile traces the model (the Kimi-K3 static fp8 binder calls it
+    post-load). Left unregistered, every call keeps the XLA fp8 dot."""
+    global _STATIC_FP8_GEMV_OP, _STATIC_FP8_GEMV_READY
+    if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
+        return
+    if _STATIC_FP8_GEMV_OP is None:
+        import jax  # noqa: F401  (force loud failure if JAX is missing)
+
+        from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+        def _op(
+            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
+        ) -> jax.Array:
+            return _static_fp8_gemv.static_fp8_gemv_jax(
+                x, w, out_scale, inv_x, _static_fp8_gemv.block_k(x.shape[1], w.shape[1])
+            )
+
+        def _fake(x, w, out_scale, inv_x):
+            return x.new_empty((x.shape[0], w.shape[1]))
+
+        op = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv", _op)
+        op.register_fake(_fake)
+        _STATIC_FP8_GEMV_OP = op
+    _STATIC_FP8_GEMV_READY = True
+
+
+def static_fp8_gemv_enabled() -> bool:
+    """Whether the static fp8 Pallas GEMV is registered."""
+    return _STATIC_FP8_GEMV_READY
+
+
+def _static_fp8_gemv_eligible(x: torch.Tensor, w: StaticFp8Weight) -> bool:
+    return (
+        _STATIC_FP8_GEMV_READY
+        and x.dim() == 2
+        and 0 < x.shape[0] <= _static_fp8_gemv.MAX_TOKENS
+        and x.dtype == torch.bfloat16
+        # The binder pads N to a 128 multiple only when the op is registered.
+        and w.weight.shape[1] % 128 == 0
+        and _static_fp8_gemv.block_k(x.shape[1], w.weight.shape[1]) > 0
+    )
+
+
+def pad_static_fp8_n(w: StaticFp8Weight, force: bool = False) -> StaticFp8Weight:
+    """Zero-pad N to a 128 multiple (``n_out`` keeps the real width).
+
+    An unaligned fp8 [K, N] operand makes XLA relayout the whole weight before
+    every call (Kimi-K3 MLA q_a, N=2112: 166 us per call). Padding is only
+    applied when the kernel is registered (or ``force``). The pad is cloned
+    into a base tensor: a view graph input costs an eager as_strided per step.
+    """
+    n = w.weight.shape[1]
+    if not (_STATIC_FP8_GEMV_READY or force) or n % 128 == 0:
+        return w
+    extra = 128 - n % 128
+    weight = (
+        torch.nn.functional.pad(w.weight.view(torch.uint8), (0, extra))
+        .view(w.weight.dtype)
+        .clone()
+    )
+    out_scale = torch.nn.functional.pad(w.out_scale, (0, extra)).clone()
+    return w._replace(weight=weight, out_scale=out_scale, n_out=n)

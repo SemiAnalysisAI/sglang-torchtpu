@@ -140,7 +140,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
 
     def test_padded_n_matches_unpadded(self):
         """N=2112 (Kimi-K3 MLA q_a) padded to 2176 must not change the output."""
-        from sglang_tpu.static_fp8_gemv_pallas import pad_n
+        from sglang_tpu.fp8_linear import pad_static_fp8_n as pad_n
 
         gen = torch.Generator().manual_seed(6)
         w = (torch.randn(K, 2112, generator=gen) * 0.02).to(torch.bfloat16)
@@ -160,7 +160,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
         )
 
     def test_aligned_n_is_left_alone(self):
-        from sglang_tpu.static_fp8_gemv_pallas import pad_n
+        from sglang_tpu.fp8_linear import pad_static_fp8_n as pad_n
 
         w, g, _ = _inputs(7)
         packed = quantize_rmsnorm_fed_weight(w, g)
@@ -178,7 +178,7 @@ class TestStaticFp8PallasGemvHelpers(CustomTestCase):
         )
 
     def test_block_k_divides_k_and_fits_vmem(self):
-        from sglang_tpu.static_fp8_gemv_pallas import block_k
+        from sglang_tpu.kernels.static_fp8_gemv import block_k
 
         # Kimi-K3 TP32 shapes: KDA qkvg, MoE front, latent up.
         for k, n in ((7168, 1536), (7168, 3968), (3584, 7168)):
@@ -232,26 +232,26 @@ class TestStaticFp8PallasGemvGate(CustomTestCase):
         return mock.Mock(weight=torch.zeros(1024, n))
 
     def test_batches_up_to_the_padded_tile(self):
-        from sglang_tpu import static_fp8_gemv_pallas as g
+        from sglang_tpu import fp8_linear as f
 
         x = lambda m: torch.zeros(m, 1024, dtype=torch.bfloat16)
-        with mock.patch.object(g, "_READY", True):
-            self.assertTrue(g.eligible(x(32), self._w(1536)))
-            self.assertFalse(g.eligible(x(33), self._w(1536)))
+        with mock.patch.object(f, "_STATIC_FP8_GEMV_READY", True):
+            self.assertTrue(f._static_fp8_gemv_eligible(x(32), self._w(1536)))
+            self.assertFalse(f._static_fp8_gemv_eligible(x(33), self._w(1536)))
             # An unpadded N keeps the XLA dot.
-            self.assertFalse(g.eligible(x(1), self._w(1500)))
+            self.assertFalse(f._static_fp8_gemv_eligible(x(1), self._w(1500)))
 
     def test_switch_off_leaves_the_op_unregistered(self):
-        from sglang_tpu import static_fp8_gemv_pallas as g
+        from sglang_tpu import fp8_linear as f
 
         with (
             tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.override(False),
-            mock.patch.object(g, "_READY", False),
-            mock.patch.object(g, "_build_op") as build,
+            mock.patch.object(f, "_STATIC_FP8_GEMV_READY", False),
+            mock.patch.object(f, "_STATIC_FP8_GEMV_OP", None),
         ):
-            g.register()
-            self.assertFalse(g.enabled())
-        build.assert_not_called()
+            f.register_static_fp8_gemv_op()
+            self.assertFalse(f.static_fp8_gemv_enabled())
+            self.assertIsNone(f._STATIC_FP8_GEMV_OP)
 
 
 H, LATENT, SHARED, QKVG, QKV_A = 256, 128, 128, 192, 96
@@ -328,14 +328,14 @@ class TestKimiK3StaticFp8Binder(CustomTestCase):
 
     def setUp(self):
         from sglang.srt.models import kimi_k3
-        from sglang_tpu import static_fp8_gemv_pallas
+        from sglang_tpu.kimi_k3 import static_fp8
 
         patches = [
             mock.patch.object(kimi_k3, "KimiK3MoE", _FakeMoE),
             mock.patch.object(kimi_k3, "KimiK3DeltaAttention", _FakeKDA),
             mock.patch.object(kimi_k3, "KimiK3MLAAttention", _FakeMLA),
             # No JAX on CPU: the binder would register the Pallas op here.
-            mock.patch.object(static_fp8_gemv_pallas, "register"),
+            mock.patch.object(static_fp8, "register_static_fp8_gemv_op"),
         ]
         for p in patches:
             p.start()

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pallas decode GEMV for static-input-scale fp8 weights (``StaticFp8Weight``).
 
-``apply_tpu_static_fp8_linear`` lowers to an activation-quantize fusion, an
-XLA fp8 dot over 16 padded rows and a scale fusion. At decode the dot reads
+``apply_tpu_static_fp8_linear`` (sglang_tpu/fp8_linear.py, which also
+registers this kernel as an op) lowers to an activation-quantize fusion, an XLA
+fp8 dot over 16 padded rows and a scale fusion. At decode the dot reads
 the fp8 weight well below HBM bandwidth (Kimi-K3 TP32: the KDA [q, k, v, g]
 projection took 12.3 us, the MoE front 12.6 us). This kernel streams the
 [K, N] weight in K blocks with the default double buffering, quantizes the
@@ -15,11 +16,6 @@ an fp8 x fp8 MXU dot with f32 accumulation and the f32 output scale.
 """
 
 import functools
-from threading import Lock
-
-import torch
-
-from sglang_tpu.envs import envs as tpu_envs
 
 # One fp8 sublane tile; the activation is zero-padded to it.
 _ROWS = 32
@@ -31,11 +27,6 @@ _VMEM_LIMIT = 40 * 1024 * 1024
 _VMEM_BUDGET = 32 * 1024 * 1024
 # Largest K block tried; 1792 measured best on the Kimi-K3 TP32 shapes.
 _MAX_BLOCK_K = 1792
-
-_OP: list = []
-_LOCK = Lock()
-# Plain bool, not list truthiness: Dynamo traces the eligibility check.
-_READY = False
 
 
 def block_k(k: int, n: int) -> int:
@@ -107,79 +98,3 @@ def static_fp8_gemv_jax(x, w, out_scale, inv_x, bk: int):
         name=f"static_fp8_gemv_k{kdim}_n{n}_bk{bk}",
     )(inv_x.astype(jnp.float32), x, w, out_scale.reshape(1, n).astype(jnp.float32))
     return out[:m]
-
-
-def _build_op():
-    import jax  # noqa: F401  (force loud failure if JAX is missing)
-
-    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
-
-    def _wrapped(
-        x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
-    ) -> jax.Array:
-        return static_fp8_gemv_jax(
-            x, w, out_scale, inv_x, block_k(x.shape[1], w.shape[1])
-        )
-
-    def _fake(x, w, out_scale, inv_x):
-        return x.new_empty((x.shape[0], w.shape[1]))
-
-    op = cpu_export_jax_op("sglang_tpu_pallas::static_fp8_gemv", _wrapped)
-    op.register_fake(_fake)
-    return op
-
-
-def register() -> None:
-    """Register the op when enabled; must run before torch.compile traces the
-    model (the static fp8 binder calls it post-load). Left unregistered, every
-    call keeps the XLA fp8 dot."""
-    global _READY
-    if not tpu_envs.SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV.get():
-        return
-    with _LOCK:
-        if not _OP:
-            _OP.append(_build_op())
-        _READY = True
-
-
-def enabled() -> bool:
-    """Whether the op is registered (the binder logs which path runs)."""
-    return _READY
-
-
-def eligible(x: torch.Tensor, w) -> bool:
-    return (
-        _READY
-        and x.dim() == 2
-        and 0 < x.shape[0] <= MAX_TOKENS
-        and x.dtype == torch.bfloat16
-        # The binder pads N to a 128 multiple only when the op is registered.
-        and w.weight.shape[1] % 128 == 0
-        and block_k(x.shape[1], w.weight.shape[1]) > 0
-    )
-
-
-def run(x: torch.Tensor, w) -> torch.Tensor:
-    out = _OP[0](x, w.weight, w.out_scale, w.inv_x)
-    return out[:, : w.n_out] if w.n_out else out
-
-
-def pad_n(w, force: bool = False):
-    """Zero-pad N to a 128 multiple (``n_out`` keeps the real width).
-
-    An unaligned fp8 [K, N] operand makes XLA relayout the whole weight before
-    every call (Kimi-K3 MLA q_a, N=2112: 166 us per call). Padding is only
-    applied when the kernel is registered (or ``force``). The pad is cloned
-    into a base tensor: a view graph input costs an eager as_strided per step.
-    """
-    n = w.weight.shape[1]
-    if not (_READY or force) or n % 128 == 0:
-        return w
-    extra = 128 - n % 128
-    weight = (
-        torch.nn.functional.pad(w.weight.view(torch.uint8), (0, extra))
-        .view(w.weight.dtype)
-        .clone()
-    )
-    out_scale = torch.nn.functional.pad(w.out_scale, (0, extra)).clone()
-    return w._replace(weight=weight, out_scale=out_scale, n_out=n)

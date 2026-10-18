@@ -26,7 +26,14 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang_tpu.fp8_linear import StaticFp8Weight, quantize_rmsnorm_fed_weight
+from sglang_tpu.fp8_linear import (
+    StaticFp8Weight,
+    pad_static_fp8_n,
+    quantize_rmsnorm_fed_weight,
+    register_static_fp8_gemv_op,
+    static_fp8_gemv_enabled,
+)
+from sglang_tpu.kernels.static_fp8_gemv import MAX_TOKENS as STATIC_FP8_GEMV_MAX_TOKENS
 from sglang_tpu.kimi_k3 import STATIC_FP8_PARTS as PARTS
 from sglang_tpu.kimi_k3 import static_fp8_parts as selected_parts
 
@@ -35,11 +42,7 @@ logger = logging.getLogger(__name__)
 
 def _pack(weight_kn: torch.Tensor, norm_weight: torch.Tensor) -> StaticFp8Weight:
     """Quantize, then pad N for the Pallas GEMV when it is registered."""
-    from sglang_tpu import static_fp8_gemv_pallas
-
-    return static_fp8_gemv_pallas.pad_n(
-        quantize_rmsnorm_fed_weight(weight_kn, norm_weight)
-    )
+    return pad_static_fp8_n(quantize_rmsnorm_fed_weight(weight_kn, norm_weight))
 
 
 def _dense_weight_kn(linear: nn.Module, k: int) -> Optional[torch.Tensor]:
@@ -153,9 +156,7 @@ def bind_static_fp8(model: nn.Module) -> None:
     if not parts or getattr(model, "_static_fp8_bound", False):
         return
     model._static_fp8_bound = True
-    from sglang_tpu import static_fp8_gemv_pallas
-
-    static_fp8_gemv_pallas.register()
+    register_static_fp8_gemv_op()
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.models.kimi_k3 import (
         KimiK3DeltaAttention,
@@ -235,12 +236,12 @@ def bind_static_fp8(model: nn.Module) -> None:
             unbound,
         )
     if freed:
-        if static_fp8_gemv_pallas.enabled():
+        if static_fp8_gemv_enabled():
             logger.info(
                 "Static fp8 GEMVs run the Pallas kernel for up to %d tokens; "
                 "larger calls (prefill, bigger decode or spec-verify batches) "
                 "use the XLA fp8 dot.",
-                static_fp8_gemv_pallas.MAX_TOKENS,
+                STATIC_FP8_GEMV_MAX_TOKENS,
             )
         else:
             logger.info(
