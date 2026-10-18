@@ -19,6 +19,13 @@ from sglang_tpu.hooks.attn_residual import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.mhc import (
+    hc_ffn_post_pre,
+    hc_post,
+    hc_pre,
+    register_mhc_ops,
+    wire_hc_ffn_post_pre,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
@@ -73,6 +80,31 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.layers.attn_residual._aggregate_fused_add",
         aggregate_fused_add,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.__init__",
+        register_mhc_ops,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.layer_boundary.residual.mhc.MHCState.__init__",
+        wire_hc_ffn_post_pre,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
+        hc_pre,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_ffn_post_pre",
+        hc_ffn_post_pre,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_post",
+        hc_post,
         HookType.AROUND,
     ),
     (
