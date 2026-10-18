@@ -36,6 +36,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
@@ -142,6 +143,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         bind_kimi_k3_static_fp8,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",
+        broadcast_undeferred,
+        HookType.AROUND,
     ),
 ]
 
