@@ -9,7 +9,7 @@ FROM ${BASE_IMAGE} AS final
 WORKDIR /sgl-workspace/sglang
 
 # Copy source trees
-COPY README.md LICENSE ./
+COPY README.md LICENSE NOTICE ./
 COPY python    ./python
 COPY sglang_tpu ./sglang_tpu
 COPY pyproject.toml ./pyproject.toml
