@@ -23,6 +23,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Any, Callable, Tuple
 
 import jax
@@ -330,9 +331,15 @@ TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], Til
 class IndexMaps:
     """Index maps for GMM kernel."""
 
-    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
+    def __init__(
+        self,
+        metadata_ref: MetadataRef,
+        cfgs: GmmConfigs,
+        rhs_group_offset: jax.Array | None = None,
+    ):
         self.metadata_ref = metadata_ref
         self.cfgs = cfgs
+        self.rhs_group_offset = rhs_group_offset
 
     def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -353,6 +360,10 @@ class IndexMaps:
         offset: int = 0,
     ):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        if self.rhs_group_offset is not None:
+            # Only the weight is layer-stacked; the scale and bias maps keep
+            # the per-layer group id.
+            group_id = group_id + self.rhs_group_offset
         return (group_id, k_id, offset + n_id)
 
     def rhs_bias_index_map(
@@ -444,11 +455,13 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
 
 
 def generate_block_specs(
-    metadata_ref: MetadataRef, cfgs: GmmConfigs
+    metadata_ref: MetadataRef,
+    cfgs: GmmConfigs,
+    rhs_group_offset: jax.Array | None = None,
 ) -> Tuple[Tuple[pl.BlockSpec, RhsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
-    index_map = IndexMaps(metadata_ref, cfgs)
+    index_map = IndexMaps(metadata_ref, cfgs, rhs_group_offset)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
     lhs_block_spec = pl.BlockSpec(
@@ -931,10 +944,10 @@ def zero_out_end(
 def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
-    group_offset_ref: jax.Array,  # int32[1]
+    group_offset_ref: jax.Array,  # int32[1]; int32[2] with a layer-stacked rhs
     # In
     lhs_ref: jax.Array,  # [size_m, size_k]
-    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]; stacked: [*layers, ...]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
     # Scratch memory
@@ -994,6 +1007,17 @@ def kernel_main(
         f" equal to size_n {cfgs.dims.size_n}"
     )
 
+    num_rhs_layers = math.prod(rhs_ref.weight.shape[:-3])
+    rhs_group_offset = None
+    if rhs_ref.weight.ndim > 3:
+        # Flatten the layers into the group axis, so this layer's groups start
+        # at group_offset_ref[1] (gmm_v2 sets it to layer * size_group).
+        assert group_offset_ref.shape == (2,), group_offset_ref.shape
+        rhs_ref = dataclasses.replace(
+            rhs_ref, weight=rhs_ref.weight.reshape(-1, *rhs_ref.weight.shape[-2:])
+        )
+        rhs_group_offset = group_offset_ref[1]
+
     # Pack along K (2nd minor dim) so that pltpu.bitcast can unpack inside the
     # kernel.
     # [G, K, N] -> [G, K//packing, N] uint32
@@ -1001,7 +1025,7 @@ def kernel_main(
         rhs_weight = rhs_ref.weight
         rhs_weight = rhs_weight.bitcast(jnp.uint32)
         assert rhs_weight.shape == (
-            cfgs.dims.size_group,
+            num_rhs_layers * cfgs.dims.size_group,
             cfgs.dims.size_k // cfgs.rhs_cfgs.packing,
             cfgs.dims.size_n * (2 if cfgs.fuse_act else 1),
         )
@@ -1015,7 +1039,7 @@ def kernel_main(
         cfgs=cfgs,
     )
 
-    in_specs, out_specs = generate_block_specs(metadata_ref, cfgs)
+    in_specs, out_specs = generate_block_specs(metadata_ref, cfgs, rhs_group_offset)
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -1293,11 +1317,19 @@ def validate_inputs(
     fuse_act: str | None = None,
     packed_fp4: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
+    stacked_rhs: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k_raw, size_n = rhs.shape
+    if stacked_rhs:
+        # [*layers, G, K, N]: a call computes one layer, so size_group is the
+        # per-layer G and the scale and bias are that layer's alone.
+        assert rhs.ndim > 3, f"rhs_layer_index needs a layer-stacked rhs: {rhs.shape}"
+        size_group, size_k_raw, size_n = rhs.shape[-3:]
+    else:
+        assert rhs.ndim == 3, f"layer-stacked rhs {rhs.shape} needs rhs_layer_index"
+        size_group, size_k_raw, size_n = rhs.shape
     if packed_fp4:
         # uint8-packed float4: 2 codes per byte, so real K = shape[1] * 2.
         size_k = size_k_raw * 2
@@ -1310,7 +1342,7 @@ def validate_inputs(
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k_raw, size_n)
+    assert rhs.shape[-3:] == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1417,6 +1449,7 @@ def make_gmm_configs(
     rhs_quant_dtype: jnp.dtype | None = None,
     dequantize_rhs: bool = False,
     requantize_rhs: bool = False,
+    stacked_rhs: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1430,6 +1463,7 @@ def make_gmm_configs(
         fuse_act,
         packed_fp4=packed_fp4,
         rhs_quant_dtype=rhs_quant_dtype,
+        stacked_rhs=stacked_rhs,
     )
 
     if rhs_scale is not None:
@@ -1442,10 +1476,10 @@ def make_gmm_configs(
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
-        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+        if rhs_scale.shape[3] != rhs.shape[-1] and rhs_scale.shape[3] % 128 == 0:
             scale_block_n = 128
         else:
-            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+            scale_block_n = rhs.shape[-1] // rhs_scale.shape[3]
         if fuse_act is not None:
             assert dims.size_n % scale_block_n == 0, (
                 f"fused activation requires the gate/up boundary "
@@ -1688,6 +1722,7 @@ def gmm_v2(
     rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
     dequantize_rhs: bool = False,
     rhs_channel_scale: jax.Array | None = None,
+    rhs_layer_index: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1706,6 +1741,10 @@ def gmm_v2(
             divided by these multipliers. Additive rhs_bias is unsupported in
             this mode. Weights stay packed INT4 in HBM.
         group_offset: Optional. The group offset of shape [1,].
+        rhs_layer_index: Optional int32 scalar or [1,], required exactly when
+            rhs is layer-stacked as [*layers, size_group, size_k, size_n]:
+            the layer (over the flattened leading dims) to compute. rhs_scale
+            and rhs_bias are that layer's alone. Not bounds-checked.
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
         precision: Unused. Exists for compatibility reasons.
@@ -1758,9 +1797,21 @@ def gmm_v2(
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_rhs,
         requantize_rhs=requantize_rhs,
+        stacked_rhs=rhs_layer_index is not None,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
+
+    if rhs_layer_index is not None:
+        # The layer's first rhs group rides the prefetched group_offset as a
+        # device value, so one compiled kernel serves every layer.
+        assert jnp.shape(rhs_layer_index) in ((), (1,)), jnp.shape(rhs_layer_index)
+        rhs_group_offset = (
+            jnp.asarray(rhs_layer_index, jnp.int32).reshape(1) * dims.size_group
+        )
+        group_offset = jnp.concatenate(
+            [group_offset.astype(jnp.int32), rhs_group_offset]
+        )
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None

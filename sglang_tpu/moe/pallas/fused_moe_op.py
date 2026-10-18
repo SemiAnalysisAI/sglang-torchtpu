@@ -171,7 +171,7 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     in -- otherwise packed w2 mismatches lhs K and falls back to the heuristic.
 
     ``num_current_groups`` is set equal to ``num_total_groups`` because callers
-    pass the LOCAL expert count (``w1.shape[0]``), which under EP is already
+    pass the LOCAL expert count (``w1.shape[-3]``), which under EP is already
     this rank's share -- so both are the local count and the lookup is correct
     under expert parallelism as written.
 
@@ -192,7 +192,7 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     )
 
     m, k = lhs.shape
-    _g, _k_raw, n = rhs.shape
+    _k_raw, n = rhs.shape[-2:]
     # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
     _k = _k_raw * 2 if packed_fp4 else _k_raw
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
@@ -490,6 +490,9 @@ def _fused_moe_jax(
     permute_dense_threshold=0,
     w1_channel_scale=None,
     w2_channel_scale=None,
+    # i32[1] on device: w1/w2 are layer-stacked [*layers, g, ...] and this call
+    # computes that layer; scales and biases stay per-layer [g, ...].
+    w_layer_index=None,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -510,15 +513,27 @@ def _fused_moe_jax(
     )
 
     m, hidden_size = hidden_states.shape
-    num_experts = w1.shape[0]
+    stacked = w_layer_index is not None
+    if stacked:
+        if w1.ndim < 4 or w1.shape[:-2] != w2.shape[:-2]:
+            raise ValueError(
+                "w_layer_index needs w1/w2 stacked as [*layers, g, k, n] with "
+                f"matching leading dims, got {w1.shape} / {w2.shape}"
+            )
+    elif w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError(
+            f"layer-stacked w1 {w1.shape} / w2 {w2.shape} need w_layer_index"
+        )
+    num_experts = w1.shape[-3]
     out_dtype = hidden_states.dtype
 
     # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
     # streams only the hit experts (single_token_moe.py) replaces route
     # metadata + two gmm_v2 calls + activation + combine. It reads topk_ids
     # directly, so it does not depend on the permute path chosen below
-    # (permute_dense_threshold).
-    if m == 1 and not no_combine:
+    # (permute_dense_threshold). It indexes 3D weights with no layer offset, so
+    # layer-stacked weights keep the gmm_v2 path.
+    if m == 1 and not no_combine and not stacked:
         from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.moe.pallas import single_token_moe
 
@@ -593,7 +608,8 @@ def _fused_moe_jax(
 
     from sglang_tpu.envs import envs as tpu_envs
 
-    if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
+    # The streaming kernel reads 3D weights with no layer offset.
+    if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get() and not stacked:
         from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
 
         # One kernel streaming the selected experts' weights; None outside its case.
@@ -756,8 +772,8 @@ def _fused_moe_jax(
     if compact_block_scales:
         gmm1_tile_info = TileSizes(
             tile_m=min(128, int(x_sorted.shape[0])),
-            tile_k=int(w1.shape[1]),
-            tile_n=min(896, int(w1.shape[2])),
+            tile_k=int(w1.shape[-2]),
+            tile_n=min(896, int(w1.shape[-1])),
         )
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
@@ -766,14 +782,14 @@ def _fused_moe_jax(
         _vmem_safe_packed_tile_n(gmm1_tile_info or calculate_tiling)
     )
     if w1_scale is None:
-        assert w1.shape[1] % 128 == 0, (
-            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
+        assert w1.shape[-2] % 128 == 0, (
+            f"gmm_v2 w1 K={w1.shape[-2]} is not lane-aligned; pad the weight K "
             "to a multiple of 128 at load time"
         )
-        if w1.shape[1] != hidden_size:
+        if w1.shape[-2] != hidden_size:
             # activations are born at model width; zero-pad K to the
             # load-padded weight's width (0 * w = 0, exact)
-            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - hidden_size)))
+            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[-2] - hidden_size)))
     elif hidden_size % 128 != 0:
         raise NotImplementedError(
             f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
@@ -820,6 +836,7 @@ def _fused_moe_jax(
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
         rhs_channel_scale=w1_channel_scale,
+        rhs_layer_index=w_layer_index,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -864,6 +881,7 @@ def _fused_moe_jax(
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
         rhs_channel_scale=w2_channel_scale,
+        rhs_layer_index=w_layer_index,
         group_offset=group_offset,
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
@@ -1016,6 +1034,7 @@ def _build_fused_moe_op():
         permute_dense_threshold: int = 0,
         w1_channel_scale: Optional[jax.Array] = None,
         w2_channel_scale: Optional[jax.Array] = None,
+        w_layer_index: Optional[jax.Array] = None,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -1037,6 +1056,7 @@ def _build_fused_moe_op():
             permute_dense_threshold,
             w1_channel_scale,
             w2_channel_scale,
+            w_layer_index,
         )
 
     custom_op = jax_op(op_name, _wrapped)
@@ -1061,6 +1081,7 @@ def _build_fused_moe_op():
         permute_dense_threshold: int = 0,
         w1_channel_scale: Optional[torch.Tensor] = None,
         w2_channel_scale: Optional[torch.Tensor] = None,
+        w_layer_index: Optional[torch.Tensor] = None,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -1098,6 +1119,7 @@ def fused_moe_call(
     w2_channel_scale: Optional[torch.Tensor] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
+    w_layer_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -1107,6 +1129,10 @@ def fused_moe_call(
       * ``w2``: ``[num_experts, intermediate, hidden_size]``
       * ``topk_weights``: ``[num_tokens, topk]``  (routing scores, dtype of x)
       * ``topk_ids``: ``[num_tokens, topk]``  (int32 expert ids)
+
+    ``w1`` / ``w2`` may instead hold several layers' experts stacked as
+    ``[*layers, num_experts, ...]``; ``w_layer_index`` (int32 ``[1]``, on
+    device) then selects the layer, while scales and biases stay per-layer.
 
     Slots with a negative or out-of-range id (TopK's padded tokens) are
     dropped: they contribute zero, and a token with no live slot outputs zeros.
@@ -1148,4 +1174,5 @@ def fused_moe_call(
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
         w1_channel_scale,
         w2_channel_scale,
+        w_layer_index,
     )

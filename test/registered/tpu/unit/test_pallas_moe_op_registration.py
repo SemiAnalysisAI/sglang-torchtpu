@@ -153,6 +153,7 @@ class TestPallasMoeCallContract(CustomTestCase):
             128,  # permute_dense_threshold
             None,  # w1_channel_scale (vmem-fp8 only)
             None,  # w2_channel_scale (vmem-fp8 only)
+            None,  # w_layer_index (layer-stacked experts only)
         )
 
     def test_situ_params_are_encoded_in_the_activation(self):
