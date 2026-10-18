@@ -154,9 +154,6 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         enable_dsa_prefill_context_parallel=False,
     )
     with (
-        patch.object(
-            scheduler, "_pp_init_wave", return_value=wave if use_wave else None
-        ),
         patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
         patch.object(
             scheduler_pp_mixin,

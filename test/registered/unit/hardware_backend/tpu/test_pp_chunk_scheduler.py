@@ -35,7 +35,6 @@ from sglang_tpu.pp_chunk_scheduler import (
 from sglang_tpu.pp_chunks import StepCostModel
 
 
-@pytest.fixture(autouse=True)
 def pending_step_limit(scheduler):
     return _pending_step_limit(
         cost=scheduler._tpu_pp_chunk_cost,
@@ -57,6 +56,7 @@ def profile_and_install_cost_model(scheduler):
     )
 
 
+@pytest.fixture(autouse=True)
 def pipeline_topology():
     # The scheduler reads its stage count from the published parallel config.
     with published_topology(pp_size=8):
