@@ -83,6 +83,26 @@ class TestTpuMoeMethods(CustomTestCase):
         self.assertIs(type(UnquantizedFusedMoEMethod()), UnquantizedFusedMoEMethod)
         self.assertIs(type(Fp8MoEMethod(config)), Fp8MoEMethod)
 
+    def test_each_moe_method_registers_its_op_before_model_tracing(self):
+        register_moe_quantization_methods()
+        methods = (
+            UnquantizedFusedMoEMethod(),
+            Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True)),
+            Mxfp4MoEMethod("experts"),
+            CompressedTensorsWNA16MoE(self._ct_config(), self._int4()),
+        )
+        for method in methods:
+            config = MoeRunnerConfig()
+            with (
+                self.subTest(method=type(method).__name__),
+                patch(
+                    "sglang_tpu.moe.pallas.fused_moe_op._build_fused_moe_op"
+                ) as register_op,
+            ):
+                method.create_moe_runner(torch.nn.Module(), config)
+                register_op.assert_called_once_with()
+                self.assertIs(method.moe_runner_config, config)
+
     def test_square_transpose_retains_live_parameter_storage(self):
         method = TpuUnquantizedFusedMoEMethod()
         layer = torch.nn.Module()
