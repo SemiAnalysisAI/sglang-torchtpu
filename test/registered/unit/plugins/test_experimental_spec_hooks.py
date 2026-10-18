@@ -8,7 +8,7 @@ import sys
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -28,6 +28,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSampl
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
+from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.hooks.experimental_spec import alloc_extend, hook_specs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -283,7 +284,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
     def test_either_flag_enables_the_experimental_worker(self):
         from sglang.srt.environ import envs as srt_envs
-        from sglang_tpu.experimental import is_experimental_spec_worker
+        from sglang_tpu.experimental import (
+            is_experimental_mtp,
+            is_experimental_spec_worker,
+        )
 
         for experimental, no_d2h in ((True, False), (False, True), (False, False)):
             with (
@@ -294,6 +298,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
                     self.assertEqual(
                         is_experimental_spec_worker(algo), experimental or no_d2h
                     )
+                self.assertEqual(
+                    is_experimental_mtp(SpeculativeAlgorithm.EAGLE),
+                    experimental or no_d2h,
+                )
 
     def test_overlap_utils_tpu_imports_without_the_hook_package(self):
         """Core overlap_utils imports overlap_utils_tpu while the scheduler module
@@ -322,6 +330,125 @@ class TestExperimentalSpecHooks(CustomTestCase):
         on = {target for target, _, _ in hook_specs()}
         self.assertFalse(hot & off)
         self.assertEqual(hot & on, hot)
+
+    def test_chain_draft_prompt_reads_the_next_token_of_each_row(self):
+        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+            fill_sampled_tails,
+            shift_prompt_tokens,
+        )
+
+        # Request 0 finishes its prompt; request 1 is a chunk followed by token 22.
+        shifted, row_reqs, is_sampled = shift_prompt_tokens(
+            torch.tensor([10, 11, 12, 20, 21]),
+            extend_lens=[3, 2],
+            padded_tokens=8,
+            chunked_row=1,
+            next_prompt_token=22,
+        )
+        torch.testing.assert_close(row_reqs, torch.tensor([0, 0, 0, 1, 1, 0, 0, 0]))
+        self.assertEqual(is_sampled.nonzero().view(-1).tolist(), [2])
+        draft_ids = fill_sampled_tails(
+            shifted, row_reqs, is_sampled, torch.tensor([7, 8, 0, 0])
+        )
+        torch.testing.assert_close(draft_ids[:5], torch.tensor([11, 12, 7, 21, 22]))
+
+    def test_chain_draft_rows_hand_rpa_the_pre_row_length(self):
+        """TARGET_VERIFY RPA adds the row width itself; a post-row length let draft
+        steps attend stale draft KV and cut chain acceptance by ~13%."""
+        from sglang_tpu.experimental.speculative.spec_ops import (
+            build_chain_block_inputs,
+            build_draft_block_inputs,
+        )
+        from sglang_tpu.experimental.speculative.spec_types import VerifyRows
+
+        seq_lens = torch.tensor([10, 20, 0])
+        live = torch.tensor([True, True, False])
+        positions = seq_lens[:, None] + torch.arange(4)
+        rows = VerifyRows(
+            positions=positions,
+            cache_locs=positions,
+            flat_positions=positions.reshape(-1),
+            flat_cache_locs=positions.reshape(-1),
+        )
+        step = build_chain_block_inputs(
+            torch.tensor([1, 2, 3]), rows, seq_lens, live, 2
+        )
+        self.assertEqual(step.seq_lens.tolist(), [12, 22, 0])
+        self.assertEqual(step.positions.tolist(), [12, 22, 2])
+        extend = build_chain_block_inputs(
+            torch.zeros((3, 4), dtype=torch.int64), rows, seq_lens, live, 0
+        )
+        self.assertEqual(extend.seq_lens.tolist(), [10, 20, 0])
+        block = build_draft_block_inputs(
+            torch.tensor([1, 2, 3]), rows, seq_lens, live, 0, 4
+        )
+        self.assertEqual(block.seq_lens.tolist(), [14, 24, 0])
+
+    def test_mtp_takes_the_chain_paths_only_when_enabled(self):
+        from sglang_tpu.experimental import is_experimental_spec_worker
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+            TpuChainSpecWorker,
+        )
+        from sglang_tpu.hooks.experimental_spec import (
+            need_topk,
+            prepare_spec_decode,
+            spec_need_hidden_states,
+            supports_kv_free_fence,
+            supports_tpu_direct_compile,
+        )
+        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+
+        mtp = SpeculativeAlgorithm.from_string("NEXTN")
+        spec_args = SimpleNamespace(speculative_algorithm="NEXTN")
+        prepared = []
+        draft_input = MagicMock(spec=HostPaddedChainDraftInput)
+        draft_input.prepare_for_decode.side_effect = prepared.append
+        batch = SimpleNamespace(
+            spec_algorithm=mtp, host_pad_bs=lambda bs: bs, spec_info=draft_input
+        )
+        core_batch = SimpleNamespace(spec_algorithm=mtp, spec_info=draft_input)
+        core_prepare = lambda batch: prepared.append("core")  # noqa: E731
+        core_fence = lambda algo, *, copies_draft_tail: True  # noqa: E731
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            self.assertFalse(is_experimental_spec_worker(SpeculativeAlgorithm.EAGLE3))
+            self.assertIs(
+                select_experimental_spec_worker(None, mtp, None), TpuChainSpecWorker
+            )
+            self.assertIs(
+                select_experimental_spec_worker(
+                    None, SpeculativeAlgorithm.DFLASH, None
+                ),
+                TpuBlockSpecWorker,
+            )
+            prepare_spec_decode(core_prepare, batch)
+            self.assertFalse(
+                supports_kv_free_fence(core_fence, mtp, copies_draft_tail=True)
+            )
+            self.assertFalse(need_topk(lambda algo: True, mtp))
+            self.assertTrue(supports_tpu_direct_compile(lambda algo: False, mtp))
+            with patch(
+                "sglang_tpu.hooks.experimental_spec.get_spec", return_value=spec_args
+            ):
+                # The carry stays in the draft's table, so FutureMap relays no hidden.
+                self.assertFalse(spec_need_hidden_states(lambda: True))
+        self.assertEqual(prepared, [batch])
+        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+            self.assertIsNone(select_experimental_spec_worker(None, mtp, None))
+            # Off the flag, init_new never sets host_pad_bs, so core prepares.
+            prepare_spec_decode(core_prepare, core_batch)
+            self.assertTrue(
+                supports_kv_free_fence(core_fence, mtp, copies_draft_tail=True)
+            )
+            self.assertTrue(need_topk(lambda algo: True, mtp))
+            self.assertFalse(supports_tpu_direct_compile(lambda algo: False, mtp))
+            with patch(
+                "sglang_tpu.hooks.experimental_spec.get_spec", return_value=spec_args
+            ):
+                self.assertTrue(spec_need_hidden_states(lambda: True))
+        self.assertEqual(prepared, [batch, "core"])
 
     def test_draft_merge_preserves_right_hand_length_metadata(self):
         left, right = _state([1]), _state([2, 3])

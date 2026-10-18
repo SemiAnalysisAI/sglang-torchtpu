@@ -77,7 +77,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
 )
-from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraftWorker
+from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
     accept_drafts_sampled,
@@ -127,7 +127,7 @@ class TpuSpecWorker(BaseSpecWorker):
     def __init__(
         self,
         target_worker: TpModelWorker,
-        draft_worker: TpuBlockDraftWorker | EagleDraftWorker,
+        draft_worker: TpuDraftWorker | EagleDraftWorker,
         num_drafts: int,
     ) -> None:
         super().__init__()
@@ -713,6 +713,9 @@ class TpuSpecWorker(BaseSpecWorker):
             )
         extend_sizes = range(1, cap + 1)
         vocab_size = runner.model_config.vocab_size
+        # A multimodal wrapper's eager outer logits processor emits live rows,
+        # which TpuSampler pads to the batch bucket (whatever the input modality).
+        eager_logits = not self._compile_policy()._compiles_logits_processor()
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
@@ -751,6 +754,13 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.zeros((rows,), dtype=torch.int64, device=self.device)[
                         :bs
                     ].cpu()
+                if eager_logits and self._pad_bs(bs) != bs:
+                    torch.nn.functional.pad(
+                        torch.zeros((bs, vocab_size), dtype=torch.float32).to(
+                            self.device
+                        ),
+                        (0, 0, 0, self._pad_bs(bs) - bs),
+                    ).cpu()
 
     def _warmup_extend_logits(
         self, cap: int, rows: int, vocab_size: int
