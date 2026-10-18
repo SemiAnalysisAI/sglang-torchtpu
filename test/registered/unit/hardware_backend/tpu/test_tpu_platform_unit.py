@@ -214,10 +214,27 @@ class TestTpuPlatformMemory(CustomTestCase):
             self.assertEqual(free, 10 << 30)
 
 
+def _require_resolved_dp_layout(overrides):
+    """Platform defaults only ever see the resolved DP layout.
+
+    handle_deprecated_dp_attention rewrites `--dp-size N --enable-dp-attention`
+    to attn_dp_size=N, dp_size=1, enable_dp_attention=False before platform
+    defaults run. Handing the hook the deprecated spelling tests a state
+    production never reaches: these cases stayed green while the DP-attention
+    refusals they cover had stopped firing.
+    """
+    if overrides.get("enable_dp_attention"):
+        raise AssertionError(
+            "pass attn_dp_size=N: the pipeline resolves enable_dp_attention "
+            "before platform defaults run"
+        )
+
+
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         # apply_server_args_defaults declares rather than writes, so the assertions read the
         # decisions back with resolution_result, as the projection does.
         defaults = dict(
@@ -414,14 +431,13 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
 
     def test_unsupported_builtin_spec_algorithm_is_rejected(self):
         args = self._args(speculative_algorithm="NGRAM")
-        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE"):
             self._apply(args)
 
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=False,
         )
         with self.assertRaisesRegex(
@@ -432,18 +448,16 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
     def test_dp_attention_allows_valid_dp_lm_head_combos(self):
         # attn_tp_size > 1 with enable_dp_lm_head=True
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=2,
+            attn_dp_size=2,
             enable_dp_lm_head=True,
         )
         self._apply(args)
 
         # attn_tp_size == 1 with enable_dp_lm_head=False
         args = self._args(
-            enable_dp_attention=True,
             tp_size=8,
-            dp_size=8,
+            attn_dp_size=8,
             enable_dp_lm_head=False,
         )
         self._apply(args)
@@ -585,7 +599,7 @@ class TestPrefillContextParallelValidation(CustomTestCase):
                 "bf16 KV cache fails in warmup for gpt-oss",
             ),
             (dict(speculative_algorithm="EAGLE3"), {}, "speculative decoding"),
-            (dict(enable_dp_attention=True, dp_size=8), {}, "DP attention"),
+            (dict(attn_dp_size=8), {}, "DP attention"),
             (dict(moe_dp_size=1), {}, "requires --moe-dp-size 8"),
             (dict(enable_torch_compile=False), {}, "requires --enable-torch-compile"),
             (dict(tpu_compile_tracer="direct"), {}, "requires --tpu-compile-tracer"),
@@ -667,6 +681,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     batched RPA backend implements; every other combination is refused by name."""
 
     def _args(self, **overrides):
+        _require_resolved_dp_layout(overrides)
         defaults = dict(
             attention_backend="pallas_tpu_rpa_batched",
             tp_size=8,
@@ -733,7 +748,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 dcp_size=1,
                 attention_backend="pallas_tpu_rpa_v3",
                 pp_size=2,
-                enable_dp_attention=True,
+                attn_dp_size=2,
                 enable_torch_compile=False,
             )
         )
@@ -766,9 +781,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
                 self._assert_refused("(?i)kv[-_ ]cache[-_ ]dtype", kv_cache_dtype=dtype)
 
     def test_refuses_dp_attention(self):
-        self._assert_refused(
-            "(?i)dp[-_ ]attention", enable_dp_attention=True, dp_size=2
-        )
+        self._assert_refused("(?i)dp[-_ ]attention", attn_dp_size=2)
 
     def test_refuses_prefill_context_parallelism(self):
         self._assert_refused(
@@ -878,7 +891,7 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         # The gate has to be wired into apply_server_args_defaults, or a bad
         # configuration reaches the model runner.
         platform = TpuSRTPlatform()
-        args = self._args(enable_dp_attention=True, dp_size=2, enable_dp_lm_head=True)
+        args = self._args(attn_dp_size=2, enable_dp_lm_head=True)
         with (
             patch("sglang_tpu.patches._prepare_tpu_env"),
             patch.dict(os.environ, {"SGLANG_TPU_REQ_TO_TOKEN_ON_HOST": "1"}),

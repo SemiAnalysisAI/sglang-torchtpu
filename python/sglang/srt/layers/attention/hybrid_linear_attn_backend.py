@@ -110,6 +110,25 @@ class MambaAttnBackendBase(AttentionBackend):
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
+    def commit_verified_states(
+        self,
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        src_indices_raw: Optional[torch.Tensor],
+    ) -> None:
+        """Commit each verified request's state at its last accepted token."""
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw=src_indices_raw,
+        )
+
     @property
     def mamba_chunk_size(self) -> int:
         if self._mamba_chunk_size is None:
@@ -1512,13 +1531,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
+        self.linear_attn_backend.commit_verified_states(
             mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
+            src_indices_raw,
         )
 
         self._update_ple_state_after_mtp_verify(

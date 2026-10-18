@@ -11,12 +11,27 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks.attn_residual import (
+    aggregate,
+    aggregate_fused_add,
+    prepare_attn_residual_kernel,
+    register_attn_residual_ops,
+)
+from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.mhc import (
+    hc_ffn_post_pre,
+    hc_post,
+    hc_pre,
+    register_mhc_ops,
+    wire_hc_ffn_post_pre,
+)
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +53,61 @@ HOOKS: list[tuple] = [
         skip_spec_op_precompile_without_draft,
         HookType.AROUND,
     ),
+    (
+        "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_worker",
+        select_experimental_spec_worker,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearModel.__init__",
+        register_attn_residual_ops,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        prepare_attn_residual_kernel,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.attn_residual._aggregate",
+        aggregate,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.layers.attn_residual._aggregate_fused_add",
+        aggregate_fused_add,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.__init__",
+        register_mhc_ops,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.layers.layer_boundary.residual.mhc.MHCState.__init__",
+        wire_hc_ffn_post_pre,
+        HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
+        hc_pre,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_ffn_post_pre",
+        hc_ffn_post_pre,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_post",
+        hc_post,
+        HookType.AROUND,
+    ),
 ]
 
 HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hook_specs())
 
 _registered = False
 

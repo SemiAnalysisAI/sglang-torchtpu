@@ -513,6 +513,49 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # One token with combine (bs=1 decode) on packed MXFP4: one kernel that
+    # streams only the hit experts (single_token_moe.py) replaces route
+    # metadata + two gmm_v2 calls + activation + combine. It reads topk_ids
+    # directly, so it does not depend on the permute path chosen below
+    # (permute_dense_threshold).
+    if m == 1 and not no_combine:
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas import single_token_moe
+
+        if (
+            tpu_envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.get()
+            and single_token_moe.validated(
+                hidden_size,
+                w1.shape[2] // 2,
+                global_num_experts or num_experts,
+                topk,
+                activation_name,
+            )
+            and single_token_moe.eligible(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                w1_channel_scale,
+                w2_channel_scale,
+            )
+        ):
+            return single_token_moe.single_token_moe(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_ids,
+                topk_weights,
+                offset=(expert_group_offset if global_num_experts > num_experts else 0),
+                act=_fuse_act_name(activation_name),
+                hidden_size=hidden_size,
+            ).astype(out_dtype)
+
     # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
     # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
     # Block size (32 MXFP4, 512 NVFP4) is data-driven from the scale.
@@ -547,6 +590,30 @@ def _fused_moe_jax(
         )
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
+
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
+        from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
+
+        # One kernel streaming the selected experts' weights; None outside its case.
+        out = maybe_moe_stream(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            use_group_offset=global_num_experts > num_experts,
+            w_quant_bits=w_quant_bits,
+        )
+        if out is not None:
+            return out
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
     # sublane tiling (16 for the bf16 activations this path runs on). Padding
@@ -606,9 +673,8 @@ def _fused_moe_jax(
         # argsort is stable enough on TPU for our usage; the gmm kernel
         # only cares about contiguous expert runs.
         argsort_idx = jnp.argsort(topk_ids_flat)
-        # Row-of-original-token for each sorted slot.
-        token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
-        sorted_token_ids = token_indices[argsort_idx]
+        # Slot i belongs to token i // topk; a divide avoids an XLA gather.
+        sorted_token_ids = (argsort_idx // topk).astype(jnp.int32)
 
         # gmm_v2 only reads and writes the rows of expert groups at or after
         # ``group_offset``, so this rank's routed-row window is all the permute

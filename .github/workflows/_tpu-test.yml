@@ -72,6 +72,12 @@ on:
         required: false
         type: string
         default: ""
+      # SGLANG_PLATFORM for the pods: tpu (mode A) or tpu_oot (mode B, the plugin
+      # platform). P/D runs accept only tpu.
+      platform:
+        required: false
+        type: string
+        default: tpu
       # Names this job. Nested two deep (nightly -> stage -> here) the Actions
       # sidebar shows ONLY this job's name per leg, so it must be the test; the
       # fallbacks cover callers whose suite already is the test.
@@ -157,6 +163,7 @@ jobs:
           IN_PARTITION_ID: ${{ inputs.partition_id }}
           IN_PARTITION_SIZE: ${{ inputs.partition_size }}
           IN_RUN_NAME: ${{ inputs.run_name }}
+          IN_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
           label="$IN_LABEL"
@@ -188,6 +195,7 @@ jobs:
             --partition-id "$IN_PARTITION_ID" \
             --partition-size "$IN_PARTITION_SIZE" \
             --name "$IN_RUN_NAME" \
+            --platform "$IN_PLATFORM" \
             --service-account "$TPU_CI_POD_KSA" \
             ${IN_NIGHTLY_FLAG:+"$IN_NIGHTLY_FLAG"} > /tmp/job.yaml
           echo "== rendered (key fields) =="
