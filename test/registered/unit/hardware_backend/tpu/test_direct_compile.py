@@ -232,6 +232,21 @@ def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     )
 
 
+class TestAuxHiddenStatePytree(CustomTestCase):
+    def test_aux_states_flatten_to_tensor_leaves_and_rebuild(self):
+        """An EAGLE3 target's (hidden, aux) output must reach direct_compile as
+        tensor leaves; an opaque list leaf fails its all-TPU-tensors check."""
+        hidden, first, second = torch.zeros(2), torch.ones(2), torch.full((2,), 2.0)
+        leaves, treespec = tree_util.tree_flatten(
+            (hidden, AuxHiddenStateList([first, second]))
+        )
+        self.assertEqual(len(leaves), 3)
+        self.assertTrue(all(isinstance(leaf, torch.Tensor) for leaf in leaves))
+        _, aux = tree_util.tree_unflatten(treespec, leaves)
+        self.assertIsInstance(aux, AuxHiddenStateList)
+        self.assertIs(aux[1], second)
+
+
 class TestDirectCompile(CustomTestCase):
     def test_cold_call_and_synchronous_mode_return_real_results(self):
         def compile_helper(fn, **kwargs):

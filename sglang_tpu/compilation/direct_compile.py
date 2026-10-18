@@ -135,10 +135,11 @@ tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
 # Pipeline stages exchange PPProxyTensors as the compiled input and output.
 register_pp_proxy_pytree(tree_util)
-# Models that return (hidden, aux) for EAGLE3/DFlash capture hand it out as-is.
+# EAGLE3 targets return their aux hidden states as this list subclass, which
+# tree_util would otherwise treat as one opaque leaf.
 tree_util.register_pytree_node(
     AuxHiddenStateList,
-    lambda aux: (list(aux), None),
+    lambda states: (list(states), None),
     lambda _, children: AuxHiddenStateList(children),
 )
 

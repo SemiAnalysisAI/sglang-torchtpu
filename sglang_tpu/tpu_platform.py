@@ -741,8 +741,12 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
+        # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
+        # weights have loaded (its binder runs post-load).
+        static_fp8_parts()
         cfg = resolving_view(server_args)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
@@ -1271,6 +1275,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
+        # Before the first collective and before torch.compile traces the model.
+        from sglang_tpu.twolevel_allreduce import register_from_parallel_state
+
+        register_from_parallel_state()
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration
