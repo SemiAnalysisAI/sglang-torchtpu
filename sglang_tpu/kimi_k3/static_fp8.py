@@ -120,12 +120,45 @@ class HostSplitUp(NamedTuple):
         return self.op(x, w.weight, w.out_scale, w.inv_x)
 
 
+# (hosts, ranks per host) the host split was measured on: tpu7x 2x2x4, TP32 =
+# 4 hosts x 8 ranks. Other shapes keep the replicated GEMVs until measured.
+VALIDATED_TOPOLOGIES = frozenset({(4, 8)})
+
+
+def _check_ranks_agree(enabled: bool) -> None:
+    """Every rank must take the same path: if one host missed the switch, its
+    ranks would keep the replicated GEMVs while the others wait in the host
+    barrier, and the first single-token decode would hang. Fail at startup
+    instead."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if world_group.world_size <= 1:
+        return
+    seen = [None] * world_group.world_size
+    dist.all_gather_object(seen, bool(enabled), group=world_group.cpu_group)
+    if len(set(seen)) > 1:
+        on = [rank for rank, flag in enumerate(seen) if flag]
+        raise RuntimeError(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV must be set the same on every "
+            f"rank; it is on for ranks {on} only."
+        )
+
+
 def _host_split_layout() -> Optional[tuple[int, int, int]]:
     """(world, ranks per host, this rank's host-local index) when the host
-    split applies, else None."""
+    split applies, else None. Called once per process from bind_static_fp8,
+    on every rank that selected static fp8 parts (all of them when the switch
+    is on: static_fp8_parts requires moe_front and latent_up)."""
     from sglang_tpu.envs import envs as tpu_envs
 
-    if not tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.get():
+    enabled = tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.get()
+    _check_ranks_agree(enabled)
+    if not enabled:
         return None
     import torch.distributed as dist
 
@@ -135,18 +168,32 @@ def _host_split_layout() -> Optional[tuple[int, int, int]]:
     )
     from sglang.srt.runtime_context import get_server_args
 
+    server_args = get_server_args()
     world = get_tensor_model_parallel_world_size()
-    nnodes = get_server_args().nnodes
+    nnodes = server_args.nnodes
     # TP spanning the world is host-major, with world / nnodes ranks per host.
-    if world != dist.get_world_size() or world % nnodes or world // nnodes <= 1:
+    if (
+        world != dist.get_world_size()
+        or world % nnodes
+        or (nnodes, world // nnodes) not in VALIDATED_TOPOLOGIES
+    ):
         logger.warning(
             "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but TP %d over %d hosts "
-            "is not a host-major group spanning the world; the GEMVs stay "
-            "replicated.",
+            "is not a measured host-major topology spanning the world (hosts, "
+            "ranks per host in %s); the GEMVs stay replicated.",
             world,
             nnodes,
+            sorted(VALIDATED_TOPOLOGIES),
         )
         return None
+    compile_bs = server_args.tpu_compile_bs
+    if compile_bs and 1 not in compile_bs:
+        logger.warning(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but the TPU compile "
+            "batch sizes %s have no batch size 1, so no compiled decode step "
+            "takes the host-split GEMVs.",
+            compile_bs,
+        )
     local = world // nnodes
     return world, local, get_tensor_model_parallel_rank() % local
 

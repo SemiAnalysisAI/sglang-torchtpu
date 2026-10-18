@@ -462,7 +462,7 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
             with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all"):
                 self.assertIn("latent_up", static_fp8_parts())
 
-    def _layout(self, world, nnodes, rank=13, world_size=None):
+    def _layout(self, world, nnodes, rank=13, world_size=None, compile_bs=None):
         from sglang_tpu.kimi_k3 import static_fp8 as sf
 
         with (
@@ -482,19 +482,21 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_server_args",
-                return_value=mock.Mock(nnodes=nnodes),
+                return_value=mock.Mock(nnodes=nnodes, tpu_compile_bs=compile_bs),
             ),
         ):
             return sf._host_split_layout()
 
     def test_layout_from_hosts(self):
         self.assertEqual(self._layout(32, 4), (32, 8, 5))  # tpu7x 2x2x4, TP32
-        self.assertEqual(self._layout(8, 1), (8, 8, 5))  # one host
 
     def test_layout_off_for_other_groups(self):
         from sglang_tpu.kimi_k3 import static_fp8 as sf
 
-        for world, nnodes, world_size in ((32, 3, 32), (32, 32, 32), (16, 2, 32)):
+        # Not host-major spanning the world, or not a measured topology (one
+        # host, or 8 hosts x 8 ranks).
+        cases = ((32, 3, 32), (32, 32, 32), (16, 2, 32), (8, 1, 8), (64, 8, 64))
+        for world, nnodes, world_size in cases:
             with self.subTest(world=world, nnodes=nnodes, world_size=world_size):
                 with self.assertLogs(sf.logger, "WARNING"):
                     self.assertIsNone(
@@ -516,6 +518,31 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
             for alias in node.names
         ]
         self.assertNotIn("annotations", future)
+
+    def test_warns_without_compile_bs_1(self):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
+
+        with self.assertLogs(sf.logger, "WARNING") as logs:
+            self.assertEqual(self._layout(32, 4, compile_bs=[2, 4]), (32, 8, 5))
+        self.assertIn("no batch size 1", "\n".join(logs.output))
+
+    def test_ranks_must_agree_on_the_switch(self):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
+
+        def gather(seen, flag, group=None):
+            seen[:] = [flag, flag, not flag, flag]
+
+        world_group = mock.Mock(world_size=4, cpu_group=None)
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=world_group,
+            ),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"ranks \[0, 1, 3\]"):
+                sf._check_ranks_agree(True)
 
     def test_split_ranks_needs_128_multiples(self):
         from sglang_tpu.kimi_k3 import static_fp8 as sf

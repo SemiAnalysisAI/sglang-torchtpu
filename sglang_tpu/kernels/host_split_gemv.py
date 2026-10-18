@@ -85,7 +85,8 @@ def _kernel(*refs, nk, local, cols, used, has_router, used_e, has_rest):
     def _():
         y = (acc[0:1, :] * s_ref[...]).astype(gat_out.dtype)
         rows = cols // 128
-        packed[...] = jnp.zeros_like(packed)
+        # The alignment gap rows are sent but never read back, so they are
+        # left unwritten.
         packed[0:rows, :] = y[:, :cols].reshape(rows, 128)
         if has_router:
             off = -(-rows // _ALIGN_ROWS) * _ALIGN_ROWS
