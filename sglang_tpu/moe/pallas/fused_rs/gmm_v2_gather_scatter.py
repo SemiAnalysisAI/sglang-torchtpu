@@ -332,8 +332,13 @@ def inner_kernel(
             rhs_scale = tiled_rhs_ref.get_scale()
             if rhs_scale.ndim == 2:
                 # Compact [num_quant_blocks, n] tile (fused-RS 3D scale layout).
-                return rhs_scale[b_id : b_id + 1, start_n:end_n]
-            return rhs_scale[..., b_id, :, start_n:end_n]
+                scale = rhs_scale[b_id : b_id + 1, start_n:end_n]
+            else:
+                scale = rhs_scale[..., b_id, :, start_n:end_n]
+            # e4m3 block scales (NVFP4 with separate globals) widen on use.
+            if scale.dtype == jnp.float8_e4m3fn:
+                scale = scale.astype(jnp.float32)
+            return scale
 
         def _online_quantize(block, axis, quant_dtype):
             if jnp.issubdtype(quant_dtype, jnp.floating):

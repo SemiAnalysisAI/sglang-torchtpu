@@ -73,6 +73,10 @@ SMALL = dict(
     wo_s=11,
     wpool_s=12,
     wunpool_s=13,
+    # NVFP4 per-expert global scales (scale_fp8): gate in lanes [0, Ep), up in [Ep, 2 Ep)
+    expert_gs=14,
+    # and down in lanes [0, Ep)
+    expert_gs_down=15,
 )
 SMALL_ROWS = 16
 
@@ -121,6 +125,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # exact fp8 block-diagonal dot on just those rows, padded up to the next power of two;
     # busier experts dequantize to bf16 for all rows
     compact_rows: int = 8
+    # fp4 experts carry e4m3 block scales plus per-expert globals (smalls rows expert_gs*)
+    # instead of bf16 scales with the globals folded in
+    scale_fp8: bool = False
     # K chunk of the block-diagonal dot; 128-256 beat 512 at 2-8 rows
     blockdiag_kc: int = 256
     # in a step of at most few_rows_max rows (n_req * rows_per_req), the o-proj all-reduce is one
@@ -138,6 +145,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
     kv_packed: bool = False
+    # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
+    # expert is done, overlapping y_rs with the rest of the expert loop
+    y_early: bool = False
     vmem_limit_bytes: int = 60 * 2**20
 
     @property
@@ -311,16 +321,20 @@ def _dequant_fp4(words, scale):
 
 def _fp4_dot(x, wslot, sslot, K, N, chunk_words):
     kw = K // FP4_PACK
-    acc = None
+    gq = chunk_words * FP4_PACK // FP4_GROUP
+    # e4m3 scales tile 32 rows per sublane group: read whole tiles, slice them as f32
+    srows = 32 if sslot.dtype == jnp.float8_e4m3fn and gq < 32 else 0
+    acc = sblk = None
     for c in range(0, kw, chunk_words):
         cw = min(chunk_words, kw - c)
-        w = _dequant_fp4(
-            wslot[pl.ds(c, cw), pl.ds(0, N)],
-            sslot[
-                pl.ds(c * FP4_PACK // FP4_GROUP, cw * FP4_PACK // FP4_GROUP),
-                pl.ds(0, N),
-            ],
-        )
+        g0, gn = c * FP4_PACK // FP4_GROUP, cw * FP4_PACK // FP4_GROUP
+        if srows:
+            if g0 % srows == 0:
+                sblk = sslot[pl.ds(g0, srows), pl.ds(0, N)].astype(jnp.float32)
+            sc = sblk[g0 % srows : g0 % srows + gn]
+        else:
+            sc = sslot[pl.ds(g0, gn), pl.ds(0, N)]
+        w = _dequant_fp4(wslot[pl.ds(c, cw), pl.ds(0, N)], sc)
         part = jnp.dot(
             x[:, c * FP4_PACK : (c + cw) * FP4_PACK].astype(jnp.bfloat16),
             w,
@@ -347,7 +361,9 @@ def _fp4_blockdiag_dot(xc, wslot, sslot, K, N, kc):
         jax.lax.broadcasted_iota(jnp.int32, (rows, kc), 0) % gpc
         == jax.lax.broadcasted_iota(jnp.int32, (rows, kc), 1) // FP4_GROUP
     )
-    acc = None
+    # e4m3 scales tile 32 rows per sublane group: read whole tiles, slice them as f32
+    srows = 32 if sslot.dtype == jnp.float8_e4m3fn and gpc < 32 else gpc
+    acc = sblk = None
     for c0 in range(0, K, kc):
         xs = xc[:, c0 : c0 + kc]
         lhs = jnp.where(
@@ -357,7 +373,10 @@ def _fp4_blockdiag_dot(xc, wslot, sslot, K, N, kc):
             wslot[pl.ds(c0 // FP4_PACK, kc // FP4_PACK), pl.ds(0, N)], jnp.float4_e2m1fn
         ).astype(jnp.float8_e4m3fn)
         res = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
-        s = sslot[pl.ds(c0 // FP4_GROUP, gpc), pl.ds(0, N)].astype(jnp.float32)
+        g0 = c0 // FP4_GROUP
+        if g0 % srows == 0:
+            sblk = sslot[pl.ds(g0, srows), pl.ds(0, N)].astype(jnp.float32)
+        s = sblk[g0 % srows : g0 % srows + gpc]
         part = res * (jnp.concatenate([s] * A, axis=0) if A > 1 else s)
         acc = part if acc is None else acc + part
     return jnp.concatenate(
@@ -632,6 +651,41 @@ class _Coll:
 
         return pad
 
+    def row_copy(self, kind, send_ref, r, rows_per):
+        """Row ``r`` of ``send_ref`` to its reduce-scatter owner ``r // rows_per``."""
+        owner = r // rows_per
+        return owner, self._copy(
+            kind,
+            send_ref.at[pl.ds(r, 1)],
+            self.pads[kind].at[self.me, pl.ds(r - owner * rows_per, 1)],
+            owner,
+        )
+
+    def reduce_scatter_rows_finish(self, kind, send_ref, rows_per, n_live):
+        """``reduce_scatter_rows`` whose remote rows were already started one by one
+        (``row_copy``, every row of every live owner exactly once): wait for them."""
+        pad = self.pads[kind]
+        my_live = self.me * rows_per < n_live
+
+        @pl.when(my_live)
+        def _():
+            pad[self.me] = send_ref[pl.ds(pl.multiple_of(self.me * rows_per, rows_per), rows_per)]
+
+        for r in range(self.tp * rows_per):
+            owner, cp = self.row_copy(kind, send_ref, r, rows_per)
+
+            @pl.when((owner != self.me) & (owner * rows_per < n_live))
+            def _(cp=cp):
+                cp.wait_send()
+
+        @pl.when(my_live)
+        def _():
+            _, cp = self.row_copy(kind, send_ref, 0, rows_per)
+            for _ in range((self.tp - 1) * rows_per):
+                cp.wait_recv()
+
+        return pad
+
     def reduce_scatter_cols(self, kind, src_ref, width):
         """``src_ref [R, tp*width]`` f32: device m receives everyone's columns ``[m*width, ...)``."""
         pad = self.pads[kind]
@@ -680,6 +734,7 @@ def scratch_plan(cfg: MKConfig):
     w13_words = He // FP4_PACK
     w2_words = Il // FP4_PACK
     cpt = c.chunk_pages * c.page_size
+    sdt = jnp.float8_e4m3fn if c.scale_fp8 else jnp.bfloat16
     items = [
         (
             "ring",
@@ -687,9 +742,9 @@ def scratch_plan(cfg: MKConfig):
         ),  # dense weight stream
         ("ring_sems", pltpu.SemaphoreType.DMA((c.ring_slots,))),
         ("w13", pltpu.VMEM((nslot, w13_words, 2 * Il), jnp.uint32)),
-        ("w13s", pltpu.VMEM((nslot, He // FP4_GROUP, 2 * Il), jnp.bfloat16)),
+        ("w13s", pltpu.VMEM((nslot, He // FP4_GROUP, 2 * Il), sdt)),
         ("w2", pltpu.VMEM((nslot, w2_words, He), jnp.uint32)),
-        ("w2s", pltpu.VMEM((nslot, max(Il // FP4_GROUP, 16), He), jnp.bfloat16)),
+        ("w2s", pltpu.VMEM((nslot, max(Il // FP4_GROUP, 16), He), sdt)),
         ("w13_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w13s_sems", pltpu.SemaphoreType.DMA((nslot,))),
         ("w2_sems", pltpu.SemaphoreType.DMA((nslot,))),
@@ -737,6 +792,12 @@ def scratch_plan(cfg: MKConfig):
         ("ids_s", pltpu.SMEM((R, LANE), jnp.int32)),
         ("ids_sem", pltpu.SemaphoreType.DMA((1,))),
         ("seen", pltpu.SMEM((c.n_experts_padded,), jnp.int32)),
+        # y_early: each row's last expert (index into uniq), and the rows grouped by it:
+        # rows done at u are dn_rows[dn_end[u] - dn_cnt[u] : dn_end[u]]
+        ("row_done", pltpu.SMEM((R,), jnp.int32)),
+        ("dn_cnt", pltpu.SMEM((R * K + 8,), jnp.int32)),
+        ("dn_end", pltpu.SMEM((R * K + 8,), jnp.int32)),
+        ("dn_rows", pltpu.SMEM((R,), jnp.int32)),
         # collective pads: bf16 pairs packed into u32 (_pack_bf16x2)
         ("pad_o_rs", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
         ("pad_o_ag", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
@@ -750,6 +811,14 @@ def scratch_plan(cfg: MKConfig):
         ("coll_ssems", pltpu.SemaphoreType.DMA((8,))),
         ("coll_rsems", pltpu.SemaphoreType.DMA((8,))),
     ]
+    if c.scale_fp8:
+        items += [
+            # the fp8 layers' bf16 channel scales, which the e4m3 slabs cannot hold
+            ("w13c", pltpu.VMEM((nslot, 2, 2 * Il), jnp.bfloat16)),
+            ("w2c", pltpu.VMEM((nslot, 2, He), jnp.bfloat16)),
+            ("gs_s", pltpu.SMEM((2, 2 * c.n_experts_padded), jnp.float32)),
+            ("gs_sem", pltpu.SemaphoreType.DMA((1,))),
+        ]
     return items
 
 
@@ -1347,10 +1416,42 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 return carry
 
             jax.lax.fori_loop(0, n_live * K, place, 0)
+            if c.y_early:
+                # rows past n_live (sent only for a partly live owner) go with the last expert
+                for r in range(R):
+                    S["row_done"][r] = jnp.where(r < n_live, 0, jnp.maximum(n_u - 1, 0))
+
+                def last_use(slot, carry):
+                    r = slot // K
+                    u = S["ex_of"][S["ids_s"][r, slot % K]]
+                    S["row_done"][r] = jnp.maximum(S["row_done"][r], u)
+                    return carry
+
+                jax.lax.fori_loop(0, n_live * K, last_use, 0)
+
+                def zero(u, carry):
+                    S["dn_cnt"][u] = 0
+                    return carry
+
+                jax.lax.fori_loop(0, jnp.maximum(n_u, 1), zero, 0)
+                for r in range(R):
+                    d = S["row_done"][r]
+                    S["dn_cnt"][d] = S["dn_cnt"][d] + 1
+
+                def ends(u, off):
+                    S["dn_end"][u] = off
+                    return off + S["dn_cnt"][u]
+
+                jax.lax.fori_loop(0, jnp.maximum(n_u, 1), ends, 0)
+                for r in range(R):
+                    d = S["row_done"][r]
+                    S["dn_rows"][S["dn_end"][d]] = r
+                    S["dn_end"][d] = S["dn_end"][d] + 1
             return n_u
 
         def moe(l, ffn_in32, sm, kind, nxt):
             ffn_in = ffn_in32.astype(jnp.bfloat16)
+            Rc = c.rows_per_dev
             # pooler (column-parallel by TP rank) first: its gather flies during routing
             with _scope("pool_mv"):
                 pooled = (
@@ -1391,6 +1492,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 W2 = S["w2"].reshape(nslot, Il // 4, He)
             depth = nslot - 1
             base = 4 * l if isinstance(l, int) else None
+            # scale slabs: e4m3 block scales (fp4, scale_fp8) or bf16 (fp4 folded, fp8 channel)
+            chan = c.scale_fp8 and kind != "fp4"
+            S13 = S["w13c"] if chan else S["w13s"]
+            S2 = S["w2c"] if chan else S["w2s"]
+            gscale = c.scale_fp8 and kind == "fp4"
+            if gscale:
+                gs_copy = pltpu.make_async_copy(
+                    W["smalls"].at[l, pl.ds(SMALL["expert_gs"], 2), pl.ds(0, 2 * Ep)],
+                    S["gs_s"],
+                    S["gs_sem"].at[0],
+                )
+                gs_copy.start()
 
             def ex_refs(li):
                 return [EX[4 * li + j] for j in range(4)]
@@ -1404,7 +1517,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     (
                         (W13, S["w13_sems"], kw13, 2 * Il, False),
                         (
-                            S["w13s"],
+                            S13,
                             S["w13s_sems"],
                             He // FP4_GROUP if kind == "fp4" else 2,
                             2 * Il,
@@ -1412,7 +1525,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         ),
                         (W2, S["w2_sems"], kw2, He, False),
                         (
-                            S["w2s"],
+                            S2,
                             S["w2s_sems"],
                             Il // FP4_GROUP if kind == "fp4" else 2,
                             He,
@@ -1468,7 +1581,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 for dst, sem, rows_, cols, j in (
                     (W13, S["w13_sems"], kw13, 2 * Il, 0),
                     (
-                        S["w13s"],
+                        S13,
                         S["w13s_sems"],
                         He // FP4_GROUP if kind == "fp4" else 2,
                         2 * Il,
@@ -1476,7 +1589,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     ),
                     (W2, S["w2_sems"], kw2, He, 2),
                     (
-                        S["w2s"],
+                        S2,
                         S["w2s_sems"],
                         Il // FP4_GROUP if kind == "fp4" else 2,
                         He,
@@ -1544,12 +1657,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         gu = _fp8_dot(
                             x_full,
                             W13.at[slot],
-                            S["w13s"][slot, 0:1, pl.ds(0, 2 * Il)].astype(jnp.float32),
+                            S13[slot, 0:1, pl.ds(0, 2 * Il)].astype(jnp.float32),
                             He,
                             2 * Il,
                             c.fp4_chunk_words,
                         )
                     gate, up = gu[:, :Il], gu[:, Il:]
+                    if gscale:
+                        gate, up = gate * S["gs_s"][0, e], up * S["gs_s"][0, Ep + e]
                     h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
                     if kind == "fp4":
                         y = _fp4_dot(
@@ -1564,11 +1679,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         y = _fp8_dot(
                             h,
                             W2.at[slot],
-                            S["w2s"][slot, 0:1, :].astype(jnp.float32),
+                            S2[slot, 0:1, :].astype(jnp.float32),
                             Il,
                             He,
                             min(Il // 4, 32),
                         )
+                    if gscale:
+                        y = y * S["gs_s"][1, e]
                     # slot space: row r, slot k gets y[r] where ids[r, k] == e
                     with _scope("ex_accum"):
                         S["ysend"][...] = jnp.where(
@@ -1589,12 +1706,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         xc, W13.at[slot], S["w13s"].at[slot], He, 2 * Il, c.blockdiag_kc
                     )
                     gate, up = gu[:, :Il], gu[:, Il:]
+                    if gscale:
+                        gate, up = gate * S["gs_s"][0, e], up * S["gs_s"][0, Ep + e]
                     h = (gate * jax.nn.sigmoid(gate) * up).astype(jnp.bfloat16)
-                    yp = _pack_bf16x2(
-                        _fp4_blockdiag_dot(
-                            h, W2.at[slot], S["w2s"].at[slot], Il, He, c.blockdiag_kc
-                        )
+                    yc = _fp4_blockdiag_dot(
+                        h, W2.at[slot], S["w2s"].at[slot], Il, He, c.blockdiag_kc
                     )
+                    yp = _pack_bf16x2(yc * S["gs_s"][1, e] if gscale else yc)
                     for j, p in enumerate(pairs):
 
                         @pl.when(j < cnt)
@@ -1614,14 +1732,31 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     pl.when(cnt > c.compact_rows)(full_expert)
                 else:
                     full_expert()
+                if c.y_early:
+
+                    def send_row(t, carry):
+                        r = S["dn_rows"][S["dn_end"][i] - S["dn_cnt"][i] + t]
+                        owner, cp = coll.row_copy("y", S["ysend"], r, Rc)
+
+                        @pl.when((owner != me) & (owner * Rc < n_live))
+                        def _():
+                            cp.start()
+
+                        return carry
+
+                    jax.lax.fori_loop(0, S["dn_cnt"][i], send_row, 0)
                 return carry
 
+            if gscale:
+                gs_copy.wait()
             with _scope("experts"):
                 jax.lax.fori_loop(0, n_u, ebody, 0)
             # ---- token-sharded reduce of the per-rank partials, then norm + combine
-            Rc = c.rows_per_dev
             with _scope("y_rs"):
-                pad = coll.reduce_scatter_rows("y", S["ysend"], Rc, n_live)
+                if c.y_early:
+                    pad = coll.reduce_scatter_rows_finish("y", S["ysend"], Rc, n_live)
+                else:
+                    pad = coll.reduce_scatter_rows("y", S["ysend"], Rc, n_live)
             with _scope("combine"):
                 ysum = _unpack_bf16x2(pad[0])
                 for d in range(1, c.tp):

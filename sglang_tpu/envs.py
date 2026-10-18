@@ -63,6 +63,12 @@ class TpuEnvs:
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
+    # per-expert global scales after each dot: half the scale bytes of folded bf16.
+    SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
+    # soon as the row's last expert is done (MKConfig.y_early).
+    SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

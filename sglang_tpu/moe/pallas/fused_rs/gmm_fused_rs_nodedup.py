@@ -1623,7 +1623,7 @@ def gmm_v2_fused_rs(
         # every expert's scales on each call (group-16 scales are large).
         scale_dtype = (
             w1_scale.dtype
-            if w1_scale.dtype in (jnp.bfloat16, jnp.float32)
+            if w1_scale.dtype in (jnp.bfloat16, jnp.float32, jnp.float8_e4m3fn)
             else jnp.dtype(jnp.float32)
         )
         w1_scale = w1_scale.astype(scale_dtype)

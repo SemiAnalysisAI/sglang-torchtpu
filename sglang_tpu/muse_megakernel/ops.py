@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, kv_pack_heads
 from sglang_tpu.muse_megakernel import kernel as K
 
@@ -120,6 +121,7 @@ class MuseMegakernel(torch.nn.Module):
         tp_rank: int,
         max_rows: int,
         max_position: int,
+        scale_fp8: bool,
     ) -> None:
         super().__init__()
         self.geo = geo
@@ -127,6 +129,7 @@ class MuseMegakernel(torch.nn.Module):
         self.tp_size = tp_size
         self.max_rows = max_rows
         self.max_position = max_position
+        self.scale_fp8 = scale_fp8
         self.chunk_pages = _CHUNK_PAGES
         # the pools' layout: SGLANG_TPU_KV_PACK_HEADS stores the rank's heads in one row
         self.kv_packed = (
@@ -176,6 +179,11 @@ class MuseMegakernel(torch.nn.Module):
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
         experts, kinds = [], []
+        # e4m3 NVFP4 block scales come with per-expert globals (SGLANG_TPU_NVFP4_E4M3_SCALES)
+        scale_fp8 = any(
+            layer.mlp.experts.w13_weight_scale.dtype == torch.float8_e4m3fn
+            for layer in decoder.layers
+        )
         for layer in decoder.layers:
             attn, moe = layer.self_attn, layer.mlp
             if layer.post_attention_layernorm.weight is not None:
@@ -214,6 +222,12 @@ class MuseMegakernel(torch.nn.Module):
             sm[S["expert_bias"], :Ep] = K.NEG
             sm[S["expert_bias"], : geo.n_experts] = moe.e_score_correction_bias.float()
             sm[S["post_expert_w"], : geo.expert_hidden] = moe.post_expert_norm.gain()
+            if scale_fp8 and moe.experts.w13_weight_scale.dtype == torch.float8_e4m3fn:
+                E = geo.n_experts
+                gs13 = moe.experts._tpu_w13_global_scale
+                sm[S["expert_gs"], :E] = gs13[:, 0]
+                sm[S["expert_gs"], Ep : Ep + E] = gs13[:, 1]
+                sm[S["expert_gs_down"], :E] = moe.experts._tpu_w2_global_scale
             # fp8 e4m3 dense copies with per-output-channel scales (the router stays bf16).
             for name, mats in (
                 ("wqkvg", qkvg),
@@ -269,6 +283,7 @@ class MuseMegakernel(torch.nn.Module):
             tp_rank=parallel.tp_rank,
             max_rows=max_rows,
             max_position=rope_tab.shape[0],
+            scale_fp8=scale_fp8,
         )
         _INSTANCE[:] = [mk]
         _register_op()
@@ -318,6 +333,9 @@ class MuseMegakernel(torch.nn.Module):
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
             chunk_pages=self.chunk_pages,
             kv_packed=self.kv_packed,
+            scale_fp8=self.scale_fp8,
+            # measured a loss at 32 rows, where the expert loop is compute-bound
+            y_early=tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16,
         )
         # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
         # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
