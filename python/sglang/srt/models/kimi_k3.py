@@ -690,6 +690,10 @@ class KimiK3MoE(nn.Module):
         self._static_fp8_front = None
         self._static_fp8_front_split: Optional[List[int]] = None
         self._static_fp8_latent_up = None
+        # Single-token variants of the front (with the router gate) and latent
+        # up-proj, split across the ranks of a host (TPU plugin); None = off.
+        self._host_split_front = None
+        self._host_split_latent_up = None
 
         # Static eligibility for fusing the latent all-reduce with the RMSNorm
         # epilogue (SGLANG_K3_AR_FUSION): kernel needs latent == NORM_DIM and
@@ -1120,7 +1124,13 @@ class KimiK3MoE(nn.Module):
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
         static_front = None
-        if self._static_fp8_front is not None and hidden_states.shape[0] > 0:
+        router_logits = None
+        if self._host_split_front is not None and hidden_states.shape[0] == 1:
+            latent_in, router_logits, shared_gate_up = self._host_split_front(
+                hidden_states
+            )
+            static_front = (latent_in, shared_gate_up)
+        elif self._static_fp8_front is not None and hidden_states.shape[0] > 0:
             static_front = torch.split(
                 self._static_fp8_front(hidden_states),
                 self._static_fp8_front_split,
@@ -1236,7 +1246,8 @@ class KimiK3MoE(nn.Module):
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
-            router_logits = self.gate(hidden_states)
+            if router_logits is None:
+                router_logits = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1301,7 +1312,9 @@ class KimiK3MoE(nn.Module):
             else:
                 latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
-            if self._static_fp8_latent_up is not None:
+            if self._host_split_latent_up is not None and latent.shape[0] == 1:
+                out = self._host_split_latent_up(latent)
+            elif self._static_fp8_latent_up is not None:
                 out = self._static_fp8_latent_up(latent)
             else:
                 out, _ = self.routed_expert_up_proj(latent)

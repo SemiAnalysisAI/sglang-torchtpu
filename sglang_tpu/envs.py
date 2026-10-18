@@ -29,6 +29,11 @@ class TpuEnvs:
     # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
     # (kernels/static_fp8_gemv.py); False keeps the XLA fp8 dot for every batch.
     SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
+    # Kimi-K3 single-token decode: split the replicated latent down / up-proj
+    # and router gate GEMVs by output columns across the ranks of a host and
+    # exchange the columns inside the host (host_split_gemv.py). Needs
+    # SGLANG_TPU_K3_STATIC_FP8 moe_front and latent_up (checked at startup).
+    SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV = EnvBool(False)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
