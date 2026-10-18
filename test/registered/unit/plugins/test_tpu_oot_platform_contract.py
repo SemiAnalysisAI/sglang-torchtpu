@@ -337,6 +337,11 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             prepare_attn_residual_kernel,
             register_attn_residual_ops,
         )
+        from sglang_tpu.hooks.moe_topk import (
+            biased_grouped_topk,
+            biased_topk,
+            register_router_topk,
+        )
         from sglang_tpu.hooks.pipeline_parallel import (
             check_pipeline_parallel_compat,
             skip_spec_op_precompile_without_draft,
@@ -364,6 +369,30 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             (
                 "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
                 skip_spec_op_precompile_without_draft,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.TopK.__init__",
+                register_router_topk,
+                HookType.AFTER,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_topk_impl",
+                biased_topk,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.layers.moe.topk.biased_grouped_topk_impl",
+                biased_grouped_topk,
                 HookType.AROUND,
             ),
             HOOKS,
