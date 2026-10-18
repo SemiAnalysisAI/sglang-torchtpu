@@ -63,7 +63,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.spec_common import adjust_verify_logits
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -89,6 +88,7 @@ from sglang_tpu.experimental.speculative.chain_verifier import ChainVerifier
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
+    apply_verify_logit_bias,
     build_verify_tokens,
     live_result_rows,
     pad_state_rows,
@@ -214,6 +214,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        self._warmup_verify_logit_bias()
         # A PD prefill server never verifies, so its mamba pool has no checkpoints.
         if (
             self._target_has_linear_attn
@@ -799,6 +800,18 @@ class TpuSpecWorker(BaseSpecWorker):
         logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(self.device)
         return logits if rows == cap else logits[:rows]
 
+    def _warmup_verify_logit_bias(self) -> None:
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        for pbs in self._b_bucketer().buckets:
+            warmup_compiled_op(
+                apply_verify_logit_bias,
+                torch.zeros(
+                    (pbs * self.num_verify_rows, vocab_size), device=self.device
+                ),
+                torch.zeros((pbs, vocab_size), device=self.device),
+                self.num_verify_rows,
+            )
+
     def _sampling_param_warmup_args(
         self, padded_bs: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1081,11 +1094,11 @@ class TpuSpecWorker(BaseSpecWorker):
             skip_attn_backend_init=False,
         )
         logits_output = target_out.logits_output
-        adjust_verify_logits(
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=batch.sampling_info,
-            draft_token_num=self.num_verify_rows,
-        )
+        bias = batch.sampling_info.device_logit_bias(bucket_state.seq_lens.shape[0])
+        if bias is not None:
+            logits_output.next_token_logits = apply_verify_logit_bias(
+                logits_output.next_token_logits, bias, self.num_verify_rows
+            )
         return logits_output
 
     @staticmethod
@@ -1163,17 +1176,14 @@ class TpuSpecWorker(BaseSpecWorker):
         # Their per-request device state is not bucket-padded, so filter/merge
         # would compile per batch-size pair.
         if (
-            sampling_info.logit_bias is not None
-            or sampling_info.acc_additive_penalties is not None
+            sampling_info.acc_additive_penalties is not None
             or sampling_info.acc_scaling_penalties is not None
             or (
                 sampling_info.penalizer_orchestrator is not None
                 and sampling_info.penalizer_orchestrator.is_required
             )
         ):
-            raise NotImplementedError(
-                "TpuSpecWorker does not support penalties or logit_bias."
-            )
+            raise NotImplementedError("TpuSpecWorker does not support penalties.")
         # The sort-based target filter keeps different boundary ties than the
         # verify filter, so filtered sampling needs the sort-free path on both.
         if not self._bsearch_filtering and any(

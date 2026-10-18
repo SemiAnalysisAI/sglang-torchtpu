@@ -95,6 +95,14 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             if (value := getattr(self, name)) is not None
         }
 
+    def device_logit_bias(self, rows: int) -> torch.Tensor | None:
+        """Upload live bias rows at the forward's physical bucket, with neutral padding."""
+        if self.logit_bias is None:
+            return None
+        return _pad_host_rows(
+            self.logit_bias, rows, 0.0, is_pin_memory_available(self.device)
+        ).to(self.device, non_blocking=True)
+
     def on_device(self) -> SamplingBatchInfo:
         """This info with the sampling param tensors on self.device; HOST_PADDED keeps its bucket rows."""
         moved = {
@@ -102,4 +110,6 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             for name in _PARAM_FILLS
             if (value := getattr(self, name)) is not None
         }
-        return dataclasses.replace(self, **moved)
+        return dataclasses.replace(
+            self, logit_bias=self.device_logit_bias(self.temperatures.shape[0]), **moved
+        )
