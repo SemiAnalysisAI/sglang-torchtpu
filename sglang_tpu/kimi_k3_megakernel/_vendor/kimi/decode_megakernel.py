@@ -5229,6 +5229,7 @@ def decode_local(
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    rank=None,  # SGLANG-PATCH: see below.
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5257,7 +5258,11 @@ def decode_local(
     aux_hidden_layers = tuple(aux_hidden_layers)
 
     # Compose true-batched layer primitives without the batch-one fused stack.
-    rank = jax.lax.axis_index("tp")
+    # SGLANG-PATCH: a caller may pass this device's rank as a traced value.
+    # axis_index outside pallas_call emits stablehlo.partition_id, which
+    # torch_tpu's export bridge cannot partition a second time.
+    if rank is None:
+        rank = jax.lax.axis_index("tp")
     vocabulary = weights["embedding"].shape[0]
 
     if batched_decoder_boundaries:

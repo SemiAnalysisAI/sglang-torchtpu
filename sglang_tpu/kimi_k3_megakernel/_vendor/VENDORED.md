@@ -63,3 +63,9 @@ In commit order:
    ownership), and every position read is clamped to 0 so cache reads and
    writes stay in bounds. Padding rows are never owned by a request, so their
    state contents do not matter.
+7. **Caller-supplied rank** (`kimi/decode_megakernel.py`). `decode_local`
+   takes an optional `rank`. Its own `jax.lax.axis_index("tp")` sits outside
+   `pallas_call` and lowers to `stablehlo.partition_id`, which torch_tpu's
+   export bridge partitions a second time and crashes on. SGLang passes each
+   device's rank as a traced value read from a `P("tp")`-sharded operand, so
+   the replicated token operand holds the same values on every device.
