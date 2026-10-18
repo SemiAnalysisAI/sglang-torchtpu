@@ -592,7 +592,7 @@ def _attention_kernel(
 
             if prev_out is not None:
                 # Artificial dependency to force MXU/VPU interleaving by limiting
-                # the compiler's QK runahead
+                # LLO's QK runahead
                 # We use jnp.where to prevent XLA from optimizing the dependency away.
                 # prev_out won't be inf in practice.
                 bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
