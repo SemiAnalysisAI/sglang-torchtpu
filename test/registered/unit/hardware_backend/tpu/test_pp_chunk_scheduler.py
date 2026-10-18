@@ -27,13 +27,36 @@ from sglang.test.test_utils import published_topology
 from sglang_tpu import pp_chunk_scheduler, pp_profile
 from sglang_tpu.pp_chunk_scheduler import (
     TpuPipelinePrefillAdder,
-    pending_step_limit,
-    profile_and_install_cost_model,
+)
+from sglang_tpu.pp_chunk_scheduler import pending_step_limit as _pending_step_limit
+from sglang_tpu.pp_chunk_scheduler import (
+    profile_cost_model,
 )
 from sglang_tpu.pp_chunks import StepCostModel
 
 
 @pytest.fixture(autouse=True)
+def pending_step_limit(scheduler):
+    return _pending_step_limit(
+        cost=scheduler._tpu_pp_chunk_cost,
+        cached_prefix=scheduler._tpu_pp_cached_prefix,
+        waiting_queue=scheduler.waiting_queue,
+        chunked_req=scheduler.chunked_req,
+        mbs=scheduler.mbs,
+        last_mbs=scheduler.last_mbs,
+        tree_cache=scheduler.tree_cache,
+    )
+
+
+def profile_and_install_cost_model(scheduler):
+    scheduler._tpu_pp_chunk_cost = profile_cost_model(
+        runner=scheduler.tp_worker.model_runner,
+        page_size=getattr(scheduler, "page_size", 256),
+        chunked_prefill_size=getattr(scheduler, "chunked_prefill_size", 4096),
+        world_group=getattr(scheduler, "world_group", None),
+    )
+
+
 def pipeline_topology():
     # The scheduler reads its stage count from the published parallel config.
     with published_topology(pp_size=8):

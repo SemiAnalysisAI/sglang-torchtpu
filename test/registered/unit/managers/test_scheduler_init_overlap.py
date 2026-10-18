@@ -17,6 +17,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -32,6 +34,14 @@ _SCHED_MOD = "sglang.srt.managers.scheduler"
 def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     """A bare Scheduler with only the attributes init_overlap touches."""
     s = Scheduler.__new__(Scheduler)
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler_components.backend_extension import (
+        SchedulerExtension,
+    )
+
+    s.scheduler_extension = SchedulerExtension()
+    s.enable_hierarchical_cache = False
+    s.disaggregation_mode = DisaggregationMode.NULL
     s.device = "cpu"
     s.forward_stream = object()  # sentinel; only used on the stream path
     s.enable_overlap = enable_overlap
@@ -225,6 +235,82 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         )
         self.assertIsNone(out)
         s._relay_forward_payload.assert_not_called()
+
+
+class TestSchedulerExtensionOwnership(CustomTestCase):
+    def test_platform_factory_selects_distinct_scheduler_instances(self):
+        from sglang.srt.managers.scheduler_components.backend_extension import (
+            SchedulerExtension,
+        )
+        from sglang.srt.platforms.interface import SRTPlatform
+        from sglang_tpu.platform import TpuOOTPlatform
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        for platform in (SRTPlatform(), TpuSRTPlatform(), TpuOOTPlatform()):
+            with (
+                self.subTest(platform=type(platform).__name__),
+                patch(f"{_SCHED_MOD}.current_platform", platform),
+            ):
+                first = Scheduler.__new__(Scheduler)
+                second = Scheduler.__new__(Scheduler)
+                first.init_scheduler_extension()
+                second.init_scheduler_extension()
+                expected = (
+                    SchedulerExtension
+                    if type(platform) is SRTPlatform
+                    else TpuSchedulerExtension
+                )
+                self.assertIs(type(first.scheduler_extension), expected)
+                self.assertIsNot(first.scheduler_extension, second.scheduler_extension)
+
+    def test_direct_handoff_does_not_patch_shared_future_map(self):
+        from sglang.srt.managers.overlap_utils import FutureMap
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.future_map import TpuFutureMap
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        stash = FutureMap.stash
+        pool = SimpleNamespace(req_to_token=torch.zeros(8, 16))
+        extension = TpuSchedulerExtension()
+        relay = extension.create_future_map(SpeculativeAlgorithm.NONE, "cpu", pool)
+        self.assertIs(type(relay), TpuFutureMap)
+        self.assertIs(FutureMap.stash, stash)
+        self.assertNotIn("tpu_direct_handoff", FutureMap.__dict__)
+        other = extension.create_future_map(SpeculativeAlgorithm.NONE, "cpu", pool)
+        relay.tpu_direct_handoff = object()
+        self.assertIsNone(other.tpu_direct_handoff)
+
+    def test_draftless_stage_skips_spec_precompile(self):
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        # No target runner is deliberately provided: a non-last PP stage must
+        # return before touching policy, draft-model fields or device state.
+        TpuSchedulerExtension().precompile_spec_ops(
+            target_runner=None,
+            draft_worker=SimpleNamespace(draft_worker=None),
+            vocab_size=32,
+        )
+
+    def test_pipeline_control_buffers_survive_until_slot_reuse(self):
+        from sglang_tpu.pp_scheduler import TpuPipelineTransport
+
+        transport = TpuPipelineTransport(None, 2)
+        retired = []
+
+        def commit(work):
+            retired.extend(work)
+            work.clear()
+
+        first, second = object(), object()
+        transport.begin_control_step(0, commit)
+        self.assertEqual(transport.retain_control_work([first]), [])
+        transport.begin_control_step(1, commit)
+        transport.retain_control_work([second])
+        self.assertEqual(retired, [])
+        transport.begin_control_step(0, commit)
+        self.assertEqual(retired, [first])
+        self.assertEqual(transport.control_work[1], [second])
 
 
 if __name__ == "__main__":

@@ -53,20 +53,6 @@ def mrope_decode_device(original, batch, device):
     return original(batch, device)
 
 
-def create_future_map(original, algorithm, device, req_to_token_pool, *args, **kwargs):
-    if (
-        envs.SGLANG_TPU_HOST_PADDING.get()
-        and algorithm.is_none()
-        and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
-    ):
-        from sglang_tpu.host_padding_relay import HostPaddingFutureMap
-
-        return HostPaddingFutureMap(
-            device, algorithm, req_to_token_pool, *args, **kwargs
-        )
-    return original(algorithm, device, req_to_token_pool, *args, **kwargs)
-
-
 def resolve_forward_inputs(original, batch, future_map):
     from sglang_tpu.host_padding_relay import HostPaddingFutureMap
 
@@ -115,11 +101,6 @@ def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     return [
-        (
-            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.create_future_map",
-            create_future_map,
-            HookType.AROUND,
-        ),
         (
             "sglang.srt.managers.overlap_utils.resolve_forward_inputs",
             resolve_forward_inputs,
