@@ -532,15 +532,6 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        # The fused-MoE Pallas op is a MoE-layer concern (every quant method's
-        # TPU path calls it), so register it once here at construction -- before
-        # torch.compile traces the model -- rather than in each quant method.
-        # Mirrors the RPA v3 attention backend.
-        if _is_tpu:
-            from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-            _build_fused_moe_op()
-
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -1225,7 +1216,6 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
-                    "TpuCompressedTensorsWNA16MoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1476,7 +1466,6 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
-                    "TpuCompressedTensorsWNA16MoE",
                 ]
             )
             and "zero" not in weight_name
