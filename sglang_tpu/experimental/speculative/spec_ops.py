@@ -23,25 +23,31 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
+from sglang_tpu.sampling.seeded import sample_categorical, sample_with_seed
 from sglang_tpu.sampling_mask import tpu_filter_probs
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
 
 @compiled_op()
-def apply_verify_logit_bias(
-    logits: torch.Tensor, logit_bias: torch.Tensor, num_verify_rows: int
+def apply_verify_logit_modifiers(
+    logits: torch.Tensor, modifiers: VerifyLogitModifiers, num_verify_rows: int
 ) -> torch.Tensor:
     result = logits.clone()
     adjust_verify_logits(
         next_token_logits=result,
-        sampling_info=VerifyLogitModifiers(logit_bias=logit_bias),
+        sampling_info=modifiers,
         draft_token_num=num_verify_rows,
     )
     return result
 
 
 def sample_tokens(
-    logits: torch.Tensor, temperatures: torch.Tensor, top_ks: torch.Tensor
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    coins=None,
+    sampling_seed=None,
+    positions=None,
 ) -> torch.Tensor:
     """Sample one token per row of [pbs, V] logits; rows with top_k <= 1 take argmax.
 
@@ -51,7 +57,15 @@ def sample_tokens(
     greedy = torch.argmax(logits, dim=-1)
     temps = temperatures.float().clamp_min(1e-5)[:, None]
     probs = torch.softmax(logits.float() / temps, dim=-1)
-    return torch.where(top_ks <= 1, greedy, _exponential_race(probs))
+    if sampling_seed is not None:
+        sampled = sample_with_seed(probs, sampling_seed, positions)
+    else:
+        sampled = (
+            _exponential_race(probs)
+            if coins is None
+            else sample_categorical(probs, coins)
+        )
+    return torch.where(top_ks <= 1, greedy, sampled)
 
 
 @compiled_op()
@@ -214,6 +228,8 @@ def accept_drafts_sampled(
     draft_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: torch.Tensor,
+    coins: torch.Tensor | None = None,
+    final_sampling_coins: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lossless acceptance of a draft chain (Leviathan et al. 2023).
 
@@ -235,6 +251,8 @@ def accept_drafts_sampled(
         draft_tokens,
         num_verify_drafts,
         top_ks,
+        coins,
+        final_sampling_coins,
     )
 
 
@@ -248,6 +266,8 @@ def accept_drafts_sampled_filtered(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
+    coins: torch.Tensor | None = None,
+    final_sampling_coins: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """accept_drafts_sampled against the target filtered like the target sampler.
 
@@ -268,6 +288,8 @@ def accept_drafts_sampled_filtered(
         draft_tokens,
         num_verify_drafts,
         top_ks,
+        coins,
+        final_sampling_coins,
     )
 
 
@@ -278,6 +300,8 @@ def _accept_drafts_rejection_sampling(
     draft_tokens: torch.Tensor,
     num_verify_drafts: torch.Tensor,
     top_ks: torch.Tensor,
+    coins: torch.Tensor | None = None,
+    final_sampling_coins: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sampling acceptance over p [bs, N + 1, V] and q [bs, N, V]; greedy rows where top_k <= 1.
 
@@ -296,7 +320,7 @@ def _accept_drafts_rejection_sampling(
     )
     p_draft = torch.where(vocab_onehot, p[:, :n], 0).sum(-1)
     q_draft = torch.where(vocab_onehot, q, 0).sum(-1)
-    u = torch.rand_like(p_draft)
+    u = torch.rand_like(p_draft) if coins is None else coins[:, :n]
     # u <= p / q without dividing by q.
     sample_ok = (u * q_draft <= p_draft) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
@@ -307,7 +331,12 @@ def _accept_drafts_rejection_sampling(
     # All-zero residual only arises from rounding when p == q; p is exact there.
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
     rejected = (sample_num_correct < num_verify_drafts)[:, None]
-    sample_bonus = _exponential_race(torch.where(rejected, residual, p_at))
+    weights = torch.where(rejected, residual, p_at)
+    sample_bonus = (
+        _exponential_race(weights)
+        if final_sampling_coins is None
+        else sample_categorical(weights, final_sampling_coins)
+    )
 
     greedy = (top_ks <= 1).view(-1)
     return (
@@ -357,6 +386,8 @@ def accept_drafts_target_only(
     min_ps: torch.Tensor,
     threshold_single: float,
     threshold_acc: float,
+    coins: torch.Tensor | None = None,
+    final_sampling_coins: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lossless acceptance of a deterministic draft chain against the filtered target p.
 
@@ -381,7 +412,7 @@ def accept_drafts_target_only(
 
     vocab = torch.arange(p.shape[-1], device=draft_tokens.device)
     p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
-    u = torch.rand_like(p_draft)
+    u = torch.rand_like(p_draft) if coins is None else coins[:, :n]
     sample_ok = (
         (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
     ) & verify_mask
@@ -394,7 +425,11 @@ def accept_drafts_target_only(
     residual = torch.where(rejected_mask, 0, p_at)
     # All-zero residual only arises from rounding when p_k(d_k) == 1.
     residual = torch.where(residual.sum(-1, keepdim=True) > 0, residual, p_at)
-    sample_bonus = _exponential_race(residual)
+    sample_bonus = (
+        _exponential_race(residual)
+        if final_sampling_coins is None
+        else sample_categorical(residual, final_sampling_coins)
+    )
 
     greedy = (top_ks <= 1).view(-1)
     return (

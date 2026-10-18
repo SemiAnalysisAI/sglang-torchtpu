@@ -83,10 +83,12 @@ def seeded_verify_coins(
     seq_lens: torch.Tensor,
     draft_token_num: int,
     device,
+    uniform_fn=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Derive deterministic verify-side coins from per-request sampling seeds.
 
-    Traceable.
+    Traceable. ``uniform_fn`` lets a backend provide the same hash-to-coin
+    contract without requiring the default kernel or float64 arithmetic.
     Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
     column) mapped to [0, 1). Columns [0, draft_token_num) drive the
     per-draft rejection coins; column draft_token_num drives the final
@@ -98,13 +100,16 @@ def seeded_verify_coins(
     until the draft RNG is seeded in a follow-up; top-k/greedy draft
     selection is already deterministic.
     """
-    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-
     cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
-    hashed = murmur_hash32(
-        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
-    )
-    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    if uniform_fn is None:
+        from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+        hashed = murmur_hash32(
+            sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
+        )
+        uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    else:
+        uniforms = uniform_fn(sampling_seed, seq_lens, cols)
     # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
     # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
     # past the last CDF bucket and can return a zero-probability token.
@@ -146,6 +151,12 @@ def verify_coins(
         (candidates.shape[0],), dtype=torch.float32, device=device
     )
     return coins, coins_for_final_sampling
+
+
+def accumulate_spec_penalty_tokens(batch: ScheduleBatch) -> None:
+    """Host: accumulate the preceding accepted run before taking its forward snapshot."""
+    if batch.sampling_info.penalizer_orchestrator.is_required:
+        batch.cumulate_penalty_output_tokens()
 
 
 def build_dp_idle_draft_batch(batch: ScheduleBatch) -> ScheduleBatch:

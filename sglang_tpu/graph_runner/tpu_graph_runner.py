@@ -35,6 +35,7 @@ from sglang.srt.compilation.support_torch_compile import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.core_compile_annotations import (
     annotate_core_compile_boundaries,
@@ -80,7 +81,7 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     return (
         (algo.is_eagle() and not algo.is_frozen_kv_mtp())
         or algo.is_dflash()
-        or is_experimental_spec_worker(algo)
+        or is_experimental_spec_worker(algo, pp_size=get_parallel().pp_size)
     )
 
 
@@ -89,9 +90,10 @@ def _resolve_spec_compile_policy_mixin(
 ) -> type[BaseSpecDecodeCompilePolicyMixin]:
     """Resolve speculative compile policy mixin class based on algorithm."""
     # Checked first: the experimental workers also serve DFLASH, MTP and EAGLE3.
-    if is_experimental_chain(spec_algorithm):
+    pp_size = get_parallel().pp_size
+    if is_experimental_chain(spec_algorithm, pp_size=pp_size):
         return TpuChainSpecDecodeCompilePolicyMixin
-    if is_experimental_spec_worker(spec_algorithm):
+    if is_experimental_spec_worker(spec_algorithm, pp_size=pp_size):
         return TpuBlockSpecDecodeCompilePolicyMixin
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin

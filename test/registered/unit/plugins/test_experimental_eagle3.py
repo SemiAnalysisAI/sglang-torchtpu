@@ -86,7 +86,9 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
 
 def _select_worker(algorithm):
     """The TPU platform's worker for algorithm, or None for core's own."""
-    return TpuSRTPlatform().get_spec_worker_cls(algorithm, None, default=None)
+    return TpuSRTPlatform().get_spec_worker_cls(
+        algorithm, SimpleNamespace(pp_size=1), default=None
+    )
 
 
 class TestExperimentalEagle3(CustomTestCase):

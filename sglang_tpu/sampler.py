@@ -15,14 +15,17 @@ from sglang.srt.layers.sampler import (
     Sampler,
     _SamplingMaskCapture,
     _select_sampling_mask_rows,
+    apply_custom_logit_processor,
     sampling_from_probs_torch,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
 from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.sampling.seeded import sample_with_seed
 from sglang_tpu.top_k import PallasDistributedTopKConfig
 
 logger = logging.getLogger(__name__)
@@ -476,6 +479,23 @@ class TpuSampler(Sampler):
         super().__init__()
         self._device_params = _DeviceParamCache()
 
+    def _preprocess_logits(self, logits, sampling_info):
+        if not is_host_padded(sampling_info):
+            return super()._preprocess_logits(logits, sampling_info)
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(logits[: len(sampling_info)], sampling_info)
+        sanitize_nan_logits(logits, "sampler: next_token_logits")
+        return logits
+
+    def _sample_from_logprobs(self, logprobs, sampling_info, positions):
+        # TPU uses fixed-shape inverse CDF, keyed by request and position.
+        # It is deterministic on this backend; GPU Gumbel-max draws may differ.
+        return sample_with_seed(
+            torch.softmax(logprobs.float(), dim=-1),
+            sampling_info.sampling_seed,
+            positions,
+        ).to(torch.int32)
+
     def forward(
         self,
         logits_output,
@@ -490,6 +510,14 @@ class TpuSampler(Sampler):
         if is_host_padded(sampling_info):
             sampling_info = sampling_info.on_device()
             padded_bs = sampling_info.temperatures.shape[0]
+            if (
+                sampling_info.sampling_seed is not None
+                and positions.shape[0] < padded_bs
+            ):
+                assert positions.shape[0] == len(sampling_info)
+                positions = torch.nn.functional.pad(
+                    positions, (0, padded_bs - positions.shape[0])
+                )
             logits = logits_output.next_token_logits
             # An eager outer logits processor (multimodal wrappers) emits live
             # rows; HOST_PADDED sampling runs at the batch bucket.
@@ -576,6 +604,31 @@ class TpuSampler(Sampler):
         """
 
         capture_rows = sampling_info.sampling_mask_batch_indices
+
+        if sampling_info.sampling_seed is not None:
+            from sglang_tpu.sampling_mask import tpu_filter_probs
+
+            filtered_probs = (
+                probs
+                if simple_sampling_case
+                else tpu_filter_probs(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    need_top_k=sampling_info.need_top_k_sampling,
+                    need_top_p=sampling_info.need_top_p_sampling,
+                    need_min_p=sampling_info.need_min_p_sampling,
+                )
+            )
+            tokens = sample_with_seed(
+                filtered_probs, sampling_info.sampling_seed, positions
+            )
+            return tokens, (
+                None
+                if capture_rows is None
+                else _capture_sampling_mask(filtered_probs, tokens, capture_rows)
+            )
 
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
