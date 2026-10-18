@@ -27,12 +27,14 @@ jobs:
   gitleaks:
     runs-on: ubuntu-latest
     steps:
-      # Full commit history so the range below resolves, but no file contents:
-      # gitleaks fetches blobs on demand for the commits it scans.
+      # Full history so the range below resolves for any PR, including ones
+      # that merge main. Cheaper variants were tried and dropped: a blobless
+      # clone cannot fetch blobs on demand once credentials are not persisted
+      # (gitleaks then scans nothing and still passes), and a shallow fetch of
+      # only the PR's commits stops early at merge commits.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          filter: blob:none
           persist-credentials: false
 
       - name: Install gitleaks
