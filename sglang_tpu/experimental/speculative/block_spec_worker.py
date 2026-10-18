@@ -14,12 +14,11 @@ Not ported yet: hybrid (mamba) targets.
 
 from __future__ import annotations
 
-from dataclasses import fields
-
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -33,11 +32,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.draft_worker_common import (
-    make_draft_block_spec_info,
-    make_draft_input_v2,
-)
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -52,14 +48,15 @@ from sglang_tpu.experimental.speculative.base_spec_worker import (
     TpuSpecWorker,
 )
 from sglang_tpu.experimental.speculative.block_draft_worker import TpuBlockDraftWorker
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
     TpuDflashDraftWorker,
 )
-from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
+    accept_drafts_sampled_filtered,
     build_draft_block_inputs,
     sample_tokens,
 )
@@ -98,6 +95,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             raise NotImplementedError(
                 "TpuBlockSpecWorker does not support mamba targets."
             )
+        # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
+        if is_dp_attention_enabled():
+            raise NotImplementedError(
+                "TpuBlockSpecWorker does not support DP attention."
+            )
         self._spec_algorithm = target_runner.spec_algorithm
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
         super().__init__(target_worker, draft_worker, draft_worker.num_drafts)
@@ -114,18 +116,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=self._draft_block_width, device=self.device
         )
-        # Filled per batch bucket once the target compile policy exists.
-        self._num_verify_drafts: dict[int, torch.Tensor] = {}
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        # No confidence budget yet: every bucket verifies all gamma drafts.
-        self._num_verify_drafts = {
-            padded_bs: torch.full(
-                (padded_bs,), self.num_drafts, dtype=torch.int32, device=self.device
-            )
-            for padded_bs in self._bucket_sizes()
-        }
         self._warmup_draft_block_inputs()
         self._warmup_draft_sampling()
         # The base snapshot ran before these block-draft warmups.
@@ -144,7 +137,8 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         block_hidden, graph_draft_tokens = self._forward_draft_block(
             bucket=bucket, rows=rows, verify_input=verify_input
         )
-        num_verify_drafts = self._num_verify_drafts[bs]
+        # No confidence budget yet: every bucket verifies all gamma drafts.
+        num_verify_drafts = self._all_drafts[bs]
         temperatures, top_ks = bucket.temperatures, bucket.top_ks
         if temperatures is None or top_ks is None:
             # The draft graph already drafted greedily (sample_draft_tokens_tpu).
@@ -191,9 +185,11 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         batch: ScheduleBatch,
         state: SpecState,
         rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
     ) -> SpecState:
+        del verify_input
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
@@ -255,22 +251,30 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         result.next_draft_input = self.state_to_spec_info(next_state)
         return result
 
-    def state_to_spec_info(self, state: SpecState) -> DFlashDraftInputV2:
-        draft_input = make_draft_input_v2(
-            bonus_tokens=state.bonus_tokens, new_seq_lens=state.seq_lens
+    def make_verify_input(
+        self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
+    ) -> DFlashVerifyInput:
+        return DFlashVerifyInput(
+            draft_token=verify_tokens,
+            positions=rows.flat_positions,
+            draft_token_num=self.num_verify_rows,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
-        return HostPaddedDraftInput(
-            **{
-                field.name: getattr(draft_input, field.name)
-                for field in fields(draft_input)
-                if field.init
-            }
+
+    def state_to_spec_info(self, state: SpecState) -> HostPaddedBlockDraftInput:
+        return HostPaddedBlockDraftInput(
+            bonus_tokens=state.bonus_tokens.to(torch.int64),
+            new_seq_lens=state.seq_lens.to(torch.int64),
         )
 
     def get_spec_state(self, batch: ScheduleBatch) -> SpecState:
         draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise TypeError(f"Expected DFlashDraftInputV2, got {type(draft_input)}.")
+        if not isinstance(draft_input, HostPaddedBlockDraftInput):
+            raise TypeError(
+                f"Expected HostPaddedBlockDraftInput, got {type(draft_input)}."
+            )
         return SpecState(
             bonus_tokens=draft_input.bonus_tokens,
             seq_lens=batch.seq_lens,
@@ -406,6 +410,16 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
+                # Sampled verify when requests restrict top-k/top-p/min-p.
+                verify_rows = (padded_bs * self.num_verify_rows, draft_logits.shape[-1])
+                warmup_compiled_op(
+                    accept_drafts_sampled_filtered,
+                    torch.zeros(verify_rows, dtype=torch.float32, device=self.device),
+                    draft_tokens,
+                    self._all_drafts[padded_bs],
+                    draft_logits.float(),
+                    *self._sampling_param_warmup_args(padded_bs),
+                )
 
     # The base default reads draft_worker.draft_runners, which TpuBlockDraftWorker lacks.
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:

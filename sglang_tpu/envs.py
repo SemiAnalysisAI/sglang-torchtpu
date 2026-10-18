@@ -8,7 +8,7 @@ core readers move; never declare one name in both registries.
 
 from __future__ import annotations
 
-from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt
+from sglang.srt.environ import EnvBool, EnvField, EnvFloat, EnvInt, EnvTuple
 
 __all__ = ["TpuEnvs", "envs"]
 
@@ -21,6 +21,14 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static
+    # input scale (see kimi_k3/static_fp8.py). Comma-separated subset of
+    # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all" (every validated part:
+    # all but mla_qkv_a). Empty keeps bf16.
+    SGLANG_TPU_K3_STATIC_FP8 = EnvTuple(())
+    # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
+    # (kernels/static_fp8_gemv.py); False keeps the XLA fp8 dot for every batch.
+    SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
@@ -54,8 +62,16 @@ class TpuEnvs:
     SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
 
     # Speculative decoding
-    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
+    # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+
+    # PD disaggregation (raiden)
+    # TCP connections per rank pair for raiden KV reads and resharding pushes,
+    # not the pipeline path. Set the same value on prefill and decode. More can
+    # raise throughput but opens more connections, and above 4 is unlikely to
+    # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
+    SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
 
     @classmethod
     def names(cls) -> list[str]:
