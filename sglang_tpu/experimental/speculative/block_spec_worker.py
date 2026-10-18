@@ -8,8 +8,6 @@ commit: project target features of the committed rows into the draft context
         KV; root := bonus.
 extend: target forward on new prompt tokens, inject every row's target feature
         into the draft context KV, root := first sampled token.
-
-Not ported yet: hybrid (mamba) targets.
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
-from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -91,10 +88,6 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 "TpuBlockSpecWorker only supports SGLANG_RAGGED_VERIFY_MODE=static."
             )
         target_runner = target_worker.model_runner
-        if mambaish_config(target_runner.model_config) is not None:
-            raise NotImplementedError(
-                "TpuBlockSpecWorker does not support mamba targets."
-            )
         # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
         if is_dp_attention_enabled():
             raise NotImplementedError(
@@ -121,6 +114,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         super().init_cuda_graphs()
         self._warmup_draft_block_inputs()
         self._warmup_draft_sampling()
+        self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -420,6 +414,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     draft_logits.float(),
                     *self._sampling_param_warmup_args(padded_bs),
                 )
+
+    def _warmup_extend_draft_inputs(self) -> None:
+        """extend's draft positions / cache_loc uploads at every token bucket."""
+        compile_policy = self.target_worker.model_runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        assert compile_policy.t_bucketer is not None
+        with torch.no_grad():
+            for tokens in compile_policy.t_bucketer.buckets:
+                for dtype in (torch.int64, torch.int32):
+                    torch.zeros((tokens,), dtype=dtype).to(
+                        self.device, non_blocking=True
+                    ).cpu()
 
     # The base default reads draft_worker.draft_runners, which TpuBlockDraftWorker lacks.
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:

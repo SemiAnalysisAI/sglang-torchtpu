@@ -35,7 +35,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -62,7 +66,7 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -94,6 +98,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
+from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
 
@@ -162,6 +167,9 @@ class TpuSpecWorker(BaseSpecWorker):
                 "SGLANG_SPEC_TP_SYNC must enable both or neither spec-accept site "
                 "under DP attention."
             )
+        self._target_has_linear_attn = (
+            mambaish_config(target_worker.model_runner.model_config) is not None
+        )
         self._bucket: BucketState | None = None
         self._accept_threshold_single = get_spec().speculative_accept_threshold_single
         self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
@@ -189,6 +197,8 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        if self._target_has_linear_attn:
+            self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
             self._simulated_drafts = {
                 pbs: torch.full(
@@ -242,6 +252,23 @@ class TpuSpecWorker(BaseSpecWorker):
             for pbs in bucket_sizes:
                 # _bucket_state derives live_mask from the padded pool rows.
                 (torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0).cpu()
+                # Eager ops compile per input layout, so bump finalize_accept's output.
+                next_seq_lens = self._warmup_accept(pbs).next_seq_lens
+                (next_seq_lens + self.num_verify_rows).to(torch.int32).cpu()
+
+    def _warmup_accept(self, padded_bs: int) -> AcceptResult:
+        """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
+
+        def zeros(*shape: int) -> torch.Tensor:
+            return torch.zeros(shape, dtype=torch.int64, device=self.device)
+
+        return finalize_accept(
+            zeros(padded_bs, self.num_drafts),
+            zeros(padded_bs),
+            zeros(padded_bs),
+            zeros(padded_bs),
+            torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+        )
 
     @abstractmethod
     def draft(
@@ -438,10 +465,28 @@ class TpuSpecWorker(BaseSpecWorker):
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
         )
+        if self._target_has_linear_attn:
+            self._commit_linear_attn_states(batch=batch, accept=accept)
         next_state = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
         )
         return next_state, logits_output, accept
+
+    def _commit_linear_attn_states(
+        self, *, batch: ScheduleBatch, accept: AcceptResult
+    ) -> None:
+        """Select each slot's verify checkpoint at its last accepted token."""
+        runner = self.target_worker.model_runner
+        attn_backend = runner.attn_backend
+        assert isinstance(attn_backend, HybridLinearAttnBackend), type(attn_backend)
+        # Slots come from the verify forward's bucket metadata; padded rows accept 0,
+        # so their -1 step leaves the slot untouched.
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=accept.accept_lens.to(torch.int64) - 1,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=None,
+            model=runner.model,
+        )
 
     def forward_batch_generation(
         self,
@@ -671,18 +716,27 @@ class TpuSpecWorker(BaseSpecWorker):
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS:
-                    # Materialized like the compiled output, then the finalize trim.
-                    logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(
-                        self.device
-                    )
-                    runner.sampler(
-                        LogitsProcessorOutput(next_token_logits=logits[:pbs]),
-                        self._warmup_sampling_info(pbs, vocab_size, **variant),
-                        False,
-                        None,
-                        None,
-                        torch.zeros((pbs,), dtype=torch.int64, device=self.device),
-                    ).cpu()
+                    # A target that keeps extend outputs padded samples all cap rows,
+                    # materializing the pbs-row params to them.
+                    variants = {(pbs, False), (cap, True)}
+                    if pbs == 1:
+                        # Unpadded [1, 1] params broadcast over the cap rows as-is.
+                        variants.add((cap, False))
+                    for rows, params_on_cpu in variants:
+                        runner.sampler(
+                            LogitsProcessorOutput(
+                                next_token_logits=self._warmup_extend_logits(
+                                    cap, rows, vocab_size
+                                )
+                            ),
+                            self._warmup_sampling_info(
+                                pbs, vocab_size, params_on_cpu=params_on_cpu, **variant
+                            ),
+                            False,
+                            None,
+                            None,
+                            torch.zeros((rows,), dtype=torch.int64, device=self.device),
+                        ).cpu()
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,
                 # req_pool_indices int64; orig_seq_lens int32) to the cap.
@@ -690,11 +744,22 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.nn.functional.pad(
                         torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
                     ).cpu()
-                # ModelRunner.sample positions, then the block-draft extend trim.
+                # ModelRunner.sample positions, then the block-draft extend trim; a
+                # target that keeps extend outputs padded samples at the cap rows.
                 (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
-                torch.zeros((self._pad_bs(bs),), dtype=torch.int64, device=self.device)[
-                    :bs
-                ].cpu()
+                for rows in {self._pad_bs(bs), cap}:
+                    torch.zeros((rows,), dtype=torch.int64, device=self.device)[
+                        :bs
+                    ].cpu()
+
+    def _warmup_extend_logits(
+        self, cap: int, rows: int, vocab_size: int
+    ) -> torch.Tensor:
+        """Fresh logits materialized like the compiled cap output, trimmed to rows."""
+        # Held by the caller alone, as in serving: the sampler then donates the
+        # buffer to its in-place ops, and donation changes the compiled program.
+        logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(self.device)
+        return logits if rows == cap else logits[:rows]
 
     def _sampling_param_warmup_args(
         self, padded_bs: int
@@ -715,6 +780,7 @@ class TpuSpecWorker(BaseSpecWorker):
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
         runner = self.target_worker.model_runner
         max_bs = min(runner.max_running_requests, self._b_bucketer().max_val)
+        cap = self._compile_policy()._extend_compile_cap()
         # A scratch map runs the production publish/stash; live buffers stay untouched.
         future_map = FutureMap(
             self.device, runner.spec_algorithm, runner.req_to_token_pool
@@ -722,32 +788,36 @@ class TpuSpecWorker(BaseSpecWorker):
         with torch.no_grad():
             for bs in range(1, max_bs + 1):
                 indices = torch.zeros((bs,), dtype=torch.int64).to(self.device)
-                # Decode relays [:bs] views of the state at each bucket the rank
-                # can run; extend relays a compact seq_lens upload.
-                relays = [
-                    (
-                        torch.zeros(
-                            (padded_bs,), dtype=torch.int64, device=self.device
-                        )[:bs],
-                        map_carry(self.make_dummy_carry(padded_bs), lambda t: t[:bs]),
+                # Decode relays [:bs] views of finalize_accept's outputs at each bucket
+                # the rank can run; extend relays a compact seq_lens upload.
+                relays = []
+                for padded_bs in self._decode_buckets_for(bs):
+                    accept = self._warmup_accept(padded_bs)
+                    relays.append(
+                        (
+                            accept.bonus_tokens[:bs],
+                            accept.next_seq_lens[:bs],
+                            map_carry(
+                                self.make_dummy_carry(padded_bs), lambda t: t[:bs]
+                            ),
+                        )
                     )
-                    for padded_bs in self._decode_buckets_for(bs)
-                ]
-                relays.append(
-                    (
-                        torch.zeros((bs,), dtype=torch.int64).to(self.device),
-                        self.make_dummy_carry(bs),
+                compact_rows = torch.zeros((bs,), dtype=torch.int64).to(self.device)
+                # Extend stashes its [:bs] tokens sampled at the cap rows.
+                cap_tokens = torch.zeros((cap,), dtype=torch.int64, device=self.device)
+                for bonus_tokens in (compact_rows, cap_tokens[:bs]):
+                    relays.append(
+                        (bonus_tokens, compact_rows, self.make_dummy_carry(bs))
                     )
-                )
-                for rows, carry in relays:
-                    future_map.publish(indices, rows)
+                for bonus_tokens, seq_lens, carry in relays:
+                    future_map.publish(indices, seq_lens)
                     future_map.stash(
                         indices,
                         RelayPayload.from_draft_input(
                             self.state_to_spec_info(
                                 SpecState(
-                                    bonus_tokens=rows,
-                                    seq_lens=rows,
+                                    bonus_tokens=bonus_tokens,
+                                    seq_lens=seq_lens,
                                     req_pool_indices=indices,
                                     draft_carry=carry,
                                 )
@@ -797,6 +867,19 @@ class TpuSpecWorker(BaseSpecWorker):
                         device=self.device,
                     ).cpu()
 
+    def _warmup_linear_attn_commit(self) -> None:
+        """_commit_linear_attn_states' eager ops at every batch bucket."""
+        mamba_pool = self.target_worker.model_runner.req_to_token_pool.mamba_pool
+        assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+        with torch.no_grad():
+            for pbs in self._b_bucketer().buckets:
+                # int32 like the GDN metadata slots; the null slot 0 is never written.
+                slots = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
+                accept_lens = torch.zeros((pbs,), dtype=torch.int32, device=self.device)
+                mamba_pool.select_checkpoints(
+                    slots.clamp(min=0), accept_lens.to(torch.int64) - 1
+                )
+
     def _warmup_sampling_info(
         self,
         padded_bs: int,
@@ -806,13 +889,19 @@ class TpuSpecWorker(BaseSpecWorker):
         top_k: bool = False,
         top_p: bool = False,
         min_p: bool = False,
+        params_on_cpu: bool = False,
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
+        # Pinned like HostPaddedSamplingInfo's rows: a pageable H2D is its own
+        # program and would fuse into the sampler's first op.
+        pin = is_pin_memory_available(self.device)
         return HostPaddedSamplingInfo(
-            temperatures=torch.ones((padded_bs, 1)),
-            top_ps=torch.full((padded_bs,), 0.9 if top_p else 1.0),
-            top_ks=torch.full((padded_bs,), top_k_value, dtype=torch.int32),
-            min_ps=torch.full((padded_bs,), 0.1 if min_p else 0.0),
+            temperatures=torch.ones((padded_bs, 1), pin_memory=pin),
+            top_ps=torch.full((padded_bs,), 0.9 if top_p else 1.0, pin_memory=pin),
+            top_ks=torch.full(
+                (padded_bs,), top_k_value, dtype=torch.int32, pin_memory=pin
+            ),
+            min_ps=torch.full((padded_bs,), 0.1 if min_p else 0.0, pin_memory=pin),
             is_all_greedy=greedy,
             is_any_greedy=greedy,
             need_top_p_sampling=top_p,
@@ -822,6 +911,8 @@ class TpuSpecWorker(BaseSpecWorker):
             device=self.device,
             host_pad_bs=self._pad_bs,
             real_batch_size=padded_bs,
+            # Serving's flag survives on_device(), so the sampler pads the params to the logits rows.
+            sampling_params_on_cpu=params_on_cpu,
         )
 
     def _compile_policy(self) -> DecoderTpuCompilePolicy:
