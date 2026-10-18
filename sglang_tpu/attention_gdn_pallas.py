@@ -452,6 +452,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.mamba_pool.warmup_state_copy(
                 self.req_to_token_pool.size
             )
+        self._warmup_slot_bookkeeping()
         # Per-forward GDN metadata (int32, TPU-native), computed once in
         # init_forward_metadata and read by every GDN layer's forward — not
         # carried by the shared ForwardMetadata dataclass.
@@ -473,6 +474,21 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
+
+    def _warmup_slot_bookkeeping(self) -> None:
+        """Slot allocation's mapping write and clear_slots, once per new-request count."""
+        pool = self.req_to_token_pool
+        mapping = pool.req_index_to_mamba_index_mapping
+        with torch.no_grad():
+            for count in range(1, pool.size + 1):
+                # Allocator slot ids arrive as CPU int64; request row 0 and state
+                # slot 0 are reserved, so these writes touch no request.
+                slots = torch.zeros(count, dtype=torch.int64)
+                mapping[[0] * count] = slots.to(
+                    device=mapping.device, dtype=torch.int32
+                )
+                pool.mamba_pool.clear_slots(slots)
+            mapping[0:1].cpu()
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device

@@ -58,6 +58,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_TOKEN_MODE,
     sample_simulated_acc_len,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.compilation.recompilation_checker import (
@@ -173,16 +174,35 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         with torch.no_grad():
             for bs in live_sizes:
-                # _bucket_state pads device-born bonus_tokens/seq_lens to the bucket.
-                pad_rows(
+                # _bucket_state pads device-born bonus_tokens/seq_lens to the bucket;
+                # RPA verify metadata then bumps them by the verify width.
+                padded = pad_rows(
                     torch.zeros((bs,), dtype=torch.int64, device=self.device),
                     self._pad_bs(bs),
-                ).cpu()
+                )
+                (padded + self.num_verify_rows).to(torch.int32).cpu()
             for shape, dtype in h2d_shapes:
                 torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
             for pbs in bucket_sizes:
                 # _bucket_state derives live_mask from the padded pool rows.
                 (torch.zeros((pbs,), dtype=torch.int64, device=self.device) != 0).cpu()
+                # Eager ops compile per input layout, so bump finalize_accept's output.
+                next_seq_lens = self._warmup_accept(pbs).next_seq_lens
+                (next_seq_lens + self.num_verify_rows).to(torch.int32).cpu()
+
+    def _warmup_accept(self, padded_bs: int) -> AcceptResult:
+        """finalize_accept outputs at padded_bs, the inputs eager consumers see while serving."""
+
+        def zeros(*shape: int) -> torch.Tensor:
+            return torch.zeros(shape, dtype=torch.int64, device=self.device)
+
+        return finalize_accept(
+            zeros(padded_bs, self.num_drafts),
+            zeros(padded_bs),
+            zeros(padded_bs),
+            zeros(padded_bs),
+            torch.ones((padded_bs,), dtype=torch.bool, device=self.device),
+        )
 
     @abstractmethod
     def draft(
@@ -453,20 +473,31 @@ class TpuSpecWorker(BaseSpecWorker):
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for greedy, top_k in ((True, False), (False, False), (False, True)):
-                    # Materialized like the compiled output, then the finalize trim.
-                    logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(
-                        self.device
-                    )
-                    runner.sampler(
-                        LogitsProcessorOutput(next_token_logits=logits[:pbs]),
-                        self._warmup_sampling_info(
-                            pbs, vocab_size, greedy=greedy, top_k=top_k
-                        ),
-                        False,
-                        None,
-                        None,
-                        torch.zeros((pbs,), dtype=torch.int64, device=self.device),
-                    ).cpu()
+                    # A target that keeps extend outputs padded samples all cap rows,
+                    # materializing the pbs-row params to them.
+                    variants = {(pbs, False), (cap, True)}
+                    if pbs == 1:
+                        # Unpadded [1, 1] params broadcast over the cap rows as-is.
+                        variants.add((cap, False))
+                    for rows, params_on_cpu in variants:
+                        runner.sampler(
+                            LogitsProcessorOutput(
+                                next_token_logits=self._warmup_extend_logits(
+                                    cap, rows, vocab_size
+                                )
+                            ),
+                            self._warmup_sampling_info(
+                                pbs,
+                                vocab_size,
+                                greedy=greedy,
+                                top_k=top_k,
+                                params_on_cpu=params_on_cpu,
+                            ),
+                            False,
+                            None,
+                            None,
+                            torch.zeros((rows,), dtype=torch.int64, device=self.device),
+                        ).cpu()
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,
                 # req_pool_indices int64; orig_seq_lens int32) to the cap.
@@ -474,16 +505,28 @@ class TpuSpecWorker(BaseSpecWorker):
                     torch.nn.functional.pad(
                         torch.zeros((bs,), dtype=dtype).to(self.device), (0, cap - bs)
                     ).cpu()
-                # ModelRunner.sample positions, then the block-draft extend trim.
+                # ModelRunner.sample positions, then the block-draft extend trim; a
+                # target that keeps extend outputs padded samples at the cap rows.
                 (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
-                torch.zeros((self._pad_bs(bs),), dtype=torch.int64, device=self.device)[
-                    :bs
-                ].cpu()
+                for rows in {self._pad_bs(bs), cap}:
+                    torch.zeros((rows,), dtype=torch.int64, device=self.device)[
+                        :bs
+                    ].cpu()
+
+    def _warmup_extend_logits(
+        self, cap: int, rows: int, vocab_size: int
+    ) -> torch.Tensor:
+        """Fresh logits materialized like the compiled cap output, trimmed to rows."""
+        # Held by the caller alone, as in serving: the sampler then donates the
+        # buffer to its in-place ops, and donation changes the compiled program.
+        logits = torch.zeros((cap, vocab_size), dtype=torch.float32).to(self.device)
+        return logits if rows == cap else logits[:rows]
 
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
         runner = self.target_worker.model_runner
         max_bs = min(runner.max_running_requests, self._b_bucketer().max_val)
+        cap = self._compile_policy()._extend_compile_cap()
         # A scratch map runs the production publish/stash; live buffers stay untouched.
         future_map = FutureMap(
             self.device, runner.spec_algorithm, runner.req_to_token_pool
@@ -492,21 +535,25 @@ class TpuSpecWorker(BaseSpecWorker):
             for bs in range(1, max_bs + 1):
                 padded_bs = self._pad_bs(bs)
                 indices = torch.zeros((bs,), dtype=torch.int64).to(self.device)
-                # Decode relays [:bs] views of bucket state; extend relays a
-                # compact seq_lens upload.
-                bucket_rows = torch.zeros(
-                    (padded_bs,), dtype=torch.int64, device=self.device
-                )[:bs]
+                # Decode relays [:bs] views of finalize_accept's outputs; extend
+                # relays a compact seq_lens upload.
+                accept = self._warmup_accept(padded_bs)
                 compact_rows = torch.zeros((bs,), dtype=torch.int64).to(self.device)
-                for rows in (bucket_rows, compact_rows):
-                    future_map.publish(indices, rows)
+                # Extend stashes its [:bs] tokens sampled at the cap rows.
+                cap_tokens = torch.zeros((cap,), dtype=torch.int64, device=self.device)
+                for bonus_tokens, seq_lens in (
+                    (accept.bonus_tokens[:bs], accept.next_seq_lens[:bs]),
+                    (compact_rows, compact_rows),
+                    (cap_tokens[:bs], compact_rows),
+                ):
+                    future_map.publish(indices, seq_lens)
                     future_map.stash(
                         indices,
                         RelayPayload.from_draft_input(
                             self.state_to_spec_info(
                                 SpecState(
-                                    bonus_tokens=rows,
-                                    seq_lens=rows,
+                                    bonus_tokens=bonus_tokens,
+                                    seq_lens=seq_lens,
                                     req_pool_indices=indices,
                                 )
                             )
@@ -539,14 +586,25 @@ class TpuSpecWorker(BaseSpecWorker):
                 )
 
     def _warmup_sampling_info(
-        self, padded_bs: int, vocab_size: int, *, greedy: bool, top_k: bool
+        self,
+        padded_bs: int,
+        vocab_size: int,
+        *,
+        greedy: bool,
+        top_k: bool,
+        params_on_cpu: bool = False,
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
+        # Pinned like HostPaddedSamplingInfo's rows: a pageable H2D is its own
+        # program and would fuse into the sampler's first op.
+        pin = is_pin_memory_available(self.device)
         return HostPaddedSamplingInfo(
-            temperatures=torch.ones((padded_bs, 1)),
-            top_ps=torch.ones((padded_bs,)),
-            top_ks=torch.full((padded_bs,), top_k_value, dtype=torch.int32),
-            min_ps=torch.zeros((padded_bs,)),
+            temperatures=torch.ones((padded_bs, 1), pin_memory=pin),
+            top_ps=torch.ones((padded_bs,), pin_memory=pin),
+            top_ks=torch.full(
+                (padded_bs,), top_k_value, dtype=torch.int32, pin_memory=pin
+            ),
+            min_ps=torch.zeros((padded_bs,), pin_memory=pin),
             is_all_greedy=greedy,
             is_any_greedy=greedy,
             need_top_p_sampling=False,
@@ -556,6 +614,8 @@ class TpuSpecWorker(BaseSpecWorker):
             device=self.device,
             host_pad_bs=self._pad_bs,
             real_batch_size=padded_bs,
+            # Serving's flag survives on_device(), so the sampler pads the params to the logits rows.
+            sampling_params_on_cpu=params_on_cpu,
         )
 
     def _compile_policy(self) -> DecoderTpuCompilePolicy:

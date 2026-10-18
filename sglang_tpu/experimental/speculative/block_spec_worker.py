@@ -121,6 +121,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         }
         self._warmup_draft_block_inputs()
         self._warmup_draft_sampling()
+        self._warmup_extend_draft_inputs()
         # The base snapshot ran before these block-draft warmups.
         snapshot_recompilation_baseline()
 
@@ -399,6 +400,18 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
+
+    def _warmup_extend_draft_inputs(self) -> None:
+        """extend's draft positions / cache_loc uploads at every token bucket."""
+        compile_policy = self.target_worker.model_runner.compile_policy
+        assert isinstance(compile_policy, DecoderTpuCompilePolicy)
+        assert compile_policy.t_bucketer is not None
+        with torch.no_grad():
+            for tokens in compile_policy.t_bucketer.buckets:
+                for dtype in (torch.int64, torch.int32):
+                    torch.zeros((tokens,), dtype=dtype).to(
+                        self.device, non_blocking=True
+                    ).cpu()
 
     # The base default reads draft_worker.draft_runners, which TpuBlockDraftWorker lacks.
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:

@@ -80,6 +80,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
 from sglang_tpu.top_k import (
@@ -1126,12 +1127,14 @@ class TestInstallExtendCap(_PolicyTestCase):
 
 
 class TestQwen3VLDecoderPolicy(_PolicyTestCase):
-    def _forward_batch(self):
+    def _forward_batch(self, sampling_info=None):
         return SimpleNamespace(
             _tpu_real_q=3,
             _tpu_real_b=2,
             batch_size=4,
             seq_lens=torch.zeros(4, dtype=torch.int32),
+            sampling_info=sampling_info,
+            forward_mode=ForwardMode.EXTEND,
         )
 
     def test_slices_raw_hidden_states_before_logits_processing(self):
@@ -1186,6 +1189,40 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result_hidden.shape, (3, 4))
         self.assertEqual(result_aux[0].shape, (3, 4))
+
+    def test_host_padded_extend_keeps_the_bucket_rows(self):
+        """The experimental spec worker samples and writes draft KV at the buckets.
+
+        Trimming to the live tokens here would run the eager logits and the draft
+        KV writer once per prompt length while serving.
+        """
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        sampling_info = HostPaddedSamplingInfo(
+            temperatures=torch.ones((4, 1)),
+            top_ps=torch.ones((4,)),
+            top_ks=torch.ones((4,), dtype=torch.int32),
+            min_ps=torch.zeros((4,)),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=8,
+            device="cpu",
+            host_pad_bs=lambda bs: bs,
+            real_batch_size=4,
+        )
+        forward_batch = self._forward_batch(sampling_info)
+        hidden_states = torch.zeros(5, 4)
+        aux = [torch.ones(5, 4)]
+
+        result_hidden, result_aux = policy.finalize_forward_batch(
+            (hidden_states, aux), forward_batch
+        )
+
+        self.assertIs(result_hidden, hidden_states)
+        self.assertIs(result_aux[0], aux[0])
+        self.assertEqual(forward_batch.seq_lens.shape, (4,))
 
     @staticmethod
     def _policy_for(*, multimodal: bool):
