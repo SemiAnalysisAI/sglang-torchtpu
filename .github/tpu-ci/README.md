@@ -78,6 +78,11 @@ container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
   group's test files in **live-server mode** (`SGLANG_TPU_USE_LIVE_SERVER=1` + `BASE_URL`),
   so tests assert on real results. Workers serve until the leader tears down, exit 0.
 
+`--platform` (the `platform` input of `_tpu-test.yml`) sets the pods'
+`SGLANG_PLATFORM`. The PR gate and the single-host nightly (`nightly-tpu-4-v7`)
+pass `tpu_oot` (mode B, the plugin platform); every other lane keeps the
+default `tpu` (mode A). Each test runs in one mode only.
+
 ### Multi-host = test-owned launch, grouped by setup
 
 The model+config is **not** bound to a suite — each multi-host test file declares its
@@ -141,8 +146,8 @@ Each slot fills the lane its MMMU-Pro legs leave idle:
 
 | Slot | 1-host lane | 2-host lane |
 |---|---|---|
-| `day-10am` | single-host accuracy (gpt-oss, Gemma 4) | Kimi-K2.6 MMMU shards |
-| `day-5pm` | Gemma 4 / Qwen3.5 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
+| `day-10am` | single-host accuracy (gpt-oss, Gemma 4, Qwen3.8) | Kimi-K2.6 MMMU shards |
+| `day-5pm` | Gemma 4 / Qwen3.5 / Qwen3.8 MMMU-Pro | DeepSeek R1 / V3.1 accuracy |
 
 Each stage is a reusable workflow (the nightly calls feature validation and perf with the
 shared image), and ALSO its own `workflow_dispatch` trigger (with its own build) for running one stage — or one
