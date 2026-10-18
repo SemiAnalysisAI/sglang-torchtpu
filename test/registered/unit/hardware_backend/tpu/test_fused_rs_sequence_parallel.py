@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.fused_rs_sequence_parallel import (
@@ -111,18 +112,27 @@ class TestFusedRsSequenceParallel(CustomTestCase):
 
 class TestFusedRsModelContract(CustomTestCase):
     def test_prepares_model_owned_post_expert_norm(self):
+        """A norm parameter the model owns under the MoE layer survives post-load
+        staging; caching that same tensor gave it two restore devices."""
         layer = torch.nn.Module()
+        layer.norm = torch.nn.Module()
+        layer.norm.weight = torch.nn.Parameter(
+            torch.full((4,), 0.5), requires_grad=False
+        )
         layer.hidden_size = 4
         layer.w2_weight = torch.empty(1, 4, 4)
         layer.allow_backend_reduction = False
         layer.supports_tpu_fused_rs_post_expert_norm = True
-        norm_weight = torch.ones(4)
-        layer.tpu_fused_rs_post_expert_norm_weight = lambda: norm_weight
+        layer.tpu_fused_rs_post_expert_norm_weight = lambda: layer.norm.weight
 
-        prepare_tpu_fused_rs_post_expert_norm(layer)
+        # A processing device distinct from the tensors' own, as "tpu" is from "tpu:0".
+        with stage_module_for_post_load(layer, torch.device("cpu", 0)):
+            prepare_tpu_fused_rs_post_expert_norm(layer)
 
         self.assertTrue(layer.allow_backend_reduction)
-        self.assertIs(get_tpu_fused_rs_post_expert_norm_weight(layer), norm_weight)
+        torch.testing.assert_close(
+            get_tpu_fused_rs_post_expert_norm_weight(layer), layer.norm.weight
+        )
         self.assertIn(
             "_tpu_fused_rs_post_expert_norm_weight",
             layer._non_persistent_buffers_set,

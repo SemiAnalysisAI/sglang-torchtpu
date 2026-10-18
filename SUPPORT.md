@@ -38,6 +38,7 @@ The tables below are the short view. The sections that follow give per-row topol
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | Experimental |
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | Experimental |
 | Kimi-K3, Kimi-K2.5 | bf16, INT4 | 1 host | Experimental |
+| Muse Spark Open (text) | NVFP4 | 1 host | Experimental |
 | DeepSeek-V4 | FP8 | — | Experimental |
 | GLM-5.2 / 5.3, Qwen 3.8 | FP8, bf16 | — | Experimental |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip | Experimental |
@@ -96,6 +97,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Qwen3-Coder-30B-A3B | FP8 | 1 host | **Experimental** | Recipe available. PR-gate test disabled pending runner capacity; intended Quickstart model. |
 | Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
+| Muse Spark Open (text) | NVFP4 | 1 host tp8+ep8 (small checkpoint) | **Experimental** | Text only (`--language-model-only`). PR gate checks logprobs against a reference on a small NVFP4 checkpoint with the released expert shapes; the released checkpoint is not served in CI. |
 | DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
 | GLM-5.2 / 5.3 | FP8 | — | **Experimental** | Recipe and DSA sparse-MLA kernels. No registered test. |
 | Qwen 3.8 (27B) | bf16 | — | **Experimental** | Text serving code only. |
@@ -127,7 +129,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | FP8 blockwise | Nightly | Nightly | **Supported** | Dynamic activations only. |
 | MXFP4 (gpt-oss) | Nightly | Nightly | **Optimized** | Native packed dequant in the kernel. |
 | INT4 W4A16 MoE | CI (unit) | Nightly (Kimi-K2.6) | **Supported** | |
-| NVFP4 MoE | CI (fold test) | — | **Experimental** | No on-device numerics test. Gated SwiGLU experts only. |
+| NVFP4 MoE | CI (fold test, Muse Spark logprobs) | — | **Experimental** | On-device numerics cover block 16 on fused-RS (Muse Spark). Gated SwiGLU experts only. |
 | MXINT8 KV cache | CI (unit, CPU) | — | **Experimental** | |
 
 ### Parallelism

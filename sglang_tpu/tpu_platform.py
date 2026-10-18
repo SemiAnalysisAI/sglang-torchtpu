@@ -537,6 +537,13 @@ def _register_attention_backends() -> None:
         return DSV4TPUAttnBackend(runner)
 
 
+def _register_models() -> None:
+    """Add the model implementations under sglang_tpu.models to the registry."""
+    from sglang.srt.models.registry import ModelRegistry
+
+    ModelRegistry.register("sglang_tpu.models", overwrite=True, strict=True)
+
+
 def _resolve_num_hidden_layers(server_args) -> int:
     """Layer count from the model's HF config (lru-cached load), 0 when
     unresolvable — an unloadable model fails later with its real error, and
@@ -1222,6 +1229,7 @@ class TpuSRTPlatform(SRTPlatform):
         rank_slice._load()
         traced_rank._load()
         _register_attention_backends()
+        _register_models()
         from sglang_tpu.envs import envs as tpu_envs
 
         if tpu_envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get():

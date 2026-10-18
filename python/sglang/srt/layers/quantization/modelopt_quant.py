@@ -1650,7 +1650,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get(
+                "ignore",
+                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -3417,6 +3420,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         self.quant_config = quant_config
         self.enable_flashinfer_trtllm_moe = False
+        self.use_flashinfer_trtllm_weight_layout = False
 
     def _weight_scale_dtype(self) -> torch.dtype:
         return self._checkpoint_scale_dtype

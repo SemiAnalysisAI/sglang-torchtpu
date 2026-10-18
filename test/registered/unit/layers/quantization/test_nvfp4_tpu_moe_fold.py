@@ -742,8 +742,10 @@ class TestNvfp4Block512Contract(CustomTestCase):
             fp4_moe.prepare_tpu_nvfp4_moe_weights(layer, use_fused_rs=True)
 
         self.assertTrue(layer._tpu_fused_rs_has_post_expert_norm)
-        self.assertIs(layer._tpu_fused_rs_post_expert_norm_weight, norm_weight)
-        # The alias must not become a second registered checkpoint parameter.
+        torch.testing.assert_close(
+            layer._tpu_fused_rs_post_expert_norm_weight, norm_weight
+        )
+        # The cached copy must not become a second registered checkpoint parameter.
         self.assertNotIn("_tpu_fused_rs_post_expert_norm_weight", layer._parameters)
 
     def test_fused_backend_rejects_missing_post_expert_norm_weight_hook(self):

@@ -82,9 +82,11 @@ def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
         )
 
     layer.allow_backend_reduction = True
+    # A copy: post-load staging restores every registered tensor to one device,
+    # and the model's parameter registered here too would have two.
     layer.register_buffer(
         _CACHED_POST_EXPERT_NORM_WEIGHT,
-        weight,
+        weight.detach().clone(),
         persistent=False,
     )
 
