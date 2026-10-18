@@ -34,4 +34,8 @@ SGLang-owned files in this directory: `__init__.py` (makes the tree a package),
 
 ## Patches
 
-None yet.
+In commit order:
+
+1. **Package-relative imports** (`kimi/decode_megakernel.py`). Upstream runs
+   from its repository root and imports `collectives32`, `kimi` and
+   `pool_alias` as top-level modules.

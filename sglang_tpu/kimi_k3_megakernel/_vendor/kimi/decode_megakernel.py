@@ -14,9 +14,8 @@ from jax import typing as jax_typing
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-import collectives32
-import kimi
-import pool_alias
+# SGLANG-PATCH: package-relative imports; upstream runs from its repo root.
+from .. import collectives32, kimi, pool_alias
 
 
 _COMMUNICATION_SCRATCH_SPEC_COUNT = 10
