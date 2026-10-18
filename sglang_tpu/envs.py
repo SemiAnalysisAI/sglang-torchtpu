@@ -60,6 +60,9 @@ class TpuEnvs:
     # (twolevel_allreduce.py): host-local exchange, then cross-host. Applies
     # when TP spans the whole world; everything else keeps XLA's all-reduce.
     SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
+    # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
+    # batches (kernels/router_topk.py); False keeps the generic top-k.
+    SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
