@@ -21,14 +21,36 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # MoE: one fused kernel for single-token packed-MXFP4 decode
+    # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
+    SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
+    # MoE: one kernel streaming the selected FP8 experts' weights for 1..8 tokens
+    # (moe/pallas/moe_stream.py); False keeps the gmm_v2 path.
+    SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL = EnvBool(False)
+    # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
+    # False keeps the XLA path.
+    SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Kimi-K3: run attention-residual aggregation for decode-sized batches as
+    # one Pallas kernel (pending add + mix + out norm) instead of the torch
+    # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
+    # bit-exact with it: the kernel scores in f32, the torch path in bf16.
+    SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
+    # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch
+    # hc_pre / hc_post (see mhc.py and hooks/mhc.py).
+    SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC = EnvBool(False)
+    # Drop Dynamo guards on nn.Module state (attributes, submodules, parameters)
+    # for the decoder graph; input and global guards stay (see
+    # decoder_compile_policy._guard_filter_options). Assumes module state is
+    # fixed after warmup.
+    SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
 
     # Speculative decoding
-    # Route DSPARK to sglang_tpu.experimental.TpuDsparkWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
     @classmethod
