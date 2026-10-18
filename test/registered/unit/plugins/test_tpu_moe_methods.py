@@ -96,19 +96,31 @@ class TestTpuMoeMethods(CustomTestCase):
         self.assertEqual(layer.w2_weight.untyped_storage().nbytes(), w2.numel() * 4)
 
     def test_mxfp4_checkpoint_shard_padding_and_loader_metadata(self):
-        method = TpuMxfp4MoEMethod("experts")
-        layer = torch.nn.Module()
-        layer.num_local_experts = 2
-        layer.hidden_size = 128
-        layer.intermediate_size_per_partition = 720
-        loader = object()
-        method.create_weights(layer, 2, 128, 720, torch.bfloat16, weight_loader=loader)
-        self.assertEqual(method.intermediate_size_per_partition, 736)
-        self.assertEqual(layer.intermediate_size_per_partition, 720)
-        self.assertEqual(layer.w13_weight.shape, (2, 1472, 64))
-        self.assertEqual(layer.w2_weight.shape, (2, 128, 368))
-        self.assertIs(layer.w13_weight.weight_loader, loader)
-        self.assertTrue(torch.all(layer.w2_weight_scale == 127))
+        # Preserve the existing optional Triton-package precedence as well as
+        # the TPU-only 32-element checkpoint shard alignment.
+        for triton_available, padded in ((False, 736), (True, 768)):
+            with (
+                self.subTest(triton_available=triton_available),
+                patch(
+                    "sglang.srt.layers.quantization.mxfp4.has_triton_kernels",
+                    triton_available,
+                ),
+            ):
+                method = TpuMxfp4MoEMethod("experts")
+                layer = torch.nn.Module()
+                layer.num_local_experts = 2
+                layer.hidden_size = 128
+                layer.intermediate_size_per_partition = 720
+                loader = object()
+                method.create_weights(
+                    layer, 2, 128, 720, torch.bfloat16, weight_loader=loader
+                )
+                self.assertEqual(method.intermediate_size_per_partition, padded)
+                self.assertEqual(layer.intermediate_size_per_partition, 720)
+                self.assertEqual(layer.w13_weight.shape, (2, 2 * padded, 64))
+                self.assertEqual(layer.w2_weight.shape, (2, 128, padded // 2))
+                self.assertIs(layer.w13_weight.weight_loader, loader)
+                self.assertTrue(torch.all(layer.w2_weight_scale == 127))
 
     def test_wna16_selection_validates_schema_before_packed_loading(self):
         config = self._ct_config()
