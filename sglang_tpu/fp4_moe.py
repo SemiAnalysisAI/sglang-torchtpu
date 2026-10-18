@@ -27,7 +27,6 @@ from sglang_tpu.moe.mxfp4_tpu_util import (
     _pad_gate_up_halves_axis1,
     _pad_last_axis,
 )
-from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call
 
 # Block-512 matches the original FP8 activation quantization block. The fused-RS
 # kernel additionally supports block-256 with W4A8 and blocks 16-128 with W4A16.
@@ -41,6 +40,13 @@ PACKING = 2  # two FP4 codes per uint8 byte
 # weights and repeat kernel setup inside the same compiled graph. Calls above
 # 8K remain deterministically chunked.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 8192
+
+
+def fused_moe_call(**kwargs):
+    # Weight preparation is host-only; load the device bridge on execution.
+    from sglang_tpu.moe.pallas.fused_moe_op import fused_moe_call as call
+
+    return call(**kwargs)
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
