@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup contract of ``--tpu-decode-megakernel kimi_k3``.
+"""Startup contract of ``SGLANG_TPU_ENABLE_K3_MEGAKERNEL``.
 
 The megakernel keeps each decoding request's KDA and MLA state in its own
 per-row arrays. It reads SGLang's paged KV and Mamba pools once, when the
@@ -13,11 +13,7 @@ the orchestrator, before any TPU runtime starts.
 
 from __future__ import annotations
 
-import logging
-
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
-
-logger = logging.getLogger(__name__)
 
 # The compiled batch tiles; the state arrays hold max(rows) rows.
 ROW_BUCKETS = (1, 2, 4, 8)
@@ -30,7 +26,7 @@ MIN_CONTEXT = 384
 ARCHITECTURES = ("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
 
 _ATTENTION_BACKEND = "pallas_tpu_mla"
-_FLAG = "--tpu-decode-megakernel kimi_k3"
+_FLAG = "SGLANG_TPU_ENABLE_K3_MEGAKERNEL"
 _SOURCE = "tpu.kimi_k3_megakernel"
 
 
@@ -117,7 +113,7 @@ def _resolve_rows(server_args, cfg) -> None:
 
 
 def validate_server_args(server_args) -> None:
-    """Refuse, or resolve, the server args ``--tpu-decode-megakernel kimi_k3`` forbids."""
+    """Refuse, or resolve, the server args ``SGLANG_TPU_ENABLE_K3_MEGAKERNEL`` forbids."""
     cfg = resolving_view(server_args)
     architectures = _model_architectures(cfg)
     if not set(architectures) & set(ARCHITECTURES):
@@ -142,6 +138,11 @@ def validate_server_args(server_args) -> None:
             f"{_FLAG} requires --enable-torch-compile: the megakernel decode step "
             "is dispatched from the compiled forward."
         )
+    if not cfg.disable_radix_cache:
+        raise ValueError(
+            f"{_FLAG} requires --disable-radix-cache: decoded tokens have no KV or "
+            "Mamba state in SGLang's pools to share."
+        )
     if cfg.context_length is None:
         raise ValueError(
             f"{_FLAG} requires --context-length: the megakernel holds state for the "
@@ -153,10 +154,3 @@ def validate_server_args(server_args) -> None:
     if cfg.kv_cache_dtype == "auto":
         # Before the platform's fp8 default for the Pallas RPA backends.
         declare_resolution(server_args, _SOURCE, kv_cache_dtype="bfloat16")
-    if not cfg.disable_radix_cache:
-        logger.warning(
-            "%s: disabling the radix cache; finished requests' decoded tokens "
-            "have no KV or Mamba state in SGLang's pools to share.",
-            _FLAG,
-        )
-        declare_resolution(server_args, _SOURCE, disable_radix_cache=True)

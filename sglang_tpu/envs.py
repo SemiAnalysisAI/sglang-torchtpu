@@ -57,8 +57,11 @@ class TpuEnvs:
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not
     # bit-exact with it: the kernel scores in f32, the torch path in bf16.
     SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL = EnvBool(False)
-    # Kimi-K3 decode megakernel (--tpu-decode-megakernel kimi_k3): upstream's
-    # tuned kernel options; False runs its plain recipe, for A/B and triage.
+    # Kimi-K3: every decode step as one whole-model Pallas call
+    # (kimi_k3_megakernel/README.md). Startup refuses the flags it cannot
+    # serve. ..._TUNED_RECIPE=False runs upstream's plain kernel options, for
+    # A/B and triage.
+    SGLANG_TPU_ENABLE_K3_MEGAKERNEL = EnvBool(False)
     SGLANG_TPU_OPT_K3_MEGAKERNEL_TUNED_RECIPE = EnvBool(True)
     # GLM-5.3-Flash: one fused Pallas kernel per mHC site instead of the torch
     # hc_pre / hc_post (see mhc.py and hooks/mhc.py).

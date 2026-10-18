@@ -792,6 +792,7 @@ class TpuSRTPlatform(SRTPlatform):
             Phase,
             with_phase,
         )
+        from sglang_tpu.envs import envs as tpu_envs
         from sglang_tpu.kimi_k3 import static_fp8_parts
         from sglang_tpu.patches import _prepare_tpu_env
 
@@ -799,6 +800,10 @@ class TpuSRTPlatform(SRTPlatform):
         # weights have loaded (its binder runs post-load).
         static_fp8_parts()
         cfg = resolving_view(server_args)
+        if tpu_envs.SGLANG_TPU_ENABLE_K3_MEGAKERNEL.get():
+            from sglang_tpu.kimi_k3_megakernel.config import validate_server_args
+
+            validate_server_args(server_args)
         if cfg.pp_size > 1:
             _validate_pipeline_parallel_args(server_args)
         _validate_raiden_optimistic_prefill(

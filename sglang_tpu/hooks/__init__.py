@@ -34,6 +34,7 @@ from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.kimi_k3_megakernel import attach_kimi_k3_megakernel
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -97,6 +98,12 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         prepare_attn_residual_kernel,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.model_executor.model_runner.ModelRunner."
+        "maybe_precompile_model_kernels_after_loading",
+        attach_kimi_k3_megakernel,
         HookType.AFTER,
     ),
     (

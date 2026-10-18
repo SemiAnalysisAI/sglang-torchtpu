@@ -1,26 +1,32 @@
-"""Kimi-K3 TPU decode megakernel: row bookkeeping, handoff and expert sharing.
+"""Kimi-K3 TPU decode megakernel: startup contract, row bookkeeping and handoff.
 
 CPU-only: the handoff runs against the real TPU pool classes allocated on the
 host, and the decode op is a recording stand-in.
 """
 
+import sys
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.mxfp4_tpu_util import _e8m0_to_fp32
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.hooks.kimi_k3_megakernel import attach_kimi_k3_megakernel
 from sglang_tpu.kimi_k3_megakernel.handoff import Handoff, HandoffSources
 from sglang_tpu.kimi_k3_megakernel.policy import (
     STEP_INPUTS_ATTR,
@@ -37,8 +43,192 @@ from sglang_tpu.kimi_k3_megakernel.weights import (
 )
 from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
 from sglang_tpu.mamba_pool import TpuMambaPool
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+_RESOLVER = "tpu.kimi_k3_megakernel"
+
+
+def _launch(**overrides):
+    """A valid megakernel launch as the platform hook sees it."""
+    fields = dict(
+        model_path="moonshotai/Kimi-K3",
+        trust_remote_code=True,
+        revision=None,
+        json_model_override_args=None,
+        tp_size=32,
+        ep_size=8,
+        pp_size=1,
+        dp_size=1,
+        attn_dp_size=1,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        dcp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm=None,
+        speculative_eagle_topk=None,
+        speculative_use_rejection_sampling=False,
+        disaggregation_mode="null",
+        disaggregation_transfer_backend="mooncake",
+        optimistic_prefill_attempts=0,
+        max_queued_requests=None,
+        enable_priority_scheduling=False,
+        enable_hierarchical_cache=False,
+        hicache_io_backend=None,
+        enable_pdmux=False,
+        enable_mixed_chunk=False,
+        enable_lora=None,
+        lora_paths=None,
+        enable_return_hidden_states=False,
+        enable_return_routed_experts=False,
+        enable_deterministic_inference=False,
+        enable_eplb=False,
+        ep_num_redundant_experts=0,
+        load_format="auto",
+        enable_torch_compile=True,
+        tpu_compile_tracer="dynamo",
+        tpu_compile_bs=None,
+        max_running_requests=None,
+        context_length=9344,
+        disable_radix_cache=True,
+        attention_backend=None,
+        kv_cache_dtype="auto",
+        page_size=128,
+        dtype=None,
+        sampling_backend=None,
+        disable_cuda_graph=False,
+        cuda_graph_config=default_cuda_graph_config(),
+        disable_overlap_schedule=False,
+        mem_fraction_static=None,
+        enable_dynamic_chunking=False,
+        use_ray=False,
+        max_total_tokens=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _set_enabled(test, enabled):
+    """Set SGLANG_TPU_ENABLE_K3_MEGAKERNEL for one test.
+
+    EnvField.override restores the variable only when its block exits
+    normally; closing the stack from a cleanup restores it after a raising
+    test too, so it cannot leak into other test files in the process.
+    """
+    stack = ExitStack()
+    stack.enter_context(tpu_envs.SGLANG_TPU_ENABLE_K3_MEGAKERNEL.override(enabled))
+    test.addCleanup(stack.close)
+
+
+def _apply(args, architectures=("KimiK3ForConditionalGeneration",)):
+    hf_config = SimpleNamespace(architectures=list(architectures), num_hidden_layers=93)
+    with (
+        patch("sglang_tpu.patches._prepare_tpu_env") as prepare_env,
+        patch(
+            "sglang.srt.utils.hf_transformers.config.get_config",
+            return_value=hf_config,
+        ),
+    ):
+        TpuSRTPlatform().apply_server_args_defaults(args)
+    return prepare_env
+
+
+def _declared_by_megakernel(args):
+    return {
+        field: value
+        for source, declared in getattr(args, "_resolved_overrides", None) or ()
+        if source == _RESOLVER
+        for field, value in declared.items()
+    }
+
+
+class TestStartupContract(CustomTestCase):
+    """SGLANG_TPU_ENABLE_K3_MEGAKERNEL launches are refused or resolved before weights load."""
+
+    def setUp(self):
+        _set_enabled(self, True)
+
+    def test_valid_launch_resolves_rows_tiles_backend_and_kv(self):
+        args = _launch()
+        _apply(args)
+        self.assertEqual(resolution_result(args, "max_running_requests"), 8)
+        self.assertEqual(resolution_result(args, "tpu_compile_bs"), [1, 2, 4, 8])
+        self.assertEqual(resolution_result(args, "attention_backend"), "pallas_tpu_mla")
+        # bf16, not the platform's fp8 default for the Pallas backends.
+        self.assertEqual(resolution_result(args, "kv_cache_dtype"), "bfloat16")
+
+    def test_flag_off_declares_nothing(self):
+        _set_enabled(self, False)
+        args = _launch(tp_size=4, ep_size=4, disable_radix_cache=False)
+        _apply(args, architectures=("Qwen3ForCausalLM",))
+        self.assertEqual(_declared_by_megakernel(args), {})
+
+    def test_each_unsupported_flag_is_refused_by_name(self):
+        cases = {
+            "--enable-mixed-chunk": dict(enable_mixed_chunk=True),
+            "--speculative-algorithm": dict(speculative_algorithm="EAGLE"),
+            "--decode-context-parallel-size": dict(dcp_size=2),
+            "--attention-context-parallel-size": dict(attn_cp_size=2),
+            "--pipeline-parallel-size": dict(pp_size=2),
+            "--dp-size": dict(dp_size=2),
+            "--attention-data-parallel-size": dict(attn_dp_size=2),
+            "--disaggregation-mode": dict(disaggregation_mode="decode"),
+            "--enable-hierarchical-cache": dict(enable_hierarchical_cache=True),
+            "--enable-pdmux": dict(enable_pdmux=True),
+            "--kv-cache-dtype fp8_e4m3": dict(kv_cache_dtype="fp8_e4m3"),
+            "--enable-lora": dict(enable_lora=True),
+            "--lora-paths": dict(lora_paths=["adapter"]),
+            "--enable-return-hidden-states": dict(enable_return_hidden_states=True),
+            "--enable-return-routed-experts": dict(enable_return_routed_experts=True),
+            "--enable-deterministic-inference": dict(
+                enable_deterministic_inference=True
+            ),
+            "--enable-eplb": dict(enable_eplb=True),
+            "--ep-num-redundant-experts": dict(ep_num_redundant_experts=8),
+            "--load-format dummy": dict(load_format="dummy"),
+            "--tpu-compile-tracer direct": dict(tpu_compile_tracer="direct"),
+            "--attention-backend pallas_tpu_rpa_v3": dict(
+                attention_backend="pallas_tpu_rpa_v3"
+            ),
+            "--enable-torch-compile": dict(enable_torch_compile=False),
+            "--context-length": dict(context_length=None),
+            "--disable-radix-cache": dict(disable_radix_cache=False),
+            "--tp-size 32 --ep-size 8": dict(ep_size=32),
+        }
+        for flag, override in cases.items():
+            with self.subTest(flag=flag):
+                args = _launch(**override)
+                with self.assertRaisesRegex(ValueError, flag):
+                    _apply(args)
+                self.assertEqual(_declared_by_megakernel(args), {})
+
+    def test_refusal_precedes_tpu_env_setup(self):
+        with patch("sglang_tpu.patches._prepare_tpu_env") as prepare_env:
+            with self.assertRaises(ValueError):
+                _apply(_launch(enable_mixed_chunk=True))
+        prepare_env.assert_not_called()
+
+    def test_non_kimi_k3_model_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "serves Kimi-K3"):
+            _apply(_launch(), architectures=("DeepseekV3ForCausalLM",))
+
+    def test_max_running_requests_must_be_a_row_tile(self):
+        for rows in (3, 5, 6, 7, 16):
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(ValueError, "--max-running-requests in"):
+                    _apply(_launch(max_running_requests=rows))
+        args = _launch(max_running_requests=4)
+        _apply(args)
+        self.assertEqual(resolution_result(args, "tpu_compile_bs"), [1, 2, 4])
+
+    def test_tpu_compile_bs_must_be_the_row_tiles(self):
+        with self.assertRaisesRegex(ValueError, "--tpu-compile-bs 1 2 4 8"):
+            _apply(_launch(tpu_compile_bs=[1, 4, 8]))
+        args = _launch(tpu_compile_bs=[8, 4, 2, 1])
+        _apply(args)
+        self.assertNotIn("tpu_compile_bs", _declared_by_megakernel(args))
 
 
 class TestSlotTable(CustomTestCase):
@@ -380,6 +570,29 @@ class TestPolicyStep(CustomTestCase):
         runner.prepare_decode.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "MIXED"):
             self._prepare(ForwardMode.MIXED, runner)
+
+
+class TestAttachHook(CustomTestCase):
+    def _run(self, enabled):
+        model_runner = SimpleNamespace(
+            model="model",
+            model_config=SimpleNamespace(model_path="/weights/k3", context_len=9344),
+        )
+        _set_enabled(self, enabled)
+        attach = unittest.mock.Mock()
+        # A stand-in module: the real one imports jax, which CPU CI lacks.
+        with patch.dict(
+            sys.modules,
+            {"sglang_tpu.kimi_k3_megakernel.attach": SimpleNamespace(attach=attach)},
+        ):
+            attach_kimi_k3_megakernel(None, model_runner)
+        return attach
+
+    def test_attaches_only_when_enabled(self):
+        self._run(False).assert_not_called()
+        self._run(True).assert_called_once_with(
+            "model", model_path="/weights/k3", context_length=9344
+        )
 
 
 def _moe_layer(seed):
