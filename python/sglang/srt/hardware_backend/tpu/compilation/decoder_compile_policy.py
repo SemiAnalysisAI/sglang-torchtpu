@@ -1362,9 +1362,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         # Distribute tokens across bs requests so that per-request length does not
         # exceed the per-request page table capacity (context_len) for large buckets.
-        base = global_tokens // bs
-        rem = global_tokens % bs
-        lens = [base + (1 if i < rem else 0) for i in range(bs)]
+        # Under the page-aligned TPU layout every request is laid out in whole
+        # pages per zigzag chunk, so warm up with requests of 2 * cp pages (any
+        # remainder would pile up on a few ranks and overflow the local bucket);
+        # the remaining batch rows are empty.
+        from sglang.srt.layers.cp.zigzag import _TPU_LAYOUT
+
+        page = int(_TPU_LAYOUT["page_align"] or 0)
+        unit = 2 * cp_size * page
+        if page and global_tokens % unit == 0:
+            n_req = max(1, min(bs, global_tokens // unit))
+            while global_tokens % n_req or (global_tokens // n_req) % unit:
+                n_req -= 1
+            lens = [global_tokens // n_req] * n_req + [0] * (bs - n_req)
+        else:
+            base = global_tokens // bs
+            rem = global_tokens % bs
+            lens = [base + (1 if i < rem else 0) for i in range(bs)]
         start_loc = [0]
         for l in lens[:-1]:
             start_loc.append(start_loc[-1] + l)

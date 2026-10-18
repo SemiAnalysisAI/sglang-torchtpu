@@ -73,6 +73,16 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     # per-rank row count differs from `stride`.
     gather_rank: Optional[Any] = None
     gather_local: Optional[Any] = None
+    # Page-aligned layout (TPU): per request, the owner rank and the row
+    # inside that rank's local block of every page of its new KV, in global
+    # token order; `new_kv_num_pages` pages are valid per request. The shim
+    # turns these into `new_kv_page_indices` for the bucketed gather buffer.
+    new_kv_page_rank: Optional[Any] = None
+    new_kv_page_row: Optional[Any] = None
+    new_kv_num_pages: Optional[Any] = None
+    # Per-request layout lengths (page-padded on TPU; == extend lens otherwise).
+    layout_seqs_len: Optional[List[int]] = None
+    layout_page: int = 0
     local_rows: Optional[Any] = None
     cp_last_rows: Optional[Any] = None
     cp_last_owner_mask: Optional[Any] = None
@@ -111,9 +121,34 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     kv_len_next_list: Optional[List[int]] = None
     actual_seq_q_prev_list: Optional[List[int]] = None
     actual_seq_q_next_list: Optional[List[int]] = None
+    # Per request, the largest head / tail chunk over all CP ranks (equal to
+    # the actual_* lists unless the TPU page-granular layout is on).
+    max_seq_q_prev_list: Optional[List[int]] = None
+    max_seq_q_next_list: Optional[List[int]] = None
 
 
 ContextParallelMetadata = ZigzagContextParallelMetadata
+
+
+# TPU prefill-CP layout knobs (off = the CUDA zigzag split, token granular).
+#
+# page_align > 0: every zigzag chunk is a whole number of KV pages, so each
+# rank's chunks start on page boundaries in the rank-major all-gathered K/V
+# and the attention kernel can address that buffer through a page table
+# (`new_kv_page_indices`) instead of the host reordering 16K rows per layer.
+# A request whose length is not a page multiple is laid out as if padded to
+# one; the padding rows duplicate its last real token and the kernel ignores
+# them through `kv_new_lens`.
+#
+# rotate_pairs: request i hands zigzag pair p to rank (p - i) mod cp instead
+# of rank p, so the page-granular remainder of many short requests lands on
+# different ranks rather than always on rank 0.
+_TPU_LAYOUT = {"page_align": 0, "rotate_pairs": False}
+
+
+def set_zigzag_tpu_layout(page_align: int = 0, rotate_pairs: bool = False) -> None:
+    _TPU_LAYOUT["page_align"] = int(page_align or 0)
+    _TPU_LAYOUT["rotate_pairs"] = bool(rotate_pairs)
 
 
 def _concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
@@ -179,67 +214,89 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         else:
             prefix_offsets = [0] * bs
 
-        # TODO: move these per-request layout/index computations to a Triton
-        # kernel if Python-side metadata construction becomes a bottleneck.
+        page = _TPU_LAYOUT["page_align"]
+        rotate = _TPU_LAYOUT["rotate_pairs"] and page > 0
+        cp = self.cp_size
+        # Layout lengths: page-padded on TPU, the real lengths otherwise.
+        if page > 0:
+            layout_lens = [-(-length // page) * page for length in extend_seqs_len]
+        else:
+            layout_lens = list(extend_seqs_len)
+
         per_seq_block_sizes: List[List[int]] = []
         split_list: List[int] = []
-        for length in extend_seqs_len:
-            base = length // cp_segment_num
-            rem = length % cp_segment_num
+        for length in layout_lens:
+            if page > 0:
+                units, unit = length // page, page
+            else:
+                units, unit = length, 1
+            base = units // cp_segment_num
+            rem = units % cp_segment_num
             block_sizes = [
-                base + 1 if block_id < rem else base
+                (base + 1 if block_id < rem else base) * unit
                 for block_id in range(cp_segment_num)
             ]
             per_seq_block_sizes.append(block_sizes)
             split_list.extend(block_sizes)
 
+        # Zigzag pair p = chunks (p, 2cp-1-p). Rank r of request b owns pair
+        # (r + shift_b) mod cp; shift is 0 without rotation.
+        shifts = [(b % cp) if rotate else 0 for b in range(bs)]
+
+        def head_chunk(rank: int, b: int) -> int:
+            return (rank + shifts[b]) % cp
+
+        def tail_chunk(rank: int, b: int) -> int:
+            return cp_segment_num - 1 - head_chunk(rank, b)
+
         per_rank_actual_token = []
-        for rank in range(self.cp_size):
+        for rank in range(cp):
             per_rank_actual_token.append(
                 sum(
-                    block_sizes[rank] + block_sizes[cp_segment_num - 1 - rank]
-                    for block_sizes in per_seq_block_sizes
+                    per_seq_block_sizes[b][head_chunk(rank, b)]
+                    + per_seq_block_sizes[b][tail_chunk(rank, b)]
+                    for b in range(bs)
                 )
             )
-        max_rank_len = [max(per_rank_actual_token)] * self.cp_size
+        max_rank_len = [max(per_rank_actual_token)] * cp
 
         cp_rank = self.cp_rank
         zigzag_index: List[int] = []
         for batch_id in range(bs):
-            zigzag_index.append(batch_id * cp_segment_num + cp_rank)
-            zigzag_index.append(
-                batch_id * cp_segment_num + (cp_segment_num - cp_rank - 1)
-            )
+            zigzag_index.append(batch_id * cp_segment_num + head_chunk(cp_rank, batch_id))
+            zigzag_index.append(batch_id * cp_segment_num + tail_chunk(cp_rank, batch_id))
 
         reverse_split_len: List[int] = []
         gathered_chunk_ids: List[int] = []
-        for r in range(self.cp_size):
+        for r in range(cp):
             for batch_id in range(bs):
-                reverse_split_len.append(per_seq_block_sizes[batch_id][r])
-                gathered_chunk_ids.append(batch_id * cp_segment_num + r)
-                reverse_split_len.append(
-                    per_seq_block_sizes[batch_id][cp_segment_num - 1 - r]
-                )
-                gathered_chunk_ids.append(
-                    batch_id * cp_segment_num + (cp_segment_num - 1 - r)
-                )
+                h, t = head_chunk(r, batch_id), tail_chunk(r, batch_id)
+                reverse_split_len.append(per_seq_block_sizes[batch_id][h])
+                gathered_chunk_ids.append(batch_id * cp_segment_num + h)
+                reverse_split_len.append(per_seq_block_sizes[batch_id][t])
+                gathered_chunk_ids.append(batch_id * cp_segment_num + t)
 
-        target_chunk_ids = list(range(bs * cp_segment_num))
-        cp_reverse_index = [gathered_chunk_ids.index(c) for c in target_chunk_ids]
+        gathered_pos = {c: i for i, c in enumerate(gathered_chunk_ids)}
+        cp_reverse_index = [gathered_pos[c] for c in range(bs * cp_segment_num)]
 
         kv_len_prev_list: List[int] = []
         kv_len_next_list: List[int] = []
         actual_seq_q_prev_list: List[int] = []
         actual_seq_q_next_list: List[int] = []
+        # Largest head / tail chunk of each request over the whole CP group.
+        # With the page-granular split chunks of one request can differ by a
+        # page, and the ring (cache phase) needs every rank to walk the same
+        # number of Q blocks per virtual sequence.
+        max_seq_q_prev_list: List[int] = []
+        max_seq_q_next_list: List[int] = []
         for batch_id, block_sizes in enumerate(per_seq_block_sizes):
-            kv_len_prev_list.append(
-                prefix_offsets[batch_id] + sum(block_sizes[: cp_rank + 1])
-            )
-            kv_len_next_list.append(
-                prefix_offsets[batch_id] + sum(block_sizes[: cp_segment_num - cp_rank])
-            )
-            actual_seq_q_prev_list.append(block_sizes[cp_rank])
-            actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
+            h, t = head_chunk(cp_rank, batch_id), tail_chunk(cp_rank, batch_id)
+            kv_len_prev_list.append(prefix_offsets[batch_id] + sum(block_sizes[: h + 1]))
+            kv_len_next_list.append(prefix_offsets[batch_id] + sum(block_sizes[: t + 1]))
+            actual_seq_q_prev_list.append(block_sizes[h])
+            actual_seq_q_next_list.append(block_sizes[t])
+            max_seq_q_prev_list.append(max(block_sizes[:cp]))
+            max_seq_q_next_list.append(max(block_sizes[cp:]))
 
         try:
             device = torch.device(get_device().device)
@@ -261,7 +318,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         cu_q_combined = [0] + list(accumulate(actual_seq_q_combined_list))
         cu_kv_combined = [0] + list(accumulate(kv_len_combined_list))
 
-        total_seq_lens = sum(extend_seqs_len)
+        total_seq_lens = sum(layout_lens)
         assert len(split_list) == bs * cp_segment_num
         assert sum(split_list) == total_seq_lens
         assert len(zigzag_index) == 2 * bs
@@ -293,23 +350,61 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         sl = np.asarray(split_list, dtype=np.int64)
         chunk_offsets = np.concatenate([[0], np.cumsum(sl)])
         zz = np.asarray(zigzag_index, dtype=np.int64)
-        local_indices = _concat_ranges(chunk_offsets[zz], sl[zz])
-        n_local = len(local_indices)
+        # Local rows in *layout* token space (page-padded per request on TPU).
+        local_layout = _concat_ranges(chunk_offsets[zz], sl[zz])
+        n_local = len(local_layout)
+        ext = np.asarray(extend_seqs_len, dtype=np.int64)
+        lay = np.asarray(layout_lens, dtype=np.int64)
+        real_start = np.concatenate([[0], np.cumsum(ext)])
+        lay_start = np.concatenate([[0], np.cumsum(lay)])
+        if page > 0 and n_local:
+            # Map each layout row to a real global token: padding rows of a
+            # request duplicate its last real token.
+            req = np.searchsorted(lay_start, local_layout, side="right") - 1
+            within = local_layout - lay_start[req]
+            within = np.minimum(within, np.maximum(ext[req] - 1, 0))
+            local_indices = real_start[req] + within
+        else:
+            local_indices = local_layout
         local_indices_padded = np.zeros((max(stride, n_local),), dtype=np.int32)
         local_indices_padded[:n_local] = local_indices
         local_rows = torch.from_numpy(local_indices_padded).to(device)
 
         # Last real token of each request -> local row (owner rank only).
-        ext = np.asarray(extend_seqs_len, dtype=np.int64)
-        last_tok = np.cumsum(ext) - 1
-        # local_indices is sorted ascending per zigzag chunk but not globally;
-        # map global token -> local row through an inverse table.
+        # local rows are sorted ascending per zigzag chunk but not globally;
+        # map layout token -> local row through an inverse table.
+        last_tok = lay_start[:-1] + np.maximum(ext - 1, 0)
         inv = np.full((int(total_seq_lens) + 1,), -1, dtype=np.int64)
-        inv[local_indices] = np.arange(n_local)
+        inv[local_layout] = np.arange(n_local)
         loc = inv[np.where(ext > 0, last_tok, 0)]
         owner = (ext > 0) & (loc >= 0)
         cp_last_rows = torch.from_numpy(np.where(owner, loc, 0).astype(np.int32)).to(device)
         cp_last_owner_mask = torch.from_numpy(owner).to(device)
+
+        # Page table of the rank-major gathered K/V (TPU page-aligned layout):
+        # page p of request b -> (owner rank, row inside that rank's block).
+        new_kv_page_rank = new_kv_page_row = new_kv_num_pages = None
+        if page > 0:
+            n_pages = lay // page
+            max_pages = int(n_pages.max()) if bs else 0
+            new_kv_page_rank = np.zeros((bs, max(max_pages, 1)), dtype=np.int32)
+            new_kv_page_row = np.zeros((bs, max(max_pages, 1)), dtype=np.int32)
+            # Row offset of (rank, b, head/tail) inside rank's local block:
+            # local order on every rank is [b0 head, b0 tail, b1 head, b1 tail, ...].
+            for r in range(cp):
+                off = 0
+                for b in range(bs):
+                    sizes = per_seq_block_sizes[b]
+                    h, t = head_chunk(r, b), tail_chunk(r, b)
+                    chunk_page0 = np.cumsum([0] + sizes[:-1]) // page
+                    for c, row0 in ((h, off), (t, off + sizes[h])):
+                        n_c = sizes[c] // page
+                        if n_c:
+                            p0 = int(chunk_page0[c])
+                            new_kv_page_rank[b, p0 : p0 + n_c] = r
+                            new_kv_page_row[b, p0 : p0 + n_c] = row0 + np.arange(n_c) * page
+                    off += sizes[h] + sizes[t]
+            new_kv_num_pages = n_pages.astype(np.int32)
 
         return ZigzagContextParallelMetadata(
             split_list=split_list,
@@ -323,6 +418,11 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             local_rows=local_rows,
             cp_last_rows=cp_last_rows,
             cp_last_owner_mask=cp_last_owner_mask,
+            new_kv_page_rank=new_kv_page_rank,
+            new_kv_page_row=new_kv_page_row,
+            new_kv_num_pages=new_kv_num_pages,
+            layout_seqs_len=layout_lens,
+            layout_page=page,
             stride=stride,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
@@ -377,6 +477,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             kv_len_next_list=kv_len_next_list,
             actual_seq_q_prev_list=actual_seq_q_prev_list,
             actual_seq_q_next_list=actual_seq_q_next_list,
+            max_seq_q_prev_list=max_seq_q_prev_list,
+            max_seq_q_next_list=max_seq_q_next_list,
             total_seq_lens=total_seq_lens,
             bs=bs,
         )

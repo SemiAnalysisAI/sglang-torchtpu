@@ -162,6 +162,11 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
             self._cp_op = build_batched_rpa_cp_op()
             if get_parallel().attn_cp_size > 1:
+                from sglang.srt.layers.cp.zigzag import set_zigzag_tpu_layout
+
+                # Page-aligned zigzag chunks let the kernel read the all-gathered
+                # K/V in rank order through a page table (no host reorder).
+                set_zigzag_tpu_layout(page_align=self.page_size, rotate_pairs=True)
                 build_batched_rpa_pcp_ring_op(
                     get_parallel().attn_cp_size, get_parallel().attn_tp_size
                 )

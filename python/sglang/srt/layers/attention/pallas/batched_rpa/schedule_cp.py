@@ -119,6 +119,68 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     def rank(self):
         return self.extra_refs[0][0] if self.extra_refs else 0
 
+    @jax.named_scope("seq_loop_cp")
+    def seq_loop(
+        self,
+        s_idx,
+        carry: schedule.LoopCarry,
+        *,
+        cu_q_lens_ref,
+        q_positions_ref,
+        global_kv_cache_lens_ref,
+        kv_new_lens_ref,
+        update_kv_cache_ref,
+    ) -> schedule.LoopCarry:
+        """Like the base loop, but a sequence with no Q rows on this rank still
+        runs one (empty) Q block when the rank has KV duties for it:
+
+        * ring (PCP cache phase): every rank must take the same number of
+          ring steps, so every rank walks as many Q blocks as the rank with
+          the longest chunk of this request (`extra_refs[1]`, the group-wide
+          max Q length), and a rank whose chunk is empty still walks one;
+        * NEW_TOKENS_ONLY with a KV write: the pages this rank owns are
+          written by the last Q block, which must exist.
+
+        The forced block has `q_sz_task == 0`: it moves no Q/O rows, only its
+        KV traffic runs.
+        """
+        cfgs = self.cfgs
+        q_start = cu_q_lens_ref[s_idx]
+        q_end = cu_q_lens_ref[s_idx + 1]
+        q_len = q_end - q_start
+        q_position = q_positions_ref[s_idx]
+        global_kv_cache_len = global_kv_cache_lens_ref[s_idx]
+        kv_new_len = kv_new_lens_ref[s_idx]
+        k_len = global_kv_cache_len + kv_new_len
+        update_kv_cache = update_kv_cache_ref[s_idx]
+
+        num_q = pl.cdiv(q_len, cfgs.bq_sz)
+        if cfgs.ring_enabled:
+            duty = global_kv_cache_len > 0
+            if len(self.extra_refs) > 1:
+                ring_q_len = self.extra_refs[1][s_idx]
+                num_q = jnp.maximum(num_q, pl.cdiv(ring_q_len, cfgs.bq_sz))
+        elif cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
+            duty = (kv_new_len > 0) & (update_kv_cache != 0)
+        else:
+            duty = False
+        num_q = jnp.maximum(num_q, jnp.where(duty, 1, 0))
+        num_k = pl.cdiv(k_len, cfgs.bkv_sz)
+
+        q_loop_fn = functools.partial(
+            self.q_loop,
+            s_idx=s_idx,
+            q_start=q_start,
+            q_end=q_end,
+            q_position=q_position,
+            global_kv_cache_len=global_kv_cache_len,
+            kv_new_len=kv_new_len,
+            num_k=num_k,
+            num_q=num_q,
+            update_kv_cache=update_kv_cache,
+        )
+        return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
+
     @property
     def schedule_rank(self):
         """Whose cache stripe this schedule walks.
@@ -292,6 +354,9 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         sched.k_idx[step, target_lane] = jnp.where(is_valid_task, loop_k_idx, 0)
         sched.is_last_k[step, target_lane] = is_last_k
 
+        # An empty Q block (forced ring / write block past this rank's rows)
+        # keeps its zero-size DMAs inside the Q buffer.
+        q_src = jnp.where(q_sz_task > 0, q_src, q_end)
         sched.dma_q[step, target_lane, 0] = jnp.where(is_valid_task, q_src, 0)
         sched.dma_q[step, target_lane, 1] = jnp.where(is_valid_task, q_sz_task, 0)
 

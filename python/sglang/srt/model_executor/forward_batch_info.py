@@ -754,6 +754,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # vocab-parallel embedding's TP all-reduce sees identical ids on every
     # rank; the model selects these rows right after the embedding.
     cp_local_rows: Optional[torch.Tensor] = None
+    # TPU prefill CP: page table addressing the rank-major all-gathered new
+    # K/V (see compiled_forward_shim), or None to reorder rows on the host.
+    cp_new_kv_page_indices: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the

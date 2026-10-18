@@ -14,6 +14,7 @@ import inspect
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -619,6 +620,31 @@ def _pad_forward_batch_inputs(
                     :target_gather_len
                 ]
         forward_batch.direct_reorder_index = getattr(meta, "direct_reorder_index", None)
+        forward_batch.cp_new_kv_page_indices = None
+        if getattr(meta, "new_kv_page_rank", None) is not None and meta.layout_page:
+            # Page table of the rank-major all-gathered K/V: rank r's block
+            # starts at row r * pad_t; page p of request b is at
+            # (rank, row) from the layout. One row per virtual sequence (head
+            # and tail chunk of a request share its table), padded to pad_b
+            # requests and cp * pad_t / page pages (the gather buffer's size).
+            from sglang.srt.runtime_context import get_parallel
+
+            cp_size = get_parallel().attn_cp_size
+            page = int(meta.layout_page)
+            width = (cp_size * pad_t) // page
+            n_req = meta.new_kv_page_rank.shape[0]
+            table = np.zeros((pad_b, width), dtype=np.int32)
+            cols = min(width, meta.new_kv_page_rank.shape[1])
+            if n_req and cols:
+                idx = (
+                    meta.new_kv_page_rank[:, :cols].astype(np.int64) * pad_t
+                    + meta.new_kv_page_row[:, :cols]
+                ) // page
+                table[: min(n_req, pad_b), :cols] = idx[:pad_b]
+            table = np.repeat(table, 2, axis=0)  # virtual seqs 2b, 2b+1
+            forward_batch.cp_new_kv_page_indices = torch.from_numpy(
+                np.ascontiguousarray(table.reshape(-1))
+            ).to(forward_batch.input_ids.device)
         local_rows = getattr(meta, "local_rows", None)
         if local_rows is not None:
             if local_rows.shape[0] < pad_t:

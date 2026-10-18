@@ -753,6 +753,7 @@ def ragged_paged_attention(
     decode_query_size: int = 1,
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
+    cp_ring_q_lens: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     alias_kv_cache: bool = True,
@@ -802,6 +803,11 @@ def ragged_paged_attention(
         sharded across devices in this group. Defaults to None.
       cp_rank: Rank of the current device within the CP group, which determine the
         token ownership. Defaults to None.
+      cp_ring_q_lens: [max_num_seqs] int32, ring (PCP cache phase) only. Per
+        sequence, the largest Q length any CP rank holds for it; every rank
+        walks `cdiv(cp_ring_q_lens, bq)` Q blocks so the ring hops stay in
+        lockstep when ranks hold unequal chunks. Defaults to this rank's own
+        Q lengths.
       attention_scope: Which KV positions to attend to. FULL attends all
         positions, CACHE_ONLY skips new tokens, NEW_TOKENS_ONLY skips cached
         tokens. Defaults to FULL.
@@ -1054,6 +1060,8 @@ def ragged_paged_attention(
         if cp_group_size is not None:
             computer_cls = schedule_cp.CPMetadataComputer
             extra_scalars = (cp_rank,) if cp_rank is not None else ()
+            if cp_ring_q_lens is not None and cp_rank is not None:
+                extra_scalars = extra_scalars + (cp_ring_q_lens,)
         else:
             computer_cls = schedule.BaseMetadataComputer
             extra_scalars = ()

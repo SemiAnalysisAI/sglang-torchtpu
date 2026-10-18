@@ -404,6 +404,10 @@ class PcpBatchedMetadata:
     # Any request in the batch has cached (prefix) tokens: selects the
     # program that runs the ring / cache phase. Host value (trace-time).
     has_prefix: bool = False
+    # [2 * num_reqs] largest head / tail chunk of each request over the CP
+    # group: the ring walks that many Q blocks on every rank so the hops stay
+    # in lockstep when the page-granular split gives ranks unequal chunks.
+    ring_q_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def create_empty(cls, device=None) -> "PcpBatchedMetadata":
@@ -455,7 +459,7 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
     from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
 
     mesh = _get_pallas_mesh(("pcp", "model"), (cp_size, attn_tp_size))
-    num_tensor_args = 12
+    num_tensor_args = 13
 
     def _local(
         queries,
@@ -470,6 +474,7 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
         kv_new_lens,
         cp_rank,
         update_kv_cache,
+        ring_q_lens,
         *,
         sm_scale,
         sliding_window,
@@ -495,6 +500,7 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
             attention_scope=configs.AttentionScope.CACHE_ONLY,
             cp_group_size=cp_size,
             cp_rank=cp_rank,
+            cp_ring_q_lens=ring_q_lens,
             pcp_ring_axis_name="pcp",
             pcp_ring_mesh_axis_names=("pcp", "model"),
             q_positions=q_positions,
@@ -523,6 +529,7 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
         kv_new_lens: jax.Array,
         cp_rank: jax.Array,
         update_kv_cache: jax.Array,
+        ring_q_lens: jax.Array,
         sm_scale: float,
         sliding_window: int | None,
         soft_cap: float | None,
@@ -556,6 +563,7 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
             kv_new_lens,
             cp_rank,
             update_kv_cache,
+            ring_q_lens,
         )
 
     op = _export_mesh_op(
@@ -832,9 +840,12 @@ def build_pcp_batched_metadata(
         q_pos_offsets = []
         pcp_write = []
         kv_new_lens = []
+        ring_q_lens = []
         run = 0
         real_b = getattr(forward_batch, "_real_b", getattr(forward_batch, "_tpu_real_b", None))
         meta_num_reqs = len(meta.actual_seq_q_prev_list)
+        max_prev = getattr(meta, "max_seq_q_prev_list", None) or meta.actual_seq_q_prev_list
+        max_next = getattr(meta, "max_seq_q_next_list", None) or meta.actual_seq_q_next_list
         for i in range(num_reqs):
             is_valid_req = (i < real_b) if real_b is not None else (i < meta_num_reqs)
             if i < meta_num_reqs:
@@ -843,12 +854,15 @@ def build_pcp_batched_metadata(
                 toff_head = meta.kv_len_prev_list[i] - c_head
                 toff_tail = meta.kv_len_next_list[i] - c_tail
                 ext_len = int(extend_lens[i]) if (extend_lens is not None and i < len(extend_lens)) else (c_head + c_tail) * two_p
+                m_head = max_prev[i]
+                m_tail = max_next[i]
             else:
                 c_head = 0
                 c_tail = 0
                 toff_head = 0
                 toff_tail = 0
                 ext_len = 0
+                m_head = m_tail = 0
 
             # Head chunk (sequence 2*i)
             run += c_head
@@ -856,6 +870,7 @@ def build_pcp_batched_metadata(
             q_pos_offsets.append(toff_head)
             pcp_write.append(False)  # Head chunk does not commit cache
             kv_new_lens.append(ext_len)
+            ring_q_lens.append(m_head)
 
             # Tail chunk (sequence 2*i + 1)
             run += c_tail
@@ -863,6 +878,7 @@ def build_pcp_batched_metadata(
             q_pos_offsets.append(toff_tail)
             pcp_write.append(is_valid_req)  # Tail chunk commits cache
             kv_new_lens.append(ext_len)
+            ring_q_lens.append(m_tail)
 
         c_per_req = (
             meta.actual_seq_q_prev_list[0]
@@ -877,6 +893,7 @@ def build_pcp_batched_metadata(
         q_pos_offsets = []
         pcp_write = []
         kv_new_lens = []
+        ring_q_lens = []
         run = 0
         for i in range(num_reqs):
             is_valid_req = (i < real_b) if real_b is not None else (i < len(c_sizes))
@@ -896,8 +913,10 @@ def build_pcp_batched_metadata(
             q_pos_offsets.append(toff_tail)
             pcp_write.append(is_valid_req)
             kv_new_lens.append(ext_len)
+            ring_q_lens.extend((c_len, c_len))
 
     pcp_cu_t = torch.tensor(pcp_cu, dtype=torch.int32, device=device)
+    ring_q_lens_t = torch.tensor(ring_q_lens, dtype=torch.int32, device=device)
     q_pos_t = torch.tensor(q_pos_offsets, dtype=torch.int32, device=device)
     pcp_write_t = torch.tensor(pcp_write, dtype=torch.bool, device=device)
     kv_new_lens_t = torch.tensor(kv_new_lens, dtype=torch.int32, device=device)
@@ -931,6 +950,7 @@ def build_pcp_batched_metadata(
         pcp_cache_lens=pcp_cache_lens_t,
         c_per_req=c_per_req,
         has_prefix=has_prefix,
+        ring_q_lens=ring_q_lens_t,
     )
 
 
@@ -1004,8 +1024,14 @@ def batched_rpa_pcp_forward(
     curr_distribution = base_meta.distribution * 2
     cache_lens_2x = pcp_meta.pcp_cache_lens.repeat_interleave(2)
     zeros_2x = torch.zeros_like(cache_lens_2x, dtype=torch.int32)
+    ring_q_lens = getattr(pcp_meta, "ring_q_lens", None)
+    if ring_q_lens is None:
+        # Equal chunks on every rank: this rank's own Q lengths.
+        ring_q_lens = pcp_meta.pcp_cu_q_lens[1:] - pcp_meta.pcp_cu_q_lens[:-1]
+    ring_q_lens = ring_q_lens.to(dtype=torch.int32, device=device)
 
     # 2. Current Phase (All-Gather current chunk tokens)
+    new_kv_page_indices = getattr(forward_batch, "cp_new_kv_page_indices", None)
     if (
         strategy is not None
         and getattr(forward_batch, "attn_cp_metadata", None) is not None
@@ -1021,7 +1047,14 @@ def batched_rpa_pcp_forward(
         kv_local = torch.cat(
             [k.reshape(num_local, kd), v.reshape(num_local, vd)], dim=-1
         ).contiguous()
-        kv_glob = cp_all_gather_rows(kv_local, forward_batch)
+        if new_kv_page_indices is not None:
+            # Page-aligned zigzag layout: the kernel addresses the rank-major
+            # gathered buffer through `new_kv_page_indices`; no row reorder.
+            group = get_parallel().attn_cp_group
+            kv_glob = kv_local.new_empty((cp_size * num_local, kv_local.shape[1]))
+            group.all_gather_into_tensor(kv_glob, kv_local)
+        else:
+            kv_glob = cp_all_gather_rows(kv_local, forward_batch)
         num_glob = kv_glob.shape[0]
         k_reordered = kv_glob[:, :kd].reshape(num_glob, k.shape[1], k.shape[2]).contiguous()
         v_reordered = kv_glob[:, kd:].reshape(num_glob, v.shape[1], v.shape[2]).contiguous()
@@ -1071,6 +1104,7 @@ def batched_rpa_pcp_forward(
             zeros_2x,
             cp_rank_tensor,
             zeros_2x,
+            ring_q_lens,
             float(layer.scaling),
             sliding_window,
             float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
@@ -1099,7 +1133,7 @@ def batched_rpa_pcp_forward(
         pcp_meta.q_positions,
         pcp_meta.kv_new_lens,
         cp_rank_tensor,
-        pcp_meta.new_kv_page_indices,
+        new_kv_page_indices,
         curr_update_kv,
         float(layer.scaling),
         sliding_window,
