@@ -285,6 +285,13 @@ def _run_cases(policy, mode):
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These tests replace compilation, not distributed execution.
+        initialized = patch("torch.distributed.is_initialized", return_value=False)
+        initialized.start()
+        self.addCleanup(initialized.stop)
+
     def test_custom_policy_forwards_kv_pool_without_replacing_runner_pool(self):
         compile_kv_pool = object()
 
