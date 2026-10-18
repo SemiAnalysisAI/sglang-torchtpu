@@ -88,6 +88,7 @@ class TestDenseFp8Methods(unittest.TestCase):
             False,
         )
         layer = torch.nn.Module()
+        layer.tp_size = 1
         scheme.create_weights(layer, 4, [4], 4, 4, torch.bfloat16, lambda *args: None)
         layer.weight.data.fill_(1.0)
         layer.weight_scale.data.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
