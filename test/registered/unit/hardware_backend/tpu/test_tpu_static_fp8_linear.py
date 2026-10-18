@@ -501,6 +501,22 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
                         self._layout(world, nnodes, world_size=world_size)
                     )
 
+    def test_host_split_op_module_keeps_real_annotations(self):
+        """cpu_export_jax_op reads the wrappers' jax.Array annotations; PEP 563
+        would turn them into strings and the op build fails at bind time."""
+        import ast
+
+        import sglang_tpu.kimi_k3.host_split_op as mod
+
+        tree = ast.parse(open(mod.__file__).read())
+        future = [
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            for alias in node.names
+        ]
+        self.assertNotIn("annotations", future)
+
     def test_split_ranks_needs_128_multiples(self):
         from sglang_tpu.kimi_k3 import static_fp8 as sf
 
