@@ -106,6 +106,7 @@ jobs:
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ needs.resolve.outputs.sha }}
+      version: ${{ needs.resolve.outputs.version }}
     permissions:
       contents: read
       id-token: write
@@ -119,7 +120,8 @@ jobs:
       ref: ${{ needs.resolve.outputs.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
-      test_file: test/registered/tpu/e2e/test_tpu_oot_qwen3_0_6b_singlehost_smoke.py
+      test_file: test/registered/tpu/e2e/test_tpu_qwen3_0_6b_singlehost_smoke.py
+      platform: tpu_oot
       weights_pvc: model-weights
       run_name: release-smoke
       display_name: release-smoke
