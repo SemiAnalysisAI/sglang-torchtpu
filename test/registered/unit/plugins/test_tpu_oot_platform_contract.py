@@ -339,6 +339,7 @@ class TestTpuOOTPlatformContract(CustomTestCase):
             skip_spec_op_precompile_without_draft,
         )
         from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
+        from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
 
         self.assertIn(
             (
@@ -362,6 +363,14 @@ class TestTpuOOTPlatformContract(CustomTestCase):
                 "sglang.srt.managers.scheduler.Scheduler.precompile_tpu_spec_ops",
                 skip_spec_op_precompile_without_draft,
                 HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+                bind_kimi_k3_static_fp8,
+                HookType.AFTER,
             ),
             HOOKS,
         )

@@ -274,8 +274,9 @@ class TestKernelInputsTag(CustomTestCase):
             nnodes=1,
             node_rank=0,
             use_ray=False,
-            dp_size=2,
-            enable_dp_attention=True,
+            # The resolved layout of --dp-size 2 --enable-dp-attention.
+            dp_size=1,
+            attn_dp_size=2,
         )
         scopes = []
         for tp_rank in (0, 2):
