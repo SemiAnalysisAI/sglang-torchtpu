@@ -56,6 +56,10 @@ class TpuEnvs:
     # decoder_compile_policy._guard_filter_options). Assumes module state is
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
+    # Two-level one-shot Pallas all-reduce for single-token TP decode tensors
+    # (twolevel_allreduce.py): host-local exchange, then cross-host. Applies
+    # when TP spans the whole world; everything else keeps XLA's all-reduce.
+    SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE = EnvBool(False)
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)

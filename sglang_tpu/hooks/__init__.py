@@ -38,6 +38,10 @@ from sglang_tpu.hooks.pipeline_parallel import (
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
+from sglang_tpu.hooks.twolevel_allreduce import (
+    merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,16 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer.hc_post",
         hc_post,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+        twolevel_all_reduce,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+        twolevel_merged_moe_all_reduce,
         HookType.AROUND,
     ),
     (

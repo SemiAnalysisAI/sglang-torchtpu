@@ -1275,6 +1275,10 @@ class TpuSRTPlatform(SRTPlatform):
 
         make_stage_groups_standalone(get_parallel())
         validate_chips_for_pp(get_parallel())
+        # Before the first collective and before torch.compile traces the model.
+        from sglang_tpu.twolevel_allreduce import register_from_parallel_state
+
+        register_from_parallel_state()
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration
