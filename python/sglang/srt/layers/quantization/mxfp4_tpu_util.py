@@ -84,7 +84,11 @@ def _e8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
     treat all values uniformly.
     """
     assert scale_u8.dtype == torch.uint8, f"expected uint8 e8m0, got {scale_u8.dtype}"
-    return torch.exp2(scale_u8.to(torch.int32).to(torch.float32) - 127.0)
+    # Exact powers of two from the exponent bits: torch.exp2 lowers to an
+    # approximation on TPU that can be off by an ULP. e8m0 0 is 2**-127, an fp32
+    # subnormal.
+    bits = scale_u8.to(torch.int32) << 23
+    return torch.where(scale_u8 == 0, 1 << 22, bits).view(torch.float32)
 
 
 def _flatten_block_bytes(packed_blocks: torch.Tensor) -> torch.Tensor:
