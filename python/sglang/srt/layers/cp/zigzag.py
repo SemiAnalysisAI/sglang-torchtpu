@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -113,6 +114,20 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
 
 
 ContextParallelMetadata = ZigzagContextParallelMetadata
+
+
+def _concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenate ``range(starts[i], starts[i] + lengths[i])`` for all i."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    total = int(lengths.sum())
+    if total == 0:
+        return np.zeros((0,), dtype=np.int64)
+    ends = np.cumsum(lengths)
+    begins = ends - lengths
+    # offset of each output element to the start of its own range
+    idx = np.arange(total, dtype=np.int64)
+    which = np.searchsorted(ends, idx, side="right")
+    return np.asarray(starts, dtype=np.int64)[which] + (idx - begins[which])
 
 
 class ZigzagCPStrategy(ContextParallelStrategy):
@@ -254,73 +269,47 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
         assert sum(per_rank_actual_token) == total_seq_lens
 
-        offsets = [0]
-        for l in reverse_split_len:
-            offsets.append(offsets[-1] + l)
-        perm = []
-        for idx in cp_reverse_index:
-            perm.extend(range(offsets[idx], offsets[idx] + reverse_split_len[idx]))
-        reorder_index_tensor = torch.tensor(
-            perm, device=device, dtype=torch.int32
-        )
+        # Host index construction, vectorized with numpy: every quantity below
+        # is a concatenation of integer ranges, and at 16K tokens the Python
+        # loops this replaces cost ~6 ms per prefill batch.
+        rsl = np.asarray(reverse_split_len, dtype=np.int64)
+        offsets = np.concatenate([[0], np.cumsum(rsl)])
+        rev = np.asarray(cp_reverse_index, dtype=np.int64)
+        perm = _concat_ranges(offsets[rev], rsl[rev])
+        reorder_index_tensor = torch.from_numpy(perm.astype(np.int32)).to(device)
 
         stride = max(per_rank_actual_token) if per_rank_actual_token else int(num_tokens)
-        gathered_to_rk = []
-        for r, n in enumerate(per_rank_actual_token):
-            for k in range(n):
-                gathered_to_rk.append((r, k))
-        direct_perm = []
-        gather_perm = []
-        for p in perm:
-            r, k = gathered_to_rk[p]
-            slot = (cp_rank - r) % self.cp_size
-            direct_perm.append(slot * stride + k)
-            gather_perm.append(r * stride + k)
-        direct_reorder_index = torch.tensor(
-            direct_perm, device=device, dtype=torch.int32
-        )
-        gather_reorder_index = torch.tensor(
-            gather_perm, device=device, dtype=torch.int32
-        )
+        rank_offsets = np.concatenate([[0], np.cumsum(np.asarray(per_rank_actual_token, dtype=np.int64))])
+        gather_rank = np.searchsorted(rank_offsets, perm, side="right") - 1
+        gather_local = perm - rank_offsets[gather_rank]
+        slot = (cp_rank - gather_rank) % self.cp_size
+        direct_reorder_index = torch.from_numpy(
+            (slot * stride + gather_local).astype(np.int32)
+        ).to(device)
+        gather_reorder_index = torch.from_numpy(
+            (gather_rank * stride + gather_local).astype(np.int32)
+        ).to(device)
 
-        chunk_offsets = [0]
-        for l in split_list:
-            chunk_offsets.append(chunk_offsets[-1] + l)
+        sl = np.asarray(split_list, dtype=np.int64)
+        chunk_offsets = np.concatenate([[0], np.cumsum(sl)])
+        zz = np.asarray(zigzag_index, dtype=np.int64)
+        local_indices = _concat_ranges(chunk_offsets[zz], sl[zz])
+        n_local = len(local_indices)
+        local_indices_padded = np.zeros((max(stride, n_local),), dtype=np.int32)
+        local_indices_padded[:n_local] = local_indices
+        local_rows = torch.from_numpy(local_indices_padded).to(device)
 
-        local_indices = []
-        for idx in zigzag_index:
-            local_indices.extend(
-                range(chunk_offsets[idx], chunk_offsets[idx] + split_list[idx])
-            )
-
-        local_indices_padded = list(local_indices)
-        if len(local_indices_padded) < stride:
-            local_indices_padded.extend([0] * (stride - len(local_indices_padded)))
-        local_rows = torch.tensor(
-            local_indices_padded, device=device, dtype=torch.int32
-        )
-
-        local_indices_map = {tok_id: loc_idx for loc_idx, tok_id in enumerate(local_indices)}
-        last_rows_list = []
-        last_owner_mask_list = []
-        cum_len = 0
-        for b in range(bs):
-            req_len = extend_seqs_len[b] if extend_seqs_len is not None else 0
-            if req_len > 0:
-                last_tok = cum_len + req_len - 1
-                if last_tok in local_indices_map:
-                    last_rows_list.append(local_indices_map[last_tok])
-                    last_owner_mask_list.append(True)
-                else:
-                    last_rows_list.append(0)
-                    last_owner_mask_list.append(False)
-                cum_len += req_len
-            else:
-                last_rows_list.append(0)
-                last_owner_mask_list.append(False)
-
-        cp_last_rows = torch.tensor(last_rows_list, device=device, dtype=torch.int32)
-        cp_last_owner_mask = torch.tensor(last_owner_mask_list, device=device, dtype=torch.bool)
+        # Last real token of each request -> local row (owner rank only).
+        ext = np.asarray(extend_seqs_len, dtype=np.int64)
+        last_tok = np.cumsum(ext) - 1
+        # local_indices is sorted ascending per zigzag chunk but not globally;
+        # map global token -> local row through an inverse table.
+        inv = np.full((int(total_seq_lens) + 1,), -1, dtype=np.int64)
+        inv[local_indices] = np.arange(n_local)
+        loc = inv[np.where(ext > 0, last_tok, 0)]
+        owner = (ext > 0) & (loc >= 0)
+        cp_last_rows = torch.from_numpy(np.where(owner, loc, 0).astype(np.int32)).to(device)
+        cp_last_owner_mask = torch.from_numpy(owner).to(device)
 
         return ZigzagContextParallelMetadata(
             split_list=split_list,
@@ -328,7 +317,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             cp_reverse_index=cp_reverse_index,
             reverse_split_len=reverse_split_len,
             reorder_index_tensor=reorder_index_tensor,
-            perm=perm,
+            perm=perm.tolist(),
             direct_reorder_index=direct_reorder_index,
             gather_reorder_index=gather_reorder_index,
             local_rows=local_rows,
