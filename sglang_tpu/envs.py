@@ -49,7 +49,7 @@ class TpuEnvs:
     # fixed after warmup.
     SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER = EnvBool(False)
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
-    # batches (moe/router_topk_tpu.py); False keeps the generic top-k.
+    # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
 
     # Speculative decoding
