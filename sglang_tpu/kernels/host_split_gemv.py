@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host-split single-token decode GEMV for Kimi-K3 on TPU.
+"""Host-split single-token decode GEMV (Pallas) for Kimi-K3 on TPU.
 
 Under TP32 the MoE latent down-proj, router gate and latent up-proj are
 replicated: every rank streams the whole weight each decode step. Here each
@@ -9,8 +9,8 @@ weight. Every output column is still computed by one rank from the full
 input with the replicated weight's fp8 values and scales.
 
 One kernel per projection streams this rank's fp8 [K, N] slice in K blocks
-like static_fp8_gemv_pallas (and, for the MoE front, its bf16 router-gate
-slice), signals the host barrier on the first block so the handshake
+like kernels/static_fp8_gemv.py (and, for the MoE front, its bf16
+router-gate slice), signals the host barrier on the first block so the handshake
 overlaps the weight stream, and after the last block sends the gathered
 columns to the other ranks of the host in one DMA each (dense (rows, 128)
 tiles in one VMEM buffer) and concatenates what it receives.
@@ -19,33 +19,21 @@ Outputs: the gathered columns ``[1, used * cols]`` (the first ``cols`` GEMV
 columns of the first ``used`` ranks of the host), the gathered router logits
 ``[1, used_e * 128]`` when a router slice is given, and this rank's remaining
 GEMV columns ``[1, n - cols]`` (the shared experts' gate_up) when there are
-any.
+any. The Kimi-K3 static fp8 binder (sglang_tpu/kimi_k3/static_fp8.py) builds
+the ops and binds the column slices.
 """
 
 import functools
-from threading import Lock
 
-# One fp8 sublane tile, as in static_fp8_gemv_pallas; the row is zero-padded.
+# One fp8 sublane tile, as in static_fp8_gemv.py; the row is zero-padded.
 _ROWS = 32
 _FP8_MAX = 448.0
 _ALIGN_ROWS = 16
 _VMEM_LIMIT = 40 * 1024 * 1024
-# Measured best for the Kimi-K3 TP32 GEMV shapes (static_fp8_gemv_pallas).
+# Measured best for the Kimi-K3 TP32 GEMV shapes (static_fp8_gemv.py).
 _MAX_BLOCK_K = 1792
 # Barrier namespace: 0 fused GMM reduce-scatter, 1 two-level all-reduce.
 _COLLECTIVE_ID = 2
-
-_OPS: dict = {}
-_LOCK = Lock()
-
-
-def local_size(world: int, nnodes: int) -> int:
-    """Ranks per host for a host-major TP group of ``world`` ranks, or 0 when
-    the ranks do not divide evenly across the hosts."""
-    local = world // nnodes if nnodes > 0 else 0
-    if local <= 0 or world % local:
-        return 0
-    return local
 
 
 def block_k(k: int) -> int:
@@ -201,67 +189,3 @@ def host_split_gemv_local(
         + (f"_r{used_e}" if has_router else ""),
     )(*args)
     return tuple(outs)
-
-
-def _build(world: int, local: int, cols: int, used: int, used_e: int):
-    import jax
-    from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal.pallas import get_pallas_mesh
-
-    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
-
-    mesh = get_pallas_mesh(("model",), (world,))
-    spec = P("model")
-    body = functools.partial(
-        host_split_gemv_local, local=local, cols=cols, used=used, used_e=used_e
-    )
-    if used_e:
-        sharded = jax.shard_map(
-            body,
-            mesh=mesh,
-            in_specs=(spec,) * 5,
-            out_specs=(spec,) * 3,
-            check_vma=False,
-        )
-
-        def _wrapped(
-            x: jax.Array,
-            w: jax.Array,
-            out_scale: jax.Array,
-            inv_x: jax.Array,
-            router: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            return sharded(x, w, out_scale, inv_x, router)
-
-        n_in, n_out = 5, 3
-    else:
-        sharded = jax.shard_map(
-            lambda *a: body(*a)[0],
-            mesh=mesh,
-            in_specs=(spec,) * 4,
-            out_specs=spec,
-            check_vma=False,
-        )
-
-        def _wrapped(
-            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
-        ) -> jax.Array:
-            return sharded(x, w, out_scale, inv_x)
-
-        n_in, n_out = 4, 1
-    tag = f"c{cols}_u{used}" + (f"_r{used_e}" if used_e else "")
-    return cpu_export_jax_op(
-        f"sglang_tpu_pallas::host_split_gemv_w{world}_l{local}_{tag}",
-        _wrapped,
-        mesh=mesh,
-        input_partition_specs=(spec,) * n_in,
-        output_partition_specs=(spec,) * n_out,
-    )
-
-
-def get_op(world: int, local: int, cols: int, used: int, used_e: int = 0):
-    key = (world, local, cols, used, used_e)
-    with _LOCK:
-        if key not in _OPS:
-            _OPS[key] = _build(*key)
-        return _OPS[key]

@@ -20,6 +20,7 @@ weight updates, so nothing reads the released weights again.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import NamedTuple, Optional
 
@@ -95,7 +96,7 @@ def _release(*linears: nn.Module) -> int:
 
 class HostSplitFront(NamedTuple):
     """Single-token MoE front split across the ranks of a host: one kernel
-    (sglang_tpu/host_split_gemv.py) runs this rank's latent down-proj columns
+    (sglang_tpu/kernels/host_split_gemv.py) runs this rank's latent down-proj columns
     and shared gate_up in one fp8 GEMV, its router-gate experts in bf16, and
     the host exchange. Returns (latent, router logits, shared gate_up)."""
 
@@ -133,18 +134,95 @@ def _host_split_layout() -> Optional[tuple[int, int, int]]:
         get_tensor_model_parallel_world_size,
     )
     from sglang.srt.runtime_context import get_server_args
-    from sglang_tpu.host_split_gemv import local_size
 
     world = get_tensor_model_parallel_world_size()
-    local = local_size(world, get_server_args().nnodes)
-    if world <= 1 or world != dist.get_world_size() or local <= 1:
+    nnodes = get_server_args().nnodes
+    # TP spanning the world is host-major, with world / nnodes ranks per host.
+    if world != dist.get_world_size() or world % nnodes or world // nnodes <= 1:
         logger.warning(
-            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but TP %d is not a "
-            "host-major group spanning the world; the GEMVs stay replicated.",
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but TP %d over %d hosts "
+            "is not a host-major group spanning the world; the GEMVs stay "
+            "replicated.",
             world,
+            nnodes,
         )
         return None
+    local = world // nnodes
     return world, local, get_tensor_model_parallel_rank() % local
+
+
+def _build_host_split_op(world: int, local: int, cols: int, used: int, used_e: int):
+    """The host-split GEMV for one split shape, as a torch op over the TP mesh."""
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    from sglang_tpu.kernels import host_split_gemv
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    mesh = get_pallas_mesh(("model",), (world,))
+    spec = P("model")
+    body = functools.partial(
+        host_split_gemv.host_split_gemv_local,
+        local=local,
+        cols=cols,
+        used=used,
+        used_e=used_e,
+    )
+    if used_e:
+        sharded = jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec,) * 5,
+            out_specs=(spec,) * 3,
+            check_vma=False,
+        )
+
+        def _wrapped(
+            x: jax.Array,
+            w: jax.Array,
+            out_scale: jax.Array,
+            inv_x: jax.Array,
+            router: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return sharded(x, w, out_scale, inv_x, router)
+
+        n_in, n_out = 5, 3
+    else:
+        sharded = jax.shard_map(
+            lambda *a: body(*a)[0],
+            mesh=mesh,
+            in_specs=(spec,) * 4,
+            out_specs=spec,
+            check_vma=False,
+        )
+
+        def _wrapped(
+            x: jax.Array, w: jax.Array, out_scale: jax.Array, inv_x: jax.Array
+        ) -> jax.Array:
+            return sharded(x, w, out_scale, inv_x)
+
+        n_in, n_out = 4, 1
+    tag = f"c{cols}_u{used}" + (f"_r{used_e}" if used_e else "")
+    return cpu_export_jax_op(
+        f"sglang_tpu_pallas::host_split_gemv_w{world}_l{local}_{tag}",
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(spec,) * n_in,
+        output_partition_specs=(spec,) * n_out,
+    )
+
+
+# One op per split shape (the front and the latent up-proj), built at bind
+# time, before torch.compile traces the model.
+_HOST_SPLIT_OPS: dict = {}
+
+
+def _host_split_op(world: int, local: int, cols: int, used: int, used_e: int = 0):
+    key = (world, local, cols, used, used_e)
+    if key not in _HOST_SPLIT_OPS:
+        _HOST_SPLIT_OPS[key] = _build_host_split_op(*key)
+    return _HOST_SPLIT_OPS[key]
 
 
 def _split_ranks(n: int, local: int) -> int:
@@ -175,8 +253,6 @@ def _column_slice(w_kn: torch.Tensor, used: int, index: int) -> torch.Tensor:
 def _bind_host_split(moe, in_norm_weight, down, gate_up, up, layout) -> None:
     """Bind the single-token host-split variants next to the replicated
     StaticFp8Weights, which stay for multi-token batches."""
-    from sglang_tpu import host_split_gemv
-
     world, local, index = layout
     if down is not None and gate_up is not None:
         router_kn = moe.gate.weight.detach().t()  # [H, E]
@@ -187,9 +263,7 @@ def _bind_host_split(moe, in_norm_weight, down, gate_up, up, layout) -> None:
             moe._host_split_front = HostSplitFront(
                 weight=_pack(torch.cat([latent, gate_up], dim=1), in_norm_weight),
                 router_weight=_column_slice(router_kn, used_e, index),
-                op=host_split_gemv.get_op(
-                    world, local, latent.shape[1], used_l, used_e
-                ),
+                op=_host_split_op(world, local, latent.shape[1], used_l, used_e),
             )
     if up is not None:
         used = _split_ranks(up.shape[1], local)
@@ -199,7 +273,7 @@ def _bind_host_split(moe, in_norm_weight, down, gate_up, up, layout) -> None:
             )
             moe._host_split_latent_up = HostSplitUp(
                 weight=weight,
-                op=host_split_gemv.get_op(world, local, weight.weight.shape[1], used),
+                op=_host_split_op(world, local, weight.weight.shape[1], used),
             )
 
 

@@ -462,13 +462,44 @@ class TestKimiK3HostSplitSlices(CustomTestCase):
             with tpu_envs.SGLANG_TPU_K3_STATIC_FP8.override("all"):
                 self.assertIn("latent_up", static_fp8_parts())
 
-    def test_local_size(self):
-        from sglang_tpu.host_split_gemv import local_size
+    def _layout(self, world, nnodes, rank=13, world_size=None):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
 
-        self.assertEqual(local_size(32, 4), 8)  # tpu7x 2x2x4, TP32
-        self.assertEqual(local_size(8, 1), 8)  # one host
-        self.assertEqual(local_size(32, 3), 0)  # uneven
-        self.assertEqual(local_size(32, 0), 0)
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.override(True),
+            mock.patch(
+                "torch.distributed.get_world_size",
+                return_value=world if world_size is None else world_size,
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state."
+                "get_tensor_model_parallel_world_size",
+                return_value=world,
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+                return_value=rank,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=mock.Mock(nnodes=nnodes),
+            ),
+        ):
+            return sf._host_split_layout()
+
+    def test_layout_from_hosts(self):
+        self.assertEqual(self._layout(32, 4), (32, 8, 5))  # tpu7x 2x2x4, TP32
+        self.assertEqual(self._layout(8, 1), (8, 8, 5))  # one host
+
+    def test_layout_off_for_other_groups(self):
+        from sglang_tpu.kimi_k3 import static_fp8 as sf
+
+        for world, nnodes, world_size in ((32, 3, 32), (32, 32, 32), (16, 2, 32)):
+            with self.subTest(world=world, nnodes=nnodes, world_size=world_size):
+                with self.assertLogs(sf.logger, "WARNING"):
+                    self.assertIsNone(
+                        self._layout(world, nnodes, world_size=world_size)
+                    )
 
     def test_split_ranks_needs_128_multiples(self):
         from sglang_tpu.kimi_k3 import static_fp8 as sf
