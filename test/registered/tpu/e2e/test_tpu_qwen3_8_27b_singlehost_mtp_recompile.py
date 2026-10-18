@@ -54,7 +54,13 @@ class TestQwen38MtpServesWithoutRecompile(TPULauncherTestCase):
 
     @classmethod
     def get_runtime_envs(cls):
-        return {**super().get_runtime_envs(), "MODEL": MODEL_PATH}
+        # CI-only FutureMap debug asserts scatter into live rows eagerly, one
+        # program per live bs; this server measures production serving.
+        return {
+            **super().get_runtime_envs(),
+            "MODEL": MODEL_PATH,
+            "SGLANG_IS_IN_CI": None,
+        }
 
     def test_draining_batch_compiles_nothing(self):
         log = Path(self.log_path)
