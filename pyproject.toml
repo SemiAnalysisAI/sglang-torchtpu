@@ -29,7 +29,7 @@ tpu_oot_hooks = "sglang_tpu.hooks:register"
 include = ["sglang_tpu*"]
 
 [tool.setuptools.package-data]
-"sglang_tpu" = ["**/*.md"]
+"sglang_tpu" = ["**/*.md", "kimi_k3_megakernel/_vendor/LICENSE"]
 
 [tool.setuptools_scm]
 # release-tpu.yml pins the version with SETUPTOOLS_SCM_PRETEND_VERSION so both
