@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
-from jax import tree_util
 
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -25,9 +25,17 @@ class ChainDraftForwardInput(DFlashVerifyInput):
     rpa_draft_kv_lens: torch.Tensor | None = None
 
 
-# A subclass is its own pytree type; register it like DFlashVerifyInput so
-# direct_compile traces hidden_states as a graph input.
-tree_util.register_dataclass(ChainDraftForwardInput)
+@functools.cache
+def register_chain_draft_pytree() -> None:
+    """Register ChainDraftForwardInput as a pytree, as direct_compile does DFlashVerifyInput.
+
+    A subclass is its own pytree type, so direct_compile would otherwise not
+    trace hidden_states as a graph input. jax is imported here, not at module
+    load: CPU runs import this module without jax installed.
+    """
+    from jax import tree_util
+
+    tree_util.register_dataclass(ChainDraftForwardInput)
 
 
 def chain_draft_forward_input(

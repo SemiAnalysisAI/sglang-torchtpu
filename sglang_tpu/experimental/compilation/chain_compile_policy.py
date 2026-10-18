@@ -37,6 +37,7 @@ from sglang_tpu.experimental.compilation.spec_compile_policy import (
 )
 from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
+    register_chain_draft_pytree,
 )
 
 logger = get_logger(__name__)
@@ -121,6 +122,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             traced_attention_metadata,
         )
 
+        register_chain_draft_pytree()
         # trace names forward_batch itself: ignored_argnames resolve by parameter name.
         compiled = direct_compile(
             trace,
