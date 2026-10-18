@@ -215,14 +215,17 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         """DSPARK is in flight; delete this test when it is tested on TPU."""
         self.assertFalse(self.platform.supports_speculative_algorithm("DSPARK"))
 
-    def test_claimed_draft_backends_are_registered_by_draft_utils(self):
+    def test_claimed_draft_backends_are_registered(self):
         from sglang_tpu.platform import _SUPPORTED_DRAFT_ATTENTION_BACKENDS
 
-        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - self._draft_backend_keys()
+        missing = _SUPPORTED_DRAFT_ATTENTION_BACKENDS - (
+            self._draft_backend_keys() | self._registered_draft_backends()
+        )
         self.assertEqual(
             missing,
             set(),
-            f"claimed draft backends draft_utils does not register: {sorted(missing)}",
+            "claimed draft backends neither draft_utils nor the plugin's draft "
+            f"registry provides: {sorted(missing)}",
         )
 
     def test_default_draft_backend_matches_the_core_default(self):
@@ -464,6 +467,23 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         path = os.path.join(_REPO_ROOT, "python", "sglang", "srt", relpath)
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read()
+
+    def _registered_draft_backends(self) -> set:
+        """Names sglang_tpu registers with register_draft_attention_backend."""
+        path = os.path.join(_REPO_ROOT, "sglang_tpu", "tpu_platform.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        names = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "register_draft_attention_backend"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                names.add(node.args[0].value)
+        return names
 
     def _draft_backend_keys(self) -> set:
         """Dispatch-dict keys in speculative/draft_utils.py, parsed not imported."""
