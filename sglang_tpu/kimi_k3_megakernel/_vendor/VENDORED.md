@@ -47,3 +47,8 @@ In commit order:
    process. A header now states what it replaces, why, the JAX versions it
    targets and when it is installed, and the import fails if the private
    function's four-argument signature changes.
+4. **Decode rows [0, B) of R >= B state rows** (`kimi/decode_megakernel.py`).
+   SGLang keeps one set of state arrays with `max_rows` rows and runs the
+   compiled tile `B` over rows `[0, B)`. `stack()` reads, writes and drains
+   only those rows, and both it and `make_decode` accept states with more rows
+   than the tile.
