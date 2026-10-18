@@ -3,7 +3,8 @@
 
 import hashlib
 import inspect
-from collections.abc import Callable, Sequence
+import typing
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import torch
@@ -213,11 +214,27 @@ def cpu_export_jax_op(
     input_partition_specs: Sequence[PartitionSpec] | None = None,
     output_partition_specs: Sequence[PartitionSpec] | None = None,
     donate_argnums: Sequence[int] | None = None,
+    input_output_aliases: Mapping[int, int] | None = None,
+    fake_function: Callable[..., object] | None = None,
 ):
+    """Register ``function`` as a TorchTPU custom op exported on the host.
+
+    ``input_output_aliases`` maps donated inputs to the outputs that replace
+    them; see ``_aliasing_custom_op``. Such an op takes ``fake_function`` for
+    shape propagation.
+    """
     signature = inspect.signature(function, follow_wrapped=False)
     pallas_impl._verify_signature(signature)
     static_argnums = pallas_impl._infer_static_argnums(signature)
     donate_argnums_tuple = tuple(donate_argnums or ())
+    aliases = dict(input_output_aliases or {})
+    if aliases and (
+        not set(aliases) <= set(donate_argnums_tuple) or fake_function is None
+    ):
+        raise ValueError(
+            f"{name}: aliased inputs {sorted(aliases)} must be donated "
+            f"(donate_argnums={donate_argnums_tuple}) and need a fake_function"
+        )
     input_partition_specs = tuple(input_partition_specs or ())
     output_partition_specs = tuple(output_partition_specs or ())
     output_shardings = tuple(
@@ -244,6 +261,11 @@ def cpu_export_jax_op(
             "static_argnums": static_argnums,
             "donate_argnums": donate_argnums_tuple,
             "output_partition_specs": tuple(map(str, output_partition_specs)),
+            **(
+                {"input_output_aliases": tuple(sorted(aliases.items()))}
+                if aliases
+                else {}
+            ),
         },
     )
     wrapped = _CpuExportJaxCallable(
@@ -254,8 +276,13 @@ def cpu_export_jax_op(
         input_partition_specs=input_partition_specs or None,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums_tuple,
+        **({"input_output_aliases": aliases} if aliases else {}),
     )
     wrapped.sglang_output_shardings = output_shardings
+    if aliases:
+        return _aliasing_custom_op(
+            name, wrapped, signature, aliases=aliases, fake_function=fake_function
+        )
     custom_op = torch.library.custom_op(name, wrapped, mutates_args=())
 
     def fake_function(*args, **kwargs):
@@ -275,5 +302,45 @@ def cpu_export_jax_op(
             for aval, sharding in zip(lowered.out_avals, shardings)
         )
 
+    custom_op.register_fake(fake_function)
+    return custom_op
+
+
+def _aliasing_custom_op(
+    name: str,
+    wrapped: _CpuExportJaxCallable,
+    signature: inspect.Signature,
+    *,
+    aliases: Mapping[int, int],
+    fake_function: Callable[..., object],
+):
+    """A custom op over ``wrapped`` that updates its aliased inputs in place.
+
+    ``wrapped`` copies each aliased output back into its input. A torch custom
+    op may not also return those outputs, so the op declares the inputs mutated
+    and returns only the other outputs (one tensor, or a tuple).
+    """
+    parameters = list(signature.parameters.values())
+    output_count = len(typing.get_args(signature.return_annotation))
+    kept = [index for index in range(output_count) if index not in aliases.values()]
+
+    def call(*args: torch.Tensor):
+        outputs = wrapped(*args)
+        if len(kept) == 1:
+            return outputs[kept[0]]
+        return tuple(outputs[index] for index in kept)
+
+    call.__signature__ = inspect.Signature(
+        [parameter.replace(annotation=torch.Tensor) for parameter in parameters],
+        return_annotation=(
+            torch.Tensor if len(kept) == 1 else tuple[(torch.Tensor,) * len(kept)]
+        ),
+    )
+    custom_op = torch.library.custom_op(
+        name,
+        call,
+        mutates_args=tuple(parameters[index].name for index in aliases),
+        device_types=["tpu"],
+    )
     custom_op.register_fake(fake_function)
     return custom_op

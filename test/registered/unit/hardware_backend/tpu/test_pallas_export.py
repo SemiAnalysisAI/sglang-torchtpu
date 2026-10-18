@@ -641,6 +641,59 @@ class TestPallasExportEnvironment(CustomTestCase):
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
         "requires JAX and TorchTPU",
     )
+    def test_cpu_export_jax_op_updates_aliased_inputs_in_place(self):
+        """A donated input aliased to an output is updated in place, and the op
+        returns only the other outputs (the Kimi-K3 megakernel's states)."""
+        script = textwrap.dedent("""
+            import json
+
+            import jax
+            import torch
+            import torch_tpu  # noqa: F401
+
+            from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+            def step(
+                state: jax.Array, x: jax.Array
+            ) -> tuple[jax.Array, jax.Array]:
+                return x * 2, state + x
+
+            op = cpu_export_jax_op(
+                "sglang_tpu_test::cpu_export_aliased_step",
+                step,
+                donate_argnums=(0,),
+                input_output_aliases={0: 1},
+                fake_function=lambda state, x: torch.empty_like(x),
+            )
+            state = torch.ones(8, dtype=torch.float32, device="tpu")
+            x = torch.arange(8, dtype=torch.float32, device="tpu")
+            y = op(state, x)
+            torch.accelerator.synchronize()
+            print(json.dumps({"y": y.cpu().tolist(), "state": state.cpu().tolist()}))
+            """)
+        env = os.environ.copy()
+        env.pop("JAX_PLATFORMS", None)
+        env.pop("XLA_FLAGS", None)
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"subprocess stderr:\n{completed.stderr}",
+        )
+        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["y"], [2.0 * value for value in range(8)])
+        self.assertEqual(result["state"], [1.0 + value for value in range(8)])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
     def test_partitioned_shape_supports_multiple_mesh_axes(self):
         from types import SimpleNamespace
 
