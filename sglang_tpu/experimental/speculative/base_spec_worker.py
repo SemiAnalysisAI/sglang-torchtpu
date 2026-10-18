@@ -85,6 +85,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_target_only,
     build_verify_tokens,
     finalize_accept,
+    live_result_rows,
     pad_state_rows,
     select_verify_rows,
 )
@@ -853,21 +854,20 @@ class TpuSpecWorker(BaseSpecWorker):
                         if tensor is not None:
                             tensor.cpu()
                 for padded_bs in self._decode_buckets_for(bs):
-                    # _pack_decode_result's rows, then GenerationBatchResult.copy_to_cpu.
-                    _live_rows(
-                        torch.zeros(
-                            (padded_bs, self.num_verify_rows),
-                            dtype=torch.int64,
-                            device=self.device,
-                        ),
-                        bs,
-                    ).reshape(-1).cpu()
-                    _live_rows(
-                        torch.zeros(
-                            (padded_bs,), dtype=torch.int32, device=self.device
-                        ),
-                        bs,
-                    ).cpu()
+                    if padded_bs != bs:
+                        # _pack_decode_result's rows.
+                        warmup_compiled_op(
+                            live_result_rows,
+                            torch.zeros(
+                                (padded_bs, self.num_verify_rows),
+                                dtype=torch.int64,
+                                device=self.device,
+                            ),
+                            torch.zeros(
+                                (padded_bs,), dtype=torch.int32, device=self.device
+                            ),
+                            bs,
+                        )
             if self._dp_attention:
                 for padded_bs in self._b_bucketer().buckets:
                     # _forward_idle_step's all-padding drafts.
@@ -1053,6 +1053,15 @@ class TpuSpecWorker(BaseSpecWorker):
         # Custom logit processors, penalties and logit bias are rejected up front.
         return target_out.logits_output
 
+    @staticmethod
+    def _live_result_rows(
+        accept: AcceptResult, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flat [bs * (N + 1)] accept tokens and [bs] accept lengths for the scheduler."""
+        if accept.accept_lens.shape[0] == bs:
+            return accept.accept_tokens.reshape(-1), accept.accept_lens
+        return live_result_rows(accept.accept_tokens, accept.accept_lens, bs)
+
     def _pack_decode_result(
         self,
         *,
@@ -1062,14 +1071,14 @@ class TpuSpecWorker(BaseSpecWorker):
         accept: AcceptResult,
     ) -> GenerationBatchResult:
         # The scheduler relays and accounts per live request, so cut the bucket rows here.
-        accept_lens = _live_rows(accept.accept_lens, bs)
+        next_token_ids, accept_lens = self._live_result_rows(accept, bs)
         new_seq_lens = next_state.seq_lens[:bs]
         logits_output.next_token_logits = logits_output.next_token_logits[
             : bs * self.num_verify_rows
         ]
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=_live_rows(accept.accept_tokens, bs).reshape(-1),
+            next_token_ids=next_token_ids,
             accept_lens=accept_lens,
             block_accept_lens=accept_lens,
             next_draft_input=self.state_to_spec_info(
@@ -1168,9 +1177,3 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
         "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
     }
-
-
-def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:
-    # The result-copy thread reads these after the next step is queued; a [:bs]
-    # view would then need its own program behind that step, so copy it here.
-    return tensor if tensor.shape[0] == bs else tensor[:bs].clone()

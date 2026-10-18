@@ -410,6 +410,18 @@ def finalize_accept(
     )
 
 
+@compiled_op()
+def live_result_rows(
+    accept_tokens: torch.Tensor, accept_lens: torch.Tensor, bs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scheduler's [bs] accept rows as fresh buffers, flat tokens first.
+
+    Eager [:bs] clones would defer and fuse into the next FutureMap store, one
+    program per (bucket, bs, store) that warmup never builds.
+    """
+    return accept_tokens[:bs].reshape(-1), accept_lens[:bs]
+
+
 def _verify_mask(num_verify_drafts: torch.Tensor, n: int) -> torch.Tensor:
     steps = torch.arange(n, device=num_verify_drafts.device)
     return steps[None, :] < num_verify_drafts[:, None]
