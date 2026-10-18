@@ -27,9 +27,12 @@ jobs:
   gitleaks:
     runs-on: ubuntu-latest
     steps:
+      # Full commit history so the range below resolves, but no file contents:
+      # gitleaks fetches blobs on demand for the commits it scans.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
 
       - name: Install gitleaks
