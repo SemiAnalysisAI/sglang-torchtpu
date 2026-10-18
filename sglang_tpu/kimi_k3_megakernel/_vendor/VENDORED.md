@@ -69,3 +69,17 @@ In commit order:
    export bridge partitions a second time and crashes on. SGLang passes each
    device's rank as a traced value read from a `P("tp")`-sharded operand, so
    the replicated token operand holds the same values on every device.
+8. **Compact state updates** (`kimi/decode_megakernel.py`). With
+   `return_state_updates=True` (default False, upstream behavior), `stack()`
+   takes the states read-only and returns only the `[B, ...]` KDA rows and the
+   written `[B, mla, 3, 128, D]` MLA tiles, with no custom-call aliasing;
+   `decode_local` writes them into the donated states with
+   `dynamic_update_slice` (`_apply_state_updates`). libtpu copies every output
+   of a communicating custom call that aliases an entry parameter, which cost
+   two full state copies per step (7.7 GiB, 5.2 ms at 8 rows) when the states
+   were aliased through `stack()`.
+
+Upstream's own environment reads are left as they are: `TP32_PROFILE_SCOPES`
+(`collectives32.py`, profiler scope names) and `K3_FP8_BLOCK` (`kimi/load.py`,
+the FP8 expert reblock SGLang does not use). Neither is part of SGLang's
+compile-cache key, so leave them unset when serving.

@@ -3651,6 +3651,7 @@ def stack(
     include_layer_zero: bool = False,
     state_row=None,
     kernel_options: frozenset = frozenset(),
+    return_state_updates: bool = False,  # SGLANG-PATCH: see decode_local.
 ):
     """Fuse the decoder layers while keeping a native batch tile in VMEM.
 
@@ -3664,6 +3665,8 @@ def stack(
     """
     if not 1 <= batch_size <= 8:
         raise ValueError("The fused decoder stack supports batch sizes from 1 to 8")
+    if return_state_updates and sequence_rows != 1:  # SGLANG-PATCH
+        raise ValueError("return_state_updates requires sequence_rows == 1")
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -4483,32 +4486,44 @@ def stack(
                             for row_index in range(mla_cache_batch_tile_size):
                                 batch_index = batch_offset + row_index
                                 position = jnp.maximum(position_ref[batch_index], 0)  # SGLANG-PATCH
+                                # SGLANG-PATCH: with return_state_updates the
+                                # outputs hold only the written 128-token tile.
+                                key_destination = (
+                                    key_output_ref.at[batch_index, state_index]
+                                    if return_state_updates
+                                    else key_output_ref.at[
+                                        batch_index,
+                                        state_index,
+                                        :,
+                                        pl.ds(
+                                            position // 128 * 128, 128
+                                        ),
+                                        :,
+                                    ]
+                                )
+                                value_destination = (
+                                    value_output_ref.at[batch_index, state_index]
+                                    if return_state_updates
+                                    else value_output_ref.at[
+                                        batch_index,
+                                        state_index,
+                                        :,
+                                        pl.ds(
+                                            position // 128 * 128, 128
+                                        ),
+                                        :,
+                                    ]
+                                )
                                 cache_writes.extend(
                                     (
                                         tpu.make_async_copy(
                                             key_tile_vmem.at[row_index],
-                                            key_output_ref.at[
-                                                batch_index,
-                                                state_index,
-                                                :,
-                                                pl.ds(
-                                                    position // 128 * 128, 128
-                                                ),
-                                                :,
-                                            ],
+                                            key_destination,
                                             cache_semaphores.at[0, row_index],
                                         ),
                                         tpu.make_async_copy(
                                             value_tile_vmem.at[row_index],
-                                            value_output_ref.at[
-                                                batch_index,
-                                                state_index,
-                                                :,
-                                                pl.ds(
-                                                    position // 128 * 128, 128
-                                                ),
-                                                :,
-                                            ],
+                                            value_destination,
                                             cache_semaphores.at[1, row_index],
                                         ),
                                     )
@@ -5094,6 +5109,22 @@ def stack(
         if select_state_row
         else jnp.zeros((1,), jnp.int32)
     )
+    # SGLANG-PATCH: return_state_updates returns the [B, ...] KDA rows and the
+    # written [B, mla, 3, 128, D] MLA tiles instead of the whole states.
+    state_output_shapes = (
+        (
+            jax.ShapeDtypeStruct((batch_size, *states[0].shape[1:]), states[0].dtype),
+            jax.ShapeDtypeStruct((batch_size, *states[1].shape[1:]), states[1].dtype),
+            jax.ShapeDtypeStruct(
+                (batch_size, states[2].shape[1], 3, 128, 256), states[2].dtype
+            ),
+            jax.ShapeDtypeStruct(
+                (batch_size, states[3].shape[1], 3, 128, 128), states[3].dtype
+            ),
+        )
+        if return_state_updates
+        else tuple(shape(state) for state in states)
+    )
     output_shapes = (
         shape(prefix),
         (
@@ -5103,7 +5134,7 @@ def stack(
                 (batch_size, 8, hidden_size), jnp.bfloat16
             )
         ),
-        *(shape(state) for state in states),
+        *state_output_shapes,  # SGLANG-PATCH
         jax.ShapeDtypeStruct(
             (max(1, len(aux_hidden_layers)), batch_size, hidden_size), jnp.bfloat16
         ),
@@ -5181,7 +5212,11 @@ def stack(
         body,
         name="kimi_decoder_stack",
         out_shape=output_shapes,
-        input_output_aliases={state_offset + index: index + 2 for index in range(4)},
+        input_output_aliases=(
+            {}  # SGLANG-PATCH: the outputs are compact updates, not the states.
+            if return_state_updates
+            else {state_offset + index: index + 2 for index in range(4)}
+        ),
         grid_spec=tpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
@@ -5204,6 +5239,67 @@ def stack(
     )(positions, state_row_scalar, *args)
 
 
+
+
+# SGLANG-PATCH: libtpu's TpuCopyInsertion::AddSpecialCaseCopies copies every
+# output of a communicating custom call (has_communication=true) that aliases
+# an entry parameter or the entry root. Aliasing the four [R, ...] states
+# through stack() therefore cost two full copies of them per step (7.7 GiB,
+# 5.2 ms at R=8). With return_state_updates, stack() returns only the rows and
+# 128-token tiles it wrote, with no custom-call aliasing, and these
+# dynamic_update_slices write them into the donated states outside it.
+def _apply_state_updates(states, updates, positions, *, batch_size):
+    convolution_states, recurrent_states, key_caches, value_caches = states
+    conv_updates, recurrent_updates, key_updates, value_updates = updates
+    if batch_size < convolution_states.shape[0]:
+        convolution_states = jax.lax.dynamic_update_slice(
+            convolution_states, conv_updates, (0, 0, 0, 0, 0, 0)
+        )
+        recurrent_states = jax.lax.dynamic_update_slice(
+            recurrent_states, recurrent_updates, (0, 0, 0, 0, 0)
+        )
+    elif batch_size >= 2:
+        # Two halves: one update covering the whole state folds into a plain
+        # value (HloAlgebraicSimplifier), which brings the copies back.
+        half = batch_size // 2
+        convolution_states = jax.lax.dynamic_update_slice(
+            convolution_states, conv_updates[:half], (0, 0, 0, 0, 0, 0)
+        )
+        convolution_states = jax.lax.dynamic_update_slice(
+            convolution_states, conv_updates[half:], (half, 0, 0, 0, 0, 0)
+        )
+        recurrent_states = jax.lax.dynamic_update_slice(
+            recurrent_states, recurrent_updates[:half], (0, 0, 0, 0, 0)
+        )
+        recurrent_states = jax.lax.dynamic_update_slice(
+            recurrent_states, recurrent_updates[half:], (half, 0, 0, 0, 0)
+        )
+    else:
+        convolution_states = jax.lax.dynamic_update_slice(
+            convolution_states, conv_updates[:, :, :2], (0, 0, 0, 0, 0, 0)
+        )
+        convolution_states = jax.lax.dynamic_update_slice(
+            convolution_states, conv_updates[:, :, 2:], (0, 0, 2, 0, 0, 0)
+        )
+        recurrent_states = jax.lax.dynamic_update_slice(
+            recurrent_states, recurrent_updates[:, :, :2], (0, 0, 0, 0, 0)
+        )
+        recurrent_states = jax.lax.dynamic_update_slice(
+            recurrent_states, recurrent_updates[:, :, 2:], (0, 0, 2, 0, 0)
+        )
+    for row_index in range(batch_size):
+        block_offset = (jnp.maximum(positions[row_index], 0) // 128) * 128
+        key_caches = jax.lax.dynamic_update_slice(
+            key_caches,
+            key_updates[row_index : row_index + 1],
+            (row_index, 0, 0, block_offset, 0),
+        )
+        value_caches = jax.lax.dynamic_update_slice(
+            value_caches,
+            value_updates[row_index : row_index + 1],
+            (row_index, 0, 0, block_offset, 0),
+        )
+    return convolution_states, recurrent_states, key_caches, value_caches
 
 
 def decode_local(
@@ -5230,6 +5326,7 @@ def decode_local(
     state_row=None,
     kernel_options: frozenset = frozenset(),
     rank=None,  # SGLANG-PATCH: see below.
+    return_state_updates: bool = False,  # SGLANG-PATCH: see below.
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -5342,8 +5439,19 @@ def decode_local(
             include_layer_zero=True,
             state_row=state_row,
             kernel_options=kernel_options,
+            return_state_updates=return_state_updates,  # SGLANG-PATCH
         )
     )
+    # SGLANG-PATCH: write the compact updates into the donated states.
+    if return_state_updates:
+        convolution_states, recurrent_states, key_caches, value_caches = (
+            _apply_state_updates(
+                states,
+                (convolution_states, recurrent_states, key_caches, value_caches),
+                positions,
+                batch_size=batch_size,
+            )
+        )
 
     if sequence_parallel_pre_attention and batched_decoder_boundaries:
         logits = jnp.dot(
