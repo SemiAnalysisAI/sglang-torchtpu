@@ -48,7 +48,8 @@ def parse_args():
         "--launch-module",
         type=str,
         default="sglang.launch_server",
-        help="server entry module (default: sglang.launch_server)",
+        help="server entry module (default: sglang.launch_server); external "
+        "storage backends must be registered by this launcher",
     )
     parser.add_argument(
         "--modes",
@@ -82,8 +83,8 @@ def parse_args():
         "--storage-backend",
         type=str,
         default="file",
-        help="L3 backend registered by the server (default: file); configure "
-        "other backends with --storage-extra-config",
+        help="L3 backend: file (default), or external_cache_store registered by "
+        "--launch-module; override settings with --storage-extra-config",
     )
     parser.add_argument(
         "--sub-question-input-length",
@@ -156,6 +157,16 @@ class Server:
     def launch(self):
         a = self.args
         extra_config = {"prefetch_threshold": 64}
+        if a.storage_backend == "external_cache_store":
+            # The external launcher registers the backend. Keep local data
+            # isolated per run; provider-specific settings use the JSON override.
+            extra_config.update(
+                {
+                    "local_mode": "true",
+                    "data_root": os.path.join(self.storage_dir, "external_cache_store"),
+                    "capacity_gb": "120",
+                }
+            )
         if a.storage_extra_config:
             extra_config.update(json.loads(a.storage_extra_config))
         cmd = [
