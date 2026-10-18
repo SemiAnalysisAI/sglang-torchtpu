@@ -3727,9 +3727,22 @@ def stack(
     def shape(value):
         return jax.ShapeDtypeStruct(value.shape, value.dtype)
 
+    # SGLANG-PATCH: accept SGLang's uint8 MXFP4 expert arrays (4x sublanes)
+    # and bitcast their HBM refs to uint32 inside the Pallas body.
+    def _local_weight(name, value):
+        if name in ("expert_gu", "expert_down") and value.dtype == jnp.uint8:
+            if value.shape[2] % 4 != 0:
+                raise ValueError(
+                    f"{name} uint8 sublanes must be divisible by 4: {value.shape}"
+                )
+            return jax.ShapeDtypeStruct(
+                (value.shape[1], value.shape[2] // 4, *value.shape[3:]),
+                jnp.uint32,
+            )
+        return jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
+
     local_weights = {
-        name: jax.ShapeDtypeStruct(value.shape[1:], value.dtype)
-        for name, value in weights.items()
+        name: _local_weight(name, value) for name, value in weights.items()
     }
     mla_scoped_scratch = _mla_scoped_scratch(
         local_weights,
@@ -3745,6 +3758,12 @@ def stack(
     )
     def body(position_ref, state_row_ref, prefix_ref, embedding_ref, *refs):
         layer_weights = dict(zip(NAMES, refs[: len(NAMES)], strict=True))
+        # SGLANG-PATCH: see _local_weight.
+        for expert_name in ("expert_gu", "expert_down"):
+            if layer_weights[expert_name].dtype == jnp.uint8:
+                layer_weights[expert_name] = layer_weights[expert_name].bitcast(
+                    jnp.uint32
+                )
         output_residual_ref, final_normalization_ref = refs[
             len(NAMES) : len(NAMES) + len(EPILOGUE)
         ]

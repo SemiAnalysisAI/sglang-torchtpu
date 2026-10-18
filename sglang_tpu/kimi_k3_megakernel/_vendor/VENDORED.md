@@ -52,3 +52,7 @@ In commit order:
    compiled tile `B` over rows `[0, B)`. `stack()` reads, writes and drains
    only those rows, and both it and `make_decode` accept states with more rows
    than the tile.
+5. **uint8 MXFP4 expert weights** (`kimi/decode_megakernel.py`). SGLang's
+   prefill MoE keeps the packed routed experts as uint8; the megakernel reads
+   the same tensors. `stack()` treats a uint8 `expert_gu` / `expert_down` as
+   uint32 words (4x fewer sublanes) and bitcasts the HBM refs in the body.
