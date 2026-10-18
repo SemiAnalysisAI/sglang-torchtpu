@@ -102,6 +102,11 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         )
         get_oneshot_all_gather_op(parallel.tp_size)
     _build_fused_moe_rs_op()
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_NVFP4_E4M3_SCALES.get():
+        # Building an op builds its mesh, which Dynamo cannot trace: do it before capture.
+        _build_fused_moe_rs_op(global_scales=True)
 
 
 @functools.cache
