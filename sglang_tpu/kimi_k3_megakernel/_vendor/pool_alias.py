@@ -12,6 +12,27 @@ from jax._src.lib.mlir import ir
 class Reinterpret(types.ReshapeTransform):
     pass
 
+# SGLANG-PATCH: document and guard this process-wide JAX patch.
+# What: importing this module replaces the private
+#   jax._src.pallas.mosaic.lowering._reshape_memref(ref, reshaper, ref_aval,
+#   ref_block_shape) for the whole process, so every Pallas kernel lowered
+#   afterwards (attention and MoE included) goes through _lower below.
+# Why: Mosaic has no public way to view a VMEM ref under another shape, dtype
+#   and tiled layout; the decode megakernel reuses one VMEM pool for every
+#   layer's weight tiles through Reinterpret views. Transforms that are not
+#   Reinterpret go to the original function unchanged.
+# Targets: upstream pins jax 0.11.1; SGLang runs it on jax 0.10.2, which has
+#   the same four-argument private function. The check below fails the import
+#   instead of mis-lowering if a JAX bump changes it.
+# When: only the Kimi-K3 megakernel imports this module, and only when
+#   SGLANG_TPU_ENABLE_K3_MEGAKERNEL is set.
+# Remove when: Pallas TPU exposes a public layout-reinterpreting ref view.
+import inspect as _inspect
+if len(_inspect.signature(lowering._reshape_memref).parameters) != 4:
+    raise ImportError(
+        "pool_alias replaces jax._src.pallas.mosaic.lowering._reshape_memref("
+        "ref, reshaper, ref_aval, ref_block_shape); this JAX version changed it"
+    )
 _original = lowering._reshape_memref
 
 def _lower(ref, transform, aval, block_shape):

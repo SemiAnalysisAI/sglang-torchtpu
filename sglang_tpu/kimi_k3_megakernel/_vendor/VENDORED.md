@@ -41,3 +41,9 @@ In commit order:
    `pool_alias` as top-level modules.
 2. **Python 3.10 syntax** (`pool_alias.py`). One f-string reused its outer
    quote character, which only Python 3.12 parses; SGLang supports 3.10.
+3. **Document and guard the process-wide JAX patch** (`pool_alias.py`).
+   Importing the module replaces the private
+   `jax._src.pallas.mosaic.lowering._reshape_memref` for every kernel in the
+   process. A header now states what it replaces, why, the JAX versions it
+   targets and when it is installed, and the import fails if the private
+   function's four-argument signature changes.
