@@ -7,12 +7,15 @@ the warmup needs model config.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op
-from sglang.srt.speculative.spec_common import adjust_verify_logits
+from sglang.srt.speculative.spec_common import (
+    VerifyLogitModifiers,
+    adjust_verify_logits,
+)
 from sglang_tpu.dflash_utils_tpu import select_dflash_verify_cache_locs_tpu
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
@@ -22,12 +25,6 @@ from sglang_tpu.experimental.speculative.spec_types import (
 )
 from sglang_tpu.sampling_mask import tpu_filter_probs
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
-
-
-class VerifyLogitModifiers(NamedTuple):
-    acc_additive_penalties: torch.Tensor | None = None
-    acc_scaling_penalties: torch.Tensor | None = None
-    logit_bias: torch.Tensor | None = None
 
 
 @compiled_op()
