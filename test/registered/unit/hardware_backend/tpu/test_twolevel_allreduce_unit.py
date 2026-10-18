@@ -1,7 +1,7 @@
 """CPU-side logic of the two-level Pallas all-reduce and the K3 merged MoE reduce.
 
 The kernel itself runs on TPU in test_twolevel_allreduce.py; these cover the
-host split, the eligibility gate, the fallbacks to the original collective and
+eligibility gate, the fallbacks to the original collective and
 the default (concatenating) merged_moe_all_reduce.
 """
 
@@ -16,17 +16,6 @@ from sglang_tpu import twolevel_allreduce as tl
 from sglang_tpu.envs import envs as tpu_envs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
-
-class TestHostSplit(CustomTestCase):
-    def test_derived_from_nnodes(self):
-        self.assertEqual(tl.local_size(32, 4), 8)
-        self.assertEqual(tl.local_size(8, 1), 8)
-        self.assertEqual(tl.local_size(16, 2), 8)
-
-    def test_no_split_when_ranks_do_not_divide(self):
-        self.assertEqual(tl.local_size(30, 4), 0)
-        self.assertEqual(tl.local_size(32, 0), 0)
 
 
 class TestEligibility(CustomTestCase):
@@ -68,15 +57,7 @@ class TestFallbacks(CustomTestCase):
         original = mock.Mock(return_value=("a", "b"))
         latent = torch.zeros(1, 3584, dtype=torch.bfloat16)
         shared = torch.zeros(1, 7168, dtype=torch.float32)
-        with (
-            mock.patch.object(tl, "_READY", True),
-            mock.patch.object(tl, "_WORLD", 32),
-            mock.patch(
-                "sglang.srt.distributed.parallel_state."
-                "get_tensor_model_parallel_world_size",
-                return_value=32,
-            ),
-        ):
+        with mock.patch.object(tl, "_READY", True):
             self.assertEqual(
                 tl.merged_moe_all_reduce_around(original, latent, shared), ("a", "b")
             )
@@ -118,7 +99,8 @@ class TestRegistration(CustomTestCase):
         self._register(True, world=8, nnodes=1).assert_called_once_with(8, 8)
 
     def test_unmeasured_topologies_keep_xla(self):
-        for world, nnodes in ((64, 8), (16, 2), (4, 1)):
+        # (33, 4) would map to 4 x 8 without the divisibility check.
+        for world, nnodes in ((64, 8), (16, 2), (4, 1), (33, 4), (30, 4)):
             with self.subTest(world=world, nnodes=nnodes):
                 with self.assertLogs(tl.logger, "WARNING"):
                     reg = self._register(True, world=world, nnodes=nnodes)

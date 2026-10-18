@@ -1026,19 +1026,6 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
-    def _merge_moe_all_reduce(self, shared_output, shared_event) -> bool:
-        """SGLANG_K3_MERGE_MOE_ALLREDUCE applies: both the routed latent and a
-        synchronous TP-sharded shared-expert output still need a TP reduce."""
-        return (
-            envs.SGLANG_K3_MERGE_MOE_ALLREDUCE.get()
-            and shared_output is not None
-            and shared_event is None
-            and self.tp_size > 1
-            and self._routed_needs_reduce
-            and not self._shared_experts_tp1
-            and not self._shared_experts_tp_comm
-        )
-
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
@@ -1274,9 +1261,15 @@ class KimiK3MoE(nn.Module):
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            if self._merge_moe_all_reduce(shared_output, shared_event):
-                # One collective for the TP-partial latent and shared output;
-                # the norm only needs the reduced latent.
+            # One collective for the TP-partial latent and shared output; the
+            # norm only needs the reduced latent. _routed_needs_reduce means
+            # plain TP (tp_size > 1, no EP a2a), so the shared experts are
+            # TP-sharded and ran synchronously on this stream.
+            if (
+                envs.SGLANG_K3_MERGE_MOE_ALLREDUCE.get()
+                and shared_output is not None
+                and self._routed_needs_reduce
+            ):
                 latent, shared_output = merged_moe_all_reduce(
                     expert_output, shared_output
                 )

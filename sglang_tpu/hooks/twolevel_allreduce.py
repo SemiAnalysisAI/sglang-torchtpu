@@ -24,14 +24,9 @@ merged_moe_all_reduce
        provider, per #1444.
 """
 
+from sglang_tpu.twolevel_allreduce import all_reduce_around as all_reduce
+from sglang_tpu.twolevel_allreduce import (
+    merged_moe_all_reduce_around as merged_moe_all_reduce,
+)
 
-def all_reduce(original, *args, **kwargs):
-    from sglang_tpu.twolevel_allreduce import all_reduce_around
-
-    return all_reduce_around(original, *args, **kwargs)
-
-
-def merged_moe_all_reduce(original, *args, **kwargs):
-    from sglang_tpu.twolevel_allreduce import merged_moe_all_reduce_around
-
-    return merged_moe_all_reduce_around(original, *args, **kwargs)
+__all__ = ["all_reduce", "merged_moe_all_reduce"]

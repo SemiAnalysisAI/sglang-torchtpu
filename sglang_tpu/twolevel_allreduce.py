@@ -20,7 +20,6 @@ keeps the original all-reduce.
 
 import functools
 import logging
-from threading import Lock
 
 import torch
 
@@ -35,14 +34,11 @@ _ALIGN_ROWS = 16
 # Barrier-semaphore namespace of this kernel. The fused GMM reduce-scatter uses
 # collective_id=0; a distinct id keeps the two from sharing a barrier.
 _COLLECTIVE_ID = 1
-# Tensors per call: 1 (plain all-reduce) or 2 (Kimi-K3 latent + shared).
-_ARITIES = (1, 2)
-
+# Ops keyed by tensors per call: 1 (plain all-reduce) or 2 (Kimi-K3 latent +
+# shared). A process has one TP world, registered once.
 _OPS: dict = {}
-_LOCK = Lock()
-# Plain values, not dict truthiness: Dynamo traces the eligibility checks.
+# Plain bool, not dict truthiness: Dynamo traces the eligibility checks.
 _READY = False
-_WORLD = 0
 
 
 def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
@@ -65,8 +61,8 @@ def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
     barrier = pltpu.get_barrier_semaphore()
     for p in local_peers + remote_peers:
         pltpu.semaphore_signal(barrier, 1, device_id=(p,), device_id_type=mesh_id)
-    if n > 1:
-        packed[...] = jnp.zeros_like(packed)  # alignment gaps between tensors
+    # The alignment gaps between tensors stay unwritten: the sums are
+    # elementwise and each output reads only its own rows.
     for x, r, off in zip(xs, rows, offs):
         packed[off : off + r, :] = x[...].reshape(r, 128)
     pltpu.semaphore_wait(barrier, len(local_peers) + len(remote_peers))
@@ -190,15 +186,6 @@ def _build(world: int, local: int, n: int):
 VALIDATED_TOPOLOGIES = frozenset({(4, 8), (1, 8)})
 
 
-def local_size(world: int, nnodes: int) -> int:
-    """Ranks per host for a host-major TP group of ``world`` ranks, or 0 when
-    the two-level split does not apply."""
-    local = world // nnodes if nnodes > 0 else 0
-    if local <= 0 or world % local:
-        return 0
-    return local
-
-
 def _check_ranks_agree(enabled: bool) -> None:
     """Every rank must take the same path: if one host missed the switch, its
     ranks would stay on XLA's all-reduce while the others wait in the Pallas
@@ -222,14 +209,11 @@ def _check_ranks_agree(enabled: bool) -> None:
 
 
 def register(world: int, local: int) -> None:
-    """Build the ops; must run before torch.compile traces the model."""
-    global _READY, _WORLD
-    with _LOCK:
-        for n in _ARITIES:
-            if (world, n) not in _OPS:
-                _OPS[(world, n)] = _build(world, local, n)
-        _WORLD = world
-        _READY = True
+    """Build the ops; must run before torch.compile traces the model. Called
+    once, from prepare_model_parallel_groups."""
+    global _READY
+    _OPS.update({n: _build(world, local, n) for n in (1, 2)})
+    _READY = True
 
 
 def register_from_parallel_state() -> None:
@@ -256,19 +240,19 @@ def register_from_parallel_state() -> None:
         )
         return
     server_args = get_server_args()
-    local = local_size(world, server_args.nnodes)
-    if not local:
-        logger.info("Two-level Pallas all-reduce off: no host split for TP %d.", world)
-        return
-    if (world // local, local) not in VALIDATED_TOPOLOGIES:
+    nnodes = server_args.nnodes
+    # TP spans the world, so TP ranks are host-major with world / nnodes per host.
+    if world % nnodes or (nnodes, world // nnodes) not in VALIDATED_TOPOLOGIES:
         logger.warning(
-            "Two-level Pallas all-reduce off: %d hosts x %d ranks is not a "
-            "measured topology (%s); XLA's all-reduce stays.",
-            world // local,
-            local,
+            "Two-level Pallas all-reduce off: TP %d over %d hosts is not a "
+            "measured topology (hosts, ranks per host in %s); XLA's all-reduce "
+            "stays.",
+            world,
+            nnodes,
             sorted(VALIDATED_TOPOLOGIES),
         )
         return
+    local = world // nnodes
     register(world, local)
     logger.info(
         "Two-level Pallas all-reduce on: TP %d = %d hosts x %d ranks. It takes "
@@ -278,11 +262,11 @@ def register_from_parallel_state() -> None:
         world // local,
         local,
     )
-    compile_bs = getattr(server_args, "tpu_compile_bs", None)
+    compile_bs = server_args.tpu_compile_bs
     if compile_bs and 1 not in compile_bs:
         logger.warning(
-            "Two-level Pallas all-reduce is on but --tpu-compile-bs %s has no "
-            "batch size 1, so no compiled decode step takes it.",
+            "Two-level Pallas all-reduce is on but the TPU compile batch sizes "
+            "%s have no batch size 1, so no compiled decode step takes it.",
             compile_bs,
         )
 
@@ -302,29 +286,19 @@ def all_reduce_around(original, group, input_: torch.Tensor) -> torch.Tensor:
     """AROUND hook for ``GroupCoordinator.all_reduce``."""
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if not (
-        _READY
-        and group.world_size == _WORLD
-        and group is get_tp_group()
-        and eligible(input_)
-    ):
+    if not (_READY and group is get_tp_group() and eligible(input_)):
         return original(group, input_)
-    return _OPS[(_WORLD, 1)](input_)
+    return _OPS[1](input_)
 
 
 def merged_moe_all_reduce_around(original, latent, shared):
     """AROUND hook for ``kimi_k3.merged_moe_all_reduce``: both TP-partial
     tensors in one packed exchange, with no concat / split copies."""
-    from sglang.srt.distributed.parallel_state import (
-        get_tensor_model_parallel_world_size,
-    )
-
     if not (
         _READY
-        and get_tensor_model_parallel_world_size() == _WORLD
         and eligible(latent)
         and eligible(shared)
         and latent.numel() + shared.numel() <= MAX_ELEMS
     ):
         return original(latent, shared)
-    return _OPS[(_WORLD, 2)](latent, shared)
+    return _OPS[2](latent, shared)
