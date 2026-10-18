@@ -56,3 +56,10 @@ In commit order:
    prefill MoE keeps the packed routed experts as uint8; the megakernel reads
    the same tensors. `stack()` treats a uint8 `expert_gu` / `expert_down` as
    uint32 words (4x fewer sublanes) and bitcasts the HBM refs in the body.
+6. **Padded rows** (`kimi/decode_megakernel.py`). SGLang pads a batch of `n`
+   live rows up to the compiled tile and passes position `-1` for the padding.
+   Those rows route no experts (the MoE routing masks them out of local
+   ownership, and the shared-route expert prefetch also requires agreeing
+   ownership), and every position read is clamped to 0 so cache reads and
+   writes stay in bounds. Padding rows are never owned by a request, so their
+   state contents do not matter.
