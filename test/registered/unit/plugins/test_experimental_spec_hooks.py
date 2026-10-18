@@ -28,7 +28,11 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSampl
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
-from sglang_tpu.hooks.experimental_spec import alloc_extend, hook_specs
+from sglang_tpu.hooks.experimental_spec import (
+    alloc_extend,
+    hook_specs,
+    kimi_spec_defaults,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -322,6 +326,30 @@ class TestExperimentalSpecHooks(CustomTestCase):
         on = {target for target, _, _ in hook_specs()}
         self.assertFalse(hot & off)
         self.assertEqual(hot & on, hot)
+
+    def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
+        def original(server_args):
+            raise ValueError("core refused")
+
+        for algo, experimental, passes in (
+            ("DSPARK", True, True),
+            ("DSPARK", False, False),
+            ("DFLASH", True, False),
+        ):
+            args = SimpleNamespace(speculative_algorithm=algo)
+            with (
+                self.subTest(algo=algo, experimental=experimental),
+                envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(experimental),
+                patch(
+                    "sglang.srt.arg_groups.overrides.resolving_view",
+                    side_effect=lambda server_args: server_args,
+                ),
+            ):
+                if passes:
+                    self.assertIsNone(kimi_spec_defaults(original, args))
+                else:
+                    with self.assertRaisesRegex(ValueError, "core refused"):
+                        kimi_spec_defaults(original, args)
 
     def test_draft_merge_preserves_right_hand_length_metadata(self):
         left, right = _state([1]), _state([2, 3])
