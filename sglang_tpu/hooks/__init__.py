@@ -17,6 +17,10 @@ from sglang_tpu.hooks.attn_residual import (
     prepare_attn_residual_kernel,
     register_attn_residual_ops,
 )
+from sglang_tpu.hooks.draft_kv_pool import (
+    draft_cell_size_per_token,
+    draft_mha_pool_class,
+)
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.mhc import (
@@ -143,6 +147,16 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
         bind_kimi_k3_static_fp8,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._tpu_mha_pool_class",
+        draft_mha_pool_class,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.speculative.dflash_utils.dflash_draft_cell_size_per_token",
+        draft_cell_size_per_token,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.speculative.spec_tp_sync.SpecTpSync.sync",
