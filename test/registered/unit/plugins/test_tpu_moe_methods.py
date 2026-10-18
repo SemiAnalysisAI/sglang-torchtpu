@@ -35,6 +35,16 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class TestTpuMoeMethods(CustomTestCase):
     def setUp(self):
         clear_oot_replacements()
+        runtime = SimpleNamespace(
+            moe=SimpleNamespace(flashinfer_mxfp4_moe_precision="bf16")
+        )
+        for target, value in (
+            ("sglang.srt.layers.quantization.mxfp4.get_exec", runtime),
+            ("sglang_tpu.fp8_moe.get_parallel", SimpleNamespace(pp_size=1)),
+        ):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.addCleanup(clear_oot_replacements)
         flags = get_flags().moe
         backend = flags.runner_backend
