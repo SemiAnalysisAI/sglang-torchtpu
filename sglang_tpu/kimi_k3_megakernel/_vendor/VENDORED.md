@@ -39,3 +39,5 @@ In commit order:
 1. **Package-relative imports** (`kimi/decode_megakernel.py`). Upstream runs
    from its repository root and imports `collectives32`, `kimi` and
    `pool_alias` as top-level modules.
+2. **Python 3.10 syntax** (`pool_alias.py`). One f-string reused its outer
+   quote character, which only Python 3.12 parses; SGLang supports 3.10.

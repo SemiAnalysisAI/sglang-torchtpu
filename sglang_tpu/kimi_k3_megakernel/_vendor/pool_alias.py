@@ -30,7 +30,8 @@ def _lower(ref, transform, aval, block_shape):
         strides.insert(0, strides[0] * minor_tiles)
         minor_dimension = dimension
     inner = f"({packing},1)" if packing > 1 else ""
-    layout = ir.Attribute.parse(f"#tpu.tiled<({rows},128){inner},[{",".join(map(str, strides))}]>")
+    # SGLANG-PATCH: no reused quote inside the f-string; SGLang supports Python 3.10.
+    layout = ir.Attribute.parse(f"#tpu.tiled<({rows},128){inner},[{','.join(map(str, strides))}]>")
     result_type = ir.MemRefType.get(transform.shape, original_type.element_type, layout=layout, memory_space=original_type.memory_space)
     alias = tpu.reinterpret_cast(result_type, ref)
     erased = ir.MemRefType.get(transform.shape, original_type.element_type, memory_space=original_type.memory_space)
