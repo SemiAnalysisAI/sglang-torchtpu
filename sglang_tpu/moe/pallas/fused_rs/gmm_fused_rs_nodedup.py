@@ -1573,6 +1573,7 @@ def kernel_main_fused_rs_fp8(
         "caller_tile_m",
         "expert_tp",
         "local_rows",
+        "tiled_output",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1603,11 +1604,15 @@ def gmm_v2_fused_rs(
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
     local_rows: bool = False,
+    tiled_output: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
     ``local_rows`` (expert TP only): the scalar-prefetched row indices hold just
     this device's contiguous block of routed rows instead of all ``ep_size`` blocks.
+    ``tiled_output``: return the bf16 result in the kernel's own
+    (rows, size_n2 // 128, 128) layout when N2 is unpadded, so a row-split
+    reduction can read it without a relayout copy.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
@@ -2200,6 +2205,8 @@ def gmm_v2_fused_rs(
         name=pallas_name,
     )(*pallas_inputs)
 
+    if tiled_output and aligned_n2 == size_n2:
+        return result
     return result.reshape(chunk_size * top_k, aligned_n2)[:, :size_n2]
 
 

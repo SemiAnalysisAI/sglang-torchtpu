@@ -226,6 +226,11 @@ def moe_gmm_local_rs_nodedup(
         )
     size_m = lhs_indices.shape[0]
     local_rows = expert_tp and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get()
+    tiled_output = (
+        expert_tp
+        and not fp8_direct_write
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE.get()
+    )
     _assert_fused_rs_smem_safe(size_m // ep_size if local_rows else size_m)
 
     # Compute local row range [local_start, local_end) without per-row source
@@ -316,6 +321,7 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
         local_rows=local_rows,
+        tiled_output=tiled_output,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -329,7 +335,16 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
-    if expert_tp:
+    if expert_tp and out_buf.ndim == 3:
+        # Split rows only: the ep sum reads the kernel's tiled layout in place.
+        out_3d = (
+            out_buf.reshape(chunk_size, topk, ep_size, *out_buf.shape[1:])
+            .astype(jnp.float32)
+            .sum(axis=2)
+            .astype(out_buf.dtype)
+            .reshape(chunk_size, topk, hidden_size)
+        )
+    elif expert_tp:
         out_3d = (
             out_buf.reshape(chunk_size, topk, ep_size, hidden_size)
             .astype(jnp.float32)

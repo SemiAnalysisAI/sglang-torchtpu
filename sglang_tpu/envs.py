@@ -80,6 +80,9 @@ class TpuEnvs:
     # call is no longer capped at 1/ep_size of the tokens and the expert weights are
     # streamed once per chunk rather than once per capped call.
     SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(False)
+    # Expert-TP fused-RS: sum the per-device partial rows in the kernel's tiled
+    # (rows, hidden // 128, 128) layout instead of relayouting them to 2D first.
+    SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
