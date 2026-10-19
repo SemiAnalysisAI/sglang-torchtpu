@@ -41,7 +41,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -527,6 +527,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 )
                 pool.mamba_pool.clear_slots(slots)
             mapping[0:1].cpu()
+            if get_disagg().disaggregation_mode != "null":
+                # The P/D state payload reads one row by Python int, a constant
+                # baked into each program, so every row is a separate program.
+                for row in range(mapping.shape[0]):
+                    mapping[row].cpu()
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device

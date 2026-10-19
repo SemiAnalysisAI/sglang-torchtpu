@@ -5,6 +5,8 @@ not repaired afterward. All non-experimental calls delegate unchanged.
 kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
 TPU and otherwise pins GPU verify/draft backends; the experimental worker
 serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
+materialize_future_map: the live FutureMap's lazy torch.empty buffers would fuse
+into their first store, compiling at whatever shape the first batch has.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -205,6 +207,29 @@ def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
         mamba_pool.clear_slots(
             torch.stack([req.kv.mamba_pool_idx.reshape(()) for req in batch.reqs])
         )
+
+
+def materialize_future_map(
+    result: FutureMap, algorithm: SpeculativeAlgorithm, *args, **kwargs
+) -> FutureMap:
+    # A torch.empty buffer stays lazy and fuses into its first store, one program
+    # per first-batch shape; an uploaded buffer is concrete.
+    if algorithm.is_none():
+        return result
+    from sglang_tpu.compilation.recompilation_checker import (
+        snapshot_recompilation_baseline,
+    )
+
+    result.output_tokens_buf = _uploaded_zeros_like(result.output_tokens_buf)
+    result.new_seq_lens_buf = _uploaded_zeros_like(result.new_seq_lens_buf)
+    # The map is built after the scheduler's warmup baseline.
+    torch.accelerator.synchronize()
+    snapshot_recompilation_baseline()
+    return result
+
+
+def _uploaded_zeros_like(buf: torch.Tensor) -> torch.Tensor:
+    return torch.zeros(buf.shape, dtype=buf.dtype).to(buf.device)
 
 
 def stage_prefill_tokens(original, batch):
@@ -414,6 +439,12 @@ def hook_specs():
                 "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
                 prepare_spec_decode,
                 HookType.AROUND,
+            ),
+            (
+                "sglang.srt.speculative.spec_info.SpeculativeAlgorithm."
+                "create_future_map",
+                materialize_future_map,
+                HookType.AFTER,
             ),
             (
                 "sglang.srt.speculative.eagle_disaggregation."
