@@ -104,6 +104,9 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
         ).to(self.device, non_blocking=True)
 
     def _apply_post_grammar_logits_transforms(self, logits):
+        # Prefill only, outside compiled forwards: not warmed. Like the other
+        # vocabulary-sized live-extent pads, its eager programs compile once per
+        # new row count, the first time a biased request needs them.
         bias = self.device_logit_bias(logits.shape[0])
         if bias is not None:
             logits.add_(bias)
