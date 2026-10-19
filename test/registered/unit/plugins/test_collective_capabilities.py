@@ -103,6 +103,39 @@ class TestCollectiveCapabilities(unittest.TestCase):
         self.assertEqual(result["value"].device.type, "meta")
         self.assertIs(receive.call_args.kwargs["group"], coordinator.device_group)
 
+    def test_rank_uniform_graphs_requires_uniform_padding(self):
+        with self.assertRaisesRegex(ValueError, "requires uniform_dp_padding"):
+            PlatformCapabilities(rank_uniform_graphs=True)
+        caps = PlatformCapabilities(rank_uniform_graphs=True, uniform_dp_padding=True)
+        self.assertTrue(caps.rank_uniform_graphs)
+
+    def test_traced_padding_mode_reads_the_lazy_platform(self):
+        # Production code reads ``platforms.current_platform`` through the
+        # module's lazy ``__getattr__``; patch the backing field so the traced
+        # lookup takes that same path.
+        platform = SimpleNamespace(
+            capabilities=PlatformCapabilities(uniform_dp_padding=True)
+        )
+
+        def padded(value):
+            mode = dp_attention.DpPaddingMode.get_dp_padding_mode(True, [0, 7])
+            return value + int(mode)
+
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        with (
+            patch.object(platforms, "_current_platform", platform),
+            patch.object(
+                dp_attention,
+                "dp_gather_width",
+                side_effect=AssertionError("variable padding"),
+            ),
+        ):
+            self.assertNotIn("current_platform", vars(platforms))
+            compiled = torch.compile(padded, backend="eager", fullgraph=True)
+            result = compiled(torch.zeros(1))
+        self.assertEqual(result.item(), int(dp_attention.DpPaddingMode.MAX_LEN))
+
 
 if __name__ == "__main__":
     unittest.main()
