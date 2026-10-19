@@ -82,6 +82,8 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     new_kv_num_pages: Optional[Any] = None
     # Per-request layout lengths (page-padded on TPU; == extend lens otherwise).
     layout_seqs_len: Optional[List[int]] = None
+    # Leading pad rows per request under `pool_align` (0 otherwise).
+    layout_leads: Optional[List[int]] = None
     layout_page: int = 0
     local_rows: Optional[Any] = None
     cp_last_rows: Optional[Any] = None
@@ -147,12 +149,19 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 # per-rank row count at budget / cp (e.g. a 63-page request plus a 1-page
 # head of the next one is exactly 8 pages on every rank of 8) instead of
 # spilling one rank into the next token bucket.
-_TPU_LAYOUT = {"page_align": 0, "balance_pairs": False}
+# pool_align: lay each request out starting at the pool page boundary below
+# its prefix, i.e. with `prefix % page` leading pad rows, so every layout page
+# is exactly one pool page (replicated-pool prefill writes whole pages; the
+# zero-copy new-KV table of the two-phase path is NOT valid with this on).
+_TPU_LAYOUT = {"page_align": 0, "balance_pairs": False, "pool_align": False}
 
 
-def set_zigzag_tpu_layout(page_align: int = 0, balance_pairs: bool = False) -> None:
+def set_zigzag_tpu_layout(
+    page_align: int = 0, balance_pairs: bool = False, pool_align: bool = False
+) -> None:
     _TPU_LAYOUT["page_align"] = int(page_align or 0)
     _TPU_LAYOUT["balance_pairs"] = bool(balance_pairs)
+    _TPU_LAYOUT["pool_align"] = bool(pool_align) and _TPU_LAYOUT["page_align"] > 0
 
 
 def _concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
@@ -220,10 +229,20 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         page = _TPU_LAYOUT["page_align"]
         balance = _TPU_LAYOUT["balance_pairs"] and page > 0
+        pool_align = _TPU_LAYOUT["pool_align"] and page > 0
         cp = self.cp_size
+        # Leading pad rows per request (pool_align): the request starts at
+        # the pool page boundary below its prefix.
+        leads = [
+            (prefix_offsets[i] % page) if (pool_align and extend_seqs_len[i] > 0) else 0
+            for i in range(bs)
+        ]
         # Layout lengths: page-padded on TPU, the real lengths otherwise.
         if page > 0:
-            layout_lens = [-(-length // page) * page for length in extend_seqs_len]
+            layout_lens = [
+                -(-(leads[i] + length) // page) * page
+                for i, length in enumerate(extend_seqs_len)
+            ]
         else:
             layout_lens = list(extend_seqs_len)
 
@@ -311,8 +330,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         max_seq_q_next_list: List[int] = []
         for batch_id, block_sizes in enumerate(per_seq_block_sizes):
             h, t = head_chunk(cp_rank, batch_id), tail_chunk(cp_rank, batch_id)
-            kv_len_prev_list.append(prefix_offsets[batch_id] + sum(block_sizes[: h + 1]))
-            kv_len_next_list.append(prefix_offsets[batch_id] + sum(block_sizes[: t + 1]))
+            base_pos = prefix_offsets[batch_id] - leads[batch_id]
+            kv_len_prev_list.append(base_pos + sum(block_sizes[: h + 1]))
+            kv_len_next_list.append(base_pos + sum(block_sizes[: t + 1]))
             actual_seq_q_prev_list.append(block_sizes[h])
             actual_seq_q_next_list.append(block_sizes[t])
             max_seq_q_prev_list.append(max(block_sizes[:cp]))
@@ -377,12 +397,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         lay = np.asarray(layout_lens, dtype=np.int64)
         real_start = np.concatenate([[0], np.cumsum(ext)])
         lay_start = np.concatenate([[0], np.cumsum(lay)])
+        lead_arr = np.asarray(leads, dtype=np.int64)
         if page > 0 and n_local:
             # Map each layout row to a real global token: padding rows of a
-            # request duplicate its last real token.
+            # request duplicate its first (leading pad) / last real token.
             req = np.searchsorted(lay_start, local_layout, side="right") - 1
-            within = local_layout - lay_start[req]
-            within = np.minimum(within, np.maximum(ext[req] - 1, 0))
+            within = local_layout - lay_start[req] - lead_arr[req]
+            within = np.clip(within, 0, np.maximum(ext[req] - 1, 0))
             local_indices = real_start[req] + within
         else:
             local_indices = local_layout
@@ -393,7 +414,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         # Last real token of each request -> local row (owner rank only).
         # local rows are sorted ascending per zigzag chunk but not globally;
         # map layout token -> local row through an inverse table.
-        last_tok = lay_start[:-1] + np.maximum(ext - 1, 0)
+        last_tok = lay_start[:-1] + lead_arr + np.maximum(ext - 1, 0)
         inv = np.full((int(total_seq_lens) + 1,), -1, dtype=np.int64)
         inv[local_layout] = np.arange(n_local)
         loc = inv[np.where(ext > 0, last_tok, 0)]
@@ -442,6 +463,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             new_kv_page_row=new_kv_page_row,
             new_kv_num_pages=new_kv_num_pages,
             layout_seqs_len=layout_lens,
+            layout_leads=leads,
             layout_page=page,
             stride=stride,
             per_rank_actual_token=per_rank_actual_token,

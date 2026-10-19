@@ -170,13 +170,30 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
                 # SGLANG_TPU_CP_PAGE_LAYOUT=0 falls back to the token-granular
                 # split with the host-side reorder (A/B and escape hatch).
                 if os.environ.get("SGLANG_TPU_CP_PAGE_LAYOUT", "1") != "0":
-                    set_zigzag_tpu_layout(page_align=self.page_size, balance_pairs=True)
+                    from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                        _REPLICATED_PREFILL,
+                    )
+
+                    set_zigzag_tpu_layout(
+                        page_align=self.page_size,
+                        balance_pairs=True,
+                        # Whole-page writes need every layout page to be one
+                        # pool page; only the replicated-pool path can use it.
+                        pool_align=_REPLICATED_PREFILL
+                        and os.environ.get("SGLANG_TPU_PCP_POOL_ALIGN", "1") != "0",
+                    )
                     # The replicated-pool prefill writes pages through this op.
                     from sglang.srt.hardware_backend.tpu.kv_row_write import (
                         ensure_kv_row_ops,
                     )
 
                     ensure_kv_row_ops()
+                    if os.environ.get("SGLANG_TPU_PCP_REF_KERNEL", "0") == "1":
+                        from sglang.srt.hardware_backend.tpu.batched_rpa_cp import (
+                            build_batched_rpa_ref_full_op,
+                        )
+
+                        build_batched_rpa_ref_full_op()
                 build_batched_rpa_pcp_ring_op(
                     get_parallel().attn_cp_size, get_parallel().attn_tp_size
                 )

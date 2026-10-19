@@ -423,10 +423,19 @@ class PcpBatchedMetadata:
     #                (unstriped) page table per virtual sequence.
     kv_row_dst: Optional[torch.Tensor] = None
     touched_slots: Optional[torch.Tensor] = None
+    # Page-granular write (pool-aligned layout): gathered page feeding each
+    # touched page, and per request the touched index / leading rows of a
+    # page shared with the prefix (0 = none).
+    page_src: Optional[torch.Tensor] = None
+    boundary_pos: Optional[torch.Tensor] = None
+    boundary_lead: Optional[torch.Tensor] = None
     prefix_send: Optional[torch.Tensor] = None
     prefix_recv: Optional[torch.Tensor] = None
     kv_lens_full: Optional[torch.Tensor] = None
     full_page_indices: Optional[torch.Tensor] = None
+    # [2 * num_reqs] end position (prefix + chunk end) of each virtual
+    # sequence, for a kernel without q_positions (reference kernel).
+    kv_lens_ends: Optional[torch.Tensor] = None
 
     @classmethod
     def create_empty(cls, device=None) -> "PcpBatchedMetadata":
@@ -606,6 +615,106 @@ def build_batched_rpa_pcp_ring_op(cp_size: int, attn_tp_size: int):
     _OP_CACHE[key] = target_op
     _GLOBAL_RING_OP = target_op
     return target_op
+
+_REF_FULL_OP_NAME = "sglang_tpu_pallas::ragged_paged_attention_ref_full"
+
+
+def build_batched_rpa_ref_full_op():
+    """FULL-scope attention through the merge-base (reference) batched RPA
+    kernel, for A/B against this branch's kernel (SGLANG_TPU_PCP_REF_KERNEL=1).
+
+    The reference kernel has no q_positions: a virtual sequence's Q rows are
+    its last `q_len` positions, read from `keys`/`values`, and `kv_lens` is
+    its end position.
+    """
+    cached = _OP_CACHE.get(_REF_FULL_OP_NAME)
+    if cached is not None:
+        return cached
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang.srt.layers.attention.pallas.batched_rpa_ref import configs as rconfigs
+    from sglang.srt.layers.attention.pallas.batched_rpa_ref import wrapper as rwrapper
+
+    def _wrapped(
+        queries: jax.Array,
+        keys: jax.Array,
+        values: jax.Array,
+        kv_cache_fused: jax.Array,
+        kv_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        sm_scale: float = 1.0,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        out, kv_updated = rwrapper.ragged_paged_attention(
+            queries=queries,
+            keys=keys,
+            values=values,
+            kv_cache=kv_cache_fused,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            use_causal_mask=True,
+            skip_kv_update=True,
+            kv_layout=rconfigs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        return out, kv_updated
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{_REF_FULL_OP_NAME}",
+        static_argnums=(8, 9, 10, 11, 12),
+        donate_argnums=(3,),
+        input_output_aliases={3: 1},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        _REF_FULL_OP_NAME, mutates_args=("kv_cache_fused",), device_types=["tpu"]
+    )
+    def custom_op(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        sm_scale: float = 1.0,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> torch.Tensor:
+        out, _ = jax_kernel(
+            queries, keys, values, kv_cache_fused, kv_lens, page_indices, cu_q_lens,
+            distribution, sm_scale, sliding_window, soft_cap, k_scale, v_scale,
+        )
+        return out
+
+    @custom_op.register_fake
+    def _fake_impl(queries, keys, values, kv_cache_fused, *args, **kwargs):
+        return torch.empty_like(queries)
+
+    _OP_CACHE[_REF_FULL_OP_NAME] = custom_op
+    return custom_op
+
+
+_USE_REF_KERNEL = os.environ.get("SGLANG_TPU_PCP_REF_KERNEL", "0") == "1"
+
 
 def build_batched_rpa_cp_op():
     """Register the CP-aware custom op for batched RPA."""
@@ -999,6 +1108,12 @@ def build_pcp_batched_metadata(
 _REPLICATED_PREFILL = os.environ.get("SGLANG_TPU_PCP_REPLICATED_PREFILL", "0") == "1"
 
 
+def _zigzag_layout() -> dict:
+    from sglang.srt.layers.cp.zigzag import _TPU_LAYOUT
+
+    return _TPU_LAYOUT
+
+
 def _gather_prefix_pages() -> bool:
     """Whether a prefix may live only on its owner ranks' stripes.
 
@@ -1083,22 +1198,48 @@ def _build_replicated_maps(
         row_valid[src] = True
     if int(row_pos.max(initial=0)) >= pages_per_seq * page:
         return {}  # beyond the page table (should not happen)
-    # Pages the new tokens land in, in (req, page) order; index 0 = dump page.
-    p_max = rows // page + num_reqs + 1
-    key = np.where(row_valid, row_req * pages_per_seq + row_pos // page, -1)
-    uniq, inverse = np.unique(key, return_inverse=True)
-    # np.unique sorts; -1 (padding) is first when present.
-    has_pad = bool(len(uniq)) and uniq[0] == -1
-    touched = uniq[1:] if has_pad else uniq
-    if len(touched) + 1 > p_max:
-        return {}
-    tidx = inverse - (1 if has_pad else 0) + 1  # 1-based touched index, pad -> 0
-    tidx = np.where(row_valid, tidx, 0)
-    t_req = np.zeros((p_max,), np.int64); t_page = np.zeros((p_max,), np.int64)
-    t_valid = np.zeros((p_max,), bool)
-    t_req[1 : 1 + len(touched)] = touched // pages_per_seq
-    t_page[1 : 1 + len(touched)] = touched % pages_per_seq
-    t_valid[1 : 1 + len(touched)] = True
+    leads = getattr(meta, "layout_leads", None)
+    pool_aligned = bool(_zigzag_layout().get("pool_align")) and leads is not None
+    page_src = boundary_pos = boundary_lead = None
+    if pool_aligned:
+        # Layout page p of request b is pool page pre // page + p.
+        lead = np.asarray([leads[i] if i < len(leads) else 0 for i in range(n_meta)])
+        p_max = rows // page + 1
+        pb_, pp_ = np.nonzero(n_pages[:, None] > np.arange(rank_of.shape[1])[None, :])
+        pb_ = pb_[pb_ < num_reqs]; pp_ = pp_[: len(pb_)]
+        if len(pb_) + 1 > p_max:
+            return {}
+        t_req = np.zeros((p_max,), np.int64); t_page = np.zeros((p_max,), np.int64)
+        t_valid = np.zeros((p_max,), bool); t_src = np.zeros((p_max,), np.int64)
+        t_req[1 : 1 + len(pb_)] = pb_
+        t_page[1 : 1 + len(pb_)] = pre[pb_] // page + pp_
+        t_valid[1 : 1 + len(pb_)] = True
+        t_src[1 : 1 + len(pb_)] = (rank_of[pb_, pp_].astype(np.int64) * pad_t + row_of[pb_, pp_]) // page
+        b_pos = np.zeros((num_reqs,), np.int64); b_lead = np.zeros((num_reqs,), np.int64)
+        first = (pp_ == 0) & (lead[pb_] > 0)
+        b_pos[pb_[first]] = np.nonzero(first)[0] + 1
+        b_lead[pb_[first]] = lead[pb_[first]]
+        if int(t_page.max(initial=0)) >= pages_per_seq:
+            return {}
+    if pool_aligned:
+        tidx = np.zeros((rows,), np.int64)  # row scatter unused
+    else:
+        # Pages the new tokens land in, in (req, page) order; index 0 = dump page.
+        p_max = rows // page + num_reqs + 1
+        key = np.where(row_valid, row_req * pages_per_seq + row_pos // page, -1)
+        uniq, inverse = np.unique(key, return_inverse=True)
+        # np.unique sorts; -1 (padding) is first when present.
+        has_pad = bool(len(uniq)) and uniq[0] == -1
+        touched = uniq[1:] if has_pad else uniq
+        if len(touched) + 1 > p_max:
+            return {}
+        tidx = inverse - (1 if has_pad else 0) + 1  # 1-based touched index, pad -> 0
+        tidx = np.where(row_valid, tidx, 0)
+        t_req = np.zeros((p_max,), np.int64); t_page = np.zeros((p_max,), np.int64)
+        t_valid = np.zeros((p_max,), bool)
+        t_req[1 : 1 + len(touched)] = touched // pages_per_seq
+        t_page[1 : 1 + len(touched)] = touched % pages_per_seq
+        t_valid[1 : 1 + len(touched)] = True
 
     # --- prefix pages: owner rank r holds pages p % cp == r of each request's prefix.
     n_pref = (pre + page - 1) // page
@@ -1131,6 +1272,10 @@ def _build_replicated_maps(
         pages_i64[_t(t_req), _t(t_page)],
         torch.zeros((p_max,), dtype=torch.int64, device=device),
     )
+    if pool_aligned:
+        page_src = _t(t_src, torch.int32)
+        boundary_pos = _t(b_pos, torch.int32)
+        boundary_lead = _t(b_lead, torch.int32)
     send_slot = torch.where(_t(send_valid, torch.bool), pages_i64[_t(send_b), _t(send_p)], torch.zeros((r_max,), dtype=torch.int64, device=device))
     recv_slot = torch.where(_t(recv_valid, torch.bool), pages_i64[_t(recv_b), _t(recv_p)], torch.zeros((cp * r_max,), dtype=torch.int64, device=device))
     kv_lens_full = torch.from_numpy(
@@ -1139,7 +1284,18 @@ def _build_replicated_maps(
     if kv_lens_full.shape[0] < 2 * num_reqs:
         kv_lens_full = torch.nn.functional.pad(kv_lens_full, (0, 2 * num_reqs - kv_lens_full.shape[0]))
     full_page_indices = pages_2d.repeat_interleave(2, dim=0).reshape(-1)
+    ends = np.zeros((2 * num_reqs,), dtype=np.int32)
+    kp = getattr(meta, "kv_len_prev_list", None) or []
+    kn = getattr(meta, "kv_len_next_list", None) or []
+    for i in range(min(num_reqs, len(kp))):
+        ends[2 * i] = kp[i]
+        ends[2 * i + 1] = kn[i]
+    kv_lens_ends = torch.from_numpy(ends).to(device)
     return dict(
+        kv_lens_ends=kv_lens_ends,
+        page_src=page_src,
+        boundary_pos=boundary_pos,
+        boundary_lead=boundary_lead,
         kv_row_dst=kv_row_dst.to(torch.int32),
         touched_slots=touched_slots.to(torch.int32),
         prefix_send=send_slot.to(torch.int32),
@@ -1451,7 +1607,18 @@ def batched_rpa_pcp_forward_replicated(
     else:
         kq, vq = k, v
     rows = torch.cat([k_all, v_all], dim=-1).reshape(kv_all.shape[0], -1).contiguous()
-    write_rows(pcp_meta.touched_slots, pcp_meta.kv_row_dst, rows, kv_cache)
+    if getattr(pcp_meta, "page_src", None) is not None:
+        # Pool-aligned layout: every layout page is one pool page.
+        torch.ops.sglang_tpu.kv_write_pages_from_rows(
+            pcp_meta.touched_slots,
+            pcp_meta.page_src,
+            pcp_meta.boundary_pos,
+            pcp_meta.boundary_lead,
+            rows,
+            kv_cache,
+        )
+    else:
+        write_rows(pcp_meta.touched_slots, pcp_meta.kv_row_dst, rows, kv_cache)
     kq = kq.contiguous()
     vq = vq.contiguous()
 
@@ -1461,6 +1628,23 @@ def batched_rpa_pcp_forward_replicated(
     if sinks is None:
         sinks = getattr(layer, "sinks", None)
     need_lse = sinks is not None
+    if _USE_REF_KERNEL and sinks is None:
+        ref_op = _OP_CACHE.get(_REF_FULL_OP_NAME) or build_batched_rpa_ref_full_op()
+        return ref_op(
+            q,
+            kq,
+            vq,
+            kv_cache,
+            pcp_meta.kv_lens_ends,
+            pcp_meta.full_page_indices,
+            pcp_meta.pcp_cu_q_lens,
+            base_meta.distribution * 2,
+            float(layer.scaling),
+            sliding_window,
+            float(layer.logit_cap) if getattr(layer, "logit_cap", 0) else None,
+            k_scale,
+            v_scale,
+        )
     # The kernel takes no new tokens here (kv_new_lens = 0) but is compiled
     # for the pool dtype, so hand it the quantized local K/V.
     out, lse = cp_op(
