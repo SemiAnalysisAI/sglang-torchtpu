@@ -71,7 +71,7 @@ MODEL_CONFIG = {
             "TPU_COMPILE_BS": str(CONCUR),
             "ENABLE_PROFILER_ENDPOINT": "0",
             "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
-            # EAGLE3 on the experimental spec worker (TpuEagle3Worker).
+            # EAGLE3 on the experimental spec worker (TpuChainSpecWorker).
             "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
             "EXTRA_ARGS": (
                 f"--served-model-name {MODEL} "

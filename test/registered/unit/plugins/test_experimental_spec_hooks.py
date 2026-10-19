@@ -352,6 +352,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             padded_tokens=8,
             chunked_row=1,
             next_prompt_token=22,
+            vocab_size=100,
         )
         torch.testing.assert_close(row_reqs, torch.tensor([0, 0, 0, 1, 1, 0, 0, 0]))
         self.assertEqual(is_sampled.nonzero().view(-1).tolist(), [2])
@@ -640,9 +641,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
         from sglang_tpu.experimental.speculative.chain_info import (
             HostPaddedChainDraftInput,
         )
-        from sglang_tpu.experimental.speculative.eagle_info import (
-            HostPaddedEagleDraftInput,
-        )
         from sglang_tpu.hooks.experimental_spec import (
             build_disagg_block_input,
             build_disagg_eagle_input,
@@ -688,27 +686,22 @@ class TestExperimentalSpecHooks(CustomTestCase):
             future_map.reset_mock()
             return payload
 
-        eagle3 = build_disagg_eagle_input(
-            core, batch(SpeculativeAlgorithm.EAGLE3), bonus, future_map
-        )
-        self.assertIsInstance(eagle3, HostPaddedEagleDraftInput)
-        payload = check_relayed(eagle3)
-        self.assertEqual(payload.topk_index.tolist(), [[7], [7]])
-        self.assertEqual(payload.hidden_states[:, 0].tolist(), [0.0, 1.0])
-
-        seeded = []
-        with patch(
-            "sglang_tpu.experimental._pd_carry_seeder",
-            lambda indices, hidden: seeded.append((indices, hidden)),
-        ):
-            mtp = build_disagg_eagle_input(
-                core, batch(SpeculativeAlgorithm.EAGLE), bonus, future_map
-            )
-        self.assertIsInstance(mtp, HostPaddedChainDraftInput)
-        check_relayed(mtp)
-        ((indices, hidden),) = seeded
-        self.assertIs(indices, rows)
-        self.assertEqual(hidden[:, 0].tolist(), [0.0, 1.0])
+        # MTP (core resolves NEXTN to EAGLE) and EAGLE3 both keep the seed in the
+        # chain carry table.
+        for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3):
+            seeded = []
+            with patch(
+                "sglang_tpu.experimental._pd_carry_seeder",
+                lambda indices, hidden: seeded.append((indices, hidden)),
+            ):
+                chain = build_disagg_eagle_input(
+                    core, batch(algorithm), bonus, future_map
+                )
+            self.assertIsInstance(chain, HostPaddedChainDraftInput)
+            check_relayed(chain)
+            ((indices, hidden),) = seeded
+            self.assertIs(indices, rows)
+            self.assertEqual(hidden[:, 0].tolist(), [0.0, 1.0])
 
         for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
             block = build_disagg_block_input(core, batch(algorithm), bonus, future_map)

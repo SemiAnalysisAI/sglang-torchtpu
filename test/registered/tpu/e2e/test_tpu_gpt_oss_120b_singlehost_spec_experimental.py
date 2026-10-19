@@ -1,7 +1,7 @@
 """GPT-OSS-120B EAGLE3 single-host GSM8K quality gate on the experimental spec worker.
 
 Reuses test_tpu_gpt_oss_120b_singlehost_spec.py with
-SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1, which routes EAGLE3 to TpuEagle3Worker.
+SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1, which routes EAGLE3 to TpuChainSpecWorker.
 """
 
 import unittest

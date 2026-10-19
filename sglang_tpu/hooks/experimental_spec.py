@@ -24,8 +24,7 @@ from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
     is_experimental_chain,
-    is_experimental_eagle3,
-    is_experimental_spec_worker,
+    is_experimental_spec,
     uses_host_batch,
 )
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
@@ -131,43 +130,26 @@ def build_disagg_eagle_input(
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> SpecInput:
-    # Core stacks the seed on device at the live bs, one compile per bs; build it
-    # on host and upload once instead. MTP writes its hidden into the chain carry.
+    # Core stacks the seed on device at the live bs, one compile per bs. The chain
+    # worker (MTP, EAGLE3) keeps the draft hidden in its carry table instead.
     if not uses_host_batch(batch):
         return original(batch, last_tokens_tensor, future_map)
+    from sglang_tpu.experimental import get_pd_carry_seeder
+    from sglang_tpu.experimental.speculative.chain_info import (
+        HostPaddedChainDraftInput,
+    )
+
+    assert is_experimental_chain(batch.spec_algorithm), batch.spec_algorithm
     if any(req.output_dsa_topk_indices is not None for req in batch.reqs):
-        raise NotImplementedError("TpuSpecWorker does not support DSA PD seeds.")
-    hidden = torch.stack([req.hidden_states_tensor for req in batch.reqs])
-    if is_experimental_chain(batch.spec_algorithm):
-        from sglang_tpu.experimental import get_pd_carry_seeder
-        from sglang_tpu.experimental.speculative.chain_info import (
-            HostPaddedChainDraftInput,
-        )
-
-        get_pd_carry_seeder()(batch.req_pool_indices_cpu, hidden)
-        draft_input = HostPaddedChainDraftInput(
-            bonus_tokens=last_tokens_tensor,
-            new_seq_lens=batch.seq_lens.to(torch.int64),
-        )
-    else:
-        from sglang_tpu.experimental.speculative.eagle_info import (
-            HostPaddedEagleDraftInput,
-        )
-
-        # TpuEagle3Worker drafts a top-k 1 chain: one seed state per request.
-        topk_p = torch.stack(
-            [torch.as_tensor(req.output_topk_p[:1]) for req in batch.reqs]
-        ).to(torch.float32)
-        topk_index = torch.stack(
-            [torch.as_tensor(req.output_topk_index[:1]) for req in batch.reqs]
-        ).to(torch.int64)
-        draft_input = HostPaddedEagleDraftInput(
-            bonus_tokens=last_tokens_tensor,
-            new_seq_lens=batch.seq_lens.to(torch.int64),
-            topk_p=topk_p.to(batch.device, non_blocking=True),
-            topk_index=topk_index.to(batch.device, non_blocking=True),
-            hidden_states=hidden.to(batch.device, non_blocking=True),
-        )
+        raise NotImplementedError("TpuChainSpecWorker does not support DSA PD seeds.")
+    get_pd_carry_seeder()(
+        batch.req_pool_indices_cpu,
+        torch.stack([req.hidden_states_tensor for req in batch.reqs]),
+    )
+    draft_input = HostPaddedChainDraftInput(
+        bonus_tokens=last_tokens_tensor,
+        new_seq_lens=batch.seq_lens.to(torch.int64),
+    )
     return _relay_disagg_seed(batch, draft_input, future_map)
 
 
@@ -299,13 +281,9 @@ def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
 
 
 def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
-    if (
-        is_experimental_chain(spec_algorithm)
-        or is_experimental_spec_worker(spec_algorithm)
-        or is_experimental_eagle3(spec_algorithm)
-    ):
+    if is_experimental_spec(spec_algorithm):
         # commit writes draft KV after the accept tensors the result copies;
-        # the copied draft tail (kv_fence_tail) is read after that write.
+        # the copied draft tail (kv_fence_tail) is an output of that write.
         return copies_draft_tail
     return original(spec_algorithm, copies_draft_tail=copies_draft_tail)
 

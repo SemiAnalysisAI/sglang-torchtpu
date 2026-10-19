@@ -1,4 +1,4 @@
-"""Autoregressive chain drafting (MTP) on the TpuSpecWorker interface.
+"""Autoregressive chain drafting (MTP, EAGLE3) on the TpuSpecWorker interface.
 
 draft:  one compiled program per batch bucket: d_1 from the carried hidden g
         of the last committed row, then gamma - 1 decode-shaped draft forwards;
@@ -24,7 +24,6 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import compiled_op, warmup_compiled_op
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -33,7 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
-from sglang.srt.runtime_context import get_disagg, get_spec
+from sglang.srt.runtime_context import get_disagg, get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.ragged_verify import (
@@ -52,11 +51,17 @@ from sglang_tpu.experimental.speculative.chain_draft_worker import (
 )
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
 from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
+from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
+    TpuEagle3DraftWorker,
+)
 from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
     TpuMtpDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
+    accept_drafts_target_only,
     build_chain_block_inputs,
+    build_verify_tokens,
+    finalize_accept,
     pick,
     select_verify_rows,
 )
@@ -72,7 +77,9 @@ from sglang_tpu.experimental.speculative.spec_types import (
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuChainDraftWorker]] = {
+    # MTP: core resolves NEXTN to EAGLE.
     SpeculativeAlgorithm.EAGLE: TpuMtpDraftWorker,
+    SpeculativeAlgorithm.EAGLE3: TpuEagle3DraftWorker,
 }
 
 
@@ -95,11 +102,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
             raise NotImplementedError(
                 "TpuChainSpecWorker does not support --speculative-draft-window-size."
             )
-        # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
-        if is_dp_attention_enabled():
-            raise NotImplementedError(
-                "TpuChainSpecWorker does not support DP attention."
-            )
         target_runner = target_worker.model_runner
         self._spec_algorithm = target_runner.spec_algorithm
         draft_worker = _DRAFT_WORKER_CLS[self._spec_algorithm](target_runner)
@@ -111,16 +113,34 @@ class TpuChainSpecWorker(TpuSpecWorker):
             )
         self._chain_draft_worker = draft_worker
         self._draft_runner = draft_worker.model_runner
+        self._target_vocab_size = target_runner.model_config.vocab_size
+        self._target_is_multimodal = process_model_config().is_multimodal
+        # An idle DP rank mirrors its peers' draft syncs without knowing whether they
+        # sample; greedy drafts sync one [pbs, N] int64 either way, and sampled
+        # requests take the target-only accept, as TPU EAGLE does.
+        self._sampled_drafts = not self._dp_attention
         self._disagg_mode = get_disagg().disaggregation_mode
         if self._disagg_mode == "decode":
             register_pd_carry_seeder(self._seed_carry)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
-        self._warmup_draft_ops()
-        self._warmup_extend_ops()
+        # A PD prefill server never decodes.
+        if self._disagg_mode != "prefill":
+            self._warmup_draft_ops()
+            if not self._sampled_drafts:
+                self._warmup_target_only_accept()
         if self._disagg_mode == "decode":
             self._warmup_seed_carry()
+        else:
+            self._warmup_extend_ops()
+            if self._target_is_multimodal:
+                self._warmup_multimodal_prefill()
+        if (
+            self._disagg_mode != "prefill"
+            and self.target_worker.model_runner.model_config.model_is_mrope
+        ):
+            self._warmup_verify_mrope()
         # The base snapshot ran before these chain-draft warmups.
         self._snapshot_warm_baseline()
 
@@ -134,13 +154,14 @@ class TpuChainSpecWorker(TpuSpecWorker):
         del batch
         # Host KV bound past the last draft row; RPA reads the exact length per step.
         seq_lens_cpu, _ = verify_input.padded_kv_lens_after_rows(self.num_drafts)
+        sampled = self._sampled_drafts
         return self._draft_chain(
             state=bucket.state,
             rows=rows,
             req_pool_indices_cpu=verify_input.req_pool_indices_cpu,
             seq_lens_cpu=seq_lens_cpu,
-            temperatures=bucket.temperatures,
-            top_ks=bucket.top_ks,
+            temperatures=bucket.temperatures if sampled else None,
+            top_ks=bucket.top_ks if sampled else None,
         )
 
     def _draft_chain(
@@ -154,6 +175,33 @@ class TpuChainSpecWorker(TpuSpecWorker):
         top_ks: torch.Tensor | None,
     ) -> DraftResult:
         """The fused draft and its eager prelude; warmup runs it as serving does."""
+        padded_bs = state.seq_lens.shape[0]
+        drafter = self._chain_draft_worker
+        with drafter.draft_context():
+            draft_tokens, draft_logits = self._run_fused_draft(
+                state=state,
+                rows=rows,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                temperatures=temperatures,
+                top_ks=top_ks,
+            )
+        return DraftResult(
+            draft_tokens=draft_tokens,
+            draft_logits=draft_logits,
+            num_verify_drafts=self._all_drafts[padded_bs],
+        )
+
+    def _run_fused_draft(
+        self,
+        *,
+        state: SpecState,
+        rows: VerifyRows,
+        req_pool_indices_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        temperatures: torch.Tensor | None,
+        top_ks: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         padded_bs = state.seq_lens.shape[0]
         drafter = self._chain_draft_worker
         forward_batch = drafter.fused_draft_batch(
@@ -189,11 +237,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             draft_tokens = self._tp_sync.sync(
                 SpecTpSyncSite.SPEC_DRAFT_GREEDY, draft_tokens
             )
-        return DraftResult(
-            draft_tokens=draft_tokens,
-            draft_logits=draft_logits,
-            num_verify_drafts=self._all_drafts[padded_bs],
-        )
+        return draft_tokens, draft_logits
 
     def commit(
         self,
@@ -210,21 +254,23 @@ class TpuChainSpecWorker(TpuSpecWorker):
         padded_bs = state.seq_lens.shape[0]
         width = self.num_verify_rows
         # Rows past the bonus carry token 0; their draft KV is past the new seq_lens.
-        draft_out = forward_draft_rows(
-            draft_runner=self._draft_runner,
-            spec_algorithm=self._spec_algorithm,
-            inputs=build_chain_block_inputs(
-                accept.window_tokens, rows, state.seq_lens, accept.live_mask, 0
-            ),
-            req_pool_indices=state.req_pool_indices,
-            verify_input=verify_input,
-            offset=0,
-            width=width,
-            spec_info=chain_draft_forward_input(
-                hidden_states=target_hidden, width=width
-            ),
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+        inputs = build_chain_block_inputs(
+            accept.window_tokens, rows, state.seq_lens, accept.live_mask, 0
         )
+        with self._chain_draft_worker.draft_context():
+            draft_out = forward_draft_rows(
+                draft_runner=self._draft_runner,
+                spec_algorithm=self._spec_algorithm,
+                inputs=inputs,
+                req_pool_indices=state.req_pool_indices,
+                verify_input=verify_input,
+                offset=0,
+                width=width,
+                spec_info=chain_draft_forward_input(
+                    hidden_states=target_hidden, width=width
+                ),
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
         draft_hidden = draft_out.hidden_states
         assert draft_hidden is not None, "Chain draft rows returned no hidden."
         last_hidden = pick(
@@ -246,6 +292,13 @@ class TpuChainSpecWorker(TpuSpecWorker):
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
         self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
+        if not batch.reqs:
+            # A DP-attention rank without prompts (DP padding relabels its batch)
+            # still issues the draft prefill's collectives.
+            self._forward_idle_draft_prefill(
+                batch, target_hidden=result.logits_output.hidden_states
+            )
+            return self._idle_extend_result(result)
         bs = batch.seq_lens.shape[0]
         # Sampling ran at the batch bucket; the draft reads it there, the scheduler takes live rows.
         bucket_tokens = result.next_token_ids
@@ -256,26 +309,25 @@ class TpuChainSpecWorker(TpuSpecWorker):
             raise RuntimeError("Chain-draft extend requires target hidden capture.")
         assert logits_output.hidden_states_token_indices is None
         tail_hidden = self._extend_draft(
-            batch, target_hidden=target_hidden, bucket_tokens=bucket_tokens
+            batch,
+            target_hidden=target_hidden,
+            bucket_tokens=bucket_tokens,
+            mm_input_embeds=logits_output.mm_input_embeds,
         )
         logits_output.hidden_states = None
+        logits_output.mm_input_embeds = None
         next_state = SpecState(
             bonus_tokens=result.next_token_ids,
             seq_lens=batch.seq_lens,
             req_pool_indices=batch.req_pool_indices,
         )
         result.new_seq_lens = next_state.seq_lens
-        next_draft_input = self.state_to_spec_info(next_state)
+        draft_input = self.state_to_spec_info(next_state)
         # The draft prompt forward writes the step's last KV; tail_hidden is its output.
-        next_draft_input.kv_fence_tail = tail_hidden
+        draft_input.kv_fence_tail = tail_hidden
         if self._disagg_mode == "prefill":
-            # Core ships hidden_states[i] as the EAGLE seed; topk is a host
-            # placeholder so its per-row reads stay off the device.
-            cap = tail_hidden.shape[0]
-            next_draft_input.hidden_states = tail_hidden
-            next_draft_input.topk_p = torch.zeros((cap, 1), dtype=torch.float32)
-            next_draft_input.topk_index = torch.zeros((cap, 1), dtype=torch.int64)
-        result.next_draft_input = next_draft_input
+            _attach_pd_seeds(draft_input, tail_hidden=tail_hidden, bs=bs)
+        result.next_draft_input = draft_input
         return result
 
     def _extend_draft(
@@ -284,27 +336,13 @@ class TpuChainSpecWorker(TpuSpecWorker):
         *,
         target_hidden: torch.Tensor,
         bucket_tokens: torch.Tensor,
+        mm_input_embeds: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Draft forward on the prompt shifted by one token; stores and returns the [cap, H] carry."""
-        input_ids = batch.input_ids
-        assert input_ids is not None and input_ids.device.type == "cpu", (
-            "HOST_PADDED extend stages prompt tokens on host"
-        )
-        # finalize keeps HOST_PADDED target hidden at the token bucket.
+        """Draft forward on the prompt shifted by one token; store and return each request's last hidden."""
+        # finalize keeps HOST_PADDED target hidden (and mm embeds) at the token bucket.
         padded_tokens = target_hidden.shape[0]
-        chunked_row, next_prompt_token = _chunked_tail(batch)
-        shifted, row_reqs, is_sampled = shift_prompt_tokens(
-            input_ids,
-            extend_lens=batch.extend_lens,
-            padded_tokens=padded_tokens,
-            chunked_row=chunked_row,
-            next_prompt_token=next_prompt_token,
-        )
-        draft_ids = fill_sampled_tails(
-            shifted.to(self.device, non_blocking=True),
-            row_reqs.to(self.device, non_blocking=True),
-            is_sampled.to(self.device, non_blocking=True),
-            bucket_tokens,
+        draft_ids = self._draft_prompt_ids(
+            batch, padded_tokens=padded_tokens, bucket_tokens=bucket_tokens
         )
         forward_batch = ForwardBatch.init_new(
             batch,
@@ -317,7 +355,23 @@ class TpuChainSpecWorker(TpuSpecWorker):
             hidden_states=target_hidden, width=1
         )
         forward_batch.return_logprob = False
-        with torch.no_grad():
+        if forward_batch.global_num_tokens_cpu is not None:
+            # DP attention pads the batch to the synced live counts, but the tokens
+            # are already at the token bucket, and the draft (run in its
+            # attention-TP group) gathers nothing across DP ranks.
+            num_ranks = len(forward_batch.global_num_tokens_cpu)
+            forward_batch.global_num_tokens_cpu = [padded_tokens] * num_ranks
+            forward_batch.global_num_tokens_gpu = torch.full(
+                (num_ranks,), padded_tokens, dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+        with self._chain_draft_worker.draft_context(), torch.no_grad():
+            if mm_input_embeds is not None:
+                assert mm_input_embeds.shape[0] == padded_tokens
+                # Embeds in hand keep the draft off its mm_inputs path, whose
+                # per-slot reads would specialize the program on batch packing.
+                forward_batch.input_embeds = self._draft_prompt_embeds(
+                    batch, mm_input_embeds=mm_input_embeds, draft_ids=draft_ids
+                )
             draft_out = self._draft_runner.forward(forward_batch).logits_output
         _, tail_hidden = _draft_logits_and_hidden(draft_out)
         # LAST capture keeps one row per request at the extend cap; padded rows hit pool row 0.
@@ -348,6 +402,111 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 torch.zeros((padded_bs,), dtype=torch.int64),
                 torch.zeros((padded_bs, carry_size), dtype=self._draft_runner.dtype),
             )
+
+    def _draft_prompt_ids(
+        self, batch: ScheduleBatch, *, padded_tokens: int, bucket_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """[padded_tokens] draft prompt ids on device: the prompt shifted by one token."""
+        input_ids = batch.input_ids
+        assert input_ids is not None and input_ids.device.type == "cpu", (
+            "HOST_PADDED extend stages prompt tokens on host"
+        )
+        chunked_row, next_prompt_token = _chunked_tail(batch)
+        shifted, row_reqs, is_sampled = shift_prompt_tokens(
+            input_ids,
+            extend_lens=batch.extend_lens,
+            padded_tokens=padded_tokens,
+            chunked_row=chunked_row,
+            next_prompt_token=next_prompt_token,
+            vocab_size=self._target_vocab_size,
+        )
+        return fill_sampled_tails(
+            shifted.to(self.device, non_blocking=True),
+            row_reqs.to(self.device, non_blocking=True),
+            is_sampled.to(self.device, non_blocking=True),
+            bucket_tokens,
+        )
+
+    def _draft_prompt_embeds(
+        self,
+        batch: ScheduleBatch,
+        *,
+        mm_input_embeds: torch.Tensor,
+        draft_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft prompt embeds [T, H]: the target's moved up a row, each request's last row re-embedded."""
+        cap = self._compile_policy()._extend_compile_cap()
+        last_rows = torch.cumsum(torch.tensor(batch.extend_lens), dim=0) - 1
+        # Padded slots repeat request 0's last row, rewriting it with the same embed.
+        tail_rows = torch.full((cap,), int(last_rows[0]), dtype=torch.int64)
+        tail_rows[: last_rows.shape[0]] = last_rows
+        tail_rows = tail_rows.to(self.device, non_blocking=True)
+        embed_tokens = self._draft_runner.model.get_input_embeddings()
+        tail_embeds = embed_tokens(draft_ids.index_select(0, tail_rows))
+        return fold_prompt_tail_embeds(mm_input_embeds, tail_rows, tail_embeds)
+
+    def _forward_idle_draft_prefill(
+        self, batch: ScheduleBatch, *, target_hidden: torch.Tensor
+    ) -> None:
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self._draft_runner,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            return_hidden_states_before_norm=False,
+        )
+        forward_batch.spec_info = chain_draft_forward_input(
+            hidden_states=target_hidden[:0], width=1
+        )
+        forward_batch.return_logprob = False
+        with self._chain_draft_worker.draft_context(), torch.no_grad():
+            self._draft_runner.forward(forward_batch)
+
+    def _idle_extend_result(
+        self, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if result.logits_output is not None:
+            result.logits_output.hidden_states = None
+        idle = self._idle_result()
+        result.next_token_ids = idle.next_token_ids
+        result.new_seq_lens = idle.new_seq_lens
+        result.next_draft_input = idle.next_draft_input
+        return result
+
+    def _forward_idle_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        state: SpecState,
+        rows: VerifyRows,
+        verify_input: TpuSpecVerifyInput,
+    ) -> None:
+        # The active step's forwards in order: draft chain, verify, commit's draft rows.
+        seq_lens_cpu, _ = verify_input.padded_kv_lens_after_rows(self.num_drafts)
+        draft_result = self._draft_chain(
+            state=state,
+            rows=rows,
+            req_pool_indices_cpu=verify_input.req_pool_indices_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            temperatures=None,
+            top_ks=None,
+        )
+        logits_output = self._forward_idle_verify(
+            batch=batch,
+            state=state,
+            rows=rows,
+            verify_input=verify_input,
+            verify_tokens=build_verify_tokens(
+                state.bonus_tokens, draft_result.draft_tokens
+            ),
+        )
+        accept = finalize_accept(
+            draft_result.draft_tokens,
+            self._device_zeros(state.seq_lens.shape[0]),
+            state.bonus_tokens,
+            state.seq_lens,
+            state.req_pool_indices != 0,
+        )
+        self.commit(batch, state, rows, verify_input, logits_output, accept)
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
@@ -423,10 +582,12 @@ class TpuChainSpecWorker(TpuSpecWorker):
         state = SpecState(
             bonus_tokens=upload(pbs), seq_lens=seq_lens, req_pool_indices=upload(pbs)
         )
-        for temperatures, top_ks in (
-            (None, None),
-            (upload(pbs, dtype=torch.float32), upload(pbs, dtype=torch.int32)),
-        ):
+        variants: list[tuple[torch.Tensor | None, torch.Tensor | None]] = [(None, None)]
+        if self._sampled_drafts:
+            variants.append(
+                (upload(pbs, dtype=torch.float32), upload(pbs, dtype=torch.int32))
+            )
+        for temperatures, top_ks in variants:
             result = self._draft_chain(
                 state=state,
                 rows=rows,
@@ -440,6 +601,85 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 self._warmup_sampled_accept(
                     pbs, result.draft_tokens, result.draft_logits
                 )
+
+    def _warmup_target_only_accept(self) -> None:
+        """Target-only acceptance, target filter included, per batch bucket."""
+        vocab_size = self.target_worker.model_runner.model_config.vocab_size
+        with torch.no_grad():
+            for padded_bs in self._b_bucketer().buckets:
+                warmup_compiled_op(
+                    accept_drafts_target_only,
+                    torch.zeros(
+                        (padded_bs * self.num_verify_rows, vocab_size),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    torch.zeros(
+                        (padded_bs, self.num_drafts),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    self._all_drafts[padded_bs],
+                    *self._sampling_param_warmup_args(padded_bs),
+                    self._accept_threshold_single,
+                    self._accept_threshold_acc,
+                )
+
+    def _warmup_multimodal_prefill(self) -> None:
+        """The draft prompt's embed fold per token bucket, and live-row logits padding."""
+        compile_policy = self._compile_policy()
+        cap = compile_policy._extend_compile_cap()
+        assert compile_policy.t_bucketer is not None
+        embed_tokens = self._draft_runner.model.get_input_embeddings()
+        tail_rows = torch.zeros((cap,), dtype=torch.int64).to(self.device)
+        with torch.no_grad():
+            for num_tokens in compile_policy.t_bucketer.buckets:
+                if num_tokens < cap:
+                    continue
+                draft_ids = torch.zeros((num_tokens,), dtype=torch.int64).to(
+                    self.device
+                )
+                with self._chain_draft_worker.draft_context():
+                    tail_embeds = embed_tokens(draft_ids.index_select(0, tail_rows))
+                warmup_compiled_op(
+                    fold_prompt_tail_embeds,
+                    torch.zeros(
+                        (num_tokens, embed_tokens.embedding_dim),
+                        dtype=embed_tokens.weight.dtype,
+                        device=self.device,
+                    ),
+                    tail_rows,
+                    tail_embeds,
+                )
+            # A multimodal wrapper's eager logits processor emits live rows;
+            # TpuSampler pads them to the batch bucket.
+            vocab_size = self._target_vocab_size
+            for bs in range(1, cap + 1):
+                logits = torch.zeros((bs, vocab_size), dtype=torch.float32).to(
+                    self.device
+                )
+                torch.nn.functional.pad(logits, (0, 0, 0, self._pad_bs(bs) - bs))
+        torch.accelerator.synchronize()
+
+    def _warmup_verify_mrope(self) -> None:
+        """compute_spec_mrope_positions on the verify rows: text-only, then per-request deltas."""
+        width = self.num_verify_rows
+
+        def upload(*shape: int) -> torch.Tensor:
+            return torch.zeros(shape, dtype=torch.int64).to(self.device)
+
+        with torch.no_grad():
+            for padded_bs in self._b_bucketer().buckets:
+                # make_verify_input hands over select_verify_rows' flat positions.
+                rows = select_verify_rows(
+                    upload(padded_bs, 2 * width), upload(padded_bs), upload(padded_bs)
+                )
+                positions = rows.flat_positions.view(padded_bs, -1)
+                positions.flatten().unsqueeze(0).repeat(3, 1).cpu()
+                deltas = torch.zeros((padded_bs, 1), dtype=torch.int64)
+                (positions + deltas.to(self.device)).flatten().unsqueeze(0).repeat(
+                    3, 1
+                ).cpu()
 
     def _warmup_extend_ops(self) -> None:
         """Host uploads and the tail fill of the draft prompt extend, per token and batch bucket."""
@@ -487,6 +727,15 @@ def fill_sampled_tails(
     return torch.where(is_sampled, bucket_tokens.index_select(0, row_reqs), shifted)
 
 
+@compiled_op()
+def fold_prompt_tail_embeds(
+    mm_input_embeds: torch.Tensor, tail_rows: torch.Tensor, tail_embeds: torch.Tensor
+) -> torch.Tensor:
+    """[T, H] embeds moved up by one row (row p embeds token p + 1), tail rows replaced."""
+    shifted = torch.cat((mm_input_embeds[1:], mm_input_embeds[-1:]), dim=0)
+    return shifted.index_copy(0, tail_rows, tail_embeds.to(shifted.dtype))
+
+
 def shift_prompt_tokens(
     input_ids: torch.Tensor,
     *,
@@ -494,6 +743,7 @@ def shift_prompt_tokens(
     padded_tokens: int,
     chunked_row: int | None,
     next_prompt_token: int | None,
+    vocab_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Host [padded_tokens] shifted ids, owning request per row, and rows awaiting the sampled token.
 
@@ -502,7 +752,9 @@ def shift_prompt_tokens(
     """
     num_tokens = input_ids.shape[0]
     shifted = torch.zeros((padded_tokens,), dtype=torch.int64)
-    shifted[: num_tokens - 1] = input_ids[1:]
+    # Image placeholders carry hash ids past the vocab; the draft reads those rows
+    # from the target's embeds, but must not index its embedding out of range.
+    shifted[: num_tokens - 1] = input_ids[1:].clamp(0, vocab_size - 1)
     lens = torch.tensor(list(extend_lens), dtype=torch.int64)
     last_rows = torch.cumsum(lens, dim=0) - 1
     row_reqs = torch.zeros((padded_tokens,), dtype=torch.int64)
@@ -515,6 +767,20 @@ def shift_prompt_tokens(
         is_sampled[tail] = False
         shifted[tail] = next_prompt_token
     return shifted, row_reqs, is_sampled
+
+
+def _attach_pd_seeds(
+    draft_input: HostPaddedChainDraftInput, *, tail_hidden: torch.Tensor, bs: int
+) -> None:
+    """The per-request seed core PD prefill ships to decode (output_topk_*, hidden_states_tensor).
+
+    A chain decode stores only the hidden and re-derives d_1 from it, so topk is
+    a host placeholder. hidden stays at the extend cap: core copies it to host
+    whole and reads rows by request, so no slice compiles per bs.
+    """
+    draft_input.hidden_states = tail_hidden
+    draft_input.topk_p = torch.ones((bs, 1), dtype=torch.float32)
+    draft_input.topk_index = torch.zeros((bs, 1), dtype=torch.int64)
 
 
 def _chunked_tail(batch: ScheduleBatch) -> tuple[int | None, int | None]:

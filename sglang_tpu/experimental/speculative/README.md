@@ -26,19 +26,17 @@ BaseSpecWorker (core)
 └── TpuSpecWorker                       shared verify, bucketing, warmups
     ├── TpuChainSpecWorker              autoregressive: one draft forward per token
     │     └─ has-a TpuChainDraftWorker
-    │                 └── TpuMtpDraftWorker      MTP (NEXTN)
-    ├── TpuBlockSpecWorker              block-parallel: one forward over [r, m, ..., m]
-    │     └─ has-a TpuBlockDraftWorker
-    │                 ├── TpuDflashDraftWorker   DFlash and DFlash2
-    │                 └── TpuDsparkDraftWorker   DSpark
-    └── TpuEagle3Worker                 EAGLE3   (TODO: move under TpuChainSpecWorker)
-          └─ has-a EagleDraftWorker (core)
+    │                 ├── TpuMtpDraftWorker      MTP (NEXTN)
+    │                 └── TpuEagle3DraftWorker   EAGLE3
+    └── TpuBlockSpecWorker              block-parallel: one forward over [r, m, ..., m]
+          └─ has-a TpuBlockDraftWorker
+                      ├── TpuDflashDraftWorker   DFlash and DFlash2
+                      └── TpuDsparkDraftWorker   DSpark
 
 TpuDraftWorker (ABC)  ── TpuChainDraftWorker, TpuBlockDraftWorker
 
 SpecInput (core) ── HostPaddedDraftInput ── HostPaddedChainDraftInput
-                                          ├─ HostPaddedBlockDraftInput
-                                          └─ HostPaddedEagleDraftInput
+                                          └─ HostPaddedBlockDraftInput
 ```
 
 The worker *has a* drafter instead of *being* one: the family fixes the step
@@ -53,12 +51,11 @@ family worker maps the algorithm to its drafter.
 - **DSpark is a sibling of DFlash, not a subclass.** Its model also subclasses
   `DFlashDraftModel`, but its sampling (Markov bias on the base logits) shares
   no code with DFlash's, so both derive from `TpuBlockDraftWorker`.
-- **EAGLE3 is-a chain (TODO).** EAGLE3 drafts one token per forward from the
-  carried hidden, the same as MTP, so it belongs under `TpuChainSpecWorker` with
-  a `TpuChainDraftWorker` drafter. Today it subclasses `TpuSpecWorker` directly
-  and drives core's `EagleDraftWorker`, so its draft loop, commit and compile
-  policy (`TpuEagle3SpecDecodeCompilePolicyMixin`) duplicate the chain family's.
-  Do not add fixes to it; move it to the chain family.
+- **EAGLE3 is-a chain.** EAGLE3 drafts one token per forward from the carried
+  hidden, the same as MTP, so `TpuChainSpecWorker` serves it with a
+  `TpuEagle3DraftWorker`. Only the drafter differs: its carry is the draft's
+  pre-norm hidden, and committed rows read the target's concatenated aux hidden
+  states through the draft's fc.
 
 Inheritance kept for reuse, not because it is-a (do not extend the pattern):
 

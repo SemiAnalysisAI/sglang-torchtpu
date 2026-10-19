@@ -1,7 +1,7 @@
 """GPT-OSS-20B single-host EAGLE3 PR gate on the experimental spec worker.
 
 Reuses test_tpu_gpt_oss_20b_singlehost_spec.py with
-SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1, which routes EAGLE3 to TpuEagle3Worker.
+SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1, which routes EAGLE3 to TpuChainSpecWorker.
 """
 
 import copy
