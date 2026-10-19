@@ -312,6 +312,85 @@ class TestSchedulerExtensionOwnership(CustomTestCase):
         self.assertEqual(retired, [first])
         self.assertEqual(transport.control_work[1], [second])
 
+    def test_drain_polls_senders_and_takes_the_group_minimum(self):
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        polled = []
+
+        def sender(name, drained):
+            return SimpleNamespace(
+                poll=lambda: polled.append(name), drained=lambda: drained
+            )
+
+        senders = [sender("a", True), sender("b", True), sender("c", False)]
+        extension = TpuSchedulerExtension()
+        # No group, or a group of one rank, keeps each sender's own state.
+        with patch("torch.distributed.get_world_size", return_value=1):
+            self.assertEqual(
+                extension.poll_drained(senders, [None, object()]), [True, True, False]
+            )
+        self.assertEqual(polled, ["a", "b", "c"])
+
+        def peer_still_sending(bits, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            bits[1] = 0
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=peer_still_sending),
+        ):
+            self.assertEqual(
+                extension.group_drained(senders, [object()]), [True, False, False]
+            )
+
+    def test_hicache_load_pages_only_for_prefill_host_loads(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.environ import envs
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        loaded = SimpleNamespace(host_loaded_length=4, last_node="loaded")
+        device_only = SimpleNamespace(host_loaded_length=0, last_node="device")
+        tree_cache = SimpleNamespace(path_device_indices=lambda node: node)
+        extension = TpuSchedulerExtension()
+
+        def load_page_ids(**kwargs):
+            return extension.hicache_load_page_ids(
+                tree_cache=tree_cache, page_size=16, **kwargs
+            )
+
+        with patch(
+            "sglang_tpu.prefill_early_send.tpu_hicache_load_page_ids",
+            return_value="pages",
+        ) as convert:
+            with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.DECODE,
+                        requests=[loaded],
+                    )
+                )
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[device_only],
+                    )
+                )
+                self.assertEqual(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[device_only, loaded],
+                    ),
+                    "pages",
+                )
+            with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(False):
+                self.assertIsNone(
+                    load_page_ids(
+                        disaggregation_mode=DisaggregationMode.PREFILL,
+                        requests=[loaded],
+                    )
+                )
+        convert.assert_called_once_with(page_size=16, load_indices=["loaded"])
+
 
 if __name__ == "__main__":
     unittest.main()
