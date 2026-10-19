@@ -34,7 +34,10 @@ class OotReplaceable:
 
 
 def register_oot_replacement(base_cls: type, oot_cls: type) -> None:
-    """Construct ``oot_cls`` wherever core constructs exactly ``base_cls``."""
+    """Construct ``oot_cls`` wherever core constructs exactly ``base_cls``.
+
+    Registering the same pair again is a no-op; any other conflict raises.
+    """
     if not issubclass(base_cls, OotReplaceable):
         raise TypeError(f"{base_cls.__name__} does not mix in OotReplaceable")
     if oot_cls is base_cls or not issubclass(oot_cls, base_cls):
@@ -42,6 +45,8 @@ def register_oot_replacement(base_cls: type, oot_cls: type) -> None:
             f"{oot_cls.__name__} must be a proper subclass of {base_cls.__name__}"
         )
     existing = _OOT_REPLACEMENTS.get(base_cls)
+    if existing is oot_cls:
+        return
     if existing is not None:
         raise ValueError(
             f"{base_cls.__name__} is already replaced by {existing.__name__}"

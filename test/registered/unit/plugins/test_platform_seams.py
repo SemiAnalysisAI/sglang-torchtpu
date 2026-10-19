@@ -179,6 +179,12 @@ class TestOotReplaceable(CustomTestCase):
         with self.assertRaises(ValueError):
             register_oot_replacement(_Base, type("Other", (_Base,), {}))
 
+    def test_registering_the_same_pair_again_is_a_no_op(self):
+        register_oot_replacement(_Base, _Oot)
+        register_oot_replacement(_Base, _Oot)
+        self.assertIs(type(_Base(1)), _Oot)
+        self.assertIs(oot_base_class(_Oot), _Base)
+
     def test_one_class_cannot_replace_two_bases(self):
         both = type("Both", (_SubOfBase,), {})
         register_oot_replacement(_Base, both)
