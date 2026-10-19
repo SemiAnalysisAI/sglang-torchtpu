@@ -154,7 +154,11 @@ def verify_coins(
 
 
 def accumulate_spec_penalty_tokens(batch: ScheduleBatch) -> None:
-    """Host: accumulate the preceding accepted run before taking its forward snapshot."""
+    """Host: add each request's last output token to its penalties before the snapshot.
+
+    The relaxed form the EAGLE decode path also uses: one token per step, not
+    every token the preceding step accepted.
+    """
     if batch.sampling_info.penalizer_orchestrator.is_required:
         batch.cumulate_penalty_output_tokens()
 
