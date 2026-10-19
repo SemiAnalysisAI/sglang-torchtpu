@@ -1601,8 +1601,12 @@ def gmm_v2_fused_rs(
     top_k: int,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    local_rows: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
+
+    ``local_rows`` (expert TP only): the scalar-prefetched row indices hold just
+    this device's contiguous block of routed rows instead of all ``ep_size`` blocks.
 
     Output: (chunk_size * top_k, size_n2) per chip — raw expert contributions.
     Post-kernel reduction applies topk_weights and sums over top_k dim.
@@ -1611,6 +1615,9 @@ def gmm_v2_fused_rs(
     _, size_k2, size_n2 = w2.shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
+    # Rows the kernel indexes; tile selection keeps the global size_m to match
+    # the caller's lookup.
+    kernel_size_m = size_m // ep_size if local_rows else size_m
 
     is_quantized = w1_scale is not None
     if is_quantized:
@@ -1817,7 +1824,7 @@ def gmm_v2_fused_rs(
             hidden_states.shape[0], padded_k1 // num_lanes, num_lanes
         )
     fused_dims = FusedDims(
-        size_m=size_m,
+        size_m=kernel_size_m,
         size_k1=size_k1,
         padded_k1=padded_k1,
         size_n1=size_n1,
@@ -1841,7 +1848,7 @@ def gmm_v2_fused_rs(
 
     cfgs1 = GmmConfigs(
         dims=Dimensions(
-            size_m=size_m,
+            size_m=kernel_size_m,
             size_k=size_k1,
             size_n=size_n1,
             size_group=size_group,
@@ -1878,7 +1885,7 @@ def gmm_v2_fused_rs(
 
     cfgs2 = GmmConfigs(
         dims=Dimensions(
-            size_m=size_m,
+            size_m=kernel_size_m,
             size_k=size_k2,
             size_n=aligned_n2,
             size_group=size_group,
@@ -1913,7 +1920,7 @@ def gmm_v2_fused_rs(
     )
 
     # Scratch shapes.
-    max_num_gm_static = size_group + pl.cdiv(size_m, tile_m) - 1
+    max_num_gm_static = size_group + pl.cdiv(kernel_size_m, tile_m) - 1
     n2_cols = aligned_n2 // num_lanes
 
     scratch_shapes = [
@@ -2053,7 +2060,7 @@ def gmm_v2_fused_rs(
     # Two int32[size_m] arrays + internal scratch (~10-20 KB) need to fit in
     # 1 MB SMEM. Pack when 2 separate refs would exceed ~960 KB (2 * size_m * 4).
     # That's size_m > 120K (e.g., prefill_16384 with top_k=8 has size_m=131K).
-    pack_indices = size_m > 120_000
+    pack_indices = kernel_size_m > 120_000
     if pack_indices:
         # combined = lhs_idx * top_k + topk_slot
         primary_idx_ref = lhs_indices.astype(jnp.int32) * top_k + topk_indices.astype(
@@ -2078,6 +2085,26 @@ def gmm_v2_fused_rs(
             chunk_size=chunk_size,
             num_slots=max_num_gm_static,
         )
+        if local_rows:
+            # Expert TP orders rows shard-major, so this device's rows are the
+            # contiguous block at local_start; rebase the row offsets onto it.
+            local_start = group_start[0]
+            primary_idx_ref = lax.dynamic_slice_in_dim(
+                primary_idx_ref, local_start, kernel_size_m
+            )
+            if not pack_indices:
+                secondary_idx_ref = lax.dynamic_slice_in_dim(
+                    secondary_idx_ref, local_start, kernel_size_m
+                )
+            num_slots = max_num_gm_static
+            row_offset = jnp.concatenate(
+                [
+                    jnp.stack([local_start, local_start, 0, 0]),
+                    jnp.zeros((num_slots,), jnp.int32),
+                    jnp.full((num_slots + 1,), local_start, jnp.int32),
+                ]
+            ).astype(jnp.int32)
+            group_start = group_start - row_offset
 
     pallas_inputs = (
         group_sizes,

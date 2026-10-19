@@ -72,6 +72,10 @@ class TpuEnvs:
     # Raiden HiCache transfers move each run of pages that is consecutive on both the
     # device and the host as one segment instead of one segment per page.
     SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
+    # Fused-RS expert TP passes each device only its own block of routed rows, so a
+    # call is no longer capped at 1/ep_size of the tokens and the expert weights are
+    # streamed once per chunk rather than once per capped call.
+    SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

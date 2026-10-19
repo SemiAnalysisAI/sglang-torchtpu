@@ -27,6 +27,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     _select_fused_rs_block_sizes,
 )
@@ -224,7 +225,8 @@ def moe_gmm_local_rs_nodedup(
             _compute_rs_routing(topk_indices, num_experts=num_experts, topk=topk)
         )
     size_m = lhs_indices.shape[0]
-    _assert_fused_rs_smem_safe(size_m)
+    local_rows = expert_tp and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get()
+    _assert_fused_rs_smem_safe(size_m // ep_size if local_rows else size_m)
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
@@ -313,6 +315,7 @@ def moe_gmm_local_rs_nodedup(
         top_k=kernel_topk,
         fp8_direct_write=fp8_direct_write,
         expert_tp=expert_tp,
+        local_rows=local_rows,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16

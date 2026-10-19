@@ -21,9 +21,15 @@ def fused_moe_rs_expert_tp_max_tokens(topk: int, tp_size: int) -> int:
     """Largest power-of-two token count one expert-TP call can route.
 
     Expert TP routes every (token, slot) to all ``tp_size`` expert slices, so a
-    call carries ``tokens * topk * tp_size`` kernel rows.
+    call carries ``tokens * topk * tp_size`` kernel rows, of which each device
+    indexes ``tokens * topk`` under SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.
     """
-    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // (topk * tp_size)
+    from sglang_tpu.envs import envs as tpu_envs
+
+    rows_per_token = topk * (
+        1 if tpu_envs.SGLANG_TPU_FUSED_RS_ETP_LOCAL_ROWS.get() else tp_size
+    )
+    max_tokens = (_FUSED_RS_MAX_SAFE_ROUTED_ROWS - 1) // rows_per_token
     return 1 << (max_tokens.bit_length() - 1)
 
 
