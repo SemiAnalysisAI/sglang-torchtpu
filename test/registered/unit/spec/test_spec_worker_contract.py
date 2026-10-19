@@ -31,6 +31,7 @@ from sglang.srt.speculative.spec_worker_contract import (
     SPEC_WORKER_INIT_KWARGS,
     RelayedDraftInput,
     SpecWorkerContract,
+    is_spec_worker,
 )
 from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 from sglang.srt.speculative.uno_info import UnoDraftInput
@@ -177,13 +178,29 @@ class TestSpecWorkerContract(CustomTestCase):
                 self.assertEqual(problems, [])
 
     def test_core_tells_spec_workers_from_plain_drafts(self):
-        # scheduler.py and batch_result_processor.py branch on this isinstance.
+        # scheduler.py and batch_result_processor.py branch on this check.
         for cls in CORE_WORKERS + PLUGIN_WORKERS:
             if cls in NOT_CONSTRUCTED_BY_SCHEDULER:
                 continue
             with self.subTest(worker=cls.__name__):
-                self.assertIsInstance(object.__new__(cls), SpecWorkerContract)
-        self.assertNotIsInstance(object.__new__(TpModelWorker), SpecWorkerContract)
+                self.assertTrue(is_spec_worker(object.__new__(cls)))
+        self.assertFalse(is_spec_worker(object.__new__(TpModelWorker)))
+
+    def test_spec_worker_check_reads_no_property(self):
+        """A runtime Protocol with property members made ``isinstance`` call every
+        getter on Python 3.10, so a worker whose getter raised (as an
+        unconstructed one does) read as a plain draft, and the per-request
+        check in the result processor ran every getter."""
+        reads = []
+
+        class _Worker(EAGLEWorkerV2):
+            @property
+            def compile_timing_steps(self):
+                reads.append("compile_timing_steps")
+                raise AttributeError("not built")
+
+        self.assertTrue(is_spec_worker(object.__new__(_Worker)))
+        self.assertEqual(reads, [])
 
 
 class TestRelayedDraftInputContract(CustomTestCase):

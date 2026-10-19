@@ -337,7 +337,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
-from sglang.srt.speculative.spec_worker_contract import SpecWorkerContract
+from sglang.srt.speculative.spec_worker_contract import is_spec_worker
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -2544,7 +2544,7 @@ class Scheduler(
         # runner that votes belongs to the target model.
         target_worker = (
             self.tp_worker.target_worker
-            if isinstance(self.tp_worker, SpecWorkerContract)
+            if is_spec_worker(self.tp_worker)
             else self.tp_worker
         )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(

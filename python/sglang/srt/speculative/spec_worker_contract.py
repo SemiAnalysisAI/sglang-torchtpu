@@ -17,11 +17,22 @@ DSpark-only commands behind ``is_dspark()`` / ``decide_needs_confidence_relay``
 ``block_accept_estimate_log_suffix``, ``get_confidence_budget_prepare``), the TPU
 spec-op precompile (``Scheduler.precompile_tpu_spec_ops``), and the
 NGRAM relay fields read by ``RelayPayload.from_ngram``.
+
+Known gap: ``SchedulerWeightUpdaterManager.save_remote_model`` still reads
+``draft_worker.model_runner``, which not every worker defines (EAGLE-family
+workers do not; DFlash's is the target runner).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Optional,
+    Protocol,
+    TypeGuard,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -41,12 +52,11 @@ if TYPE_CHECKING:
 SPEC_WORKER_INIT_KWARGS = ("server_args", "gpu_id", "nccl_port", "target_worker")
 
 
-@runtime_checkable
 class SpecWorkerContract(Protocol):
-    """The spec-worker members core reads.
+    """The spec-worker members core reads; ``BaseSpecWorker`` implements every one.
 
-    ``isinstance(worker, SpecWorkerContract)`` is how core tells a spec worker from
-    a plain ``TpModelWorker`` draft; ``BaseSpecWorker`` implements every member.
+    Core tells a spec worker from a plain ``TpModelWorker`` draft with
+    ``is_spec_worker``, not ``isinstance`` against this Protocol.
     """
 
     # ---- Scheduler init: memory, backends, graphs (scheduler.py) ----
@@ -124,6 +134,27 @@ class SpecWorkerContract(Protocol):
 
     # ---- Weight updates (scheduler_components/weight_updater.py) ----
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]: ...
+
+
+@runtime_checkable
+class _SpecWorkerLifecycle(Protocol):
+    """Contract methods a plain ``TpModelWorker`` draft does not have.
+
+    Methods only: ``isinstance`` against a Protocol with property members calls
+    every getter before Python 3.12, so its cost and result would depend on the
+    worker's state and the interpreter version.
+    """
+
+    def init_hicache_draft_plan(self) -> None: ...
+
+    def clear_cache_pool(self) -> None: ...
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None: ...
+
+
+def is_spec_worker(worker: object) -> TypeGuard[SpecWorkerContract]:
+    """Whether core drives ``worker`` as a spec worker rather than a plain draft."""
+    return isinstance(worker, _SpecWorkerLifecycle)
 
 
 class RelayedDraftInput(Protocol):
