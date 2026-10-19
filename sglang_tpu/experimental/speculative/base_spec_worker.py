@@ -262,6 +262,9 @@ class TpuSpecWorker(BaseSpecWorker):
 
     def _warmup_logical_bs_ops(self) -> None:
         # torch_tpu compiles one program per shape even for a plain H2D copy.
+        # Not warmed: penalizer state (and its padding to the bucket) and decode
+        # logprobs stay at the live extent in shared code, so those eager programs
+        # compile once per new live size, the first time a request needs them.
         max_bs = min(
             self.target_worker.model_runner.max_running_requests,
             self._b_bucketer().max_val,
@@ -280,6 +283,8 @@ class TpuSpecWorker(BaseSpecWorker):
             ]
             + [((pbs, 1), torch.float32) for pbs in bucket_sizes]
             + [((pbs, 2 * self.num_verify_rows), torch.int64) for pbs in bucket_sizes]
+            # Live (bs, 1): decode logprobs upload the live temperatures.
+            + [((bs, 1), torch.float32) for bs in live_sizes]
         )
         with torch.no_grad():
             for bs in live_sizes:
@@ -867,6 +872,12 @@ class TpuSpecWorker(BaseSpecWorker):
                 # ModelRunner.sample positions, then the block-draft extend trim; a
                 # target that keeps extend outputs padded samples at the cap rows.
                 (torch.zeros((bs,), dtype=torch.int64).to(self.device) - 1).cpu()
+                if self._pad_bs(bs) > bs:
+                    # Seeded sampling pads the live positions to the sampled rows.
+                    torch.nn.functional.pad(
+                        torch.zeros((bs,), dtype=torch.int64, device=self.device),
+                        (0, self._pad_bs(bs) - bs),
+                    ).cpu()
                 for rows in {self._pad_bs(bs), cap}:
                     torch.zeros((rows,), dtype=torch.int64, device=self.device)[
                         :bs
