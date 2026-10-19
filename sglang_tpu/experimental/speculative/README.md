@@ -132,5 +132,7 @@ Both raiden roles serve every algorithm with the same spec flags.
   bs. MTP ships its carry as the EAGLE hidden seed, and decode writes it back
   into the carry table.
 - KV free fence: commit writes draft KV after the accept outputs the result
-  copies, so each step attaches `kv_fence_tail`, read after that write, and the
-  async result copy copies it.
+  copies, so commit and extend return an output of their last KV write as
+  `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV
+  writer's own output), and the async result copy copies it. A separate read of
+  the KV buffer would add a program per step.

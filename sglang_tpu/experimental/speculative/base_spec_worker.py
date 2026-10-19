@@ -93,6 +93,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
+    CommitResult,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -100,7 +101,6 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.mamba_pool import TpuMambaPool, committed_read_offsets
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
@@ -203,8 +203,6 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
-        # forward_batch_generation reads it after every step.
-        self._kv_fence_tail().cpu()
         if self._target_has_linear_attn:
             self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
@@ -316,18 +314,21 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
-    ) -> SpecState:
+    ) -> CommitResult:
         """Commit the accepted tokens: advance the prefix, update the draft context.
 
         Why: the next draft must condition on the committed tokens' target
         features (DFlash/DSpark inject them into draft KV, EAGLE3 carries them).
         Noop: the draft-context update is a noop for a draft that never reads
-        target features; the advanced SpecState must still be returned.
+        target features; the advanced SpecState must still be returned, with an
+        output of the step's last KV write as kv_fence_tail.
         """
 
     @abstractmethod
     def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Extend: target forward on new prompt tokens, seed the draft context, set next_draft_input.
+
+        next_draft_input.kv_fence_tail must be an output of the last KV write.
 
         Why: new prompt tokens have no draft context yet, and the first decode
         step reads its root token from next_draft_input.
@@ -479,17 +480,17 @@ class TpuSpecWorker(BaseSpecWorker):
         bucket: BucketState,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
-    ) -> tuple[SpecState, LogitsProcessorOutput, AcceptResult]:
+    ) -> tuple[CommitResult, LogitsProcessorOutput, AcceptResult]:
         draft_result = self.draft(batch, bucket, rows, verify_input)
         logits_output, accept = self.verify(
             batch, bucket, rows, draft_result, verify_input
         )
         if self._target_has_linear_attn:
             self._commit_linear_attn_states(batch=batch, accept=accept)
-        next_state = self.commit(
+        committed = self.commit(
             batch, bucket.state, rows, verify_input, logits_output, accept
         )
-        return next_state, logits_output, accept
+        return committed, logits_output, accept
 
     def _commit_linear_attn_states(
         self, *, batch: ScheduleBatch, accept: AcceptResult
@@ -525,11 +526,10 @@ class TpuSpecWorker(BaseSpecWorker):
             result = self._idle_result()
         else:
             result = self._forward_decode(batch)
-        if not batch.forward_mode.is_idle():
-            # Idle steps write no KV; the others must cover commit's draft KV write.
-            next_draft_input = result.next_draft_input
-            assert isinstance(next_draft_input, HostPaddedDraftInput)
-            next_draft_input.kv_fence_tail = self._kv_fence_tail()
+        next_draft_input = result.next_draft_input
+        assert isinstance(next_draft_input, HostPaddedDraftInput)
+        # Rows with requests write KV; idle rows write only the reserved slot 0.
+        assert not batch.reqs or next_draft_input.kv_fence_tail is not None
         if on_publish is not None:
             on_publish(result.new_seq_lens)
         return result
@@ -548,14 +548,19 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_input.committed_lens,
             bucket.state.seq_lens,
         )
-        next_state, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        committed, logits_output, accept = self.step(batch, bucket, rows, verify_input)
+        next_state = committed.state
         # The scheduler stores this key as the next spec_info.future_indices.
         self._bucket = bucket._replace(key=batch.req_pool_indices, state=next_state)
         # Hidden rows stay on device; the overlap result copy would ship them to CPU.
         logits_output.hidden_states = None
-        return self._pack_decode_result(
+        result = self._pack_decode_result(
             bs=bs, next_state=next_state, logits_output=logits_output, accept=accept
         )
+        next_draft_input = result.next_draft_input
+        assert isinstance(next_draft_input, HostPaddedDraftInput)
+        next_draft_input.kv_fence_tail = committed.kv_fence_tail
+        return result
 
     def _decode_buckets_for(self, bs: int) -> list[int]:
         """Decode buckets a rank with bs live requests can run (_decode_bucket)."""
@@ -722,14 +727,6 @@ class TpuSpecWorker(BaseSpecWorker):
         return torch.zeros((rows,), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-
-    def _kv_fence_tail(self) -> torch.Tensor:
-        """A copy of one element of the draft pool's last layer: every family writes
-        draft KV last. A copy, since a view would keep the layer buffer alive."""
-        pool = self.primary_draft_kv_pool
-        if not isinstance(pool, TpuFusedMHATokenToKVPool):
-            raise TypeError(f"Expected TpuFusedMHATokenToKVPool, got {type(pool)}.")
-        return pool.kv_buffer[-1].view(-1)[:1].clone()
 
     def _pad_bs(self, bs: int) -> int:
         return self._b_bucketer().next_bucket(bs)

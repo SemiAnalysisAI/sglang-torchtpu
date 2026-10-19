@@ -78,6 +78,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
+    CommitResult,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -247,7 +248,7 @@ class TpuEagle3Worker(TpuSpecWorker):
         verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
-    ) -> SpecState:
+    ) -> CommitResult:
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
         assert target_hidden.shape[0] == rows.cache_locs.numel(), (
@@ -262,12 +263,14 @@ class TpuEagle3Worker(TpuSpecWorker):
             accept=accept,
         )
         # Verify rows past the new seq_lens become dead KV; freeing them is the allocator's job.
-        return SpecState(
+        next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
             seq_lens=accept.next_seq_lens,
             req_pool_indices=state.req_pool_indices,
             draft_carry=seed,
         )
+        # The draft extend writes the step's last KV; its argmax follows that write.
+        return CommitResult(state=next_state, kv_fence_tail=seed.topk_index)
 
     def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
@@ -305,7 +308,10 @@ class TpuEagle3Worker(TpuSpecWorker):
             draft_carry=map_carry(seed, lambda t: t[:bs]),
         )
         result.new_seq_lens = next_state.seq_lens
-        result.next_draft_input = self.state_to_spec_info(next_state)
+        next_draft_input = self.state_to_spec_info(next_state)
+        # The draft prefill writes the step's last KV; its argmax follows that write.
+        next_draft_input.kv_fence_tail = seed.topk_index
+        result.next_draft_input = next_draft_input
         return result
 
     def _forward_idle_step(

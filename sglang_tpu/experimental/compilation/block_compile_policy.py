@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+import torch
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -61,7 +63,7 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         self,
         draft_attn_backend: AttentionBackend,
         *,
-        kv_writer: Callable[..., None],
+        kv_writer: Callable[..., torch.Tensor],
     ) -> None:
         """Compile the draft block forward and the draft KV writer."""
         if not self.is_draft_worker:

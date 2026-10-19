@@ -37,6 +37,19 @@ class SpecState(NamedTuple):
     draft_carry: Any = None
 
 
+class CommitResult(NamedTuple):
+    """commit's output.
+
+    Attributes:
+      state: The advanced SpecState.
+      kv_fence_tail: A small device tensor computed after the step's last KV
+        write; the TPU KV free fence's result copy waits on it.
+    """
+
+    state: SpecState
+    kv_fence_tail: torch.Tensor
+
+
 def map_carry(carry: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
     """Apply fn to every row-aligned tensor of a draft_carry NamedTuple."""
     # A list, not a generator: Dynamo cannot reconstruct a generator in pad_state_rows.

@@ -101,9 +101,13 @@ class TPUAsyncCopyWorker:
             # the submission future.
             draft_tail = None
             draft_input = result.next_draft_input
-            if self.copy_draft_tail and isinstance(draft_input, HostPaddedDraftInput):
+            if (
+                self.copy_draft_tail
+                and isinstance(draft_input, HostPaddedDraftInput)
+                # Idle steps write no freeable KV and carry none.
+                and draft_input.kv_fence_tail is not None
+            ):
                 # The experimental worker's commit also writes KV after verify.
-                assert draft_input.kv_fence_tail is not None
                 draft_tail = draft_input.kv_fence_tail.to("cpu", non_blocking=True)
             elif (
                 self.copy_draft_tail

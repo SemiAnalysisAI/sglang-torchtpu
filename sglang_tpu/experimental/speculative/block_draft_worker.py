@@ -61,16 +61,21 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         cache_loc: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
-    ) -> None:
-        """Project target hidden into the draft context KV (extend: all rows; commit: accepted)."""
+    ) -> torch.Tensor:
+        """Project target hidden into the draft context KV (extend: all rows; commit: accepted).
+
+        Returns the writer's kv_fence_tail.
+        """
         # Pads to the warmed bucket, then runs the compiled _write_draft_kv_eager.
-        self._compile_policy().append_target_hidden_to_draft_kv_by_loc_tpu(
+        tail = self._compile_policy().append_target_hidden_to_draft_kv_by_loc_tpu(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
             positions=positions,
             cache_loc_2d=cache_loc_2d,
             commit_lens=commit_lens,
         )
+        assert tail is not None
+        return tail
 
     def _write_draft_kv_eager(
         self,
@@ -80,7 +85,7 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
-    ) -> None:
+    ) -> torch.Tensor:
         # The fused rpa_v3 pool forbids set_kv_buffer (write_target_hidden_kv);
         # dense DFlash and DSpark drafts share one K/V layout and Pallas writer.
         kv_pool = self.model_runner.token_to_kv_pool
@@ -99,6 +104,8 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             commit_lens=commit_lens,
             max_num_reqs=self.model_runner.req_to_token_pool.size,
         )
+        # Read inside the compiled writer, after the write: the TPU KV free fence's tail.
+        return kv_pool.kv_buffer[-1][0, 0, 0, 0, :1]
 
     def _draft_model(self) -> DFlashDraftModel:
         model = self.model_runner.model

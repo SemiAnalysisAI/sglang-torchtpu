@@ -63,6 +63,7 @@ from sglang_tpu.experimental.speculative.spec_ops import (
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
+    CommitResult,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -202,7 +203,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
-    ) -> SpecState:
+    ) -> CommitResult:
         del batch
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
@@ -232,11 +233,13 @@ class TpuChainSpecWorker(TpuSpecWorker):
         self._chain_draft_worker.carry.index_copy_(
             0, state.req_pool_indices, last_hidden
         )
-        return SpecState(
+        next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
             seq_lens=accept.next_seq_lens,
             req_pool_indices=state.req_pool_indices,
         )
+        # The draft rows' forward writes the step's last KV; last_hidden is its output.
+        return CommitResult(state=next_state, kv_fence_tail=last_hidden)
 
     def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
@@ -263,6 +266,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
         result.new_seq_lens = next_state.seq_lens
         next_draft_input = self.state_to_spec_info(next_state)
+        # The draft prompt forward writes the step's last KV; tail_hidden is its output.
+        next_draft_input.kv_fence_tail = tail_hidden
         if self._disagg_mode == "prefill":
             # Core ships hidden_states[i] as the EAGLE seed; topk is a host
             # placeholder so its per-row reads stay off the device.
