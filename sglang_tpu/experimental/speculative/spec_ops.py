@@ -41,6 +41,25 @@ def apply_verify_logit_modifiers(
     return result
 
 
+@compiled_op()
+def apply_token_bitmask(logits: torch.Tensor, bitmask: torch.Tensor) -> torch.Tensor:
+    """logits with -inf where a packed int32 grammar bitmask clears a token's bit.
+
+    xgrammar's apply_token_bitmask_inplace rule: bit j of word w allows token
+    32 * w + j, and columns past the bitmask keep their logits. Plain ops, so the
+    owning worker warms it per verify bucket; the grammar backends' TPU path is a
+    torch.compile kernel that nothing warms.
+    """
+    num_words = bitmask.shape[-1]
+    width = min(logits.shape[-1], 32 * num_words)
+    shifts = torch.arange(32, dtype=torch.int32, device=bitmask.device)
+    allowed = ((bitmask[:, :, None] >> shifts) & 1).reshape(-1, 32 * num_words)
+    masked = torch.where(allowed[:, :width] != 0, logits[:, :width], float("-inf"))
+    if width == logits.shape[-1]:
+        return masked
+    return torch.cat([masked, logits[:, width:]], dim=-1)
+
+
 def sample_tokens(
     logits: torch.Tensor,
     temperatures: torch.Tensor,

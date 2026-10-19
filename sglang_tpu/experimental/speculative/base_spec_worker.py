@@ -93,6 +93,7 @@ from sglang_tpu.experimental.speculative.chain_verifier import ChainVerifier
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
+    apply_token_bitmask,
     apply_verify_logit_modifiers,
     build_verify_tokens,
     live_result_rows,
@@ -122,6 +123,7 @@ from sglang_tpu.sampler import TpuSampler
 from sglang_tpu.sampling.seeded import verify_coins
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 # apply_dflash_simulated_acceptance's fixed_token_id, so both paths emit the same tokens.
@@ -290,6 +292,14 @@ class TpuSpecWorker(BaseSpecWorker):
                         self.make_dummy_carry(bs),
                         padded_bs,
                     )
+                    # Grammar verify copies the live rows of the padded verify tokens.
+                    GrammarTree.from_linear_chain(
+                        torch.zeros(
+                            (padded_bs * self.num_verify_rows,),
+                            dtype=torch.int64,
+                            device=self.device,
+                        ).reshape(padded_bs, self.num_verify_rows)[:bs]
+                    ).resolve()
             for shape, dtype in h2d_shapes:
                 torch.zeros(shape, dtype=dtype).to(self.device, non_blocking=True).cpu()
             for pbs in bucket_sizes:
@@ -458,7 +468,8 @@ class TpuSpecWorker(BaseSpecWorker):
                 mask_rows=physical_bs * self.num_verify_rows,
             )
             if grammar_mask is not None:
-                grammar_mask.apply(target_logits)
+                target_logits = _apply_grammar_mask(target_logits, grammar_mask)
+                logits_output.next_token_logits = target_logits
         randoms = {}
         if sampling_info.sampling_seed is not None:
             seeds = sampling_info.host_params_at(physical_bs)["sampling_seed"].to(
@@ -902,6 +913,13 @@ class TpuSpecWorker(BaseSpecWorker):
                         modifiers,
                         self.num_verify_rows,
                     )
+            rows = pbs * self.num_verify_rows
+            bitmask = torch.zeros((rows, (vocab_size + 31) // 32), dtype=torch.int32)
+            warmup_compiled_op(
+                apply_token_bitmask,
+                torch.zeros((rows, vocab_size), device=self.device),
+                bitmask.to(self.device, non_blocking=True),
+            )
             self._warmup_seeded_accept(pbs, vocab_size)
             warmup_compiled_op(
                 verify_coins,
@@ -1338,3 +1356,20 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
         "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
     }
+
+
+def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:
+    # The result-copy thread reads these after the next step is queued; a [:bs]
+    # view would then need its own program behind that step, so copy it here.
+    return tensor if tensor.shape[0] == bs else tensor[:bs].clone()
+
+
+def _apply_grammar_mask(
+    logits: torch.Tensor, grammar_mask: GrammarMask
+) -> torch.Tensor:
+    # Packed int32 bitmasks (xgrammar, llguidance) take the warmed plain-op apply;
+    # another mask type keeps its backend's own (eager) apply.
+    if grammar_mask.vocab_mask.dtype == torch.int32:
+        return apply_token_bitmask(logits, grammar_mask.vocab_mask)
+    grammar_mask.apply(logits)
+    return logits

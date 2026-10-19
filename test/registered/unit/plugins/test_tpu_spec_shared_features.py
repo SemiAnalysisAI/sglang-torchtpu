@@ -15,7 +15,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.experimental.speculative import base_spec_worker
 from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
+from sglang_tpu.experimental.speculative.spec_ops import apply_token_bitmask
 from sglang_tpu.experimental.speculative.spec_types import (
     BucketState,
     DraftResult,
@@ -73,6 +75,23 @@ class PackedChainGrammar:
     def apply_vocab_mask(self, logits, vocab_mask):
         bits = torch.arange(logits.shape[-1])
         logits.masked_fill_(((vocab_mask.long() >> bits) & 1) == 0, -float("inf"))
+
+
+class CompiledKernelGrammar(PackedChainGrammar):
+    """The backends' own TPU apply is a torch.compile kernel nothing warms."""
+
+    def apply_vocab_mask(self, logits, vocab_mask):
+        raise AssertionError("verify must mask through the warmed plugin op")
+
+
+def _reference_bitmask(logits, bitmask):
+    expected = logits.clone()
+    for row in range(logits.shape[0]):
+        for token in range(min(logits.shape[1], 32 * bitmask.shape[1])):
+            word = int(bitmask[row, token // 32]) & 0xFFFFFFFF
+            if not (word >> (token % 32)) & 1:
+                expected[row, token] = -float("inf")
+    return expected
 
 
 class TestSharedFeatures(CustomTestCase):
@@ -169,6 +188,65 @@ class TestSharedFeatures(CustomTestCase):
         self.assertEqual(accepted.accept_lens.tolist(), [3, 0])
         self.assertTrue(torch.isneginf(output.next_token_logits[0, 4]))
         torch.testing.assert_close(output.next_token_logits[3:], logits[3:])
+
+    def test_verify_masks_packed_grammar_bitmasks_through_the_warmed_op(self):
+        grammar = CompiledKernelGrammar()
+        logits = torch.zeros(6, 5)
+        logits[:, 4] = 100
+        output, accepted = self.worker(logits).verify(
+            SimpleNamespace(
+                has_grammar=True,
+                reqs=[SimpleNamespace(grammar=grammar)],
+                sampling_info=info(),
+            ),
+            self.bucket(),
+            None,
+            self.drafts(),
+            None,
+        )
+        self.assertEqual(accepted.accept_tokens[0].tolist(), [1, 2, 3])
+        self.assertTrue(torch.isneginf(output.next_token_logits[0, 4]))
+        torch.testing.assert_close(output.next_token_logits[3:], logits[3:])
+
+    def test_packed_bitmask_follows_the_xgrammar_bit_rule(self):
+        generator = torch.Generator().manual_seed(5)
+        # Two words with the sign bit set; logits wider and narrower than 64 columns.
+        bitmask = torch.randint(
+            -(2**31), 2**31 - 1, (4, 2), dtype=torch.int32, generator=generator
+        )
+        bitmask[0] = -1
+        bitmask[1, 1] = -(2**31)
+        for vocab in (70, 64, 50):
+            logits = torch.randn(4, vocab, generator=generator)
+            actual = apply_token_bitmask(logits, bitmask)
+            self.assertEqual(actual.shape, logits.shape)
+            torch.testing.assert_close(actual, _reference_bitmask(logits, bitmask))
+
+    def test_bitmask_apply_is_warmed_at_every_verify_bucket(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 3
+        worker.device = "cpu"
+        worker._b_bucketer = lambda: SimpleNamespace(buckets=[2, 4])
+        worker._warmup_seeded_accept = lambda pbs, vocab_size: None
+        worker.target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=40))
+        )
+        warmed = []
+        with patch.object(
+            base_spec_worker,
+            "warmup_compiled_op",
+            side_effect=lambda op, *args, **kwargs: warmed.append((op, args)),
+        ):
+            worker._warmup_verify_logit_modifiers()
+        shapes = [
+            (tuple(args[0].shape), tuple(args[1].shape), args[1].dtype)
+            for op, args in warmed
+            if op is apply_token_bitmask
+        ]
+        self.assertEqual(
+            shapes,
+            [((6, 40), (6, 2), torch.int32), ((12, 40), (12, 2), torch.int32)],
+        )
 
     def test_logprobs_use_live_temperatures_and_include_bonus(self):
         logits = torch.arange(30, dtype=torch.float32).reshape(6, 5).flip(0)
