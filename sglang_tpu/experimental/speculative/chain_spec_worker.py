@@ -280,7 +280,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         target_hidden: torch.Tensor,
         bucket_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Draft forward on the prompt shifted by one token; store and return each request's [cap, H] last hidden."""
+        """Draft forward on the prompt shifted by one token; stores and returns the [cap, H] carry."""
         input_ids = batch.input_ids
         assert input_ids is not None and input_ids.device.type == "cpu", (
             "HOST_PADDED extend stages prompt tokens on host"
@@ -336,6 +336,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
 
     def _warmup_seed_carry(self) -> None:
+        """_seed_carry at every batch bucket a PD seed batch pads to."""
         carry_size = self._chain_draft_worker.carry_size
         for padded_bs in self._b_bucketer().buckets:
             self._seed_carry(

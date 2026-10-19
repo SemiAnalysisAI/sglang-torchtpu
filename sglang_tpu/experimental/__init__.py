@@ -8,9 +8,11 @@ from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
 
-_host_batch_padder: Callable[[int], int] | None = None
 # (host req_pool_indices [bs], host draft hidden [bs, H]) -> None.
-_pd_carry_seeder: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+PdCarrySeeder = Callable[[torch.Tensor, torch.Tensor], None]
+
+_host_batch_padder: Callable[[int], int] | None = None
+_pd_carry_seeder: PdCarrySeeder | None = None
 
 
 def register_host_batch_padder(padder: Callable[[int], int]) -> None:
@@ -19,15 +21,14 @@ def register_host_batch_padder(padder: Callable[[int], int]) -> None:
     _host_batch_padder = padder
 
 
-def register_pd_carry_seeder(
-    seeder: Callable[[torch.Tensor, torch.Tensor], None],
-) -> None:
+def register_pd_carry_seeder(seeder: PdCarrySeeder) -> None:
     """Set the writer a PD decode server seeds the chain draft carry with."""
     global _pd_carry_seeder
     _pd_carry_seeder = seeder
 
 
-def get_pd_carry_seeder() -> Callable[[torch.Tensor, torch.Tensor], None]:
+def get_pd_carry_seeder() -> PdCarrySeeder:
+    """The PD decode server's chain carry writer; only TpuChainSpecWorker registers one."""
     if _pd_carry_seeder is None:
         raise RuntimeError("No TpuChainSpecWorker registered a PD carry seeder.")
     return _pd_carry_seeder

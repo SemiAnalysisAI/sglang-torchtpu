@@ -128,6 +128,8 @@ class PDSpecGateConfigurationTestCase(unittest.TestCase):
 
     config_module: ClassVar[str] = ""
     expected_algorithm: ClassVar[str] = ""
+    # Role -> the launcher's dry-run plan.
+    plans: ClassVar[dict[str, dict[str, Any]]]
 
     @classmethod
     def setUpClass(cls) -> None:

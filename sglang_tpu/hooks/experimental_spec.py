@@ -12,10 +12,14 @@ Remove when: the experiment is removed or those upstream seams are available.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
+from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
@@ -24,6 +28,7 @@ from sglang_tpu.experimental import (
     is_experimental_spec_worker,
     uses_host_batch,
 )
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 
 def initialize_host_batch(result, *args, **kwargs):
@@ -117,7 +122,15 @@ def prepare_spec_decode(original, batch):
     batch.spec_info.prepare_for_decode(batch)
 
 
-def build_disagg_eagle_input(original, batch, last_tokens_tensor, future_map):
+SeedBuilder = Callable[[ScheduleBatch, torch.Tensor, FutureMap], SpecInput]
+
+
+def build_disagg_eagle_input(
+    original: SeedBuilder,
+    batch: ScheduleBatch,
+    last_tokens_tensor: torch.Tensor,
+    future_map: FutureMap,
+) -> SpecInput:
     # Core stacks the seed on device at the live bs, one compile per bs; build it
     # on host and upload once instead. MTP writes its hidden into the chain carry.
     if not uses_host_batch(batch):
@@ -158,7 +171,12 @@ def build_disagg_eagle_input(original, batch, last_tokens_tensor, future_map):
     return _relay_disagg_seed(batch, draft_input, future_map)
 
 
-def build_disagg_block_input(original, batch, last_tokens_tensor, future_map):
+def build_disagg_block_input(
+    original: SeedBuilder,
+    batch: ScheduleBatch,
+    last_tokens_tensor: torch.Tensor,
+    future_map: FutureMap,
+) -> SpecInput:
     # DFlash/DSpark seed only the bonus token; the draft context KV arrives with
     # the PD transfer of the draft pool.
     if not uses_host_batch(batch):
@@ -174,7 +192,9 @@ def build_disagg_block_input(original, batch, last_tokens_tensor, future_map):
     return _relay_disagg_seed(batch, draft_input, future_map)
 
 
-def _relay_disagg_seed(batch, draft_input, future_map):
+def _relay_disagg_seed(
+    batch: ScheduleBatch, draft_input: HostPaddedDraftInput, future_map: FutureMap
+) -> HostPaddedDraftInput:
     """Publish and stash the seed by pool row, as core's PD seed builders do."""
     from sglang.srt.managers.overlap_utils import RelayPayload
 

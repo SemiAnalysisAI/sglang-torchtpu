@@ -37,7 +37,7 @@ class TestQwen3_8bDsparkPdServesWithoutRecompile(base.PDSpecRecompileTestCase):
     decode_log_path = "/tmp/pd_qwen3_8b_dspark_decode.log"
 
     @classmethod
-    def get_runtime_envs(cls):
+    def get_runtime_envs(cls) -> dict[str, str | None]:
         return {**super().get_runtime_envs(), "MODEL": MODEL_PATH}
 
 

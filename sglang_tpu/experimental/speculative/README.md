@@ -111,6 +111,8 @@ policy mixin, and routes all three.
   `at serving time` line. `test_tpu_qwen3_8_27b_singlehost_mtp_recompile.py` is
   the template. `..._SITES=1` locates the source line of a compile, but never
   benchmark with it on.
+- P/D: `test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py` runs the same
+  check on both engines.
 - Accuracy: GSM8K with spec on matches spec off. Performance: A/B on identical
   server flags.
 
@@ -118,23 +120,17 @@ policy mixin, and routes all three.
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP and mixed prefill/decode DP steps. Neither family supports DP
 attention, and the chain family (MTP) does not support a draft sliding window.
-Each raises at startup.
+Each raises at startup. P/D does not yet serve targets with linear-attention
+(GDN) layers such as Qwen3.8-27B: raiden does not move GDN state.
 
-## PD disaggregation
+## P/D disaggregation
 
-Every algorithm serves on both PD roles over raiden. Core transfers the draft KV
-pool; `build_disagg_*_input` in `../../hooks/experimental_spec.py` builds the
-decode seed on host (core's builders stack it on device at the live bs, one
-compile per bs). MTP ships its carry as the EAGLE hidden seed and the decode
-server writes it back into the carry table at the batch bucket.
+Both raiden roles serve every algorithm with the same spec flags.
 
-PD decode runs the TPU KV free fence: freed pages wait for the step's result
-copy. commit writes draft KV after the accept outputs, so every step attaches
-`kv_fence_tail`, a read of the draft pool issued after that write, and the
-async result copy copies it.
-
-Targets with linear-attention (GDN) layers, such as Qwen3.8-27B, cannot run P/D
-yet: raiden does not transfer GDN state. That also leaves MTP P/D untested on TPU.
-
-CI: `test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py`
-asserts neither engine compiles while serving.
+- Decode seed: `build_disagg_*_input` (`../../hooks/experimental_spec.py`) builds
+  it on host; core's builders stack it on device at the live bs, one compile per
+  bs. MTP ships its carry as the EAGLE hidden seed, and decode writes it back
+  into the carry table.
+- KV free fence: commit writes draft KV after the accept outputs the result
+  copies, so each step attaches `kv_fence_tail`, read after that write, and the
+  async result copy copies it.

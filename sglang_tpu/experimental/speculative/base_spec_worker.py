@@ -77,6 +77,7 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
 )
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_greedy,
@@ -202,6 +203,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        # forward_batch_generation reads it after every step.
         self._kv_fence_tail().cpu()
         if self._target_has_linear_attn:
             self._warmup_linear_attn_commit()
@@ -524,7 +526,10 @@ class TpuSpecWorker(BaseSpecWorker):
         else:
             result = self._forward_decode(batch)
         if not batch.forward_mode.is_idle():
-            result.next_draft_input.kv_fence_tail = self._kv_fence_tail()
+            # Idle steps write no KV; the others must cover commit's draft KV write.
+            next_draft_input = result.next_draft_input
+            assert isinstance(next_draft_input, HostPaddedDraftInput)
+            next_draft_input.kv_fence_tail = self._kv_fence_tail()
         if on_publish is not None:
             on_publish(result.new_seq_lens)
         return result

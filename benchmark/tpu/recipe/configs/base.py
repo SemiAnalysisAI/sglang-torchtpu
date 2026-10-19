@@ -2,6 +2,7 @@
 
 import os
 from copy import deepcopy
+from typing import Any
 
 # Overlap compute with collectives; the sparse-core collective offloads stay off
 # (they regressed these serving shapes). The joined string is part of the
@@ -78,13 +79,20 @@ _FP8_BASE_CONFIG["runtime_env"].update(
 )
 
 
-# One-host-per-engine Raiden P/D roles from a single-host spec config. Both engines
-# run the same spec flags: the draft KV pool and draft seed cross the handoff.
 PD_SINGLEHOST_GROUP = {"hosts": 2, "prefill_engines": 1, "decode_engines": 1}
 
 
-def pd_singlehost_role_configs(config: dict) -> tuple[dict, dict]:
-    """(PREFILL_CONFIG, DECODE_CONFIG) serving config's model and spec flags."""
+def pd_singlehost_role_configs(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One-host-per-engine raiden P/D roles serving config's model and flags.
+
+    Both roles keep config's spec flags: the draft KV pool and the draft seed
+    cross the handoff, so their layouts must match.
+
+    Returns:
+      (PREFILL_CONFIG, DECODE_CONFIG).
+    """
     common = deepcopy(config)
     common["server_args"].update(
         host="0.0.0.0",
