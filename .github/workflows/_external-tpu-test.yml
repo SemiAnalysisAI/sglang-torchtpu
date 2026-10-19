@@ -170,16 +170,91 @@ jobs:
             echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
           }
 
-          # Delete whatever JobSet is live if the job is canceled mid-slice.
+          # Per-nodepool lease. The concurrency key cannot make a slice-pair row ("<a>-<b>")
+          # wait for the single-slice rows ("<a>", "<b>") on the same nodepools, and rows of
+          # runs on different refs never share a key, so overlapping runs reached one nodepool
+          # and the stale-JobSet sweep below deleted a live run's JobSets. Each nodepool holds
+          # a ConfigMap lease in the cluster instead: create is atomic, the holder renews it,
+          # and only a lease left unrenewed for LOCK_TTL (a dead runner) can be taken over.
+          LOCK_TTL=900                # seconds without renewal before a lease counts as abandoned
+          LOCK_RENEW_EVERY=60         # holder renews this often
+          LOCK_POLL=30                # waiter retries this often
+          HOLDER="${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.${slice}"
+          LOCK_FILE="$RUNNER_TEMP/slice-locks"
+          : > "$LOCK_FILE"
+          lock_name() { echo "external-tpu-slice-lock-$(printf %s "$1" | sha256sum | cut -c1-16)"; }
+          # Returns 0 = held by us, 1 = busy (LOCK_INFO says by whom), 2 = cluster refused.
+          try_lock() {
+            local cm="$1" err js holder renewed now
+            err="$(kubectl -n "$ns" create configmap "$cm" --from-literal=holder="$HOLDER" \
+              --from-literal=renewed="$(date +%s)" 2>&1 >/dev/null)" && return 0
+            grep -q AlreadyExists <<<"$err" || { LOCK_INFO="$err"; return 2; }
+            js="$(kubectl -n "$ns" get configmap "$cm" -o json 2>/dev/null)" || return 1
+            holder="$(jq -r '.data.holder' <<<"$js")"; renewed="$(jq -r '.data.renewed // 0' <<<"$js")"
+            now=$(date +%s)
+            [ "$holder" = "$HOLDER" ] && return 0
+            LOCK_INFO="held by ${holder}, renewed $(( now - renewed ))s ago"
+            (( now - renewed < LOCK_TTL )) && return 1
+            echo "taking over ${cm}: ${LOCK_INFO}"
+            # replace carries the resourceVersion, so two runners taking over at once cannot both win.
+            jq --arg h "$HOLDER" --arg t "$now" '.data.holder=$h | .data.renewed=$t' <<<"$js" \
+              | kubectl -n "$ns" replace -f - >/dev/null 2>&1 || return 1
+          }
+          renew_locks() {
+            local cm js
+            while read -r cm; do
+              js="$(kubectl -n "$ns" get configmap "$cm" -o json 2>/dev/null)" || continue
+              if [ "$(jq -r '.data.holder' <<<"$js")" != "$HOLDER" ]; then
+                echo "⚠️ lease ${cm} now held by $(jq -r '.data.holder' <<<"$js")"; continue
+              fi
+              jq --arg t "$(date +%s)" '.data.renewed=$t' <<<"$js" | kubectl -n "$ns" replace -f - >/dev/null 2>&1 || true
+            done < "$LOCK_FILE"
+          }
+          release_locks() {
+            local cm
+            while read -r cm; do
+              [ "$(kubectl -n "$ns" get configmap "$cm" -o jsonpath='{.data.holder}' 2>/dev/null)" = "$HOLDER" ] \
+                && kubectl -n "$ns" delete configmap "$cm" --ignore-not-found >/dev/null 2>&1
+            done < "$LOCK_FILE"
+            true
+          }
+
+          # Delete whatever JobSet is live if the job is canceled mid-slice, then free the slice.
           CUR=""
-          cleanup() { [ -n "$CUR" ] && kubectl -n "$ns" delete "$CUR" --ignore-not-found --wait=false 2>/dev/null; true; }
+          LOCK_RENEW_PID=""
+          cleanup() {
+            [ -n "$CUR" ] && kubectl -n "$ns" delete "$CUR" --ignore-not-found --wait=false 2>/dev/null
+            [ -n "$LOCK_RENEW_PID" ] && kill "$LOCK_RENEW_PID" 2>/dev/null
+            release_locks
+          }
           trap cleanup EXIT
           # A cancel signals the step; exit through the EXIT trap rather than dying first.
           trap 'exit 130' INT TERM
 
-          # A JobSet still pinned to this row's slices was left by a canceled run (the
-          # slice concurrency group rules out a live one). With no gang scheduling, its
-          # pods would half-place this run's JobSets, so delete it before starting.
+          # Renew from the start: a pair row keeps its first lease alive while it waits on the second.
+          ( while sleep "$LOCK_RENEW_EVERY"; do renew_locks; done ) &
+          LOCK_RENEW_PID=$!
+          # Sorted order, so two rows sharing nodepools cannot each hold one and wait on the other.
+          next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY ))
+          for pool in $(printf '%s\n' "$NODEPOOL" $NODEPOOL_DECODE | sort -u); do
+            cm="$(lock_name "$pool")"; waited=0
+            while :; do
+              LOCK_INFO=""
+              try_lock "$cm"; r=$?
+              if [ "$r" = 0 ]; then echo "$cm" >> "$LOCK_FILE"; echo "leased ${cm} after ${waited}s"; break; fi
+              if [ "$r" = 2 ]; then echo "⚠️ cannot lease ${cm} (${LOCK_INFO}); running without the slice lock"; break; fi
+              (( waited % 300 == 0 )) && echo "waiting for ${cm}: ${LOCK_INFO}"
+              if [ "$(date +%s)" -ge "$next_refresh" ]; then
+                refresh_cluster_token && next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY )) \
+                  || next_refresh=$(( $(date +%s) + TOKEN_RETRY_DELAY ))
+              fi
+              sleep "$LOCK_POLL"; waited=$(( waited + LOCK_POLL ))
+            done
+          done
+
+          # With every lease held, a JobSet still pinned to this row's slices belongs to a runner
+          # that died without cleaning up. With no gang scheduling, its pods would half-place
+          # this run's JobSets, so delete it before starting.
           for pool in "$NODEPOOL" $NODEPOOL_DECODE; do
             stale="$(kubectl -n "$ns" get jobsets -o json 2>/dev/null | jq -r --arg p "$pool" '
               .items[] | select(any(.spec.replicatedJobs[].template.spec.template;
@@ -253,7 +328,7 @@ jobs:
               done ) &
             local stream_pid=$!
 
-            local deadline next_refresh auth_fails=0 iter=0 ok bad
+            local deadline next_refresh auth_fails=0 iter=0 ok bad get_err
             deadline=$(( $(date +%s) + wait_budget ))  # outlast the JobSet's activeDeadlineSeconds
             next_refresh=$(( $(date +%s) + TOKEN_REFRESH_EVERY ))
             while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -266,7 +341,9 @@ jobs:
                 kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
               fi
               iter=$(( iter + 1 ))
-              if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
+              if ! get_err="$(kubectl -n "$ns" get "$name" 2>&1 >/dev/null)"; then
+                # NotFound is not an access problem: someone deleted the JobSet under us.
+                if grep -q NotFound <<<"$get_err"; then echo "❌ ${label}: JobSet ${short} was deleted while running"; break; fi
                 auth_fails=$((auth_fails + 1))
                 [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
                 if [ "$auth_fails" -ge "$AUTH_FAIL_LIMIT" ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; break; fi
