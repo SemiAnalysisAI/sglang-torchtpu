@@ -260,10 +260,19 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
     def test_draft_pp_scope_keeps_the_configured_batch_route(self):
         from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
 
-        # A PP=2 target keeps DSpark on the compatibility worker; the draft's
-        # one-stage PP group must not switch its batches to host padding.
+        # A PP=2 target keeps DSpark on the compatibility worker, which registers
+        # no host-batch padder, so the draft's one-stage PP group must not switch
+        # its batches to host padding.
+        self.assertIs(
+            TpuSRTPlatform().get_spec_worker_cls(
+                SpeculativeAlgorithm.DSPARK, SimpleNamespace(pp_size=2), default=object
+            ),
+            object,
+        )
         with (
+            patch("sglang_tpu.experimental._host_batch_padder", None),
             get_context().override_server_args(pp_size=2),
             get_parallel().override(pp_size=1),
         ):
