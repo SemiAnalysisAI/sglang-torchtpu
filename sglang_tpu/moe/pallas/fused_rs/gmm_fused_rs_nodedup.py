@@ -1572,6 +1572,7 @@ def kernel_main_fused_rs_fp8(
         "fp8_direct_write",
         "caller_tile_m",
         "expert_tp",
+        "local_rows",
     ],
 )
 def gmm_v2_fused_rs(
