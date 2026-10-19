@@ -42,6 +42,8 @@ from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftI
 from sglang_tpu.experimental.speculative.block_spec_worker import (
     TpuBlockSpecWorker,
 )
+from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.experimental.speculative.chain_spec_worker import TpuChainSpecWorker
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -55,7 +57,11 @@ CORE_WORKERS = (
 )
 # Their modules import CUDA-only kernels (sgl_kernel, flashinfer) at load time.
 CORE_WORKERS_NOT_IMPORTABLE_ON_CPU = frozenset({"NGRAMWorker", "UnoWorkerV2"})
-PLUGIN_WORKERS = (TpuSpecWorker, TpuBlockSpecWorker)
+PLUGIN_WORKERS = (
+    TpuSpecWorker,
+    TpuBlockSpecWorker,
+    TpuChainSpecWorker,
+)
 # The plugin's abstract skeleton; only its subclasses are handed to the scheduler.
 NOT_CONSTRUCTED_BY_SCHEDULER = frozenset({TpuSpecWorker})
 # check_pipeline_parallel_compat admits only EAGLE under PP, so the scheduler
@@ -68,6 +74,7 @@ DRAFT_INPUTS = (
     DFlashDraftInputV2,
     UnoDraftInput,
     HostPaddedBlockDraftInput,
+    HostPaddedChainDraftInput,
 )
 
 _PROTOCOL_INTERNALS = frozenset({"_is_protocol", "_is_runtime_protocol", "_abc_impl"})
