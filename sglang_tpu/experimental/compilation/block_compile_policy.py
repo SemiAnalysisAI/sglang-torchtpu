@@ -21,6 +21,7 @@ from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
+from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
 from sglang_tpu.experimental.compilation.spec_compile_policy import (
     TpuSpecDecodeCompilePolicyMixin,
 )
@@ -92,6 +93,9 @@ class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     def _precompile_draft_block(self, draft_attn_backend: AttentionBackend) -> None:
         assert self.b_bucketer is not None
         width = self.draft_block_width
+        lm_head = self.model_runner.model.lm_head
+        if lm_head is not None:
+            register_argmax_draft_top_k(lm_head)
         shapes = [(bs, bs * width) for bs in self.b_bucketer.buckets]
         logger.info(
             "[spec compile policy] %s DRAFT BLOCK: %d shapes (bs=%s, width=%d)",
