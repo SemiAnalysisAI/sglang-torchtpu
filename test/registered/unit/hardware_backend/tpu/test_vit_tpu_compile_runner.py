@@ -36,6 +36,15 @@ def _unset(field):
         yield
 
 
+@contextlib.contextmanager
+def _mock_vision_flash_op(flash_op):
+    # The constructor imports this optional Pallas provider lazily. Stub the
+    # kernel boundary without importing JAX on CPU-only test hosts.
+    provider = SimpleNamespace(_get_vision_flash_op=lambda _scale: flash_op)
+    with patch.dict("sys.modules", {"sglang_tpu.attention_pallas": provider}):
+        yield
+
+
 class _SegmentBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -555,12 +564,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_shared_tpu_attention_supports_batched_flattened_callers(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
-        with (
-            patch(
-                "sglang_tpu.vision_attention._get_vision_flash_op",
-                return_value=flash_op,
-            ),
-        ):
+        with _mock_vision_flash_op(flash_op):
             attention = VisionTpuAttention(
                 head_dim=4,
                 num_heads=1,
@@ -578,12 +582,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         self.assertTrue(torch.all(segment_ids[:, 3:] == 1))
 
     def test_shared_tpu_attention_delegates_explicit_masks_to_sdpa(self):
-        with (
-            patch(
-                "sglang_tpu.vision_attention._get_vision_flash_op",
-                return_value=MagicMock(),
-            ),
-        ):
+        with _mock_vision_flash_op(MagicMock()):
             attention = VisionTpuAttention(
                 head_dim=4,
                 num_heads=2,
@@ -616,12 +615,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_shared_tpu_attention_uses_pallas_for_fp32_softmax(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
-        with (
-            patch(
-                "sglang_tpu.vision_attention._get_vision_flash_op",
-                return_value=flash_op,
-            ),
-        ):
+        with _mock_vision_flash_op(flash_op):
             attention = VisionTpuAttention(
                 head_dim=4,
                 num_heads=1,
@@ -640,12 +634,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_shared_tpu_attention_expands_kv_heads(self):
         flash_op = MagicMock(side_effect=lambda q, k, v, ids: torch.zeros_like(q))
-        with (
-            patch(
-                "sglang_tpu.vision_attention._get_vision_flash_op",
-                return_value=flash_op,
-            ),
-        ):
+        with _mock_vision_flash_op(flash_op):
             attention = VisionTpuAttention(
                 head_dim=4,
                 num_heads=2,
