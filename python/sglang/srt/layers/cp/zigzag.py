@@ -140,15 +140,19 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 # one; the padding rows duplicate its last real token and the kernel ignores
 # them through `kv_new_lens`.
 #
-# rotate_pairs: request i hands zigzag pair p to rank (p - i) mod cp instead
-# of rank p, so the page-granular remainder of many short requests lands on
-# different ranks rather than always on rank 0.
-_TPU_LAYOUT = {"page_align": 0, "rotate_pairs": False}
+# balance_pairs: instead of rank r always owning zigzag pair r, each request
+# hands its largest pair to the least-loaded rank so far (same permutation on
+# every rank). With page-granular chunks a request's pairs differ by up to a
+# page, and the scheduler fills a chunk budget page-ceiled, so this keeps the
+# per-rank row count at budget / cp (e.g. a 63-page request plus a 1-page
+# head of the next one is exactly 8 pages on every rank of 8) instead of
+# spilling one rank into the next token bucket.
+_TPU_LAYOUT = {"page_align": 0, "balance_pairs": False}
 
 
-def set_zigzag_tpu_layout(page_align: int = 0, rotate_pairs: bool = False) -> None:
+def set_zigzag_tpu_layout(page_align: int = 0, balance_pairs: bool = False) -> None:
     _TPU_LAYOUT["page_align"] = int(page_align or 0)
-    _TPU_LAYOUT["rotate_pairs"] = bool(rotate_pairs)
+    _TPU_LAYOUT["balance_pairs"] = bool(balance_pairs)
 
 
 def _concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
@@ -215,7 +219,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             prefix_offsets = [0] * bs
 
         page = _TPU_LAYOUT["page_align"]
-        rotate = _TPU_LAYOUT["rotate_pairs"] and page > 0
+        balance = _TPU_LAYOUT["balance_pairs"] and page > 0
         cp = self.cp_size
         # Layout lengths: page-padded on TPU, the real lengths otherwise.
         if page > 0:
@@ -240,11 +244,27 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             split_list.extend(block_sizes)
 
         # Zigzag pair p = chunks (p, 2cp-1-p). Rank r of request b owns pair
-        # (r + shift_b) mod cp; shift is 0 without rotation.
-        shifts = [(b % cp) if rotate else 0 for b in range(bs)]
+        # pair_of[b][r]: p itself, or under `balance_pairs` the greedy
+        # largest-pair-to-least-loaded-rank assignment (LPT), identical on
+        # every rank since it only depends on the batch.
+        pair_of: List[List[int]] = []
+        loads = [0] * cp
+        for b in range(bs):
+            if not balance:
+                pair_of.append(list(range(cp)))
+                continue
+            sizes = per_seq_block_sizes[b]
+            pair_sz = [sizes[p] + sizes[cp_segment_num - 1 - p] for p in range(cp)]
+            pairs_desc = sorted(range(cp), key=lambda p: (-pair_sz[p], p))
+            ranks_asc = sorted(range(cp), key=lambda r: (loads[r], r))
+            assign = [0] * cp
+            for p, r in zip(pairs_desc, ranks_asc):
+                assign[r] = p
+                loads[r] += pair_sz[p]
+            pair_of.append(assign)
 
         def head_chunk(rank: int, b: int) -> int:
-            return (rank + shifts[b]) % cp
+            return pair_of[b][rank]
 
         def tail_chunk(rank: int, b: int) -> int:
             return cp_segment_num - 1 - head_chunk(rank, b)

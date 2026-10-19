@@ -18,6 +18,7 @@ The kernel reads either of two KV cache layouts, chosen once here from
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
+import os
 import torch
 
 from sglang.srt.environ import envs
@@ -166,7 +167,10 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
                 # Page-aligned zigzag chunks let the kernel read the all-gathered
                 # K/V in rank order through a page table (no host reorder).
-                set_zigzag_tpu_layout(page_align=self.page_size, rotate_pairs=True)
+                # SGLANG_TPU_CP_PAGE_LAYOUT=0 falls back to the token-granular
+                # split with the host-side reorder (A/B and escape hatch).
+                if os.environ.get("SGLANG_TPU_CP_PAGE_LAYOUT", "1") != "0":
+                    set_zigzag_tpu_layout(page_align=self.page_size, balance_pairs=True)
                 build_batched_rpa_pcp_ring_op(
                     get_parallel().attn_cp_size, get_parallel().attn_tp_size
                 )
