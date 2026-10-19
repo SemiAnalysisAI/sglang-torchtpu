@@ -41,7 +41,7 @@ from sglang.srt.models.bailing_moe_v3 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_tpu
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,12 @@ _NON_TEXT_PREFIX_MAPPING = (
     # Compatibility with the private training-checkpoint wrapper.
     ("model.linear_proj.", "linear_proj."),
 )
+
+
+class BailingMoeV3VLModel(BailingMoeV3ForCausalLM):
+    """VL-specific decoder, so the boundary-table policy on this class stays
+    off the text-only BailingMoeV3ForCausalLM (same split as
+    Qwen3MoeLLMModel vs Qwen3MoeModel)."""
 
 
 class BailingMoeV3VLForConditionalGeneration(nn.Module):
@@ -93,7 +99,7 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         text_config = config.text_config
         self.multi_gate_enabled = is_bailing_multi_gate_enabled(text_config)
-        self.model = BailingMoeV3ForCausalLM(
+        self.model = BailingMoeV3VLModel(
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -135,31 +141,6 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
 
         self.is_mrope_enabled = "mrope_section" in text_config.rope_parameters
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-
-        # Compile the language model with its logits processor; the vision
-        # tower and the multimodal embed merge stay eager. The whole-model
-        # fallback fires only when nothing installs, and the vision tower's
-        # class-level annotation already counts -- so the wrapper attaches.
-        if _is_tpu:
-            graph = get_exec().graph
-            if graph.enable_torch_compile and (
-                graph.tpu_compile_tracer == "direct" or get_parallel().pp_size > 1
-            ):
-                # Fail before the weight load: the shared VL policy has no
-                # later-stage warmup and no input_ids-only direct-tracer key.
-                raise ValueError(
-                    "Bailing/Ling-3's multimodal model does not support "
-                    "pipeline parallelism or --tpu-compile-tracer direct "
-                    "with --enable-torch-compile on TPU yet."
-                )
-            from sglang.srt.compilation.support_torch_compile import (
-                support_torch_compile,
-            )
-            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-                BailingVLDecoderTpuCompilePolicy,
-            )
-
-            support_torch_compile(self.model, policy=BailingVLDecoderTpuCompilePolicy)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
