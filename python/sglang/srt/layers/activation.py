@@ -137,10 +137,18 @@ class SiluAndMul(BaseFusedOp):
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
+        # Read once so a compiled graph sees a constant.
+        self._tpu_activation_fp32 = envs.SGLANG_TPU_ACTIVATION_FP32.get()
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_tpu(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._tpu_activation_fp32:
+            return self.forward_native(x)
+        d = x.shape[-1] // 2
+        return F.silu(x[..., :d].float()).to(x.dtype) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2

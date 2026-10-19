@@ -1945,6 +1945,11 @@ class Envs:
     # of the request. Off keeps the extend graph and the serving path exactly as
     # they are today, and a request asking for prompt logprobs is rejected.
     SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
+    # Compute silu(gate) of SiluAndMul in fp32; the matmuls and the product with
+    # up stay in the model dtype. v7x evaluates a bf16 silu in bf16 arithmetic,
+    # which adds logit noise on models with large MLP activations. RL trainers
+    # that compute silu in fp32 turn this on so rollout and training agree.
+    SGLANG_TPU_ACTIVATION_FP32 = EnvBool(False)
 
     # Build the RoPE cos/sin cache at the served context length instead of the
     # checkpoint's max_position_embeddings: Qwen3.5 declares 262144 positions
