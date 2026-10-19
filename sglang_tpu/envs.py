@@ -74,6 +74,13 @@ class TpuEnvs:
     # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
 
+    # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
+    # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
+    SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+
     # PD disaggregation (raiden)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,
     # not the pipeline path. Set the same value on prefill and decode. More can
