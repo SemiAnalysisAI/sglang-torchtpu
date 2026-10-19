@@ -165,10 +165,11 @@ class MuseMegakernel(torch.nn.Module):
             raise NotImplementedError(
                 "the Muse megakernel needs expert TP across the whole TP group"
             )
-        # Remote DMA over one host's devices only; rows are padded to the TP size.
-        if parallel.tp_size not in (1, 8):
+        # Remote DMA reaches every device of the slice's mesh (tp 16 spans two hosts);
+        # rows are padded to the TP size.
+        if parallel.tp_size not in (1, 8, 16):
             raise NotImplementedError(
-                f"the Muse megakernel runs at TP 1 or 8, got {parallel.tp_size}"
+                f"the Muse megakernel runs at TP 1, 8 or 16, got {parallel.tp_size}"
             )
         if parallel.attn_dcp_size != 1:
             raise NotImplementedError("the Muse megakernel reads unstrided page tables")
@@ -497,7 +498,7 @@ def _register_op() -> None:
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
-_DEPTH_RING_PREFERENCE = ((3, 11), (3, 4), (1, 4))
+_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4))
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster only at 48.
 _COMPACT4_MAX_ROWS = 24

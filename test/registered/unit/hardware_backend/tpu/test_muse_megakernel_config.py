@@ -34,15 +34,22 @@ _GEOMETRY = SimpleNamespace(
 )
 
 
-def _megakernel(**flags):
+# Muse Spark at tp16 (two hosts): one KV head per device, so the pool cannot pack heads.
+_GEOMETRY_TP16 = SimpleNamespace(
+    **{**vars(_GEOMETRY), "q_heads": 8, "kv_heads": 1, "inter_local": 256}
+)
+
+
+def _megakernel(geo=_GEOMETRY, tp_size=8, **flags):
     return SimpleNamespace(
-        geo=_GEOMETRY,
-        tp_size=8,
+        geo=geo,
+        tp_size=tp_size,
         # Layers 0 and 61 hold FP8 experts quantized at load; the rest are NVFP4.
         kinds=("fp8",) + ("fp4",) * (_LAYERS - 2) + ("fp8",),
         max_position=262144,
         chunk_pages=4,
         kv_packed=flags.get("kv_packed", True),
+        scale_fp8=False,
     )
 
 
@@ -67,6 +74,26 @@ class TestMuseMegakernelConfig(CustomTestCase):
                         K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
                     )
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
+
+    def test_tp16_shapes_keep_a_deep_weight_ring(self):
+        # tp16's dense weights split into 26 tiles, whose only ring divisor is 2; the
+        # tiling must split tiles until a ring of at least MIN_RING_SLOTS divides them.
+        mk = _megakernel(geo=_GEOMETRY_TP16, tp_size=16, kv_packed=False)
+        for q, n_req in ((1, 1), (4, 1), (4, 4), (4, 8), (8, 4)):
+            with self.subTest(q=q, n_req=n_req):
+                cfg = ops.MuseMegakernel.config(
+                    mk,
+                    rows=-(-q * n_req // 16) * 16,
+                    q=q,
+                    n_req=n_req,
+                    n_page_entries=n_req * 2048,
+                    page_size=128,
+                    capture=(1, 16, 30, 44, 59),
+                ).validate()
+                self.assertGreaterEqual(cfg.ring_slots, K.MIN_RING_SLOTS)
+                self.assertLessEqual(
+                    K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
+                )
 
 
 if __name__ == "__main__":

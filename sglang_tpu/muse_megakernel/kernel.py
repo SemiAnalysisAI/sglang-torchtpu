@@ -431,17 +431,45 @@ def dense_plan(c):
     )
 
 
+# The ring sizes worth streaming through: below the minimum the issue window runs too few
+# tiles ahead to hide DMA latency; the maximum is the largest ring ops.py asks for.
+MIN_RING_SLOTS = 8
+MAX_RING_SLOTS = 11
+
+
 def ring_slot_shape(c):
     """u32 words per ring slot: one [tile_k, tile_n] bf16 tile."""
     return (c.tile_k // 2, c.tile_n)
 
 
 def dense_tiles(c):
-    """(name, ki, ni, tk, tn, dtype) of every ring tile of one layer, in consumption order."""
+    """(name, ki, ni, tk, tn, dtype) of every ring tile of one layer, in consumption order.
+
+    The ring size must divide the tile count, so a count with no divisor in
+    ``[MIN_RING_SLOTS, MAX_RING_SLOTS]`` gets its largest tiles split along K until it has
+    one (tp16's 26 tiles would otherwise leave a 2-slot ring that runs 1 tile ahead).
+    """
     rk, rn = ring_slot_shape(c)
+    plan = dense_plan(c)
+    shapes = [_choose_tile(K, N, rk * _PACK[jnp.dtype(dt)], rn) for _, K, N, dt in plan]
+    for _ in plan:
+        T = sum((K // tk) * (N // tn) for (_, K, N, _), (tk, tn) in zip(plan, shapes))
+        if any(T % d == 0 for d in range(MIN_RING_SLOTS, MAX_RING_SLOTS + 1)):
+            break
+        splittable = [
+            i
+            for i, ((_, K, _, _), (tk, _)) in enumerate(zip(plan, shapes))
+            if tk % 32 == 0 and K % (tk // 2) == 0
+        ]
+        if not splittable:
+            break
+        i = max(
+            splittable,
+            key=lambda i: shapes[i][0] * shapes[i][1] * jnp.dtype(plan[i][3]).itemsize,
+        )
+        shapes[i] = (shapes[i][0] // 2, shapes[i][1])
     tiles = []
-    for name, K, N, dt in dense_plan(c):
-        tk, tn = _choose_tile(K, N, rk * _PACK[jnp.dtype(dt)], rn)
+    for (name, K, N, dt), (tk, tn) in zip(plan, shapes):
         tiles += [
             (name, ki, ni, tk, tn, dt) for ni in range(N // tn) for ki in range(K // tk)
         ]
