@@ -436,6 +436,18 @@ class _HybridReqPool(HybridReqToTokenPool):
         self.mamba_pool = mamba_pool
 
 
+def _linear_attention() -> RadixLinearAttention:
+    return RadixLinearAttention(
+        layer_id=0,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=1,
+        head_k_dim=1,
+        head_v_dim=1,
+    )
+
+
 def _gdn_metadata(fill: int) -> GdnTracedMetadata:
     def tensor():
         return torch.full((2,), fill, dtype=torch.int32)
@@ -546,6 +558,7 @@ class TestHybridLinearDirectCompile(CustomTestCase):
         full_kv_pool = _FullKVPool(num_layers)
         mamba_pool = _cpu_mamba_pool(num_layers)
         model_runner = _model_runner()
+        model_runner.model.gdn = _linear_attention()
         model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
         model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
         policy = DecoderTpuCompilePolicy(
@@ -572,6 +585,22 @@ class TestHybridLinearDirectCompile(CustomTestCase):
             [id(t) for t in mamba_pool.get_state()],
             [id(t) for t in replacement[num_full:]],
         )
+
+    def test_kv_pool_without_linear_layers_leaves_linear_state_out(self):
+        """An MTP draft shares the target's hybrid pools but runs no GDN layer.
+
+        Lifting the GDN state would copy_ fresh buffers into it on every draft
+        forward, so Raiden P/D would move rows of the stale registered buffers.
+        """
+        full_kv_pool = _FullKVPool(2)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+        model_runner.req_to_token_pool = _HybridReqPool(_cpu_mamba_pool(2))
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+
+        self.assertIs(policy.get_direct_compile_kv_pool(), full_kv_pool)
 
     def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
         """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
