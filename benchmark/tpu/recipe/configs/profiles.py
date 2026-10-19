@@ -23,13 +23,19 @@ PROFILE_KEYS = (
 
 
 def _profile(
-    *, input_tokens: int, output_tokens: int, concurrency: int, prefill_tokens: int
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    concurrency: int,
+    prefill_tokens: int,
+    decode_bs: tuple[int, ...] = (),
 ) -> dict:
     """One profile, with the sizing derived from the shape it names.
 
     The context is the shape plus a chat-template allowance; the pool holds every
     in-flight request at full length plus one prefill chunk of slack, which keeps
-    a late arrival from waiting on an eviction.
+    a late arrival from waiting on an eviction. `decode_bs` adds decode buckets
+    below the concurrency, for a server whose traffic is often a single request.
     """
     context_length = input_tokens + output_tokens + 64
     return {
@@ -42,7 +48,7 @@ def _profile(
             "max_running_requests": concurrency,
             "torch_compile_max_bs": concurrency,
             "tpu_compile_tokens": [prefill_tokens],
-            "tpu_compile_bs": [concurrency],
+            "tpu_compile_bs": [*decode_bs, concurrency],
             "max_total_tokens": concurrency * context_length + prefill_tokens,
         },
     }
@@ -66,6 +72,22 @@ PROFILES = {
     # conversations and the radix cache does the work. One point, not the bench
     # matrix's agentic leg, which ramps toward a per-model target context and
     # sweeps concurrency (recipe/bench_matrix/config.sh).
+    # Few requests on a model too large for more: a 1024-token prefill chunk and
+    # a bs1 bucket next to the bs4 one, so a lone request decodes unpadded.
+    "chat_1k1k_c4": _profile(
+        input_tokens=1024,
+        output_tokens=1024,
+        concurrency=4,
+        prefill_tokens=1024,
+        decode_bs=(1,),
+    ),
+    "long_8k1k_c4": _profile(
+        input_tokens=8192,
+        output_tokens=1024,
+        concurrency=4,
+        prefill_tokens=1024,
+        decode_bs=(1,),
+    ),
     "agentic": _profile(
         input_tokens=32768, output_tokens=1024, concurrency=16, prefill_tokens=8192
     ),
