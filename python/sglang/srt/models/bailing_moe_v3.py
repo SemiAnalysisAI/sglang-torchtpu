@@ -1578,10 +1578,11 @@ class BailingMoeV3ForCausalLM(nn.Module):
             )
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
-            if _is_tpu:
-                # Assign unconditionally: repeat loads re-assign the same
-                # tensor, and the bind must not wait for a compiled forward.
-                self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
+            # Bind at load time, as deepseek_weight_loader does: the lazy
+            # bind in the eager forward would execute inside a traced
+            # region on whole-graph compile. Reassigning on a repeat load
+            # is the same tensor.
+            self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 awq_dequantize = _get_awq_dequantize()
                 if awq_dequantize is None:
