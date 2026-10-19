@@ -1929,6 +1929,12 @@ class Envs:
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
     SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
+    # Same for the PCP ring (cache-phase) kernel's tile; experiment knobs.
+    SGLANG_TPU_FORCE_RPA_RING_BKV = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_RING_BQ = EnvInt(None)
+    # Override the RPA compute-tile budget (MXU passes per pipeline step) that
+    # splits a Q block into compute sub-tiles; experiment knob.
+    SGLANG_TPU_RPA_COMPUTE_TILE_THRESHOLD = EnvInt(None)
     # Enable prefill and decode co-location on the same single- or multi-host
     # TPU slice by assigning half the chips to prefill and half to decode.
     # This is intended primarily for development and is not for production use.

@@ -453,6 +453,9 @@ class BaseBlockSizeCalculator:
         if is_8bit:
             flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
             threshold *= flops_ratio
+        forced_threshold = envs.SGLANG_TPU_RPA_COMPUTE_TILE_THRESHOLD.get()
+        if forced_threshold is not None:
+            threshold = int(forced_threshold)
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
         bq_c_rem = 0
@@ -527,13 +530,15 @@ class BaseBlockSizeCalculator:
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
-        # Under context parallelism a rank holds every Q head of its 1/cp of
-        # the tokens (32 heads for Qwen3-30B at cp 8), so the joint walk stops
-        # at a small square tile (256/256) long before VMEM is spent. Keep
-        # growing the KV tile alone: fewer, larger pipeline steps per Q block.
-        # Measured on v7x, 16K-token prefill: attention 64 -> 50 ms (256/1024
-        # vs 256/256); 512/512 was no better than 256/1024 and slower at 4K.
-        if fixed_bq_sz is None and self.serve_cfgs.cp_group_size is not None:
+        # With many Q heads per device (32 for Qwen3-30B under prefill CP,
+        # where a rank holds every head of its 1/cp of the tokens) the joint
+        # walk stops at a small square tile (256/256) long before VMEM is
+        # spent. Keep growing the KV tile alone: fewer, larger pipeline steps
+        # per Q block. Measured on v7x, 16K-token prefill: attention 64 -> 50
+        # ms (256/1024 vs 256/256); 512/512 was no better than 256/1024 and
+        # slower at 4K. A no-op where the walk already reached max_bkv_sz
+        # (e.g. 4 heads per device under plain TP: 1024/1024).
+        if fixed_bq_sz is None:
             while (
                 bkv_sz + bkv_stride <= self.max_bkv_sz
                 and self.calculate_vmem_usage(batch_size, bq_sz, bkv_sz + bkv_stride)
@@ -696,24 +701,27 @@ def calculate_block_sizes(
         model_cfgs, serve_cfgs, vmem_limit_bytes, decode_query_size
     )
     decode_bs, prefill_bs = calculator.calculate()
-    forced_bkv = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.get()
-    forced_bq = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ.get()
+    if calculator_cls is RingBlockSizeCalculator:
+        forced_bkv = envs.SGLANG_TPU_FORCE_RPA_RING_BKV.get()
+        forced_bq = envs.SGLANG_TPU_FORCE_RPA_RING_BQ.get()
+    else:
+        forced_bkv = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.get()
+        forced_bq = envs.SGLANG_TPU_FORCE_RPA_PREFILL_BQ.get()
     if forced_bkv is not None or forced_bq is not None:
-        # Experiment knobs (not applied to the ring, whose search is its own):
-        # override the prefill tile and re-derive the compute tile for it, so
-        # a larger KV tile does not run with the compute block of the smaller.
-        if calculator_cls is BaseBlockSizeCalculator:
-            page = serve_cfgs.page_size
-            bkv = prefill_bs.bkv_sz
-            if forced_bkv is not None:
-                bkv = max(page, -(-int(forced_bkv) // page) * page)
-            bq = prefill_bs.bq_sz if forced_bq is None else int(forced_bq)
-            prefill_bs = dataclasses.replace(
-                prefill_bs,
-                bq_sz=bq,
-                bkv_sz=bkv,
-                bq_c_sz=calculator.compute_tile_size(prefill_bs.batch_size, bq, bkv),
-            )
+        # Experiment knobs: override the prefill (or ring) tile and re-derive
+        # the compute tile for it, so a larger KV tile does not run with the
+        # compute block of the smaller.
+        page = serve_cfgs.page_size
+        bkv = prefill_bs.bkv_sz
+        if forced_bkv is not None:
+            bkv = max(page, -(-int(forced_bkv) // page) * page)
+        bq = prefill_bs.bq_sz if forced_bq is None else int(forced_bq)
+        prefill_bs = dataclasses.replace(
+            prefill_bs,
+            bq_sz=bq,
+            bkv_sz=bkv,
+            bq_c_sz=calculator.compute_tile_size(prefill_bs.batch_size, bq, bkv),
+        )
     return decode_bs, prefill_bs
 
 
