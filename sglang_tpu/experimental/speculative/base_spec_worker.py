@@ -755,7 +755,7 @@ class TpuSpecWorker(BaseSpecWorker):
                         # Unpadded [1, 1] params broadcast over the cap rows as-is.
                         variants.add((cap, False))
                     for rows, params_on_cpu in variants:
-                        runner.sampler(
+                        next_token_ids = runner.sampler(
                             LogitsProcessorOutput(
                                 next_token_logits=self._warmup_extend_logits(
                                     cap, rows, vocab_size
@@ -768,6 +768,10 @@ class TpuSpecWorker(BaseSpecWorker):
                             None,
                             None,
                             torch.zeros((rows,), dtype=torch.int64, device=self.device),
+                        )
+                        # extend() broadcasts these tokens; the collective compiles per shape.
+                        self._tp_sync.sync(
+                            SpecTpSyncSite.SPEC_TARGET, next_token_ids
                         ).cpu()
             for bs in extend_sizes:
                 # The shim pads the device-resident extend bs fields (seq_lens,

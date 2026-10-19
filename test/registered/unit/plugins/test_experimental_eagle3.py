@@ -11,6 +11,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.envs import envs
@@ -359,6 +360,45 @@ class TestExperimentalEagle3(CustomTestCase):
         self.assertEqual(
             [t.dtype for t in (temperatures, top_ks, top_ps, min_ps)],
             [torch.float32, torch.int32, torch.float32, torch.float32],
+        )
+
+    def test_extend_sampling_warmup_broadcasts_every_sampled_shape(self):
+        """extend() TP-broadcasts its sampled tokens; a sampled shape warmup never
+        broadcast compiles that collective at serving time."""
+        worker = _chain_worker()
+        sampled: set[tuple[tuple[int, ...], torch.dtype]] = set()
+
+        def sampler(logits_output, *_args):
+            tokens = torch.zeros((logits_output.next_token_logits.shape[0],))
+            tokens = tokens.to(torch.int32)
+            sampled.add((tuple(tokens.shape), tokens.dtype))
+            return tokens
+
+        broadcast: set[tuple[SpecTpSyncSite, tuple[int, ...], torch.dtype]] = set()
+
+        def sync(site, values):
+            broadcast.add((site, tuple(values.shape), values.dtype))
+            return values
+
+        worker._tp_sync = SimpleNamespace(sync=sync)
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                sampler=sampler, model_config=SimpleNamespace(vocab_size=8)
+            )
+        )
+        policy = SimpleNamespace(
+            _extend_compile_cap=lambda: 4, _compiles_logits_processor=lambda: True
+        )
+        buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
+        with (
+            patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
+            patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
+        ):
+            worker._warmup_extend_sampling()
+        self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
+        self.assertEqual(
+            broadcast,
+            {(SpecTpSyncSite.SPEC_TARGET, *shape_dtype) for shape_dtype in sampled},
         )
 
     def test_draft_prompt_shift_keeps_chunks_consistent(self):
