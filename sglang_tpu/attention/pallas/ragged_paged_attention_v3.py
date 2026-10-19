@@ -373,6 +373,7 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
     pad_lane_rowsum: bool = False,
+    sliding_window_chunk_skip: bool = True,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -971,6 +972,12 @@ def _ragged_paged_attention_kernel_loop(
                 start_bkv_idx = (
                     jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
                 )
+                # The next query block starts here: this query block is the
+                # last one to visit the KV blocks before it.
+                next_bq_start_bkv_idx = (
+                    jnp.maximum(processed_q_len + actual_bq_sz - sliding_window, 0)
+                    // bkv_sz
+                )
             if use_causal_mask:
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
@@ -1037,9 +1044,20 @@ def _ragged_paged_attention_kernel_loop(
                 if custom_mask_ref is not None:
                     wait_fetch_mask(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
 
-                # Start updating bkv to kv cache if applicable.
-                # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                # Write this block's new tokens to the KV cache on the last
+                # query block that visits it. Without a sliding window, that is
+                # the sequence's last query block. With one, each query block
+                # starts at its own window, so blocks left of the next query
+                # block's window are not visited again: write them now, or the
+                # new tokens there never reach the cache and a later prefix hit
+                # inside this prompt reads stale K/V.
+                is_last_visit = bq_idx == num_bq - 1
+                if sliding_window is not None:
+                    is_last_visit = jnp.logical_or(
+                        is_last_visit, bkv_idx < next_bq_start_bkv_idx
+                    )
+
+                @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
@@ -1064,6 +1082,23 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.loop(0, max_num_loops, unroll=False)
                 def attention_loop(idx):
                     bkv_start = idx * bkv_csz
+                    chunk_has_keys = bkv_start < effective_bkv_sz
+                    if sliding_window is not None and sliding_window_chunk_skip:
+                        # The block loop above skips whole KV blocks left of the
+                        # window, but a kept block is still computed from its
+                        # first key. A compute chunk that ends before the
+                        # window of this query block's first row is masked for
+                        # every row (later rows' windows start later), so skip
+                        # it: it cannot change the output. With a sink, m starts
+                        # finite and the chunk's weights exp(mask_value - m) are
+                        # 0; without one, what it accumulates is scaled by
+                        # exp(mask_value - m) = 0 at the row's first visible key.
+                        # Key k is visible from query q iff q < k + window.
+                        window_start = processed_q_len - sliding_window + 1
+                        chunk_end = processed_kv_len + bkv_start + bkv_csz
+                        chunk_has_keys = jnp.logical_and(
+                            chunk_has_keys, chunk_end > window_start
+                        )
 
                     def compute_sub_blocks(apply_masks):
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
@@ -1126,7 +1161,7 @@ def _ragged_paged_attention_kernel_loop(
                                     acc_ref.at[lm_slice],
                                 )
 
-                    in_range = bkv_start < effective_bkv_sz
+                    in_range = chunk_has_keys
                     if not use_causal_mask:
                         pl.when(in_range)(lambda: compute_sub_blocks(True))
                         return
@@ -1661,6 +1696,29 @@ def get_default_block_sizes(
     bq_csz = max(1, bq_csz)
     bkv_csz = align_to(bkv_csz, bkv_alignment)
 
+    # A sliding window much shorter than a KV compute chunk: one chunk of
+    # query rows needs only bq_csz + sliding_window - 1 keys. The kernel skips
+    # KV blocks and compute chunks left of the window of a query block's
+    # first row, so size the blocks to let that skip remove nearly all masked
+    # work:
+    #   - one query compute chunk per query block: with more, the later
+    #     chunks also compute the keys only the first row still sees;
+    #   - a window-sized KV compute chunk, the skip's granularity;
+    #   - the default KV compute chunk as the KV block, to fetch few keys
+    #     left of the window without paying per-block overhead on tiny blocks.
+    # Measured on tpu7x for gpt-oss (window 128, 8 query heads per KV head,
+    # 1 to 8 KV heads): sliding-window layers run 1.18-1.36x faster than with
+    # the full-attention blocks, and 256-row query blocks take up to 22%
+    # longer than 128-row ones.
+    if (
+        case != RpaCase.DECODE
+        and sliding_window is not None
+        and bq_csz + sliding_window - 1 <= bkv_csz
+    ):
+        bq_sz = bq_csz
+        bkv_sz = min(bkv_sz, bkv_csz)
+        bkv_csz = min(align_to(next_power_of_2(sliding_window), bkv_alignment), bkv_sz)
+
     # Reduce block sizes if VMEM estimate exceeds limit.
     # Use a fraction of vmem_limit as margin for shapes the estimate has not
     # been checked against.
@@ -1763,6 +1821,7 @@ def get_vmem_limit():
         "pad_lane_rowsum",
         "disable_semaphore_checks",
         "debug_mode",
+        "_sliding_window_chunk_skip",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1799,6 +1858,10 @@ def ragged_paged_attention(
     pad_lane_rowsum: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
+    # Private: False restores computing KV chunks left of the sliding window.
+    # The output is identical; it exists only so benchmarks and tests can A/B
+    # the skip.
+    _sliding_window_chunk_skip: bool = True,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -2026,6 +2089,8 @@ def ragged_paged_attention(
         )
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
+            if not _sliding_window_chunk_skip:
+                scope_name += "-noskip"
 
         kernel = pl.pallas_call(
             functools.partial(
@@ -2047,6 +2112,7 @@ def ragged_paged_attention(
                 case=case,
                 skip_kv_mask=skip_kv_mask,
                 pad_lane_rowsum=pad_lane_rowsum and actual_head_dim < head_dim,
+                sliding_window_chunk_skip=_sliding_window_chunk_skip,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(

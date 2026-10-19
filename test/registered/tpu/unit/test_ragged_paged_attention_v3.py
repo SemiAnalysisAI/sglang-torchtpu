@@ -264,9 +264,18 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         }
 
     def _run_and_compare(
-        self, inputs, *, distribution, tolerance=None, **kernel_kwargs
+        self,
+        inputs,
+        *,
+        distribution,
+        tolerance=None,
+        check_live_cache=False,
+        **kernel_kwargs,
     ):
-        """Run kernel + reference with matching kwargs and assert close."""
+        """Run kernel + reference with matching kwargs and assert close.
+
+        ``check_live_cache`` also asserts every live K/V slot after the call.
+        """
         import jax.numpy as jnp
 
         from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
@@ -320,7 +329,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             **kernel_kwargs,
             **scale_kwargs,
         )
-        if "decode_query_size" in kernel_kwargs:
+        if check_live_cache or "decode_query_size" in kernel_kwargs:
             self._assert_live_cache_matches_reference(inputs, updated_cache)
         kernel_out = kernel_out[: inputs["total_q_tokens"]]
 
@@ -582,6 +591,101 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------ #
+    # Sliding-window compute-chunk skip.
+    #
+    # Explicit MIXED block sizes put several bkv_csz chunks in each KV block
+    # and use a window much shorter than a block, so chunks left of the window
+    # are skipped. The skip must not change any output value: compare with
+    # the private _sliding_window_chunk_skip=False exactly, and with the
+    # reference.
+    # ------------------------------------------------------------------ #
+
+    def _check_sliding_window_chunk_skip(self, seqs, *, sliding_window, blocks):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            ref_ragged_paged_attention,
+        )
+
+        num_q_heads, num_kv_heads = 8, 2
+        self.PAGES_PER_SEQ = max(kv for kv, _ in seqs) // self.PAGE_SIZE + 1
+        self.TOTAL_NUM_PAGES = len(seqs) * self.PAGES_PER_SEQ
+        inputs = self._build_inputs(
+            seqs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            noncontiguous_pages=True,
+        )
+        total = inputs["total_q_tokens"]
+        sm_scale = 1.0 / float(np.sqrt(self.HEAD_DIM))
+        for sinks in (None, jnp.linspace(-2.0, 2.0, num_q_heads, dtype=jnp.float32)):
+            with self.subTest(sinks=sinks is not None):
+                ref = ref_ragged_paged_attention(
+                    inputs["q"][:total],
+                    inputs["ref_kpages"],
+                    inputs["ref_vpages"],
+                    inputs["kv_lens"],
+                    inputs["ref_page_indices"],
+                    inputs["cu_q_lens"],
+                    jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    attention_sink=sinks,
+                )
+                outs = {}
+                for skip in (True, False):
+                    out, cache = ragged_paged_attention(
+                        inputs["q"].copy(),
+                        inputs["new_k"].copy(),
+                        inputs["new_v"].copy(),
+                        inputs["kv_fused"].copy(),
+                        inputs["kv_lens"],
+                        inputs["page_indices_flat"],
+                        inputs["cu_q_lens"],
+                        inputs["cu_kv_lens"],
+                        # Extend rows on the MIXED range, as the backend runs them.
+                        jnp.array([0, 0, inputs["num_seqs"]], jnp.int32),
+                        None,
+                        sinks,
+                        sm_scale=sm_scale,
+                        sliding_window=sliding_window,
+                        m_block_sizes=blocks,
+                        _sliding_window_chunk_skip=skip,
+                    )
+                    outs[skip] = (
+                        np.asarray(out[:total]).astype(np.float32),
+                        np.asarray(cache).astype(np.float32),
+                    )
+                np.testing.assert_array_equal(outs[True][0], outs[False][0])
+                # The skip is compute-only, so the cache writes are identical.
+                # The writes themselves are checked against the reference by
+                # the test_extend_sliding_window_writes_all_new_kv* tests.
+                np.testing.assert_array_equal(outs[True][1], outs[False][1])
+                diff = float(
+                    np.abs(outs[True][0] - np.asarray(ref).astype(np.float32)).max()
+                )
+                self.assertLess(diff, self.TOLERANCE)
+
+    def test_sliding_window_chunk_skip_prefill(self):
+        """One sequence from position 0; four 32-key chunks per 128-key block."""
+        self._check_sliding_window_chunk_skip(
+            [(256, 256)], sliding_window=40, blocks=(32, 128, 32, 32)
+        )
+
+    def test_sliding_window_chunk_skip_prefix_and_multi_seq(self):
+        """A cached prefix and a second sequence shift the window per row."""
+        self._check_sliding_window_chunk_skip(
+            [(320, 192), (200, 200)], sliding_window=48, blocks=(32, 128, 32, 32)
+        )
+
+    def test_sliding_window_chunk_skip_query_sub_blocks(self):
+        """bq_csz < bq_sz: the skip is decided by the block's first row."""
+        self._check_sliding_window_chunk_skip(
+            [(256, 256)], sliding_window=33, blocks=(64, 128, 32, 32)
+        )
+
+    # ------------------------------------------------------------------ #
     # Original two cases — kept (single seq), now via the multi-seq helper.
     # ------------------------------------------------------------------ #
 
@@ -644,6 +748,44 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         self.TOTAL_NUM_PAGES = self.PAGES_PER_SEQ
         inputs = self._build_inputs([(kv_len, 8)])
         self._run_and_compare(inputs, distribution=(0, 0, 1), sliding_window=32)
+
+    # Each query block's KV loop starts at its window, so the last query block
+    # of a long sliding-window prefill never visits the first KV blocks. Their
+    # new tokens must still reach the cache: a later prefix-cache hit inside
+    # this prompt reads the window before the hit from there.
+
+    def test_extend_sliding_window_writes_all_new_kv(self):
+        """The last query block's window starts one 128-key block in."""
+        self.PAGES_PER_SEQ = 17
+        self.TOTAL_NUM_PAGES = 17
+        inputs = self._build_inputs(
+            [(256, 256)], num_q_heads=8, num_kv_heads=2, noncontiguous_pages=True
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 1),
+            sliding_window=40,
+            m_block_sizes=(32, 128, 32, 32),
+            check_live_cache=True,
+        )
+
+    def test_extend_sliding_window_writes_all_new_kv_prefix_multi_seq(self):
+        """A cached prefix and a second sequence, several blocks per window."""
+        self.PAGES_PER_SEQ = 21
+        self.TOTAL_NUM_PAGES = 42
+        inputs = self._build_inputs(
+            [(320, 192), (200, 200)],
+            num_q_heads=8,
+            num_kv_heads=2,
+            noncontiguous_pages=True,
+        )
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 0, 2),
+            sliding_window=48,
+            m_block_sizes=(32, 64, 32, 32),
+            check_live_cache=True,
+        )
 
     def test_decode_soft_cap(self):
         """soft_cap rescales logits with tanh before softmax. Verifies the
