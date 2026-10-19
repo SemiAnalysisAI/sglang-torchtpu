@@ -21,6 +21,12 @@ Startup fills in `--max-running-requests 8` (the megakernel's rows),
 `--tpu-compile-bs 1 2 4 8`, `--attention-backend pallas_tpu_mla` and
 `--kv-cache-dtype bfloat16` when they are unset.
 
+A complete 2x2x4 tpu7x config (4 hosts, real weights) is
+[`benchmark/tpu/recipe/configs/kimi_k3/megakernel.py`](../../benchmark/tpu/recipe/configs/kimi_k3/megakernel.py);
+`MK=0` serves the same config without the megakernel for A/B. On that slice the
+weights plus the megakernel leave no KV room below `--mem-fraction-static` 0.81,
+so it uses 0.87.
+
 One tuning knob: `SGLANG_TPU_OPT_K3_MEGAKERNEL_TUNED_RECIPE=0` runs upstream's
 plain kernel options instead of the tuned ones (A/B and triage).
 
