@@ -21,7 +21,7 @@ weight updates, so nothing reads the released weights again.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch import nn
@@ -36,6 +36,7 @@ from sglang_tpu.fp8_linear import (
 from sglang_tpu.kernels.static_fp8_gemv import MAX_TOKENS as STATIC_FP8_GEMV_MAX_TOKENS
 from sglang_tpu.kimi_k3 import STATIC_FP8_PARTS as PARTS
 from sglang_tpu.kimi_k3 import static_fp8_parts as selected_parts
+from sglang_tpu.kimi_k3.host_split_op import host_split_op
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,163 @@ def _release(*linears: nn.Module) -> int:
     return freed
 
 
-def _bind_moe(moe, in_norm: nn.Module, parts) -> tuple[list[str], int]:
+class HostSplitFront(NamedTuple):
+    """Single-token MoE front split across the ranks of a host: one kernel
+    (sglang_tpu/kernels/host_split_gemv.py) runs this rank's latent down-proj columns
+    and shared gate_up in one fp8 GEMV, its router-gate experts in bf16, and
+    the host exchange. Returns (latent, router logits, shared gate_up)."""
+
+    weight: StaticFp8Weight  # [H, latent slice | shared gate_up]
+    router_weight: torch.Tensor  # [H, expert slice], the gate's dtype
+    op: object
+
+    def __call__(self, x: torch.Tensor):
+        w = self.weight
+        return self.op(x, w.weight, w.out_scale, w.inv_x, self.router_weight)
+
+
+class HostSplitUp(NamedTuple):
+    """Single-token latent up-proj split by output columns across a host."""
+
+    weight: StaticFp8Weight
+    op: object
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight
+        return self.op(x, w.weight, w.out_scale, w.inv_x)
+
+
+# (hosts, ranks per host) the host split was measured on: tpu7x 2x2x4, TP32 =
+# 4 hosts x 8 ranks. Other shapes keep the replicated GEMVs until measured.
+VALIDATED_TOPOLOGIES = frozenset({(4, 8)})
+
+
+def _check_ranks_agree(enabled: bool) -> None:
+    """Every rank must take the same path: if one host missed the switch, its
+    ranks would keep the replicated GEMVs while the others wait in the host
+    barrier, and the first single-token decode would hang. Fail at startup
+    instead."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return
+    from sglang.srt.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    if world_group.world_size <= 1:
+        return
+    seen = [None] * world_group.world_size
+    dist.all_gather_object(seen, bool(enabled), group=world_group.cpu_group)
+    if len(set(seen)) > 1:
+        on = [rank for rank, flag in enumerate(seen) if flag]
+        raise RuntimeError(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV must be set the same on every "
+            f"rank; it is on for ranks {on} only."
+        )
+
+
+def _host_split_layout() -> Optional[tuple[int, int, int]]:
+    """(world, ranks per host, this rank's host-local index) when the host
+    split applies, else None. Called once per process from bind_static_fp8,
+    on every rank that selected static fp8 parts (all of them when the switch
+    is on: static_fp8_parts requires moe_front and latent_up)."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    enabled = tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.get()
+    _check_ranks_agree(enabled)
+    if not enabled:
+        return None
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    world = get_tensor_model_parallel_world_size()
+    nnodes = server_args.nnodes
+    # TP spanning the world is host-major, with world / nnodes ranks per host.
+    if (
+        world != dist.get_world_size()
+        or world % nnodes
+        or (nnodes, world // nnodes) not in VALIDATED_TOPOLOGIES
+    ):
+        logger.warning(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but TP %d over %d hosts "
+            "is not a measured host-major topology spanning the world (hosts, "
+            "ranks per host in %s); the GEMVs stay replicated.",
+            world,
+            nnodes,
+            sorted(VALIDATED_TOPOLOGIES),
+        )
+        return None
+    compile_bs = server_args.tpu_compile_bs
+    if compile_bs and 1 not in compile_bs:
+        logger.warning(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV is set but the TPU compile "
+            "batch sizes %s have no batch size 1, so no compiled decode step "
+            "takes the host-split GEMVs.",
+            compile_bs,
+        )
+    local = world // nnodes
+    return world, local, get_tensor_model_parallel_rank() % local
+
+
+def _split_ranks(n: int, local: int) -> int:
+    """Most host ranks (<= local) that split n columns into equal 128-multiples."""
+    for used in range(local, 0, -1):
+        if n % (used * 128) == 0:
+            return used
+    return 0
+
+
+def _slice_bounds(n: int, used: int, index: int) -> tuple[int, int]:
+    """Slice ``index`` of ``used`` equal slices of n. Ranks past ``used`` take
+    slice 0, which the exchange drops: every rank must hold the same kind of
+    tensor so that all ranks compile the same program."""
+    size = n // used
+    start = (index if index < used else 0) * size
+    return start, start + size
+
+
+def _column_slice(w_kn: torch.Tensor, used: int, index: int) -> torch.Tensor:
+    # A fresh base tensor: a view would reach the graph as a per-rank
+    # as_strided offset, and ranks compiling different programs can order
+    # the collectives differently and deadlock.
+    start, end = _slice_bounds(w_kn.shape[1], used, index)
+    return w_kn[:, start:end].clone(memory_format=torch.contiguous_format)
+
+
+def _bind_host_split(moe, in_norm_weight, down, gate_up, up, layout) -> None:
+    """Bind the single-token host-split variants next to the replicated
+    StaticFp8Weights, which stay for multi-token batches."""
+    world, local, index = layout
+    if down is not None and gate_up is not None:
+        router_kn = moe.gate.weight.detach().t()  # [H, E]
+        used_l = _split_ranks(down.shape[1], local)
+        used_e = _split_ranks(router_kn.shape[1], local)
+        if used_l and used_e:
+            latent = _column_slice(down, used_l, index)
+            moe._host_split_front = HostSplitFront(
+                weight=_pack(torch.cat([latent, gate_up], dim=1), in_norm_weight),
+                router_weight=_column_slice(router_kn, used_e, index),
+                op=host_split_op(world, local, latent.shape[1], used_l, used_e),
+            )
+    if up is not None:
+        used = _split_ranks(up.shape[1], local)
+        if used:
+            weight = _pack(
+                _column_slice(up, used, index), moe.routed_expert_norm.weight
+            )
+            moe._host_split_latent_up = HostSplitUp(
+                weight=weight,
+                op=host_split_op(world, local, weight.weight.shape[1], used),
+            )
+
+
+def _bind_moe(moe, in_norm: nn.Module, parts, layout) -> tuple[list[str], int]:
     """Returns (parts bound on this layer, bytes freed)."""
     bound: list[str] = []
     freed = 0
@@ -118,6 +275,8 @@ def _bind_moe(moe, in_norm: nn.Module, parts) -> tuple[list[str], int]:
                 torch.cat([down, gate_up], dim=1), in_norm_weight
             )
             moe._static_fp8_front_split = [down.shape[1], gate_up.shape[1]]
+            if layout is not None:
+                _bind_host_split(moe, in_norm_weight, down, gate_up, None, layout)
             freed += _release(
                 moe.routed_expert_down_proj, moe.shared_experts.gate_up_proj
             )
@@ -130,6 +289,8 @@ def _bind_moe(moe, in_norm: nn.Module, parts) -> tuple[list[str], int]:
         up = _dense_weight_kn(moe.routed_expert_up_proj, moe.moe_hidden_size)
         if up is not None:
             moe._static_fp8_latent_up = _pack(up, moe.routed_expert_norm.weight)
+            if layout is not None:
+                _bind_host_split(moe, None, None, None, up, layout)
             freed += _release(moe.routed_expert_up_proj)
             bound.append("latent_up")
     return bound, freed
@@ -167,11 +328,18 @@ def bind_static_fp8(model: nn.Module) -> None:
     counts = dict.fromkeys(sorted(parts), 0)
     spreads = {part: [] for part in counts}
     freed = 0
+    layout = _host_split_layout()
+    split_counts = {"front": 0, "latent_up": 0}
     for layer in model.model.layers:
         if isinstance(layer, PPMissingLayer):
             continue
         if isinstance(layer.mlp, KimiK3MoE):
-            bound, f = _bind_moe(layer.mlp, layer.post_attention_layernorm, parts)
+            bound, f = _bind_moe(
+                layer.mlp, layer.post_attention_layernorm, parts, layout
+            )
+            if layout is not None:
+                split_counts["front"] += layer.mlp._host_split_front is not None
+                split_counts["latent_up"] += layer.mlp._host_split_latent_up is not None
             for part in bound:
                 counts[part] += 1
                 norm_w = (
@@ -227,6 +395,14 @@ def bind_static_fp8(model: nn.Module) -> None:
             "Static fp8 input-scale headroom, max|g| / median|g| per part over "
             "the bound layers: %s",
             spread_summary,
+        )
+    if layout is not None:
+        logger.info(
+            "Kimi-K3 host-split single-token GEMVs (host-local index %d of %d) "
+            "bound per part (layers): %s",
+            layout[2],
+            layout[1],
+            split_counts,
         )
     unbound = sorted(part for part, n in counts.items() if n == 0)
     if unbound:

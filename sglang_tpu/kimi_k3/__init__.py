@@ -27,4 +27,11 @@ def static_fp8_parts() -> frozenset[str]:
         )
     if "all" in parts:
         parts = (parts - {"all"}) | STATIC_FP8_ALL_PARTS
+    # The host split slices the static fp8 copies of these two GEMVs.
+    missing = {"moe_front", "latent_up"} - parts
+    if tpu_envs.SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV.get() and missing:
+        raise ValueError(
+            "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV needs SGLANG_TPU_K3_STATIC_FP8 "
+            f"to include {sorted(missing)}"
+        )
     return frozenset(parts)
