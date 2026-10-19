@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -273,7 +274,7 @@ def scratch_shapes(spec, layout, cfg: KernelConfig):
         pltpu.VMEM((2, cfg.attn_tile, kvl), BF16),
         pltpu.VMEM((32, idh), BF16),
         pltpu.VMEM((32, idh), BF16),
-        pltpu.VMEM((L // spec.index_kpool, idh), F32),
+        pltpu.VMEM((2, cfg.attn_tile // spec.index_kpool, idh), F32),
         pltpu.VMEM(
             (cfg.n_query, L // cfg.attn_tile, cfg.attn_tile // spec.index_kpool), F32
         ),
@@ -851,8 +852,15 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         def dsa(x, d_i):
             kvb_cp = pltpu.make_async_copy(w_kvb.at[d_i], kvb, sgrp.at[3])
             kvb_cp.start()
-            pka_cp = pltpu.make_async_copy(c_ip.at[d_i], pka, sgrp.at[7])
-            pka_cp.start()
+
+            def pk_cp(t, b):
+                return pltpu.make_async_copy(
+                    c_ip.at[d_i, pl.ds(pl.multiple_of(t * PT, PT), PT)],
+                    pka.at[b],
+                    sgrp.at[6 + b],
+                )
+
+            pk_cp(0, 0).start()
             psc_cp = pltpu.make_async_copy(w_dsc.at[d_i], psc, sem_async.at[7])
             psc_cp.start()
             w_qakv_n, w_qb_n, _ = dsa_scale_widths(spec, tp)
@@ -936,8 +944,6 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             o_npk[d_i] = jnp.concatenate(fresh_keys, axis=0)
             pcol = jax.lax.broadcasted_iota(jnp.int32, (PT, 1), 0)
 
-            _wait(pka_cp, "kv_wait")
-
             if Q > 1:
                 iq_cat = jnp.concatenate(
                     [iq_all[qi].reshape(hi, idh) for qi in range(Q)], axis=0
@@ -949,7 +955,14 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 ).astype(F32)
 
             def score_tile(t, c):
-                pk = pka[pl.ds(pl.multiple_of(t * PT, PT), PT), :]
+                b = jax.lax.rem(t, 2)
+                _wait(pk_cp(t, b), "kv_wait")
+
+                @pl.when(t + 1 < nt)
+                def _():
+                    pk_cp(t + 1, 1 - b).start()
+
+                pk = pka[b]
                 for i in range(Q):
                     pk = jnp.where(
                         (pcol + t * PT == fp0 + i) & (i < fresh), fresh_keys[i], pk
@@ -1135,7 +1148,8 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 )
             return expert_copies(0, w_sgu.at[m_i], w_sdn.at[m_i])
 
-        def moe(x, m_i, kind, early):
+        def moe(x, m_i, kind, early, m_cands):
+            """`m_cands`: the MoE ordinals m_i can take here; the expert refs are per layer."""
             with _scope("router_wait"):
                 _wait(early[0], "e_wait")
             route_kw = dict(
@@ -1171,25 +1185,18 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
             # Entry 0 is the shared expert, whose copy moe_early already started.
             entries = [None] + list(range(n_slot))
 
-            def src_gu(e):
-                return w_sgu.at[m_i] if e is None else w_egu.at[base + safe[e]]
-
-            def src_dn(e):
-                return w_sdn.at[m_i] if e is None else w_edn.at[base + safe[e]]
-
-            def slot_copies(k):
+            def slot_copies(k, m=None):
+                """Slot k's copies from layer m's experts; any layer for a wait (same shapes)."""
                 e = entries[k]
-                if not CH_EXPERTS:
-                    return expert_copies(k % S, src_gu(e), src_dn(e))
                 if e is None:
                     return shared_copies(m_i)
-                row = base + safe[e]
+                m = m_cands[0] if m is None else m
                 return expert_copies(
                     k % S,
-                    w_egu.at[row],
-                    w_edn.at[row],
-                    w_egus.at[pl.ds(row, 1)],
-                    w_edns.at[pl.ds(row, 1)],
+                    w_egu[m].at[safe[e]],
+                    w_edn[m].at[safe[e]],
+                    w_egus.at[pl.ds(base + safe[e], 1)],
+                    w_edns.at[pl.ds(base + safe[e], 1)],
                 )
 
             n_e = len(entries)
@@ -1205,7 +1212,18 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
 
             def start(k):
                 def go():
-                    for c in slot_copies(k):
+                    if entries[k] is None or len(m_cands) == 1:
+                        for c in slot_copies(k):
+                            c.start()
+                        return
+                    for m in m_cands:
+
+                        @pl.when(m_i == m)
+                        def _(m=m):
+                            for c in slot_copies(k, m)[:2]:
+                                c.start()
+
+                    for c in slot_copies(k)[2:]:
                         c.start()
 
                 when(k, go)
@@ -1290,7 +1308,16 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 w_ddn, d_i, ffnsh, act, True, scale=psc[:, 2 * ffnsh : 2 * ffnsh + H]
             )
 
-        def layer(streams, L, kind, mlp_kind, next_kda=None, prewarmed=False, par=None):
+        def layer(
+            streams,
+            L,
+            kind,
+            mlp_kind,
+            next_kda=None,
+            prewarmed=False,
+            par=None,
+            moe_cands=None,
+        ):
             """`next_kda`: start that KDA layer's qkv during this FFN; `prewarmed`: ours was started so."""
             slab_kind = f"{kind}_{'sparse' if mlp_kind == 'moe' else 'dense'}"
             par = L % 2 if par is None else par
@@ -1339,7 +1366,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 )
             with _scope(mlp_kind):
                 m = (
-                    moe(x, moe_ord(L), slab_kind, early)
+                    moe(x, moe_ord(L), slab_kind, early, moe_cands or [moe_ord(L)])
                     if mlp_kind == "moe"
                     else dense(x, L)
                 )
@@ -1355,10 +1382,25 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         for L in range(n_dense):
             streams = layer(streams, L, "kda", "dense")
 
+        full_periods = min(
+            cfg.n_periods, max(0, (n_layers - spec.first_k_dense_replace) // 4)
+        )
+        f0 = spec.first_k_dense_replace
+
+        def cands(j):
+            return [moe_ord(f0 + 4 * q + j) for q in range(full_periods)]
+
         def period(p, s_):  # noqa: ARG001 - p is the traced period index
-            base = spec.first_k_dense_replace + 4 * p
-            f0 = spec.first_k_dense_replace
-            s_ = layer(s_, base, "dsa", "moe", next_kda=base + 1, par=f0 % 2)
+            base = f0 + 4 * p
+            s_ = layer(
+                s_,
+                base,
+                "dsa",
+                "moe",
+                next_kda=base + 1,
+                par=f0 % 2,
+                moe_cands=cands(0),
+            )
             s_ = layer(
                 s_,
                 base + 1,
@@ -1367,6 +1409,7 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 next_kda=base + 2,
                 prewarmed=True,
                 par=(f0 + 1) % 2,
+                moe_cands=cands(1),
             )
             s_ = layer(
                 s_,
@@ -1376,13 +1419,19 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
                 next_kda=base + 3,
                 prewarmed=True,
                 par=(f0 + 2) % 2,
+                moe_cands=cands(2),
             )
-            s_ = layer(s_, base + 3, "kda", "moe", prewarmed=True, par=(f0 + 3) % 2)
+            s_ = layer(
+                s_,
+                base + 3,
+                "kda",
+                "moe",
+                prewarmed=True,
+                par=(f0 + 3) % 2,
+                moe_cands=cands(3),
+            )
             return s_
 
-        full_periods = min(
-            cfg.n_periods, max(0, (n_layers - spec.first_k_dense_replace) // 4)
-        )
         streams = jax.lax.fori_loop(0, full_periods, period, streams)
 
         for L in range(spec.first_k_dense_replace + 4 * full_periods, n_layers):
@@ -1411,7 +1460,23 @@ def build(spec, layout, cfg: KernelConfig, slab: SlabIndex):
         o_hidden[...] = hidden
         o_logits[...] = mv_km(w_lm, 0, H, hidden)
 
-    return kernel
+    if not cfg.ch_experts:
+        raise NotImplementedError("the per-layer expert refs need ch_experts")
+    n_moe = sum(t == "sparse" for t in spec.mlp_layer_types)
+    names = list(inspect.signature(kernel).parameters)
+    n_in = names.index("o_logits")
+    packed = [n for n in names[:n_in] if n not in ("w_egu", "w_edn")]
+
+    def entry(*refs):
+        """Inputs, caches, then the per-layer gate_up and down expert refs; outputs and scratch."""
+        k = len(packed)
+        bound = dict(zip(packed, refs[:k]))
+        bound["w_egu"] = refs[k : k + n_moe]
+        bound["w_edn"] = refs[k + n_moe : k + 2 * n_moe]
+        bound.update(zip(names[n_in:], refs[k + 2 * n_moe :]))
+        return kernel(**bound)
+
+    return entry
 
 
 def _closing_pools(pos, Q, kp):

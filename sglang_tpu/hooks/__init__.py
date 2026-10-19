@@ -18,6 +18,7 @@ from sglang_tpu.hooks.attn_residual import (
     register_attn_residual_ops,
 )
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
+from sglang_tpu.hooks.cpu_pinning import pin_scheduler_main_thread
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
@@ -25,7 +26,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.glm_flash_megakernel import (
-    reserve_glm_flash_megakernel_experts,
+    drop_freed_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
@@ -60,6 +61,11 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
+        pin_scheduler_main_thread,
+        HookType.BEFORE,
+    ),
     (
         "sglang.srt.managers.scheduler.Scheduler.init_moe_gemm_config",
         initialize_dense_moe_config,
@@ -122,14 +128,14 @@ HOOKS: list[tuple] = [
         HookType.AFTER,
     ),
     (
-        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
-        reserve_glm_flash_megakernel_experts,
-        HookType.BEFORE,
-    ),
-    (
         "sglang_tpu.graph_runner.tpu_graph_runner.TpuGraphRunner.__init__",
         route_glm_flash_megakernel,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.mem_cache.memory_pool.ReqToTokenPool.free_rows",
+        drop_freed_glm_flash_megakernel_request,
+        HookType.BEFORE,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",
