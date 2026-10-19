@@ -670,6 +670,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 seq_lens=torch.tensor([11, 21], dtype=torch.int32),
                 req_pool_indices=rows,
                 req_pool_indices_cpu=rows,
+                req_to_token_pool=None,
             )
 
         future_map = MagicMock()
@@ -724,6 +725,51 @@ class TestExperimentalSpecHooks(CustomTestCase):
             build_disagg_block_input(lambda *a: sentinel, plain, bonus, future_map),
             sentinel,
         )
+
+    def test_pd_seed_resets_reused_gdn_checkpoint_offsets(self):
+        """A reused decode slot keeps its previous occupant's verify read offset;
+        the transferred GDN state sits in checkpoint row 0, so the seed resets it."""
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang_tpu.hooks.experimental_spec import _reset_pd_checkpoints
+        from sglang_tpu.mamba_pool import TpuMambaPool
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=8,
+            n_groups=1,
+            num_heads=2,
+            head_dim=4,
+            state_size=4,
+            conv_kernel=4,
+        )
+        mamba_pool = TpuMambaPool(
+            size=3,
+            spec_state_size=3,
+            cache_params=Mamba2CacheParams(
+                dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+                layers=[0],
+                shape=shape,
+            ),
+            mamba_layer_ids=[0],
+            device="cpu",
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        )
+        mamba_pool.checkpoint_read_offsets.fill_(2)
+        pool = MagicMock(spec=HybridReqToTokenPool)
+        pool.mamba_pool = mamba_pool
+        reqs = [
+            # Allocation stores a 0-d slot tensor.
+            SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=torch.tensor(i)))
+            for i in (1, 3)
+        ]
+        _reset_pd_checkpoints(SimpleNamespace(req_to_token_pool=pool, reqs=reqs))
+        self.assertEqual(mamba_pool.checkpoint_read_offsets.tolist(), [2, 0, 2, 0])
 
     def test_pd_carry_seed_writes_at_the_batch_bucket(self):
         """The decode-side carry write must keep the warmed bucket shape; padded

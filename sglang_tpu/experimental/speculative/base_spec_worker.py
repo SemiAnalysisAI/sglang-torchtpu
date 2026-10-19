@@ -52,7 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -203,7 +203,11 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
-        if self._target_has_linear_attn:
+        # A PD prefill server never verifies, so its mamba pool has no checkpoints.
+        if (
+            self._target_has_linear_attn
+            and get_disagg().disaggregation_mode != "prefill"
+        ):
             self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
             # Uploaded once, so each round only picks one (values stay data,

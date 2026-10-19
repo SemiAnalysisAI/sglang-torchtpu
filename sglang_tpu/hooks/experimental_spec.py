@@ -181,12 +181,30 @@ def _relay_disagg_seed(
     from sglang.srt.managers.overlap_utils import RelayPayload
 
     assert batch.enable_overlap
+    _reset_pd_checkpoints(batch)
     draft_input.future_indices = batch.req_pool_indices
     future_map.publish(draft_input.future_indices, batch.seq_lens)
     future_map.stash(
         draft_input.future_indices, RelayPayload.from_draft_input(draft_input)
     )
     return draft_input
+
+
+def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
+    # The transferred GDN state lands in checkpoint row 0 of each slot, but a
+    # reused decode slot keeps its previous read offset; prebuilt skips extend's clear.
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang_tpu.mamba_pool import TpuMambaPool
+
+    pool = batch.req_to_token_pool
+    if not isinstance(pool, HybridReqToTokenPool):
+        return
+    mamba_pool = pool.mamba_pool
+    assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+    if mamba_pool.checkpoint_read_offsets is not None:
+        mamba_pool.clear_slots(
+            torch.stack([req.kv.mamba_pool_idx.reshape(()) for req in batch.reqs])
+        )
 
 
 def stage_prefill_tokens(original, batch):
