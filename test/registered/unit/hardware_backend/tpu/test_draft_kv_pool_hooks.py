@@ -23,7 +23,8 @@ class TestDraftKvPoolHook(CustomTestCase):
     def test_draft_runner_takes_its_backend_pool(self):
         original = MagicMock(return_value="platform pool")
         draft = SimpleNamespace(
-            is_draft_worker=True, speculative_draft_attention_backend="pallas_tpu_rpa_v3"
+            is_draft_worker=True,
+            speculative_draft_attention_backend="pallas_tpu_rpa_v3",
         )
         with patch(
             "sglang_tpu.tpu_platform._mha_kv_pool_cls", return_value="rpa pool"
@@ -38,11 +39,15 @@ class TestDraftKvPoolHook(CustomTestCase):
                 is_draft_worker=False,
                 speculative_draft_attention_backend="pallas_tpu_rpa_v3",
             ),
-            SimpleNamespace(is_draft_worker=True, speculative_draft_attention_backend=None),
+            SimpleNamespace(
+                is_draft_worker=True, speculative_draft_attention_backend=None
+            ),
         ):
             with self.subTest(runner=runner):
                 original = MagicMock(return_value="platform pool")
-                self.assertEqual(draft_mha_pool_class(original, runner), "platform pool")
+                self.assertEqual(
+                    draft_mha_pool_class(original, runner), "platform pool"
+                )
                 original.assert_called_once_with(runner)
 
 
@@ -56,11 +61,16 @@ class TestDraftCellSizeHook(CustomTestCase):
         )
 
     def _cell_size(self, backend, config, layers=5, dtype=torch.bfloat16):
-        def generic(*, draft_model_config, draft_num_layers, draft_kv_cache_dtype, tp_size):
+        def generic(
+            *, draft_model_config, draft_num_layers, draft_kv_cache_dtype, tp_size
+        ):
             heads = draft_model_config.get_num_kv_heads(tp_size)
             dims = draft_model_config.head_dim + draft_model_config.v_head_dim
-            return heads * dims * draft_num_layers * torch._utils._element_size(
-                draft_kv_cache_dtype
+            return (
+                heads
+                * dims
+                * draft_num_layers
+                * torch._utils._element_size(draft_kv_cache_dtype)
             )
 
         spec = SimpleNamespace(speculative_draft_attention_backend=backend)

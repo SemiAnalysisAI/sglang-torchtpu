@@ -48,7 +48,10 @@ class TestSpecTpSyncHook(CustomTestCase):
 
         with patch.dict(
             sys.modules,
-            {"torch_tpu": types.ModuleType("torch_tpu"), "torch_tpu._internal": internal},
+            {
+                "torch_tpu": types.ModuleType("torch_tpu"),
+                "torch_tpu._internal": internal,
+            },
         ):
             out = broadcast_undeferred(original, "sync", "site", torch.zeros(2))
         self.assertEqual(modes, ["DEFER_NEVER"])
