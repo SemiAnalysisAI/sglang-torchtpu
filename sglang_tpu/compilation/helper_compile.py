@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU helper compilation: no dynamic-shape helpers, static helpers via compiled_op."""
+"""TPU helper compilation: no dynamic-shape helpers."""
 
 from __future__ import annotations
 
@@ -11,11 +11,6 @@ class TpuHelperCompilePolicy(HelperCompilePolicy):
         # torch_tpu has no dynamic-shape compile; inside a compiled model graph
         # the helper is traced inline anyway.
         return fn
-
-    def compile_static_helper(self, fn, *, warmup, model, uses_rng):
-        from sglang.srt.compilation.compiled_op import compiled_op
-
-        return compiled_op(warmup=warmup, model=model, uses_rng=uses_rng)(fn)
 
 
 TPU_HELPER_COMPILE_POLICY = TpuHelperCompilePolicy()

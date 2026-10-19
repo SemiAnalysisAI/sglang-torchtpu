@@ -78,19 +78,15 @@ class TestPlatformCapabilities(CustomTestCase):
     def test_fork_fields_default_to_non_tpu_behaviour(self):
         """An adopting PR swaps `_is_tpu` for the field; a wrong default changes CUDA."""
         caps = SRTPlatform.capabilities
-        self.assertFalse(caps.kv_index_tables_on_host)
-        self.assertFalse(caps.static_shapes)
         self.assertFalse(caps.uniform_dp_padding)
         self.assertFalse(caps.rank_uniform_graphs)
         self.assertTrue(caps.device_p2p)
         self.assertTrue(caps.traces_raw_collectives)
-        self.assertTrue(caps.boolean_mask_assignment)
-        self.assertTrue(caps.fp8_bmm)
 
     def test_record_is_frozen_and_keyword_only(self):
         caps = PlatformCapabilities()
         with self.assertRaises(AttributeError):
-            caps.static_shapes = True
+            caps.uniform_dp_padding = True
         with self.assertRaises(TypeError):
             PlatformCapabilities(True)
         with self.assertRaises(TypeError):
@@ -119,14 +115,10 @@ class TestTpuCapabilities(CustomTestCase):
         self.assertEqual(
             changed,
             {
-                "kv_index_tables_on_host": True,
-                "static_shapes": True,
                 "uniform_dp_padding": True,
                 "rank_uniform_graphs": True,
                 "device_p2p": False,
                 "traces_raw_collectives": False,
-                "boolean_mask_assignment": False,
-                "fp8_bmm": False,
             },
         )
 

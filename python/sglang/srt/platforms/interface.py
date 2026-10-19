@@ -50,13 +50,7 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     graph_capture: bool = False
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
-    # Fork-local fields below; each default is today's non-TPU behaviour. A field
-    # no core code reads yet is a seam awaiting its consumer: the PR adopting it
-    # checks each platform's value.
-    # req_to_token, the SWA index mapping and decode out_cache_loc live on the host.
-    kv_index_tables_on_host: bool = False
-    # Every new tensor shape compiles a program; core keeps shapes bucketed and static.
-    static_shapes: bool = False
+    # Fork-local fields below; each default is today's non-TPU behaviour.
     # DP gather/scatter supports only equal per-rank blocks (DpPaddingMode.MAX_LEN).
     uniform_dp_padding: bool = False
     # Compiled programs must be identical on every rank; no rank-dependent branches.
@@ -65,10 +59,6 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     device_p2p: bool = True
     # Dynamo can trace raw torch.distributed (c10d functional) collectives.
     traces_raw_collectives: bool = True
-    # In-place boolean-mask index assignment (x[mask] = v) lowers on the device.
-    boolean_mask_assignment: bool = True
-    # An fp8 x fp8 batched matmul kernel exists (MLA weight-absorb paths).
-    fp8_bmm: bool = True
 
 
 class SRTPlatform(DeviceMixin):

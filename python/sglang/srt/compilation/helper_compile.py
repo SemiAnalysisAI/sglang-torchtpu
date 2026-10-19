@@ -15,12 +15,10 @@ import torch
 __all__ = [
     "DEFAULT_HELPER_COMPILE_POLICY",
     "HelperCompilePolicy",
-    "WarmupArgsFactory",
     "maybe_compile",
 ]
 
 F = TypeVar("F", bound=Callable[..., Any])
-WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
 
 
 class HelperCompilePolicy:
@@ -42,20 +40,6 @@ class HelperCompilePolicy:
         if backend is not None:
             kwargs["backend"] = backend
         return torch.compile(fn, dynamic=dynamic, **kwargs)
-
-    def compile_static_helper(
-        self,
-        fn: F,
-        *,
-        warmup: WarmupArgsFactory | None,
-        model: torch.nn.Module | None,
-        uses_rng: bool,
-    ) -> F:
-        """Compile a fixed-shape helper with an optional warmup-input recipe.
-
-        Platforms without ahead-of-time helper compilation run it eagerly.
-        """
-        return fn
 
 
 DEFAULT_HELPER_COMPILE_POLICY = HelperCompilePolicy()
