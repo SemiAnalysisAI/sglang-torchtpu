@@ -69,6 +69,9 @@ class TpuEnvs:
     # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
     # soon as the row's last expert is done (MKConfig.y_early).
     SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
+    # Raiden HiCache transfers move each run of pages that is consecutive on both the
+    # device and the host as one segment instead of one segment per page.
+    SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -29,6 +29,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -38,6 +39,18 @@ logger = logging.getLogger(__name__)
 
 # Marketing name surfaced as ``layout`` for logs / compatibility reads.
 RAIDEN_LAYOUT = "fused_raiden"
+
+
+def page_runs(
+    src_pages: List[int], dst_pages: List[int]
+) -> tuple[List[int], List[int], List[int]]:
+    """Split paired page lists into maximal runs that advance by one page on both
+    sides: ``(src starts, dst starts, run lengths)``."""
+    src, dst = np.asarray(src_pages), np.asarray(dst_pages)
+    breaks = np.flatnonzero((np.diff(src) != 1) | (np.diff(dst) != 1)) + 1
+    starts = np.concatenate(([0], breaks))
+    lengths = np.diff(np.concatenate((starts, [len(src)])))
+    return src[starts].tolist(), dst[starts].tolist(), lengths.tolist()
 
 
 class TpuRaidenHostKVCache(HostKVCache):
@@ -79,6 +92,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.layout = RAIDEN_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
+        self.coalesce_pages = tpu_envs.SGLANG_TPU_RAIDEN_COALESCE_PAGES.get()
 
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
@@ -205,7 +219,10 @@ class TpuRaidenHostKVCache(HostKVCache):
         """D2H for all layers in one raiden call; returns its future-event."""
         device_pages = self._to_page_ids(device_indices)
         host_pages = self._to_page_ids(host_indices)
-        return self.transfer.backup(device_pages, host_pages)
+        if not (self.coalesce_pages and device_pages):
+            return self.transfer.backup(device_pages, host_pages)
+        device_starts, host_starts, num_pages = page_runs(device_pages, host_pages)
+        return self.transfer.backup(device_starts, host_starts, num_pages=num_pages)
 
     def load_all_layer(
         self, device_pool, host_indices, device_indices
@@ -213,7 +230,10 @@ class TpuRaidenHostKVCache(HostKVCache):
         """H2D for all layers in one raiden call; returns its future-event."""
         host_pages = self._to_page_ids(host_indices)
         device_pages = self._to_page_ids(device_indices)
-        return self.transfer.load(host_pages, device_pages)
+        if not (self.coalesce_pages and host_pages):
+            return self.transfer.load(host_pages, device_pages)
+        host_starts, device_starts, num_pages = page_runs(host_pages, device_pages)
+        return self.transfer.load(host_starts, device_starts, num_pages=num_pages)
 
     def load_to_device_per_layer(
         self,
