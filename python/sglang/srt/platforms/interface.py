@@ -50,7 +50,9 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     graph_capture: bool = False
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
-    # Fork-local fields below; each default is today's non-TPU behaviour.
+    # Fork-local fields below; each default is today's non-TPU behaviour. A field
+    # no core code reads yet is a seam awaiting its consumer: the PR adopting it
+    # checks each platform's value.
     # req_to_token, the SWA index mapping and decode out_cache_loc live on the host.
     kv_index_tables_on_host: bool = False
     # Every new tensor shape compiles a program; core keeps shapes bucketed and static.
