@@ -97,6 +97,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 "sglang.srt.sampling.sampling_batch_info.get_exec", return_value=context
             )
         )
+        from sglang.srt.runtime_context import get_context
+
+        stack.enter_context(get_context().override_server_args(pp_size=1))
         stack.enter_context(
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True)
         )
@@ -254,6 +257,19 @@ class TestExperimentalSpecHooks(CustomTestCase):
             served = self.batch([1], spec_algorithm=algorithm)
             self.assertIs(served.host_pad_bs, _pad)
             self.assertIsInstance(served.sampling_info, HostPaddedSamplingInfo)
+
+    def test_draft_pp_scope_keeps_the_configured_batch_route(self):
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        # A PP=2 target keeps DSpark on the compatibility worker; the draft's
+        # one-stage PP group must not switch its batches to host padding.
+        with (
+            get_context().override_server_args(pp_size=2),
+            get_parallel().override(pp_size=1),
+        ):
+            batch = self.batch([1])
+        self.assertFalse(hasattr(batch, "host_pad_bs"))
+        self.assertIs(type(batch.sampling_info), SamplingBatchInfo)
 
     def test_prefill_staging_and_allocation_remain_on_host(self):
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
