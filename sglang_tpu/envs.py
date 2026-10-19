@@ -29,6 +29,11 @@ class TpuEnvs:
     # Run those static fp8 GEMVs as one Pallas kernel for decode-sized batches
     # (kernels/static_fp8_gemv.py); False keeps the XLA fp8 dot for every batch.
     SGLANG_TPU_ENABLE_K3_STATIC_FP8_PALLAS_GEMV = EnvBool(True)
+    # Kimi-K3 single-token decode: split the replicated latent down / up-proj
+    # and router gate GEMVs by output columns across the ranks of a host and
+    # exchange the columns inside the host (host_split_gemv.py). Needs
+    # SGLANG_TPU_K3_STATIC_FP8 moe_front and latent_up (checked at startup).
+    SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV = EnvBool(False)
     # MoE: one fused kernel for single-token packed-MXFP4 decode
     # (moe/pallas/single_token_moe.py); False keeps the gmm_v2 path.
     SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL = EnvBool(True)
@@ -68,6 +73,17 @@ class TpuEnvs:
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
     # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
+    # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
+    # keep the bf16 weights. Changes the draft's proposals, not verification.
+    SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
+
+    # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
+    # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
+    SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
+    # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
+    # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
+    SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
 
     # PD disaggregation (raiden)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,
