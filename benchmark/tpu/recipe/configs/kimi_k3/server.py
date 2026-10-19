@@ -45,6 +45,8 @@ CONFIG["server_args"].update(
         "tpu_compile_bs": [1, CONCURRENCY],
         "mem_fraction_static": 0.75,
         "trust_remote_code": True,
+        "reasoning_parser": "kimi_k3",
+        "tool_call_parser": "kimi_k3",
         "mamba_ssm_dtype": "bfloat16",
         "scheduler_recv_interval": 16,
         # Each rank reads only its own experts instead of mapping every shard.

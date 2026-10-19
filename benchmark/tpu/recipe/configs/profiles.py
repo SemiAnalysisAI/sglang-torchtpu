@@ -81,6 +81,9 @@ PROFILES = {
         prefill_tokens=1024,
         decode_bs=(1,),
     ),
+    "long_8k1k_c1": _profile(
+        input_tokens=8192, output_tokens=1024, concurrency=1, prefill_tokens=1024
+    ),
     "long_8k1k_c4": _profile(
         input_tokens=8192,
         output_tokens=1024,
