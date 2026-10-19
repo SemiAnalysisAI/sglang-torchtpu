@@ -229,6 +229,13 @@ def register() -> None:
     if not current_platform.is_tpu():
         return
 
+    # Register the tokenizer adapter before tokenizer and worker processor loading.
+    from sglang_tpu.models.muse_spark_hf_processor import (
+        register_muse_spark_processor,
+    )
+
+    register_muse_spark_processor()
+
     from sglang.srt.plugins.hook_registry import HookRegistry
 
     for target, hook, hook_type in HOOKS:
