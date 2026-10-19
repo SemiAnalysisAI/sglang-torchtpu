@@ -235,9 +235,10 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
                 )
             vision_embeds = vision_embeds[..., : self.vision_out_dim]
 
-        # The ViT runner stages its output on the host; the bridge projection
-        # weights only exist on device.
-        if _is_tpu and vision_embeds.device.type == "cpu":
+        # The TPU ViT runner stages its output on the host; the bridge
+        # projection weights live on the device. Backends that keep the
+        # embeds and the weights on the same device skip the move.
+        if vision_embeds.device != self.linear_proj[0].weight.device:
             vision_embeds = vision_embeds.to(self.linear_proj[0].weight.device)
         vision_embeds = self.linear_proj(vision_embeds)
         if self.norm_query_embeds:
