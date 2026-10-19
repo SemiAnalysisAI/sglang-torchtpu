@@ -387,6 +387,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+from sglang_tpu.diag_timing import maybe_log as _dlog, timed as _dt  # DIAG
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2099,7 +2100,6 @@ class Scheduler(
                 break
 
             # Receive requests
-            from sglang_tpu.diag_timing import maybe_log as _dlog, timed as _dt
             _dlog()
             with _dt("1_ingest"):
                 self.ingest_requests()
@@ -2147,7 +2147,9 @@ class Scheduler(
                 break
 
             # Receive requests
-            self.ingest_requests()
+            _dlog()
+            with _dt("1_ingest"):
+                self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2158,9 +2160,10 @@ class Scheduler(
                 assert len(self.result_queue) <= 1
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with _dt("2_get_next_batch"):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
