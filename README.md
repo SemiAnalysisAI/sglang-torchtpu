@@ -26,14 +26,49 @@ SGLang-TorchTPU brings [SGLang](https://github.com/sgl-project/sglang) to Google
 
 ## Get started
 
-On a TPU7x host with `torch_tpu` and `libtpu` installed using the versions in [the TPU dependency manifest](python/pyproject_tpu.toml), install the engine and TPU plugin from source:
+### Docker
+
+Pull the TPU image, which has the engine and TPU plugin installed:
+
+```bash
+docker pull lmsysorg/sglang:v0.1.0-tpu
+```
+
+On a TPU7x host, start a container with access to the TPU chips:
+
+```bash
+docker run -it --rm --privileged --net=host --shm-size=64g \
+  -e SGLANG_PLATFORM=tpu_oot \
+  lmsysorg/sglang:v0.1.0-tpu
+```
+
+The container starts in the repository root, `/sgl-workspace/sglang`.
+
+### pip
+
+On a TPU7x host (Linux x86_64, Python 3.11 to 3.14), install the engine and TPU plugin wheels from the [v0.1.0 release](https://github.com/sgl-project/sglang-torchtpu/releases/tag/tpu-v0.1.0). Install both together: `sglang` here is this repository's build, not the PyPI package.
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+  https://github.com/sgl-project/sglang-torchtpu/releases/download/tpu-v0.1.0/sglang-0.5.22-py3-none-any.whl \
+  https://github.com/sgl-project/sglang-torchtpu/releases/download/tpu-v0.1.0/sglang_tpu-0.1.0-py3-none-any.whl
+```
+
+The serving recipes below live in the repository, so clone it to run them.
+
+### From source
+
+On a TPU7x host, install the engine with [the TPU dependency manifest](python/pyproject_tpu.toml), then the TPU plugin:
 
 ```bash
 git clone https://github.com/sgl-project/sglang-torchtpu.git
 cd sglang-torchtpu
-pip install -e python/
+cp python/pyproject_tpu.toml python/pyproject.toml
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
 pip install --no-deps -e .
 ```
+
+### Launch a server
 
 From the repository root, launch GPT-OSS-20B with the single-host serving recipe, configured for 4 chips and 8 TensorCores:
 
