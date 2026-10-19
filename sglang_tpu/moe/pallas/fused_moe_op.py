@@ -80,7 +80,7 @@ _PALLAS_MOE_OP = None
 #
 # JAX is imported inside each function body, not at module scope, so importing
 # ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
-# this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
+# this module are TPU-only: ``TpuUnquantizedFusedMoEMethod.forward_tpu`` and the
 # op registration in the plugin MoE methods' ``create_moe_runner``).
 
 

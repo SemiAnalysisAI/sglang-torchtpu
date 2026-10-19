@@ -60,7 +60,7 @@ class _MethodWithFakeRunnerConfig(TpuUnquantizedFusedMoEMethod):
 
 
 class _MoeMockRunner:
-    """Test harness ("mock runner") for ``UnquantizedFusedMoEMethod.forward_tpu``.
+    """Test harness ("mock runner") for ``TpuUnquantizedFusedMoEMethod.forward_tpu``.
 
     Encapsulates the setup that every forward_tpu test shares:
 

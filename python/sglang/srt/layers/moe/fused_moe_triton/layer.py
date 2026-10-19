@@ -87,7 +87,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
-    is_tpu,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -96,7 +95,6 @@ _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Log the deferred-finalize config at most once per process (rank). Different MoE

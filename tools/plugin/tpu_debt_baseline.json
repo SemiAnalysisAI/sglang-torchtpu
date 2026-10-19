@@ -14,7 +14,6 @@
     "python/sglang/srt/layers/layer_boundary/prepare.py": 3,
     "python/sglang/srt/layers/linear.py": 8,
     "python/sglang/srt/layers/logits_processor.py": 9,
-    "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": 2,
     "python/sglang/srt/layers/moe/hash_topk.py": 5,
     "python/sglang/srt/layers/moe/token_dispatcher/standard.py": 3,
     "python/sglang/srt/layers/moe/topk.py": 11,
