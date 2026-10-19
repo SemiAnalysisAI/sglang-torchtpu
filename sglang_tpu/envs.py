@@ -43,6 +43,10 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # Sparse MLA: pooled-DSA batches of 512+ tokens (prefill) through the
+    # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
+    # each block's union of selected pages once; False keeps the per-query kernel.
+    SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -68,6 +72,12 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
+    # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
+    # without speculation) as one Pallas call per device (glm_flash_megakernel/).
+    # Needs one running request and the radix cache off; ..._MAX_LEN caps the
+    # request length.
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(16384)
 
     # Speculative decoding
     # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
