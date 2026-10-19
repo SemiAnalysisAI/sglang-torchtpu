@@ -66,11 +66,10 @@ class PDSpecRecompileTestCase(PDSingleHostTestCase):
     self_hostname = staticmethod(_self_hostname)
     decode_host_env = "PD_DECODE_HOST"
 
-    @classmethod
-    def get_runtime_envs(cls) -> dict[str, str | None]:
-        # CI-only FutureMap debug asserts scatter into live rows eagerly, one
-        # program per live bs; these servers measure production serving.
-        return {**super().get_runtime_envs(), "SGLANG_IS_IN_CI": None}
+    # A class attribute, not get_runtime_envs: the decode role launches from it.
+    # CI-only FutureMap debug asserts scatter into live rows eagerly, one program
+    # per live bs; these servers measure production serving.
+    runtime_envs: ClassVar[dict[str, str | None]] = {"SGLANG_IS_IN_CI": None}
 
     @classmethod
     def check_server_configuration(cls) -> None:

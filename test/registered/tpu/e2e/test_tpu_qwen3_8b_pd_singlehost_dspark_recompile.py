@@ -35,10 +35,7 @@ class TestQwen3_8bDsparkPdServesWithoutRecompile(base.PDSpecRecompileTestCase):
     tag = "pd-sh-q3-8b-dspark-rc"
     log_path = "/tmp/pd_qwen3_8b_dspark_prefill.log"
     decode_log_path = "/tmp/pd_qwen3_8b_dspark_decode.log"
-
-    @classmethod
-    def get_runtime_envs(cls) -> dict[str, str | None]:
-        return {**super().get_runtime_envs(), "MODEL": MODEL_PATH}
+    runtime_envs = {**base.PDSpecRecompileTestCase.runtime_envs, "MODEL": MODEL_PATH}
 
 
 class TestQwen3_8bDsparkPdGateConfiguration(base.PDSpecGateConfigurationTestCase):
