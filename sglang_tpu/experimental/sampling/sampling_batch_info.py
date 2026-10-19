@@ -103,6 +103,11 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             self.logit_bias, rows, 0.0, is_pin_memory_available(self.device)
         ).to(self.device, non_blocking=True)
 
+    def _apply_post_grammar_logits_transforms(self, logits):
+        bias = self.device_logit_bias(logits.shape[0])
+        if bias is not None:
+            logits.add_(bias)
+
     def on_device(self) -> SamplingBatchInfo:
         """This info with the sampling param tensors on self.device; HOST_PADDED keeps its bucket rows."""
         moved = {

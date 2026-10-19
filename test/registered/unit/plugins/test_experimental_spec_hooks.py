@@ -204,6 +204,25 @@ class TestExperimentalSpecHooks(CustomTestCase):
             info.device_logit_bias(16), torch.nn.functional.pad(expected, (0, 0, 0, 8))
         )
 
+    def test_prefill_preprocessing_adds_bias_at_the_bucket_rows(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        batch = self.batch([2, 5, 8])
+        batch.reqs[0].sampling_params.logit_bias = {"1": 2.0}
+        batch.reqs[2].sampling_params.logit_bias = {"3": -4.0}
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        # Extend logits keep the batch bucket's rows; the bias holds live host rows.
+        logits = torch.zeros((4, 32))
+        ModelRunner._preprocess_logits(
+            None,
+            LogitsProcessorOutput(next_token_logits=logits),
+            batch.sampling_info.copy_for_forward(),
+        )
+        expected = torch.zeros((4, 32))
+        expected[0, 1] = 2.0
+        expected[2, 3] = -4.0
+        torch.testing.assert_close(logits, expected)
+
     def test_host_padding_follows_the_worker_not_the_algorithm(self):
         """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
         with one, every algorithm's batches are host padded."""
