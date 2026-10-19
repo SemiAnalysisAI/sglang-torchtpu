@@ -689,6 +689,25 @@ measured on a server launched as in 3.7.1. Measured 2026-10-18 on main
 | `chat_1k1k_c4` | 4 | 769 ms | 16.34 ms | 2026-10-18 |
 | DSpark, `long_8k1k_c1` | 1 | - | - | not yet published |
 
-A 1k-in / 8k-out request on the same server decodes at 7.81 ms TPOT. Accuracy
-with the K3 kernels on: GSM8K 0.976 (1319 questions; 0.976 with them off) and
-AIME26 90.0% (30 problems, temperature 0.6).
+A 1k-in / 8k-out request on the same server decodes at 7.81 ms TPOT.
+
+#### 3.7.5 Accuracy
+
+The K3 kernels change the decode math (fp8 GEMVs, a different all-reduce order),
+so accuracy was checked against main with them off, on the same four hosts. The
+long-reasoning runs used `--context-length 65536` and are otherwise the 3.7.1
+server.
+
+| Benchmark | Setting | K3 kernels on | K3 kernels off | Measured on |
+| --- | --- | --- | --- | --- |
+| GSM8K | 1319 questions, greedy | 0.976 | 0.976 | 2026-10-17 |
+| AIME26 | 30 problems x 4 samples, temperature 0.6, top_p 0.95, 61440 tokens | pass@1 90.0%, maj@4 100% | pass@1 85.0%, maj@4 95.8% | 2026-10-17 |
+| AIME26 | 30 problems x 1 sample, same sampling | 90.0% | - | 2026-10-18 |
+| MMMU-Pro (standard, 10 options) | 200 sampled questions, 16384 tokens | 81.0% | - | 2026-10-17 |
+| MMMU-Pro (standard, 10 options) | the 41 of those 200 that both runs answered | 36 / 41 | 34 / 41 | 2026-10-17 |
+
+- The AIME26 x 4 and MMMU-Pro runs predate the host-split GEMVs (#1478); the
+  AIME26 x 1 run has every kernel in the commands above.
+- Judge long reasoning on sampled, repeated runs. A single greedy pass on AIME26
+  swings by more than ten points between builds that score the same when sampled.
+- 9.5% of the MMMU-Pro answers hit the 16384-token limit; raise it for a full run.
