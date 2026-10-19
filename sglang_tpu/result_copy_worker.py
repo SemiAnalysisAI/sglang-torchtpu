@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
@@ -106,6 +107,9 @@ class TPUAsyncCopyWorker:
             elif isinstance(draft_input, DFlashDraftInputV2):
                 tail = draft_input.draft_kv_write_tail
             draft_tail = None
+            # DIAG (remove): SGLANG_TPU_DIAG_SKIP_DRAFT_TAIL=1 skips the tail copy.
+            if os.environ.get("SGLANG_TPU_DIAG_SKIP_DRAFT_TAIL") == "1":
+                tail = None
             if self.copy_draft_tail and tail is not None:
                 draft_tail = tail.to("cpu", non_blocking=True)
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.
