@@ -23,6 +23,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.experimental_spec import hook_specs
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
+from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -102,6 +103,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.layers.layer_boundary.residual.mhc.MHCState.__init__",
         wire_hc_ffn_post_pre,
         HookType.BEFORE,
+    ),
+    (
+        "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
+        bind_glm5_next_kda_weights,
+        HookType.AFTER,
     ),
     (
         "sglang.srt.models.glm5_next.Glm5NextDecoderLayer._hc_pre",

@@ -130,6 +130,9 @@ class AcceptResult(NamedTuple):
       window_tokens: flat [pbs * (N + 1)] accept_tokens with 0 for -1, for a
         commit that rewrites the whole verify window (EAGLE3 draft extend).
       window_seq_lens: [pbs] seq_lens + N + 1, the length once that window is written.
+      live_mask: [pbs] bool, False on padded rows.
+      last_steps: [pbs] int64 accept_lens - 1, the verify step each row's
+        linear-attention state commits (-1 on padded rows).
     """
 
     num_correct_drafts: torch.Tensor
@@ -139,6 +142,8 @@ class AcceptResult(NamedTuple):
     next_seq_lens: torch.Tensor
     window_tokens: torch.Tensor
     window_seq_lens: torch.Tensor
+    live_mask: torch.Tensor
+    last_steps: torch.Tensor
 
 
 class DraftBlockInputs(NamedTuple):

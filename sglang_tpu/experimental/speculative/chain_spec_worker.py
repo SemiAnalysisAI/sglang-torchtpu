@@ -210,11 +210,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
             draft_runner=self._draft_runner,
             spec_algorithm=self._spec_algorithm,
             inputs=build_chain_block_inputs(
-                accept.accept_tokens.clamp_min(0),
-                rows,
-                state.seq_lens,
-                state.req_pool_indices != 0,
-                0,
+                accept.window_tokens, rows, state.seq_lens, accept.live_mask, 0
             ),
             req_pool_indices=state.req_pool_indices,
             verify_input=verify_input,
@@ -358,7 +354,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 )
                 warmup_compiled_op(
                     build_chain_block_inputs,
-                    accept_tokens.clamp_min(0),
+                    # Flat, as AcceptResult.window_tokens arrives.
+                    accept_tokens.reshape(-1),
                     rows,
                     torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     torch.ones((pbs,), dtype=torch.bool, device=self.device),
