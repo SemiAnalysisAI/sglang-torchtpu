@@ -8,6 +8,12 @@ from sglang.srt.speculative.spec_common import seeded_verify_coins
 
 _MASK32 = 0xFFFFFFFF
 
+# Verify coins hash columns [0, draft_token_num] at the committed length and the
+# target sampler column 0 at its position. A draft drawn in one of those columns
+# at a later position would reuse the coin a following verify step reads there,
+# correlating acceptance with the rejected draft and biasing the output.
+DRAFT_COLUMN = _MASK32
+
 
 def _mul32(value, constant):
     # Keep every intermediate below signed-int64 overflow.
@@ -84,9 +90,17 @@ def sample_categorical(weights, coins):
     return (cumulative <= threshold[:, None]).sum(-1).clamp_max(weights.shape[-1] - 1)
 
 
+def _sample_at_column(weights, seed, positions, column):
+    columns = torch.full((1,), column, dtype=torch.int64, device=positions.device)
+    return sample_categorical(weights, _uniforms(seed, positions, columns)[:, 0])
+
+
 @compiled_op()
 def sample_with_seed(weights, seed, positions):
-    coins = _uniforms(
-        seed, positions, torch.zeros(1, dtype=torch.int64, device=positions.device)
-    )[:, 0]
-    return sample_categorical(weights, coins)
+    return _sample_at_column(weights, seed, positions, 0)
+
+
+@compiled_op()
+def sample_draft_with_seed(weights, seed, positions):
+    """Seeded draft draws, keyed apart from every verify and target coin."""
+    return _sample_at_column(weights, seed, positions, DRAFT_COLUMN)

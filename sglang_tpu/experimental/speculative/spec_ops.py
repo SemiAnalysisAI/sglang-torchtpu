@@ -23,7 +23,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
     map_carry,
 )
-from sglang_tpu.sampling.seeded import sample_categorical, sample_with_seed
+from sglang_tpu.sampling.seeded import sample_categorical, sample_draft_with_seed
 from sglang_tpu.sampling_mask import tpu_filter_probs
 from sglang_tpu.spec_op_warmup import SpecOpWarmupContext
 
@@ -49,16 +49,17 @@ def sample_tokens(
     sampling_seed=None,
     positions=None,
 ) -> torch.Tensor:
-    """Sample one token per row of [pbs, V] logits; rows with top_k <= 1 take argmax.
+    """Sample one draft token per [pbs, V] logits row; rows with top_k <= 1 take argmax.
 
     Uses the exponential race argmax(p / E), E ~ Exp(1), instead of multinomial
-    so the op lowers to a fixed-shape argmax on TPU.
+    so the op lowers to a fixed-shape argmax on TPU. Seeded rows draw from the
+    draft hash column, never a coin that verify or the target sampler reads.
     """
     greedy = torch.argmax(logits, dim=-1)
     temps = temperatures.float().clamp_min(1e-5)[:, None]
     probs = torch.softmax(logits.float() / temps, dim=-1)
     if sampling_seed is not None:
-        sampled = sample_with_seed(probs, sampling_seed, positions)
+        sampled = sample_draft_with_seed(probs, sampling_seed, positions)
     else:
         sampled = (
             _exponential_race(probs)

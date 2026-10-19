@@ -4,6 +4,8 @@
 import random
 import struct
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -13,10 +15,13 @@ from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_sampled,
     sample_tokens,
 )
+from sglang_tpu.sampling import seeded
 from sglang_tpu.sampling.seeded import (
+    DRAFT_COLUMN,
     hash_to_uniform,
     murmur_hash32,
     sample_categorical,
+    sample_draft_with_seed,
     sample_with_seed,
     verify_coins,
 )
@@ -86,7 +91,7 @@ class TestSeededSampling(CustomTestCase):
             torch.cat([positions[order], torch.zeros(1, dtype=torch.int64)]),
         )
         self.assertTrue(torch.equal(padded[:3], baseline[order]))
-        # The draft sampler consumes the same per-request/position categorical draw.
+        # The draft sampler draws per request and position too, from the draft column.
         actual = sample_tokens(
             weights.log(),
             torch.ones(3),
@@ -94,7 +99,61 @@ class TestSeededSampling(CustomTestCase):
             sampling_seed=seeds,
             positions=positions,
         )
-        self.assertTrue(torch.equal(actual, baseline))
+        self.assertTrue(
+            torch.equal(actual, sample_draft_with_seed(weights, seeds, positions))
+        )
+
+    def test_draft_draws_never_reuse_a_verify_or_target_coin(self):
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        gamma, vocab = 3, 5
+        num_verify_rows = gamma + 1
+        seeds = torch.tensor([7, -3])
+        seq_lens = torch.tensor([10, 20])
+        keys = {"draft": set(), "verify": set(), "target": set()}
+        site = []
+
+        def recording(seed, positions, columns):
+            keys[site[-1]].update(
+                (s, p, c)
+                for s, p in zip(seed.tolist(), positions.tolist())
+                for c in columns.tolist()
+            )
+            return hash_to_uniform(murmur_hash32(seed, positions, columns))
+
+        class _BlockDraft:
+            def sample_drafts(self, *, block_hidden, bonus_tokens, sampler):
+                del bonus_tokens
+                drafts = [sampler(block_hidden[:, k], k) for k in range(gamma)]
+                return torch.stack(drafts, dim=1), block_hidden
+
+        worker = SimpleNamespace(
+            _block_draft_worker=_BlockDraft(),
+            _tp_sync=SimpleNamespace(sync=lambda _site, tokens: tokens),
+        )
+        with patch.object(seeded, "_uniforms", recording):
+            # One row rejects at every draft index in turn, the other accepts all.
+            for rejected_at in range(gamma + 1):
+                site.append("target")
+                sample_with_seed(torch.ones(2, vocab), seeds, seq_lens - 1)
+                site.append("draft")
+                TpuBlockSpecWorker._sample_draft_block(
+                    worker,
+                    torch.zeros(2, gamma, vocab),
+                    torch.zeros(2, dtype=torch.int64),
+                    torch.ones(2),
+                    torch.full((2,), vocab),
+                    sampling_seed=seeds,
+                    seq_lens=seq_lens,
+                )
+                site.append("verify")
+                verify_coins(seeds, seq_lens, num_verify_rows)
+                seq_lens = seq_lens + torch.tensor([rejected_at, gamma]) + 1
+        self.assertTrue(keys["draft"])
+        self.assertEqual({column for *_, column in keys["draft"]}, {DRAFT_COLUMN})
+        self.assertFalse(keys["draft"] & (keys["verify"] | keys["target"]))
 
     def test_inverse_cdf_skips_zero_mass_bins_at_both_edges(self):
         weights = torch.tensor([[0.0, 2.0, 0.0, 1.0, 0.0]]).repeat(3, 1)
