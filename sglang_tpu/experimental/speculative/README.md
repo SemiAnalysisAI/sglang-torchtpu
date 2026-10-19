@@ -133,5 +133,8 @@ copy. commit writes draft KV after the accept outputs, so every step attaches
 `kv_fence_tail`, a read of the draft pool issued after that write, and the
 async result copy copies it.
 
-CI: `test/registered/tpu/e2e/test_tpu_qwen3_8_27b_pd_singlehost_*_recompile.py`
-(MTP, DFlash2, DSpark) assert neither engine compiles while serving.
+Targets with linear-attention (GDN) layers, such as Qwen3.8-27B, cannot run P/D
+yet: raiden does not transfer GDN state. That also leaves MTP P/D untested on TPU.
+
+CI: `test/registered/tpu/e2e/test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py`
+asserts neither engine compiles while serving.
