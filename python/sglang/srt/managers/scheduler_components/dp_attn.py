@@ -41,6 +41,41 @@ from sglang.srt.utils.common import is_tpu, require_mlp_tp_gather
 
 _is_tpu = is_tpu()
 
+# DIAGNOSTIC ONLY (#854): count syncs where attention-TP ranks of one DP group
+# report different token counts. The gather keeps only rank 0's row, so any
+# mismatch is either the negative-pad crash or silently misaligned rows.
+import logging as _diag_logging
+
+_diag_logger = _diag_logging.getLogger("sglang.diag.attn_tp_divergence")
+_DIAG_COUNTS = {"checks": 0, "mismatches": 0}
+
+
+def _diag_attn_tp_divergence(info_cpu: torch.Tensor) -> None:
+    if get_parallel().tp_rank != 0:
+        return
+    _DIAG_COUNTS["checks"] += 1
+    tokens = info_cpu[:, :, 0]  # [dp group, rank within group]
+    logprob = info_cpu[:, :, 1]
+    bad = (tokens != tokens[:, :1]).any(dim=1) | (logprob != logprob[:, :1]).any(dim=1)
+    if bool(bad.any()):
+        _DIAG_COUNTS["mismatches"] += 1
+        n = _DIAG_COUNTS["mismatches"]
+        if n <= 50 or n % 100 == 0:
+            _diag_logger.warning(
+                "ATTN_TP_DIVERGENCE mismatch=%d checks=%d tokens=%s logprob=%s",
+                n,
+                _DIAG_COUNTS["checks"],
+                tokens[bad].tolist(),
+                logprob[bad].tolist(),
+            )
+    elif _DIAG_COUNTS["checks"] == 1 or _DIAG_COUNTS["checks"] % 2000 == 0:
+        _diag_logger.warning(
+            "ATTN_TP_DIVERGENCE_SUMMARY checks=%d mismatches=%d",
+            _DIAG_COUNTS["checks"],
+            _DIAG_COUNTS["mismatches"],
+        )
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -237,7 +272,9 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        info_cpu = global_info_tensor.cpu()
+        _diag_attn_tp_divergence(info_cpu)
+        tp0_info_cpu = info_cpu[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
