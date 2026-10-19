@@ -37,13 +37,14 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.attention.pallas.util import (
     align_to,
     cdiv,
-    get_dtype_bitwidth,
     get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
+# The kernel's softmax runs in base 2: logits, m and sinks are scaled by log2(e).
+LOG2E = 1.4426950408889634
 DEFAULT_VMEM_LIMIT_BYTES = 120 * 1024 * 1024  # 120MB
 logger = logging.getLogger(__name__)
 
@@ -246,7 +247,6 @@ def get_vmem_estimate_bytes(
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
-    out_bits = get_dtype_bitwidth(q_dtype) if q_dtype != jnp.float32 else 32
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
@@ -262,11 +262,11 @@ def get_vmem_estimate_bytes(
         * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim)
         * (32 // q_packing)
         +
-        # l_ref + m_ref (out_dtype, not float32)
-        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * out_bits
+        # l_ref + m_ref (f32)
+        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
         +
-        # acc_ref (out_dtype)
-        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * out_bits
+        # acc_ref (f32)
+        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
     )
 
     if use_custom_mask:
@@ -372,6 +372,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -391,6 +392,9 @@ def _ragged_paged_attention_kernel_loop(
         q_packing,
         head_dim,
     ) = q_hbm_ref.shape
+    # With pad_lane_rowsum, V's last (padding) lane holds ones, so P @ V also
+    # sums P and the running sum l lives in that lane of acc (scaled by v_scale).
+    rowsum_lane = head_dim - 1 if pad_lane_rowsum else None
     (
         total_num_pages,
         page_size,
@@ -448,6 +452,7 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         xai_temperature_reg=None,
         custom_mask_data=None,
+        apply_masks=True,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -476,6 +481,10 @@ def _ragged_paged_attention_kernel_loop(
             s_scale *= k_scale
         if q_scale is not None:
             s_scale *= q_scale
+        # exp(x) lowers to exp2(x * log2e); folding log2e into the score scale
+        # saves that multiply on every score.
+        if soft_cap is None:
+            s_scale *= LOG2E
 
         s *= s_scale
 
@@ -484,7 +493,7 @@ def _ragged_paged_attention_kernel_loop(
             s = s * xai_temperature_reg[:, None]
 
         if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
+            s = (soft_cap * LOG2E) * jnp.tanh(s / soft_cap)
 
         # Do not use int16 here unless every intermediate is proven to fit:
         # positions overflow at context lengths >= 32,768, and
@@ -500,7 +509,7 @@ def _ragged_paged_attention_kernel_loop(
         v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
 
         mask = None
-        if use_causal_mask:
+        if use_causal_mask and apply_masks:
             assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
         elif custom_mask_data is not None:
@@ -510,11 +519,11 @@ def _ragged_paged_attention_kernel_loop(
             )
             mask = mask_and(mask, custom_mask_expanded == 1)
 
-        if not skip_kv_mask:
+        if not skip_kv_mask and apply_masks:
             mask = mask_and(mask, k_span < effective_kv_len_int)
             v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
-        if sliding_window is not None:
+        if sliding_window is not None and apply_masks:
             mask = mask_and(mask, q_span < k_span + sliding_window)
 
         if mask is not None:
@@ -524,12 +533,13 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...].astype(jnp.float32)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr.astype(out_dtype)
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        p = jnp.exp2(s - broadcast_minor(m_curr, s.shape))
 
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = l_ref[...].astype(jnp.float32)
-        l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
+        exp_m_diff = jnp.exp2(m_prev - m_curr)
+        if rowsum_lane is None:
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True)
+            l_prev = l_ref[...].astype(jnp.float32)
+            l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
 
         return p, v, exp_m_diff
 
@@ -546,6 +556,13 @@ def _ragged_paged_attention_kernel_loop(
         assert v.shape == (bkv_csz, head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
+        # The MXU rounds an f32 LHS against bf16 V to bf16 anyway (bit-identical);
+        # casting first halves the matmul pushes and the spilled P tile.
+        if v.dtype == jnp.bfloat16:
+            p = p.astype(jnp.bfloat16)
+        if rowsum_lane is not None:
+            lane = lax.broadcasted_iota(jnp.int32, v.shape, 1)
+            v = jnp.where(lane == rowsum_lane, jnp.ones_like(v), v)
         pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
@@ -923,6 +940,12 @@ def _ragged_paged_attention_kernel_loop(
                 # (pretend we've already seen a virtual token with logit = sink_value).
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
                 l_ref[...] = jnp.full_like(l_ref, 1.0)
+                if rowsum_lane is not None:
+                    lane = lax.broadcasted_iota(jnp.int32, acc_ref.shape, 2)
+                    l_init = 1.0 if v_scale is None else v_scale
+                    acc_ref[...] = jnp.where(lane == rowsum_lane, l_init, 0.0).astype(
+                        acc_ref.dtype
+                    )
                 for kv_head_idx in range(actual_num_kv_heads):
                     sinks = attention_sink_ref[
                         kv_head_idx
@@ -931,8 +954,8 @@ def _ragged_paged_attention_kernel_loop(
                     lm_size = actual_bq_sz * num_q_heads_per_kv_head
                     sink_tiled = jnp.tile(sinks, (actual_bq_sz, 1))
                     m_ref.at[kv_head_idx, pl.ds(lm_start, lm_size)][...] = (
-                        sink_tiled.astype(out_dtype)
-                    )
+                        sink_tiled * LOG2E
+                    ).astype(out_dtype)
             else:
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
@@ -1042,8 +1065,7 @@ def _ragged_paged_attention_kernel_loop(
                 def attention_loop(idx):
                     bkv_start = idx * bkv_csz
 
-                    @pl.when(bkv_start < effective_bkv_sz)
-                    def _():
+                    def compute_sub_blocks(apply_masks):
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                             # Slice custom mask for this compute sub-block
                             cur_mask_data = None
@@ -1094,6 +1116,7 @@ def _ragged_paged_attention_kernel_loop(
                                         effective_kv_len=effective_kv_len,
                                         xai_temperature_reg=cur_xai_temp,
                                         custom_mask_data=cur_mask_data,
+                                        apply_masks=apply_masks,
                                     )
                                 )
                                 flash_attention_step2_pv(
@@ -1103,14 +1126,45 @@ def _ragged_paged_attention_kernel_loop(
                                     acc_ref.at[lm_slice],
                                 )
 
+                    in_range = bkv_start < effective_bkv_sz
+                    if not use_causal_mask:
+                        pl.when(in_range)(lambda: compute_sub_blocks(True))
+                        return
+                    # Most prefill blocks are fully visible to every query in the
+                    # bq block and skip the ~3 mask ops per score. Branch here,
+                    # not between QK and softmax: a branch there splits the LLO
+                    # basic block and serializes the two q sub-blocks.
+                    kv_first = processed_kv_len + bkv_start
+                    kv_last = kv_first + (bkv_csz - 1)
+                    fully_visible = jnp.logical_and(
+                        kv_last <= processed_q_len, kv_last < effective_kv_len
+                    )
+                    if sliding_window is not None:
+                        q_last = processed_q_len + (actual_bq_sz - 1)
+                        fully_visible = jnp.logical_and(
+                            fully_visible, q_last < kv_first + sliding_window
+                        )
+                    pl.when(jnp.logical_and(in_range, fully_visible))(
+                        lambda: compute_sub_blocks(False)
+                    )
+                    pl.when(jnp.logical_and(in_range, jnp.logical_not(fully_visible)))(
+                        lambda: compute_sub_blocks(True)
+                    )
+
             # Load acc and calculate final output.
             acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            if rowsum_lane is None:
+                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            else:
+                l_lane = acc[..., rowsum_lane : rowsum_lane + 1]
+                if v_scale is not None:
+                    l_lane = l_lane / v_scale
+                l = jnp.broadcast_to(l_lane, acc.shape)  # noqa
             out = (
                 acc * pl.reciprocal(l, approx=True)
-                if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
+                if (l.dtype == jnp.float32 and o_hbm_ref.dtype != jnp.float32)
                 else lax.div(acc, l)
-            ).astype(out_dtype)
+            ).astype(o_hbm_ref.dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1706,6 +1760,7 @@ def get_vmem_limit():
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
+        "pad_lane_rowsum",
         "disable_semaphore_checks",
         "debug_mode",
     ),
@@ -1741,6 +1796,7 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
+    pad_lane_rowsum: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
 ):
@@ -1778,6 +1834,9 @@ def ragged_paged_attention(
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
       vmem_limit_bytes: vmem limit for the pallas kernel.
+      pad_lane_rowsum: compute the softmax row sum on the MXU through a ones
+        column in V's last padding lane. No-op when head_dim is already a
+        multiple of 128.
       debug_mode: if true, skip DMAs and flash attention.
 
     Returns:
@@ -1838,8 +1897,10 @@ def ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+    # Dtype of the m / l / acc scratch, not of the output (which follows q).
+    # bf16 accumulators lose ~2^-9 per KV block and the error grows with context.
     if out_dtype is None:
-        out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
+        out_dtype = jnp.float32
 
     # Prepare custom mask.
     if custom_mask is not None:
@@ -1985,6 +2046,7 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                pad_lane_rowsum=pad_lane_rowsum and actual_head_dim < head_dim,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(

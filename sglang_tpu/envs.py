@@ -30,6 +30,10 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # RPA v3: sum the softmax row on the MXU through a ones column in V's last
+    # padding lane instead of on the vector ALU. Only applies when head_dim is
+    # not a multiple of 128 (e.g. 64).
+    SGLANG_TPU_ENABLE_RPA_PAD_LANE_ROWSUM = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
