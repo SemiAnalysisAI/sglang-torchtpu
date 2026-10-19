@@ -1933,15 +1933,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
         extend_lens: torch.Tensor | None = None,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+        Returns the draft input's ``draft_kv_write_tail``.
         """
         if target_hidden.numel() == 0:
-            return
+            return None
 
         if _is_tpu:
             return self.append_target_hidden_to_draft_kv_by_loc_tpu(
@@ -2106,6 +2107,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
             )
+        return None
 
     def _append_target_hidden_sequential(
         self,
@@ -2710,7 +2712,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
+            draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
                 positions=positions,
@@ -2724,6 +2726,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bonus_tokens=next_token_ids,
                 seq_lens=new_seq_lens,
             )
+            batch_output.next_draft_input.draft_kv_write_tail = draft_kv_write_tail
             return batch_output
 
         # Decode / target-verify stage.
@@ -3353,7 +3356,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        self._append_target_hidden_to_draft_kv_by_loc(
+        draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=target_hidden,
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
@@ -3368,6 +3371,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        next_draft_input.draft_kv_write_tail = draft_kv_write_tail
 
         return GenerationBatchResult(
             logits_output=logits_output,

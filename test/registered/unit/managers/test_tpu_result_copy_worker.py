@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.result_copy_worker import (
@@ -178,11 +179,28 @@ def test_worker_preserves_context_and_serializes_copies(monkeypatch):
     assert contexts == []
 
 
+def _eagle_draft_input(tail):
+    return EagleDraftInput(topk_index=tail)
+
+
+def _dflash_draft_input(tail):
+    draft_input = make_draft_input_v2(
+        bonus_tokens=torch.zeros(1, dtype=torch.int64),
+        new_seq_lens=torch.ones(1, dtype=torch.int64),
+    )
+    draft_input.draft_kv_write_tail = tail
+    return draft_input
+
+
+@pytest.mark.parametrize("make_draft_input", [_eagle_draft_input, _dflash_draft_input])
 @pytest.mark.parametrize("copy_draft_tail", [True, False])
-def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
-    """Draft-extend writes draft KV after the verify outputs are produced, so
-    under the KV free fence copy_done must also wait for one of its outputs;
-    otherwise the extra copy would only delay result processing."""
+def test_copy_done_covers_spec_draft_extend(
+    monkeypatch, copy_draft_tail, make_draft_input
+):
+    """EAGLE draft-extend and the DFLASH draft KV append write draft KV after
+    the verify outputs are produced, so under the KV free fence copy_done must
+    also wait for one of their outputs; otherwise the extra copy would only
+    delay result processing."""
     device_module = SimpleNamespace(
         Stream=Mock(),
         stream=lambda value: contextmanager(lambda: (yield))(),
@@ -196,14 +214,14 @@ def test_copy_done_covers_spec_draft_extend(monkeypatch, copy_draft_tail):
     )
     issued = []
     draft_tail = object()
-    topk_index = Mock()
-    topk_index.to.side_effect = lambda *args, **kwargs: (
+    device_tail = Mock()
+    device_tail.to.side_effect = lambda *args, **kwargs: (
         issued.append("draft") or draft_tail
     )
     event = Mock()
     event.record.side_effect = lambda: issued.append("record")
     result = SimpleNamespace(
-        copy_done=event, next_draft_input=EagleDraftInput(topk_index=topk_index)
+        copy_done=event, next_draft_input=make_draft_input(device_tail)
     )
     result.copy_to_cpu = lambda *args: (
         issued.append("copy"),

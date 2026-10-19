@@ -108,7 +108,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self.dflash_hidden_size = self._infer_dflash_hidden_size()
         self.dflash_target_hidden_size = self._infer_dflash_target_hidden_size()
         self._dflash_worker: DFlashWorkerV2 | None = None
-        self._compiled_kv_appender: Callable[..., None] | None = None
+        self._compiled_kv_appender: Callable[..., torch.Tensor] | None = None
         self._compiled_block_embedder: Callable[..., torch.Tensor] | None = None
         self._compiled_draft_block: Callable[..., tuple] | None = None
 
@@ -207,12 +207,22 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self.append_target_hidden_to_draft_kv_by_loc_tpu
         )
 
-    def _compile_kv_appender(self, fn: Callable[..., None]) -> Callable[..., None]:
+    def _compile_kv_appender(
+        self, fn: Callable[..., None]
+    ) -> Callable[..., torch.Tensor]:
         """Compile the draft KV appender through this policy's active tracer.
 
         The appender reads draft attention weights and writes the draft KV pool,
         which are exactly the two tensor sources direct_compile lifts for us.
         """
+        append = fn
+
+        def fn(**kwargs: torch.Tensor | None) -> torch.Tensor:
+            append(**kwargs)
+            # The KV free fence's result copy waits on this output, which is
+            # ready only once the program and its draft KV writes finish.
+            return kwargs["cache_loc"][:1] + 1
+
         fn = torch.no_grad()(fn)
         if self.tracer == "direct":
             from sglang_tpu.compilation.direct_compile import (
@@ -568,8 +578,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
-    ) -> None:
-        """Pad inputs and execute compiled draft KV materialization on TPU."""
+    ) -> torch.Tensor | None:
+        """Pad inputs and execute compiled draft KV materialization on TPU.
+        Returns a tensor ready once the writes land, or None if none ran."""
         padded = self.pad_append_target_hidden_tpu(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -578,7 +589,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             commit_lens=commit_lens,
         )
         if padded is None:
-            return
+            return None
         (
             target_hidden,
             cache_loc,
@@ -590,7 +601,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         with torch.no_grad():
             if self._compiled_kv_appender is None:
                 raise RuntimeError("DFLASH draft KV appender is not compiled.")
-            self._compiled_kv_appender(
+            return self._compiled_kv_appender(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
                 positions=positions,

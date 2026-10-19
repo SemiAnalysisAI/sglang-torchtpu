@@ -87,25 +87,27 @@ class TPUAsyncCopyWorker:
         return_logprob: bool,
         return_hidden_states: bool,
     ) -> Optional[torch.Tensor]:
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         with (
             torch.accelerator.device_index(self.device_index),
             self.device_module.stream(self.stream),
         ):
-            # EAGLE draft-extend runs after verify and writes draft KV; copying
-            # one of its outputs makes copy_done cover it. The fence rejects
-            # algorithms whose KV writes follow every copied tensor (see
-            # supports_kv_free_fence). The returned copy stays referenced by
-            # the submission future.
-            draft_tail = None
+            # EAGLE draft-extend and the DFLASH draft KV append run after
+            # verify and write draft KV; copying one of their outputs makes
+            # copy_done cover them. The fence rejects algorithms whose KV writes
+            # follow every copied tensor (see supports_kv_free_fence). The
+            # returned copy stays referenced by the submission future.
             draft_input = result.next_draft_input
-            if (
-                self.copy_draft_tail
-                and isinstance(draft_input, EagleDraftInput)
-                and draft_input.topk_index is not None
-            ):
-                draft_tail = draft_input.topk_index.to("cpu", non_blocking=True)
+            tail = None
+            if isinstance(draft_input, EagleDraftInput):
+                tail = draft_input.topk_index
+            elif isinstance(draft_input, DFlashDraftInputV2):
+                tail = draft_input.draft_kv_write_tail
+            draft_tail = None
+            if self.copy_draft_tail and tail is not None:
+                draft_tail = tail.to("cpu", non_blocking=True)
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.
             result.copy_to_cpu(return_logprob, return_hidden_states)
             return draft_tail
