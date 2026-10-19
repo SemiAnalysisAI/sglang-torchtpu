@@ -1349,6 +1349,12 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        # DP attention keeps the interval in lockstep across ranks, whose running
+        # batches differ, so only non-DP schedulers may skip it locally.
+        self.prefill_decode_interval_skip_idle = (
+            envs.SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE.get()
+            and not self.require_mlp_sync
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1402,8 +1408,11 @@ class Scheduler(
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
 
-    def _should_defer_prefill(self) -> bool:
+    def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
         if self._prefill_decode_interval_remaining == 0:
+            return False
+        if self.prefill_decode_interval_skip_idle and running_batch.is_empty():
+            self._prefill_decode_interval_remaining = 0
             return False
 
         self._prefill_decode_interval_remaining -= 1
@@ -4035,7 +4044,7 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)

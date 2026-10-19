@@ -655,6 +655,9 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # --prefill-decode-interval does not defer prefill while no request is
+    # decoding: there is nothing to interleave, so the deferral only idles.
+    SGLANG_PREFILL_DECODE_INTERVAL_SKIP_IDLE = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
