@@ -99,6 +99,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang_tpu.mamba_pool import TpuMambaPool, committed_read_offsets
 from sglang_tpu.overlap_utils_tpu import flush_direct_handoff_tpu
 from sglang_tpu.sampler import TpuSampler
@@ -201,6 +202,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._warmup_logical_bs_ops()
         self._warmup_extend_sampling()
         self._warmup_relay_and_results()
+        self._kv_fence_tail().cpu()
         if self._target_has_linear_attn:
             self._warmup_linear_attn_commit()
         if self._simulate_acc_len > 0:
@@ -521,6 +523,8 @@ class TpuSpecWorker(BaseSpecWorker):
             result = self._idle_result()
         else:
             result = self._forward_decode(batch)
+        if not batch.forward_mode.is_idle():
+            result.next_draft_input.kv_fence_tail = self._kv_fence_tail()
         if on_publish is not None:
             on_publish(result.new_seq_lens)
         return result
@@ -713,6 +717,14 @@ class TpuSpecWorker(BaseSpecWorker):
         return torch.zeros((rows,), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
+
+    def _kv_fence_tail(self) -> torch.Tensor:
+        """A copy of one element of the draft pool's last layer: every family writes
+        draft KV last. A copy, since a view would keep the layer buffer alive."""
+        pool = self.primary_draft_kv_pool
+        if not isinstance(pool, TpuFusedMHATokenToKVPool):
+            raise TypeError(f"Expected TpuFusedMHATokenToKVPool, got {type(pool)}.")
+        return pool.kv_buffer[-1].view(-1)[:1].clone()
 
     def _pad_bs(self, bs: int) -> int:
         return self._b_bucketer().next_bucket(bs)

@@ -37,6 +37,9 @@ class HostPaddedDraftInput(SpecInput):
     tpu_verify_cache_candidates: torch.Tensor | None = None
     tpu_committed_lens: torch.Tensor | None = None
     tpu_req_pool_indices: torch.Tensor | None = None
+    # Device tensor read after the step's last KV write; the async result copy
+    # copies it so the TPU KV free fence's copy_done covers every KV write.
+    kv_fence_tail: torch.Tensor | None = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=self.SPEC_INPUT_TYPE)

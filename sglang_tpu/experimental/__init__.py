@@ -2,17 +2,35 @@ from __future__ import annotations
 
 from typing import Callable
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.envs import envs as tpu_envs
 
 _host_batch_padder: Callable[[int], int] | None = None
+# (host req_pool_indices [bs], host draft hidden [bs, H]) -> None.
+_pd_carry_seeder: Callable[[torch.Tensor, torch.Tensor], None] | None = None
 
 
 def register_host_batch_padder(padder: Callable[[int], int]) -> None:
     """Set the batch-size bucketing HOST_PADDED batches pad sampling params to."""
     global _host_batch_padder
     _host_batch_padder = padder
+
+
+def register_pd_carry_seeder(
+    seeder: Callable[[torch.Tensor, torch.Tensor], None],
+) -> None:
+    """Set the writer a PD decode server seeds the chain draft carry with."""
+    global _pd_carry_seeder
+    _pd_carry_seeder = seeder
+
+
+def get_pd_carry_seeder() -> Callable[[torch.Tensor, torch.Tensor], None]:
+    if _pd_carry_seeder is None:
+        raise RuntimeError("No TpuChainSpecWorker registered a PD carry seeder.")
+    return _pd_carry_seeder
 
 
 def uses_host_batch(batch) -> bool:

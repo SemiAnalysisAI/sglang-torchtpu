@@ -88,6 +88,7 @@ class TPUAsyncCopyWorker:
         return_hidden_states: bool,
     ) -> Optional[torch.Tensor]:
         from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
         with (
             torch.accelerator.device_index(self.device_index),
@@ -100,7 +101,11 @@ class TPUAsyncCopyWorker:
             # the submission future.
             draft_tail = None
             draft_input = result.next_draft_input
-            if (
+            if self.copy_draft_tail and isinstance(draft_input, HostPaddedDraftInput):
+                # The experimental worker's commit also writes KV after verify.
+                assert draft_input.kv_fence_tail is not None
+                draft_tail = draft_input.kv_fence_tail.to("cpu", non_blocking=True)
+            elif (
                 self.copy_draft_tail
                 and isinstance(draft_input, EagleDraftInput)
                 and draft_input.topk_index is not None

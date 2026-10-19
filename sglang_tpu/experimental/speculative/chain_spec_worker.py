@@ -13,7 +13,8 @@ extend: target forward on the prompt, then a draft forward on the prompt
         chunked request, closes each request); g := its last row.
 
 g lives in a [req pool rows, H] device table, so filter/merge and the overlap
-relay never carry it. Not ported yet: PD disaggregation and a draft sliding window.
+relay never carry it. Under PD, prefill ships g as the EAGLE hidden seed and
+decode writes it back into the table. Not ported yet: a draft sliding window.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu.experimental import register_pd_carry_seeder
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
     chain_draft_forward_input,
@@ -66,7 +68,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     TpuSpecVerifyInput,
     VerifyRows,
 )
-from sglang_tpu.experimental.speculative.spec_utils import pad_rows
+from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuChainDraftWorker]] = {
     SpeculativeAlgorithm.EAGLE: TpuMtpDraftWorker,
@@ -92,10 +94,6 @@ class TpuChainSpecWorker(TpuSpecWorker):
             raise NotImplementedError(
                 "TpuChainSpecWorker does not support --speculative-draft-window-size."
             )
-        if get_disagg().disaggregation_mode != "null":
-            raise NotImplementedError(
-                "TpuChainSpecWorker does not support PD disaggregation."
-            )
         # Idle DP ranks would need to mirror the draft's collectives (_forward_idle_step).
         if is_dp_attention_enabled():
             raise NotImplementedError(
@@ -112,11 +110,16 @@ class TpuChainSpecWorker(TpuSpecWorker):
             )
         self._chain_draft_worker = draft_worker
         self._draft_runner = draft_worker.model_runner
+        self._disagg_mode = get_disagg().disaggregation_mode
+        if self._disagg_mode == "decode":
+            register_pd_carry_seeder(self._seed_carry)
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
         self._warmup_draft_ops()
         self._warmup_extend_ops()
+        if self._disagg_mode == "decode":
+            self._warmup_seed_carry()
         # The base snapshot ran before these chain-draft warmups.
         self._snapshot_warm_baseline()
 
@@ -249,7 +252,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         if target_hidden is None:
             raise RuntimeError("Chain-draft extend requires target hidden capture.")
         assert logits_output.hidden_states_token_indices is None
-        self._extend_draft(
+        tail_hidden = self._extend_draft(
             batch, target_hidden=target_hidden, bucket_tokens=bucket_tokens
         )
         logits_output.hidden_states = None
@@ -259,7 +262,15 @@ class TpuChainSpecWorker(TpuSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
         result.new_seq_lens = next_state.seq_lens
-        result.next_draft_input = self.state_to_spec_info(next_state)
+        next_draft_input = self.state_to_spec_info(next_state)
+        if self._disagg_mode == "prefill":
+            # Core ships hidden_states[i] as the EAGLE seed; topk is a host
+            # placeholder so its per-row reads stay off the device.
+            cap = tail_hidden.shape[0]
+            next_draft_input.hidden_states = tail_hidden
+            next_draft_input.topk_p = torch.zeros((cap, 1), dtype=torch.float32)
+            next_draft_input.topk_index = torch.zeros((cap, 1), dtype=torch.int64)
+        result.next_draft_input = next_draft_input
         return result
 
     def _extend_draft(
@@ -268,8 +279,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         *,
         target_hidden: torch.Tensor,
         bucket_tokens: torch.Tensor,
-    ) -> None:
-        """Draft forward on the prompt shifted by one token; store each request's last hidden."""
+    ) -> torch.Tensor:
+        """Draft forward on the prompt shifted by one token; store and return each request's [cap, H] last hidden."""
         input_ids = batch.input_ids
         assert input_ids is not None and input_ids.device.type == "cpu", (
             "HOST_PADDED extend stages prompt tokens on host"
@@ -310,6 +321,27 @@ class TpuChainSpecWorker(TpuSpecWorker):
             self.device, non_blocking=True
         )
         self._chain_draft_worker.carry.index_copy_(0, pool_rows, tail_hidden)
+        return tail_hidden
+
+    def _seed_carry(
+        self, req_pool_indices_cpu: torch.Tensor, hidden_cpu: torch.Tensor
+    ) -> None:
+        """Write a PD seed's [bs, H] host hidden into the carry table at the batch bucket."""
+        padded_bs = self._pad_bs(req_pool_indices_cpu.shape[0])
+        # Padded rows write the reserved pool row 0.
+        self._chain_draft_worker.carry.index_copy_(
+            0,
+            padded_h2d(req_pool_indices_cpu.to(torch.int64), padded_bs, self.device),
+            padded_h2d(hidden_cpu.to(self._draft_runner.dtype), padded_bs, self.device),
+        )
+
+    def _warmup_seed_carry(self) -> None:
+        carry_size = self._chain_draft_worker.carry_size
+        for padded_bs in self._b_bucketer().buckets:
+            self._seed_carry(
+                torch.zeros((padded_bs,), dtype=torch.int64),
+                torch.zeros((padded_bs, carry_size), dtype=self._draft_runner.dtype),
+            )
 
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows

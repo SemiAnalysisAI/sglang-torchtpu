@@ -325,6 +325,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         hot = {
             "sglang.srt.speculative.spec_utils.spec_prepare_for_decode",
             "sglang.srt.speculative.eagle_disaggregation.build_eagle_disagg_draft_input",
+            "sglang.srt.speculative.dflash_disaggregation.build_dflash_disagg_draft_input",
+            "sglang.srt.speculative.dspark_disaggregation.build_dspark_disagg_draft_input",
             "sglang.srt.model_executor.forward_batch_info.ForwardBatch."
             "post_forward_mlp_sync_batch",
         }
@@ -430,9 +432,16 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 TpuBlockSpecWorker,
             )
             prepare_spec_decode(core_prepare, batch)
-            self.assertFalse(
-                supports_kv_free_fence(core_fence, mtp, copies_draft_tail=True)
-            )
+            # commit writes KV after the accept outputs; only the copied
+            # kv_fence_tail lets the fence cover it, for every family.
+            for algo in (mtp, SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.EAGLE3):
+                for copies_draft_tail in (True, False):
+                    self.assertEqual(
+                        supports_kv_free_fence(
+                            core_fence, algo, copies_draft_tail=copies_draft_tail
+                        ),
+                        copies_draft_tail,
+                    )
             self.assertFalse(need_topk(lambda algo: True, mtp))
             self.assertTrue(supports_tpu_direct_compile(lambda algo: False, mtp))
             with patch(
@@ -624,41 +633,124 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaises(_Stop):
             init(dp_attention=True)
 
-    def test_pd_seed_reaches_decode_as_the_host_padded_input(self):
+    def test_pd_seeds_reach_decode_as_host_padded_inputs(self):
         """A PD decode server's prebuilt batch must carry the experimental input
-        type: experimental decode prep and filter/merge reject the core one."""
+        type (decode prep and filter/merge reject core's), built on host: core's
+        device-side seed ops compile once per live bs."""
+        from sglang_tpu.experimental.speculative.chain_info import (
+            HostPaddedChainDraftInput,
+        )
         from sglang_tpu.experimental.speculative.eagle_info import (
             HostPaddedEagleDraftInput,
         )
-        from sglang_tpu.hooks.experimental_spec import build_disagg_eagle_input
+        from sglang_tpu.hooks.experimental_spec import (
+            build_disagg_block_input,
+            build_disagg_eagle_input,
+        )
 
+        def core(*args):
+            raise AssertionError("core seed builder must not run")
+
+        reqs = [
+            SimpleNamespace(
+                output_topk_p=torch.tensor([0.5]),
+                output_topk_index=torch.tensor([7]),
+                hidden_states_tensor=torch.full((4,), float(i)),
+                output_dsa_topk_indices=None,
+            )
+            for i in range(2)
+        ]
         rows = torch.tensor([3, 5])
-        core = SimpleNamespace(
-            bonus_tokens=torch.tensor([7, 9]),
-            topk_p=torch.ones(2, 1),
-            topk_index=torch.zeros(2, 1, dtype=torch.int64),
-            hidden_states=torch.zeros(2, 4),
-            dsa_topk_indices=None,
-            future_indices=rows,
-        )
-        batch = SimpleNamespace(
-            host_pad_bs=_pad, seq_lens=torch.tensor([11, 21], dtype=torch.int32)
-        )
-        draft = build_disagg_eagle_input(lambda *a: core, batch, None, None)
-        self.assertIsInstance(draft, HostPaddedEagleDraftInput)
-        self.assertIs(draft.future_indices, rows)
-        self.assertIs(draft.topk_p, core.topk_p)
-        self.assertIs(draft.hidden_states, core.hidden_states)
-        self.assertEqual(draft.new_seq_lens.tolist(), [11, 21])
-        self.assertFalse(draft.tpu_host_seq_lens_is_committed)
 
-        core.dsa_topk_indices = torch.zeros(2, 4)
-        with self.assertRaisesRegex(NotImplementedError, "DSA"):
-            build_disagg_eagle_input(lambda *a: core, batch, None, None)
-        batch.host_pad_bs = None
-        self.assertIs(
-            build_disagg_eagle_input(lambda *a: core, batch, None, None), core
+        def batch(algorithm):
+            return SimpleNamespace(
+                host_pad_bs=_pad,
+                enable_overlap=True,
+                device="cpu",
+                reqs=reqs,
+                spec_algorithm=algorithm,
+                seq_lens=torch.tensor([11, 21], dtype=torch.int32),
+                req_pool_indices=rows,
+                req_pool_indices_cpu=rows,
+            )
+
+        future_map = MagicMock()
+        bonus = torch.tensor([7, 9])
+
+        def check_relayed(draft):
+            self.assertIs(draft.future_indices, rows)
+            self.assertEqual(draft.new_seq_lens.tolist(), [11, 21])
+            self.assertEqual(draft.new_seq_lens.dtype, torch.int64)
+            self.assertFalse(draft.tpu_host_seq_lens_is_committed)
+            future_map.publish.assert_called_once()
+            payload = future_map.stash.call_args.args[1]
+            self.assertIs(payload.bonus_tokens, bonus)
+            future_map.reset_mock()
+            return payload
+
+        eagle3 = build_disagg_eagle_input(
+            core, batch(SpeculativeAlgorithm.EAGLE3), bonus, future_map
         )
+        self.assertIsInstance(eagle3, HostPaddedEagleDraftInput)
+        payload = check_relayed(eagle3)
+        self.assertEqual(payload.topk_index.tolist(), [[7], [7]])
+        self.assertEqual(payload.hidden_states[:, 0].tolist(), [0.0, 1.0])
+
+        seeded = []
+        with patch(
+            "sglang_tpu.experimental._pd_carry_seeder",
+            lambda indices, hidden: seeded.append((indices, hidden)),
+        ):
+            mtp = build_disagg_eagle_input(
+                core, batch(SpeculativeAlgorithm.EAGLE), bonus, future_map
+            )
+        self.assertIsInstance(mtp, HostPaddedChainDraftInput)
+        check_relayed(mtp)
+        ((indices, hidden),) = seeded
+        self.assertIs(indices, rows)
+        self.assertEqual(hidden[:, 0].tolist(), [0.0, 1.0])
+
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            block = build_disagg_block_input(core, batch(algorithm), bonus, future_map)
+            self.assertIsInstance(block, HostPaddedBlockDraftInput)
+            check_relayed(block)
+
+        reqs[0].output_dsa_topk_indices = torch.zeros(4)
+        with self.assertRaisesRegex(NotImplementedError, "DSA"):
+            build_disagg_eagle_input(
+                core, batch(SpeculativeAlgorithm.EAGLE3), bonus, future_map
+            )
+        plain = batch(SpeculativeAlgorithm.EAGLE3)
+        plain.host_pad_bs = None
+        sentinel = object()
+        self.assertIs(
+            build_disagg_eagle_input(lambda *a: sentinel, plain, bonus, future_map),
+            sentinel,
+        )
+        self.assertIs(
+            build_disagg_block_input(lambda *a: sentinel, plain, bonus, future_map),
+            sentinel,
+        )
+
+    def test_pd_carry_seed_writes_at_the_batch_bucket(self):
+        """The decode-side carry write must keep the warmed bucket shape; padded
+        rows land on the reserved pool row 0."""
+        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+            TpuChainSpecWorker,
+        )
+
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        worker._pad_bs = _pad
+        worker._draft_runner = SimpleNamespace(dtype=torch.float32)
+        carry = torch.zeros((8, 2))
+        worker._chain_draft_worker = SimpleNamespace(carry=MagicMock(wraps=carry))
+        worker._seed_carry(torch.tensor([3, 5]), torch.ones((2, 2)))
+        (dim, rows, hidden), _ = worker._chain_draft_worker.carry.index_copy_.call_args
+        self.assertEqual(rows.tolist(), [3, 5, 0, 0])
+        self.assertEqual(hidden.shape, (4, 2))
+        self.assertEqual(carry[3].tolist(), [1.0, 1.0])
+        self.assertEqual(carry[0].tolist(), [0.0, 0.0])
 
     def test_per_batch_checks_refuse_only_unsupported_requests(self):
         """Filtered sampling needs the sort-free filter (the sort-based target
