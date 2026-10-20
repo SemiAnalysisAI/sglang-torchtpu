@@ -48,9 +48,10 @@ hour and finished within 44 s. 97% of replies ended at `max_tokens`.
   against 120M. It serves 53% fewer requests than B.
 - **The fix (D) restores B's hit rate** (71.2% and 72.9% against 73.1%) and keeps the window's
   benefit: eviction time falls from 1,880 s to 600-732 s, and D serves 7-15% more requests than B.
-- **E (#1586 + #1612) also restores B's hit rate** (72.4%, prefill-only 71.8%) with eviction time
-  853 s (prefill-only 1,186 s against 1,839 s for PD). Its requests (4,970) fall inside D's
-  run-to-run spread, so the second commit gives no measurable throughput change on this load.
+- **E (#1586 + #1612) also restores B's hit rate** (72.4%, prefill-only 71.8%). Its requests (4,970) are
+  3% below D's lower run and its eviction time is higher (853 s against 600-732 s), while prefill-only
+  eviction time is lower (1,186 s against 1,839 s for PD). One E run only; whether the difference is
+  real is still being measured.
 - The repeats agree: C and C2 within 1% on requests, D and D2 within about 7-8%.
 - write_through (A) and write_back without the window (B) are close on this load: B has a higher hit
   rate and serves 4% fewer requests.
