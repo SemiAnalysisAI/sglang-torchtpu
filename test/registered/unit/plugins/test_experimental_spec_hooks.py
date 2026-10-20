@@ -492,7 +492,6 @@ class TestExperimentalSpecHooks(CustomTestCase):
                         kimi_spec_defaults(original, args)
 
     def test_platform_selects_the_experimental_workers(self):
-        from sglang.srt.environ import envs as srt_envs
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
@@ -517,7 +516,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertIs(select(SpeculativeAlgorithm.NGRAM), _CoreWorker)
         with (
             envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False),
-            srt_envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
+            envs.SGLANG_TPU_HOST_PADDING_NO_D2H.override(False),
         ):
             self.assertIs(select(SpeculativeAlgorithm.DFLASH), _CoreWorker)
             self.assertIs(select(SpeculativeAlgorithm.EAGLE3), _CoreWorker)
