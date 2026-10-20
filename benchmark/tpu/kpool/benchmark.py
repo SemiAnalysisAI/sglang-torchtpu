@@ -147,13 +147,6 @@ def benchmark_case(
                 "pooled_cache_buffer_reused": True,
                 "hlo_export_error": state["hlo_export_error"],
             }
-        # Profile separate invocations so profiler collection does not enter
-        # the host-blocking latency samples. Device timing is analyzed later.
-        with jax.profiler.trace(str(output / name / "xprof")):
-            for _ in range(5):
-                for state in states.values():
-                    state["cache"] = state["call"](raw, state["cache"], *tail)
-                    state["cache"].block_until_ready()
         result = {
             "name": name,
             "pages": pages,
@@ -169,8 +162,22 @@ def benchmark_case(
                 "median_ms"
             ]
             / rows["candidate"]["median_ms"],
-            "device_profile": str(output / name / "xprof"),
+            "device_profile": None,
+            "profile_status": "requested" if opts.profile else "not_requested",
         }
+        # Persist timings before optional profiler initialization. A native
+        # profiler crash cannot be caught by Python's exception handlers.
+        (output / f"{name}-latency.json").write_text(json.dumps(result, indent=2))
+        print("LATENCY_RESULT", json.dumps(result), flush=True)
+        if opts.profile:
+            # Profile separate invocations; exclude collection from timings.
+            with jax.profiler.trace(str(output / name / "xprof")):
+                for _ in range(5):
+                    for state in states.values():
+                        state["cache"] = state["call"](raw, state["cache"], *tail)
+                        state["cache"].block_until_ready()
+            result["device_profile"] = str(output / name / "xprof")
+            result["profile_status"] = "collected"
         print("CASE_RESULT", json.dumps(result), flush=True)
         return result
     finally:
@@ -184,6 +191,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Collect XProf after saving timings; requires a compatible profiler ABI",
+    )
     opts = parser.parse_args()
     if opts.warmup < 1 or opts.repeats < 2:
         parser.error("Require warmup >= 1 and repeats >= 2")
