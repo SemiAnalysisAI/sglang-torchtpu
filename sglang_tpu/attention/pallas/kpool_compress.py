@@ -83,9 +83,14 @@ def _kernel(
         # Keep the compute tiles two-dimensional. Group members are separate
         # [pool, feature] values, not a size-four sublane dimension introduced
         # by reshaping [128, 128] to [32, 4, 128].
+        # Packed strided loads also require a zero last-axis offset. Read
+        # each bounded member tile once, then split its keys and gates.
+        members = [
+            raw_buf[slot, pl.ds(member, 32, 4), :].astype(jnp.float32)
+            for member in range(4)
+        ]
         scores = [
-            raw_buf[slot, pl.ds(member, 32, 4), 128:].astype(jnp.float32)
-            + ape_ref[pl.ds(member, 1), :]
+            members[member][:, 128:] + ape_ref[pl.ds(member, 1), :]
             for member in range(4)
         ]
         maximum = jnp.maximum(
@@ -94,8 +99,7 @@ def _kernel(
         weight = [jnp.exp(score - maximum) for score in scores]
         denominator = (weight[0] + weight[1]) + (weight[2] + weight[3])
         weighted = [
-            (weight[member] / denominator)
-            * raw_buf[slot, pl.ds(member, 32, 4), :128].astype(jnp.float32)
+            (weight[member] / denominator) * members[member][:, :128]
             for member in range(4)
         ]
         pooled = ((weighted[0] + weighted[1]) + (weighted[2] + weighted[3])).astype(

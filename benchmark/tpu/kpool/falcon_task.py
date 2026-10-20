@@ -36,9 +36,8 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
         workload = f"""echo PHASE_AOT
 git fetch --depth=1 origin 75a03373e46643a9373cf9bcd1ed7fdfd794385d
 out="${{ARTIFACT_LOCAL_DIR:?}}/rank-${{FALCON_RANK:-0}}/aot"
-timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"{cases}
-tar -C "$out" -czf /tmp/tpu_logs/kpool-aot.tar.gz .
-echo AOT_ARTIFACT_READY
+timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"{cases} \\
+  --archive /tmp/tpu_logs/kpool-aot.tar.gz
 sleep {hold_seconds}
 """
     script = f"""set -euo pipefail
