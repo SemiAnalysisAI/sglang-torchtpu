@@ -32,7 +32,14 @@ class TpuSchedulerExtension(SchedulerExtension):
             and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
         ):
             cls = HostPaddingFutureMap
-        return cls(device, algorithm, req_to_token_pool, **kwargs)
+        future_map = cls(device, algorithm, req_to_token_pool, **kwargs)
+        from sglang_tpu.experimental import experimental_spec_enabled
+
+        if experimental_spec_enabled():
+            from sglang_tpu.hooks.experimental_spec import materialize_future_map
+
+            future_map = materialize_future_map(future_map, algorithm)
+        return future_map
 
     def init_result_copier(self, *, enable_overlap, needs_kv_free_fence):
         if enable_overlap and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get():

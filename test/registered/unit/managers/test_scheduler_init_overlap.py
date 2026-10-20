@@ -281,6 +281,33 @@ class TestSchedulerExtensionOwnership(CustomTestCase):
         relay.tpu_direct_handoff = object()
         self.assertIsNone(other.tpu_direct_handoff)
 
+    def test_plugin_spec_relay_is_materialized_by_the_extension(self):
+        """The extension builds the TPU relay itself, so it also starts the plugin
+        spec workers' relay buffers concrete, as their workers expect."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.hooks import experimental_spec
+        from sglang_tpu.scheduler_extension import TpuSchedulerExtension
+
+        pool = SimpleNamespace(req_to_token=torch.zeros(8, 16))
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+                patch.object(
+                    experimental_spec,
+                    "materialize_future_map",
+                    side_effect=lambda relay, algorithm: relay,
+                ) as materialize,
+            ):
+                relay = TpuSchedulerExtension().create_future_map(
+                    SpeculativeAlgorithm.EAGLE3, "cpu", pool
+                )
+            if enabled:
+                materialize.assert_called_once_with(relay, SpeculativeAlgorithm.EAGLE3)
+            else:
+                materialize.assert_not_called()
+
     def test_draftless_stage_skips_spec_precompile(self):
         from sglang_tpu.scheduler_extension import TpuSchedulerExtension
 
