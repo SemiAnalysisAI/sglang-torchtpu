@@ -1173,6 +1173,9 @@ class CompiledForwardShim:
                     cp_layout=cp_layout,
                     embeds_tokens=self._is_first_pp_stage(),
                 )
+        caller_capture = (
+            saved.get("capture_hidden_mode") if not wants_input_logprob else None
+        )
         try:
             # A proxy holds the previous stage's local rows; fit it after localizing.
             pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
@@ -1200,7 +1203,10 @@ class CompiledForwardShim:
                     previous = _pin_fields(forward_batch, finalize_fields)
                     try:
                         return self._finalize_forward(
-                            result, forward_batch, keep_padded=keep_padded
+                            result,
+                            forward_batch,
+                            keep_padded=keep_padded,
+                            caller_capture=caller_capture,
                         )
                     finally:
                         _restore_fields(forward_batch, previous)
@@ -1208,7 +1214,10 @@ class CompiledForwardShim:
                 out = out.then(finalize_pending)
             else:
                 out = self._finalize_forward(
-                    out, forward_batch, keep_padded=keep_padded
+                    out,
+                    forward_batch,
+                    keep_padded=keep_padded,
+                    caller_capture=caller_capture,
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
@@ -1244,12 +1253,29 @@ class CompiledForwardShim:
         return finish(out)
 
     def _finalize_forward(
-        self, out: Any, forward_batch: Any, *, keep_padded: bool
+        self,
+        out: Any,
+        forward_batch: Any,
+        *,
+        keep_padded: bool,
+        caller_capture: CaptureHiddenMode | None = None,
     ) -> Any:
-        spec_info = forward_batch.spec_info
-        if not keep_padded and (spec_info is None or not spec_info.keep_outputs_padded):
-            out = self.policy.finalize_forward_batch(out, forward_batch)
-        return out
+        previous_capture = None
+        if isinstance(out, torch.Tensor) and caller_capture is not None:
+            # A hidden-state boundary feeds an eager logits stage. Its output
+            # layout follows the caller's capture mode, not the pinned graph mode.
+            previous_capture = forward_batch.capture_hidden_mode
+            forward_batch.capture_hidden_mode = caller_capture
+        try:
+            spec_info = forward_batch.spec_info
+            if not keep_padded and (
+                spec_info is None or not spec_info.keep_outputs_padded
+            ):
+                out = self.policy.finalize_forward_batch(out, forward_batch)
+            return out
+        finally:
+            if previous_capture is not None:
+                forward_batch.capture_hidden_mode = previous_capture
 
     def _finish_forward(
         self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
