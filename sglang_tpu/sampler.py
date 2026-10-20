@@ -510,13 +510,24 @@ class TpuSampler(Sampler):
         if is_host_padded(sampling_info):
             sampling_info = sampling_info.on_device()
             padded_bs = sampling_info.temperatures.shape[0]
-            if (
-                sampling_info.sampling_seed is not None
-                and positions.shape[0] < padded_bs
-            ):
+            seed = sampling_info.sampling_seed
+            if seed is not None and positions.shape[0] < padded_bs:
                 assert positions.shape[0] == len(sampling_info)
                 positions = torch.nn.functional.pad(
                     positions, (0, padded_bs - positions.shape[0])
+                )
+            elif (
+                seed is not None
+                and positions.shape[0] > padded_bs
+                and not sampling_info.sampling_params_on_cpu
+            ):
+                # Bucket-1 params broadcast over a padded extend's rows, but
+                # seeds pair with positions row by row.
+                sampling_info = replace(
+                    sampling_info,
+                    sampling_seed=torch.nn.functional.pad(
+                        seed, (0, positions.shape[0] - padded_bs)
+                    ),
                 )
             logits = logits_output.next_token_logits
             # An eager outer logits processor (multimodal wrappers) emits live

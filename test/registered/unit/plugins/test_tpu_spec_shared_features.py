@@ -344,6 +344,49 @@ class TestSharedFeatures(CustomTestCase):
             for result in results:
                 torch.testing.assert_close(result, expected.to(torch.int64))
 
+    def test_seeded_bucket_one_params_sample_padded_extend_rows(self):
+        from sglang.srt.runtime_context import get_context
+        from sglang_tpu.sampler import TpuSampler
+        from sglang_tpu.sampling.seeded import sample_with_seed
+
+        with get_context().override_server_args(sampling_backend="pytorch"):
+            with (
+                patch(
+                    "sglang.srt.layers.sampler.get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(device_group=None)
+                    ),
+                ),
+                patch(
+                    "sglang.srt.layers.sampler.is_dp_attention_enabled",
+                    return_value=False,
+                ),
+            ):
+                sampler = TpuSampler()
+            sampler._sync_token_ids_across_tp = lambda *args: None
+            # A one-request extend whose target keeps its outputs padded to the
+            # extend cap: bucket-1 params, four logits and position rows.
+            sampling = info(
+                rows=1,
+                physical=1,
+                vocab=3,
+                temperatures=torch.tensor([[0.5]]),
+                top_ks=torch.full((1,), 1 << 30),
+                is_all_greedy=False,
+                is_any_greedy=False,
+                need_top_k_sampling=False,
+                sampling_seed=torch.tensor([123]),
+            )
+            positions = torch.tensor([7, 0, 0, 0])
+            logits = torch.tensor([[1.0, 2.0, 0.0]]).repeat(4, 1)
+            expected = sample_with_seed(
+                (logits / 0.5).softmax(-1), torch.tensor([123, 0, 0, 0]), positions
+            )
+            out = LogitsProcessorOutput(next_token_logits=logits.clone())
+            result = sampler(out, sampling, False, None, None, positions)
+            self.assertEqual(result.shape, (4,))
+            self.assertEqual(int(result[0]), int(expected[0]))
+
     def test_pipeline_opt_in_keeps_existing_worker_selection(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
