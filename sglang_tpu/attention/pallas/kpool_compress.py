@@ -8,9 +8,22 @@ finishes, including when two requests share a physical destination block.
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+
+def _hadamard128(value):
+    """Sylvester-order butterfly in f32; rounding is checked at the accuracy gate."""
+    lane = jnp.arange(128, dtype=jnp.int32)[None, :]
+    for step in (1, 2, 4, 8, 16, 32, 64):
+        low = (lane & step) == 0
+        partner = jnp.where(
+            low,
+            pltpu.roll(value, 128 - step, axis=1),
+            pltpu.roll(value, step, axis=1),
+        )
+        value = partner + jnp.where(low, value, -value)
+    return value
 
 
 def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens):
@@ -45,7 +58,6 @@ def _kernel(
     raw_ref,
     old_ref,
     ape_ref,
-    h_ref,
     out_ref,
     raw_buf,
     out_buf,
@@ -83,35 +95,38 @@ def _kernel(
         # Keep the compute tiles two-dimensional. Group members are separate
         # [pool, feature] values, not a size-four sublane dimension introduced
         # by reshaping [128, 128] to [32, 4, 128].
-        # Packed strided loads also require a zero last-axis offset. Read
-        # each bounded member tile once, then split its keys and gates.
-        members = [
-            raw_buf[slot, pl.ds(member, 32, 4), :].astype(jnp.float32)
-            for member in range(4)
-        ]
-        scores = [
-            members[member][:, 128:] + ape_ref[pl.ds(member, 1), :]
-            for member in range(4)
-        ]
+        # Follow batched_rpa's uint32 Ref + 128-column strided-load pattern.
+        # A word holds two consecutive BF16 token rows. In the flattened
+        # view, each pool occupies four rows: key01, gate01, key23, gate23.
+        raw_words = raw_buf.at[slot].bitcast(jnp.uint32).reshape(128, 128)
+        keys, gates = [], []
+        for pair in range(2):
+            key_pair = raw_words[pl.ds(pair * 2, 32, 4), :]
+            gate_pair = raw_words[pl.ds(pair * 2 + 1, 32, 4), :]
+            for half in range(2):
+                keys.append(
+                    pltpu.bitcast(
+                        (key_pair >> (half * 16)).astype(jnp.uint16), jnp.bfloat16
+                    ).astype(jnp.float32)
+                )
+                gates.append(
+                    pltpu.bitcast(
+                        (gate_pair >> (half * 16)).astype(jnp.uint16), jnp.bfloat16
+                    ).astype(jnp.float32)
+                )
+        scores = [gates[member] + ape_ref[pl.ds(member, 1), :] for member in range(4)]
         maximum = jnp.maximum(
             jnp.maximum(scores[0], scores[1]), jnp.maximum(scores[2], scores[3])
         )
         weight = [jnp.exp(score - maximum) for score in scores]
         denominator = (weight[0] + weight[1]) + (weight[2] + weight[3])
         weighted = [
-            (weight[member] / denominator) * members[member][:, :128]
-            for member in range(4)
+            (weight[member] / denominator) * keys[member] for member in range(4)
         ]
         pooled = ((weighted[0] + weighted[1]) + (weighted[2] + weighted[3])).astype(
             jnp.bfloat16
         )
-        rotated = jax.lax.dot_general(
-            pooled,
-            h_ref[...],
-            (((1,), (0,)), ((), ())),
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        )
+        rotated = _hadamard128(pooled.astype(jnp.float32))
         rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
         amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
         exponent = jnp.ceil(jnp.log2(amax / 448.0))
@@ -200,9 +215,6 @@ def compress_and_store(
     count, desc = _descriptors(
         kv_lens, page_indices, cu_q_lens, distribution, num_tokens
     )
-    h = np.ones((1, 1), dtype=np.float32)
-    while h.shape[0] < 128:
-        h = np.block([[h, h], [h, -h]])
     return pl.pallas_call(
         _kernel,
         out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
@@ -212,7 +224,6 @@ def compress_and_store(
             in_specs=(
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(),
                 pl.BlockSpec(),
             ),
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -232,5 +243,4 @@ def compress_and_store(
         raw_cache,
         pooled_cache,
         ape.astype(jnp.float32),
-        jnp.asarray(h, dtype=jnp.bfloat16),
     )
