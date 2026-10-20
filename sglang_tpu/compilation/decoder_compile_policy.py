@@ -1354,14 +1354,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         disagg_mode = get_disagg().disaggregation_mode
         pending = []
         if disagg_mode != "decode":
-            if self._input_logprob_processor is not None:
-                pending += self._input_logprob_processor.precompile(
-                    self.t_bucketer.max_val,
-                    self.model_runner.device,
-                    max_batch_size=self._extend_compile_cap(),
-                    hidden_size=self.model_runner.model_config.hidden_size,
-                    hidden_dtype=self.model_runner.dtype,
-                )
+            pending += self._precompile_prompt_logprobs()
             pending += self._precompile_extend()
             self._assert_cp_family_compiled()
         if disagg_mode != "prefill":
@@ -1385,6 +1378,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             time.perf_counter() - overall,
         )
         return pending
+
+    def _precompile_prompt_logprobs(self) -> list[PendingCall]:
+        if self._input_logprob_processor is None:
+            return []
+        return self._input_logprob_processor.precompile(
+            self.t_bucketer.max_val,
+            self.model_runner.device,
+            max_batch_size=self._extend_compile_cap(),
+            hidden_size=self.model_runner.model_config.hidden_size,
+            hidden_dtype=self.model_runner.dtype,
+        )
 
     def _warmup_host_padding(self) -> None:
         from sglang.srt.arg_groups.overrides import resolving_view

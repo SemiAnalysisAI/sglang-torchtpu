@@ -23,6 +23,7 @@ class TestInputTopLogprobs(unittest.TestCase):
         for fast in (False, True):
             for lengths, starts, chunk_size in (
                 ([512], [1], 512),
+                ([2048, 3, 16], [0, 3, 1], 2048),
                 ([129, 4, 136], [1, 4, 2], 128),
             ):
                 with self.subTest(fast=fast, lengths=lengths):

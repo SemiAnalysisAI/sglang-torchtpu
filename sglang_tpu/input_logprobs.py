@@ -319,21 +319,20 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
             lo = bisect.bisect_left(input_rows, start)
             hi = bisect.bisect_left(input_rows, end)
             logical_rows = hi - lo
-            selected_logits = _gather(
-                logits,
-                _device_indices(
-                    [index - start for index in input_rows[lo:hi]], rows, device
-                ),
-            )
-            # Keep the existing eager reduction boundaries: fusing logsumexp
-            # changes fp32 rounding. Physical rows are already bucketed.
+            local_input_rows = [index - start for index in input_rows[lo:hi]]
+            selected_ids = [0] * rows
+            for row, token_id in zip(local_input_rows, input_ids[lo:hi]):
+                selected_ids[row] = token_id
+            # Normalize the original rows and reorder only small host results.
+            # Gathering full-vocabulary rows here doubles the projection memory.
+            # Keep eager reduction boundaries to preserve fp32 rounding.
             if self.enable_fast_input_logprobs:
-                values = selected_logits
+                values = logits
                 normalizer = compute_row_log_normalizer(values)
             else:
-                values = torch.nn.functional.log_softmax(selected_logits, dim=-1)
+                values = torch.nn.functional.log_softmax(logits, dim=-1)
                 normalizer = None
-            selected = select(values, _device_indices(input_ids[lo:hi], rows, device))
+            selected = select(values, _device_indices(selected_ids, rows, device))
             chunk_slice = slice(token_to_seq_idx[start], token_to_seq_idx[end - 1] + 1)
             lengths = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
             if top_values is not None:
@@ -342,8 +341,8 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
                     values, max(widths), normalizer, None
                 )
                 split_top = _append_top_logprobs_chunk(
-                    host_values[:logical_rows],
-                    host_indices[:logical_rows],
+                    [host_values[row] for row in local_input_rows],
+                    [host_indices[row] for row in local_input_rows],
                     logical_rows,
                     widths,
                     lengths,
@@ -358,7 +357,7 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
                     named[token_to_seq_idx[index]] or [] for index in input_rows[lo:hi]
                 ]
                 host_values, host_indices = self._copy_named_logprobs(
-                    values, per_row, normalizer
+                    values, per_row, local_input_rows, normalizer
                 )
                 split_named = _append_top_logprobs_chunk(
                     host_values,
@@ -375,7 +374,7 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
             if normalizer is not None:
                 row_max, row_sum = (tensor.cpu() for tensor in normalizer)
                 chosen = (chosen.float() - row_max) - row_sum
-            token_chunks.append(chosen[:logical_rows])
+            token_chunks.append(chosen[local_input_rows])
         return (
             LogprobResult(
                 token_logprobs=torch.cat(token_chunks),
@@ -388,7 +387,7 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
         )
 
     @staticmethod
-    def _copy_named_logprobs(values, per_row, normalizer):
+    def _copy_named_logprobs(values, per_row, input_rows, normalizer):
         gather = (
             _compiled_gather_pairs() if values.device.type == "tpu" else _gather_pairs
         )
@@ -403,7 +402,7 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
             width = max((len(ids) for ids in requests), default=0)
             host_rows = torch.tensor(
                 [
-                    *range(start, start + len(requests)),
+                    *input_rows[start : start + len(requests)],
                     *([0] * (_SORT_ROWS - len(requests))),
                 ],
                 dtype=torch.int64,
@@ -507,11 +506,6 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
                 rows *= 2
                 continue
             same_rows = torch.empty(rows, dtype=torch.int64, device=device)
-            pending.append(
-                _compiled_gather().precompile(
-                    example, same_rows, async_compile=async_compile
-                )
-            )
             pending.append(
                 _compiled_token_logits().precompile(
                     example,
