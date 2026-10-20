@@ -22,13 +22,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 @pytest.mark.parametrize("sizes", [(0, 3), (3, 0), (1, 1), (2, 1), (3, 1)])
 def test_row_operations_preserve_metadata_and_history(sizes):
     left_rows, right_rows = sizes
-    for dtype, tail in ((torch.int64, ()), (torch.int32, (3,))):
-        left = torch.arange(left_rows * (3 if tail else 1), dtype=dtype).reshape(
-            left_rows, *tail
+    for dtype, tail in (
+        (torch.int64, ()),
+        (torch.int32, (3,)),
+        (torch.float32, ()),
+        (torch.float32, (1,)),
+    ):
+        width = tail[0] if tail else 1
+        left = torch.arange(left_rows * width, dtype=dtype).reshape(left_rows, *tail)
+        right = (torch.arange(right_rows * width, dtype=dtype) + 100).reshape(
+            right_rows, *tail
         )
-        right = (
-            torch.arange(right_rows * (3 if tail else 1), dtype=dtype) + 100
-        ).reshape(right_rows, *tail)
         expected = torch.cat((left, right))
         assert torch.equal(merge_rows(left, right), expected)
         if not left_rows or not right_rows:

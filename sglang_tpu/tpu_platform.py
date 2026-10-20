@@ -41,6 +41,7 @@ traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 warmup_sampling = LazyImport("sglang_tpu.serving_warmup", "warmup_sampling")
 precompile_sampling = LazyImport("sglang_tpu.serving_warmup", "precompile_sampling")
 warmup_request_relay = LazyImport("sglang_tpu.serving_warmup", "warmup_request_relay")
+merge_rows = LazyImport("sglang_tpu.row_ops", "merge_rows")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -1304,6 +1305,17 @@ class TpuSRTPlatform(SRTPlatform):
 
     def prewarm_request_relay(self, future_map, max_batch_size: int) -> None:
         warmup_request_relay(future_map, max_batch_size)
+
+    def merge_batch_rows(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        host_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if host_rows is not None:
+            return host_rows.to(left.device, non_blocking=True, copy=True)
+        return merge_rows(left, right)
 
     def on_warmup_complete(self) -> None:
         """Arm native admission and freeze torch.compile after warmup."""

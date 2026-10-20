@@ -58,7 +58,9 @@ def test_sampling_warmup_restores_rng_on_success_and_failure(fail):
         patch.object(
             serving_warmup,
             "get_exec",
-            return_value=SimpleNamespace(graph=SimpleNamespace(torch_compile_max_bs=2)),
+            return_value=SimpleNamespace(
+                graph=SimpleNamespace(torch_compile_max_bs=2, enable_torch_compile=True)
+            ),
         ),
         patch.object(serving_warmup, "warmup_output_top_logprobs"),
     ):
@@ -177,7 +179,7 @@ def test_output_sort_compilation_overlaps_dynamo_model_warmup():
 
 
 @pytest.mark.parametrize(
-    "speculative_algorithm,enabled", [("EAGLE3", True), (None, False)]
+    "speculative_algorithm,enabled", [("EAGLE3", True), ("SBD", True), (None, False)]
 )
 def test_sort_precompile_does_not_expand_speculative_or_uncompiled_warmup(
     speculative_algorithm, enabled
@@ -186,6 +188,8 @@ def test_sort_precompile_does_not_expand_speculative_or_uncompiled_warmup(
         is_draft_worker=False,
         pp_group=SimpleNamespace(is_last_rank=True),
         model_config=SimpleNamespace(is_generation=True),
+        device="cpu",
+        max_running_requests=2,
     )
     with (
         patch.object(
@@ -197,10 +201,61 @@ def test_sort_precompile_does_not_expand_speculative_or_uncompiled_warmup(
             serving_warmup,
             "get_exec",
             return_value=SimpleNamespace(
-                graph=SimpleNamespace(enable_torch_compile=enabled)
+                graph=SimpleNamespace(
+                    enable_torch_compile=enabled, torch_compile_max_bs=2
+                )
             ),
         ),
         patch.object(serving_warmup, "precompile_output_top_logprobs") as precompile,
+        patch.object(serving_warmup, "precompile_row_ops") as rows,
     ):
         serving_warmup.precompile_sampling(runner)
     precompile.assert_not_called()
+    assert rows.call_count == int(enabled)
+
+
+@pytest.mark.parametrize(
+    "is_draft,is_generation,is_last_rank",
+    [
+        (False, True, True),
+        (True, True, True),
+        (False, False, True),
+        (False, True, False),
+    ],
+)
+def test_sbd_batch_rows_warm_only_target_generation_metadata(
+    is_draft, is_generation, is_last_rank
+):
+    runner = SimpleNamespace(
+        is_draft_worker=is_draft,
+        pp_group=SimpleNamespace(is_last_rank=is_last_rank),
+        model_config=SimpleNamespace(is_generation=is_generation),
+        device="cpu",
+        max_running_requests=2,
+    )
+    with (
+        patch.object(
+            serving_warmup,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_algorithm="SBD"),
+        ),
+        patch.object(
+            serving_warmup,
+            "get_exec",
+            return_value=SimpleNamespace(
+                graph=SimpleNamespace(enable_torch_compile=True, torch_compile_max_bs=4)
+            ),
+        ),
+        patch.object(serving_warmup, "warmup_row_ops") as rows,
+    ):
+        serving_warmup.warmup_sampling(runner)
+    assert rows.call_count == int(not is_draft and is_generation and is_last_rank)
+    if rows.called:
+        templates, max_rows = rows.call_args.args
+        assert max_rows == 2
+        assert {(t.dtype, tuple(t.shape[1:])) for t in templates} == {
+            (torch.int64, ()),
+            (torch.int32, ()),
+            (torch.float32, ()),
+            (torch.float32, (1,)),
+        }

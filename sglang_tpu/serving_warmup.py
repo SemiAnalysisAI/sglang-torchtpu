@@ -19,6 +19,7 @@ from sglang_tpu.output_logprobs import (
     precompile_output_top_logprobs,
     warmup_output_top_logprobs,
 )
+from sglang_tpu.row_ops import precompile_row_ops, warmup_row_ops
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -34,22 +35,46 @@ def _max_batch_size(model_runner: ModelRunner) -> int:
     )
 
 
-def _uses_generic_sampling(model_runner: ModelRunner) -> bool:
+def _is_target_generation_runner(model_runner: ModelRunner) -> bool:
     return (
-        get_spec().speculative_algorithm is None
-        and not model_runner.is_draft_worker
+        not model_runner.is_draft_worker
         and model_runner.pp_group.is_last_rank
         and model_runner.model_config.is_generation
     )
 
 
+def _uses_generic_sampling(model_runner: ModelRunner) -> bool:
+    return (
+        _is_target_generation_runner(model_runner)
+        and get_spec().speculative_algorithm is None
+    )
+
+
+def _batch_row_templates(device: torch.device | str) -> list[torch.Tensor]:
+    return [
+        torch.zeros(shape, dtype=dtype, device="cpu").to(device)
+        for shape, dtype in (
+            ((1,), torch.int64),
+            ((1,), torch.int32),
+            ((1,), torch.float32),
+            ((1, 1), torch.float32),
+        )
+    ]
+
+
 def precompile_sampling(model_runner: ModelRunner) -> None:
-    """Queue the expensive output sort alongside model graph compilation."""
+    """Queue batch metadata and output sorting alongside model compilation."""
     if not (
-        _uses_generic_sampling(model_runner) and get_exec().graph.enable_torch_compile
+        _is_target_generation_runner(model_runner)
+        and get_exec().graph.enable_torch_compile
     ):
         return
     with torch.no_grad():
+        precompile_row_ops(
+            _batch_row_templates(model_runner.device), _max_batch_size(model_runner)
+        )
+        if not _uses_generic_sampling(model_runner):
+            return
         for bs in range(1, _max_batch_size(model_runner) + 1):
             logprobs = torch.zeros(
                 bs, model_runner.model_config.vocab_size, dtype=torch.float32
@@ -59,6 +84,19 @@ def precompile_sampling(model_runner: ModelRunner) -> None:
 
 def warmup_sampling(model_runner: ModelRunner) -> None:
     """Cover the full-vocabulary sampling tail outside the compiled decoder."""
+    if (
+        _is_target_generation_runner(model_runner)
+        and get_exec().graph.enable_torch_compile
+    ):
+        started = time.perf_counter()
+        max_bs = _max_batch_size(model_runner)
+        with torch.no_grad():
+            warmup_row_ops(_batch_row_templates(model_runner.device), max_bs)
+        logger.info(
+            "TPU batch row warmup: rows=1..%d, %.3fs",
+            max_bs,
+            time.perf_counter() - started,
+        )
     if not _uses_generic_sampling(model_runner):
         return
     sampler = model_runner.sampler
