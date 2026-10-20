@@ -79,6 +79,7 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.cp_layout import warmup_request_lengths
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental.sampling.sampling_batch_info import is_host_padded
+from sglang_tpu.input_logprobs import TpuInputLogprobProcessor
 from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
@@ -499,6 +500,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.tracer = tracer
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
+        self._input_logprob_processor: TpuInputLogprobProcessor | None = None
         self._logged_vl_warmup_variants: set[str] = set()
         # Variant tags actually warmed, so precompile() can tell a family that
         # was compiled from one an override dropped.
@@ -648,8 +650,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.model_runner.model, "logits_processor", None
             )
             if logits_processor is not None:
-                # TPUs don't support returning input logprobs -- this errors elsewhere.
+                # Keep data-dependent prompt logprobs outside the compiled forward.
                 logits_processor.compute_input_logprobs = False
+                if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
+                    previous = logits_processor.input_logprob_processor
+                    self._input_logprob_processor = TpuInputLogprobProcessor(
+                        previous.vocab_size,
+                        previous.chunking_group,
+                        skip_chunking=logits_processor.do_tensor_parallel_all_gather_dp_attn,
+                    )
+                    logits_processor.input_logprob_processor = (
+                        self._input_logprob_processor
+                    )
                 if self._cp_strategy is not None:
                     install_cp_logits_forward(logits_processor)
                     cp_logits_installed = True
@@ -1336,6 +1348,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         disagg_mode = get_disagg().disaggregation_mode
         pending = []
         if disagg_mode != "decode":
+            if self._input_logprob_processor is not None:
+                pending += self._input_logprob_processor.precompile(
+                    self.t_bucketer.max_val, self.model_runner.device
+                )
             pending += self._precompile_extend()
             self._assert_cp_family_compiled()
         if disagg_mode != "prefill":

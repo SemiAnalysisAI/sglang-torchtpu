@@ -273,6 +273,30 @@ def get_top_logprobs_chunk(
         indices = indices_tensor.tolist()
         rows_avail = len(values)
 
+    return _append_top_logprobs_chunk(
+        values,
+        indices,
+        rows_avail,
+        top_k_nums,
+        pruned_lens,
+        top_logprobs_val,
+        top_logprobs_idx,
+        split_pruned_len,
+        copy_to_pinned_cpu,
+    )
+
+
+def _append_top_logprobs_chunk(
+    values,
+    indices,
+    rows_avail,
+    top_k_nums,
+    pruned_lens,
+    top_logprobs_val,
+    top_logprobs_idx,
+    split_pruned_len,
+    copy_to_pinned_cpu,
+):
     pt = 0
     next_split_pruned_len = 0
     for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
@@ -504,9 +528,12 @@ class InputLogprobProcessor:
         self,
         vocab_size: int,
         chunking_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
+        get_top_logprobs_chunk_fn: Callable = get_top_logprobs_chunk,
     ):
         self.vocab_size = vocab_size
         self.chunking_group = chunking_group
+        self.get_top_logprobs_chunk = get_top_logprobs_chunk_fn
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
@@ -761,7 +788,7 @@ class InputLogprobProcessor:
                     pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
                         chunk_slice
                     ]
-                    split_len_topk = get_top_logprobs_chunk(
+                    split_len_topk = self.get_top_logprobs_chunk(
                         chunk_logprobs,
                         top_k_nums,
                         pruned_lens,
