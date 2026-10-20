@@ -50,13 +50,13 @@ from sglang_tpu.experimental.speculative.dspark.dspark_draft_worker import (
     TpuDsparkDraftWorker,
 )
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_sampled_filtered,
     build_draft_block_inputs,
     sample_tokens,
 )
 from sglang_tpu.experimental.speculative.spec_types import (
     AcceptResult,
     BucketState,
+    CommitResult,
     DraftResult,
     SpecState,
     TpuSpecVerifyInput,
@@ -179,7 +179,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         verify_input: TpuSpecVerifyInput,
         logits_output: LogitsProcessorOutput,
         accept: AcceptResult,
-    ) -> SpecState:
+    ) -> CommitResult:
         del verify_input
         target_hidden = logits_output.hidden_states
         assert target_hidden is not None
@@ -187,7 +187,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             "verify hidden must keep the batch bucket rows"
         )
         # Padded rows commit 0 tokens, so the writer skips them.
-        self._block_draft_worker.write_draft_kv(
+        kv_fence_tail = self._block_draft_worker.write_draft_kv(
             target_hidden=target_hidden,
             positions=rows.flat_positions,
             cache_loc=rows.flat_cache_locs,
@@ -195,11 +195,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             commit_lens=accept.accept_lens,
         )
         # Verify rows past the new seq_lens become dead target KV; freeing them is the allocator's job.
-        return SpecState(
+        next_state = SpecState(
             bonus_tokens=accept.bonus_tokens,
             seq_lens=accept.next_seq_lens,
             req_pool_indices=state.req_pool_indices,
         )
+        return CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
 
     def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
@@ -229,7 +230,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         # Must inject before returning: the scheduler may update radix afterward,
         # invalidating out_cache_loc.
-        self._block_draft_worker.write_draft_kv(
+        kv_fence_tail = self._block_draft_worker.write_draft_kv(
             target_hidden=target_hidden, positions=positions, cache_loc=cache_loc
         )
         logits_output.hidden_states = None
@@ -239,7 +240,9 @@ class TpuBlockSpecWorker(TpuSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
         result.new_seq_lens = next_state.seq_lens
-        result.next_draft_input = self.state_to_spec_info(next_state)
+        next_draft_input = self.state_to_spec_info(next_state)
+        next_draft_input.kv_fence_tail = kv_fence_tail
+        result.next_draft_input = next_draft_input
         return result
 
     def make_verify_input(
@@ -372,16 +375,7 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                 )
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
-                # Sampled verify when requests restrict top-k/top-p/min-p.
-                verify_rows = (padded_bs * self.num_verify_rows, draft_logits.shape[-1])
-                warmup_compiled_op(
-                    accept_drafts_sampled_filtered,
-                    torch.zeros(verify_rows, dtype=torch.float32, device=self.device),
-                    draft_tokens,
-                    self._all_drafts[padded_bs],
-                    draft_logits.float(),
-                    *self._sampling_param_warmup_args(padded_bs),
-                )
+                self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)
 
     def _warmup_extend_draft_inputs(self) -> None:
         """extend's draft positions / cache_loc uploads at every token bucket."""

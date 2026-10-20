@@ -59,7 +59,6 @@ from sglang_tpu.compile_cache import (
 )
 from sglang_tpu.experimental import (
     is_experimental_chain,
-    is_experimental_eagle3,
     is_experimental_spec_worker,
 )
 from sglang_tpu.experimental.compilation.block_compile_policy import (
@@ -67,9 +66,6 @@ from sglang_tpu.experimental.compilation.block_compile_policy import (
 )
 from sglang_tpu.experimental.compilation.chain_compile_policy import (
     TpuChainSpecDecodeCompilePolicyMixin,
-)
-from sglang_tpu.experimental.compilation.eagle3_compile_policy import (
-    TpuEagle3SpecDecodeCompilePolicyMixin,
 )
 
 if TYPE_CHECKING:
@@ -92,15 +88,13 @@ def _resolve_spec_compile_policy_mixin(
     spec_algorithm: SpeculativeAlgorithm,
 ) -> type[BaseSpecDecodeCompilePolicyMixin]:
     """Resolve speculative compile policy mixin class based on algorithm."""
-    # Checked first: the experimental workers also serve DFLASH and MTP.
+    # Checked first: the experimental workers also serve DFLASH, MTP and EAGLE3.
     if is_experimental_chain(spec_algorithm):
         return TpuChainSpecDecodeCompilePolicyMixin
     if is_experimental_spec_worker(spec_algorithm):
         return TpuBlockSpecDecodeCompilePolicyMixin
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
-    if is_experimental_eagle3(spec_algorithm):
-        return TpuEagle3SpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 

@@ -43,6 +43,10 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # Sparse MLA: pooled-DSA batches of 512+ tokens (prefill) through the
+    # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
+    # each block's union of selected pages once; False keeps the per-query kernel.
+    SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -68,11 +72,24 @@ class TpuEnvs:
     # MoE router: one Pallas kernel for the biased sigmoid top-k of decode-sized
     # batches (kernels/router_topk.py); False keeps the generic top-k.
     SGLANG_TPU_ENABLE_ROUTER_TOPK_KERNEL = EnvBool(True)
+    # GLM-5.3-Flash: single-request target steps (the MTP verify, or decode
+    # without speculation) as one Pallas call per device (glm_flash_megakernel/);
+    # other steps run the model as usual. ..._MAX_LEN caps the request length the
+    # kernel takes (default: the context length).
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL = EnvBool(False)
+    SGLANG_TPU_GLM_FLASH_MEGAKERNEL_MAX_LEN = EnvInt(None)
+    # Pin each scheduler's main thread to one CPU of its rank's set and keep its
+    # other threads off that physical core (hooks/cpu_pinning.py).
+    SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING = EnvBool(False)
 
     # Speculative decoding
-    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and EAGLE3
-    # to TpuEagle3Worker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
+    # Route DFLASH/DSPARK to sglang_tpu.experimental.TpuBlockSpecWorker and MTP
+    # and EAGLE3 to TpuChainSpecWorker; SGLANG_TPU_HOST_PADDING_NO_D2H also does.
     SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER = EnvBool(False)
+    # DFLASH draft linears, including the DFlash2 conv kernel projections, as fp8
+    # weight-only (fp8_weight_linear.py) for decode-sized calls; prefill-sized calls
+    # keep the bf16 weights. Changes the draft's proposals, not verification.
+    SGLANG_TPU_DFLASH_FP8_DRAFT = EnvBool(False)
 
     # Muse Spark: whole-decoder Pallas megakernel for decode and DFlash target-verify
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
@@ -87,6 +104,11 @@ class TpuEnvs:
     # raise throughput but opens more connections, and above 4 is unlikely to
     # help much. Benchmark first; in a large prefill-decode mesh, consider 1 or 2.
     SGLANG_TPU_RAIDEN_TRANSFER_PARALLELISM = EnvInt(4)
+
+    # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
+    # of the next eviction victims kept copied to host. Unset: four chunked-prefill
+    # chunks. 0: evictions back up their victims synchronously, as upstream does.
+    SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
     @classmethod
     def names(cls) -> list[str]:

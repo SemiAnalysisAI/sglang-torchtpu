@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.spec_utils import draft_tp_context
 
 
 class TpuDraftWorker(ABC):
@@ -22,6 +29,9 @@ class TpuDraftWorker(ABC):
     num_drafts: int
 
     def __init__(self, target_runner: ModelRunner) -> None:
+        # Under DP attention the draft runs inside its rank's attention-TP group, as
+        # an EAGLE3 draft does in core, so it gathers nothing across DP ranks.
+        self._owns_attention = get_parallel().attn_dp_enabled
         model_config = ModelConfig.from_server_args(
             target_runner.server_args,
             model_path=get_spec().speculative_draft_model_path,
@@ -32,14 +42,25 @@ class TpuDraftWorker(ABC):
         )
         # FIXME(junyanxu): ModelRunner requires gpu_id / nccl_port, which TPU never reads;
         # drop the placeholders once core makes them optional.
-        self.model_runner = ModelRunner(
-            model_config=model_config,
-            mem_fraction_static=get_schedule().mem_fraction_static,
-            gpu_id=0,
-            nccl_port=0,
-            server_args=target_runner.server_args,
-            is_draft_worker=True,
-        )
+        with self.draft_context():
+            self.model_runner = ModelRunner(
+                model_config=model_config,
+                mem_fraction_static=get_schedule().mem_fraction_static,
+                gpu_id=0,
+                nccl_port=0,
+                server_args=target_runner.server_args,
+                is_draft_worker=True,
+            )
+
+    @contextlib.contextmanager
+    def draft_context(self) -> Iterator[None]:
+        """The scopes every draft-model phase runs under, as EAGLEWorkerV2 enters them."""
+        with (
+            draft_tp_context(self._owns_attention),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
 
     def alloc_memory_pool(
         self,
@@ -54,11 +75,13 @@ class TpuDraftWorker(ABC):
         self.model_runner.alloc_memory_pool(memory_pool_config)
 
     def init_attention_backends(self) -> None:
-        self.model_runner.init_attention_backends()
+        with self.draft_context():
+            self.model_runner.init_attention_backends()
 
     def init_cuda_graphs(self) -> None:
-        self.model_runner.init_cuda_graphs(capture_decode_cuda_graph=False)
-        self.precompile_draft()
+        with self.draft_context():
+            self.model_runner.init_cuda_graphs(capture_decode_cuda_graph=False)
+            self.precompile_draft()
 
     @abstractmethod
     def precompile_draft(self) -> None:

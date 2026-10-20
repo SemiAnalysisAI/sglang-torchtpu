@@ -253,6 +253,28 @@ def _select_fused_rs_block_sizes(
             fp8_direct_write=fp8_direct_write,
         )
     )
+    # --- Step 4b: bound the W1/W2 VMEM buffers by their real element width ---
+    # calculate_tiling sizes the RHS tiles for the quantized width. Unquantized
+    # (bf16) experts at a large hidden size can otherwise get W1/W2 buffers that
+    # exceed VMEM. Halve tile_n (then tile_k) until each buffer set fits 16 MiB;
+    # quantized tiles already fit.
+    if not is_quantized:
+        w_bytes = jax.dtypes.itemsize_bits(w1_dtype) // 8
+        budget = 16 * 1024 * 1024
+        n1_cols = lambda: tile_n1 * 2 if act_fn else tile_n1
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget and tile_n1 > num_lanes
+        ):
+            tile_n1 //= 2
+        while (
+            num_w1_bufs * tile_k1 * n1_cols() * w_bytes > budget
+            and tile_k1 > 2 * num_lanes
+        ):
+            tile_k1 //= 2
+        while (
+            num_w2_bufs * tile_k2 * tile_n2 * w_bytes > budget and tile_n2 > num_lanes
+        ):
+            tile_n2 //= 2
     # --- Step 5: Alignment post-processing ---
     k_align1 = num_lanes
     if tile_k1 % k_align1 != 0:
@@ -963,7 +985,7 @@ def kernel_main_fused_rs(
     # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
     # tight configs (e.g. EP8 E_32 M_256), leave less than the bucket transient of
     # VMEM free -> scoped-VMEM OOM. All measured bucketing gains are on fp4 (the
-    # prod decode dtype) anyway, so only bucket when the weights are fp4.
+    # usual decode dtype) anyway, so only bucket when the weights are fp4.
     _w_qdt = cfgs1.rhs_cfgs.quant_dtype
     _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
     _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
