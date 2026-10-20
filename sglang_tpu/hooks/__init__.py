@@ -41,6 +41,10 @@ from sglang_tpu.hooks.kda_weights import (
     bind_glm5_next_kda_weights,
     rehome_kimi_k3_kda_weights,
 )
+from sglang_tpu.hooks.kimi_k3_vision import (
+    attach_k3_vision_runner,
+    encode_with_k3_vision_runner,
+)
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -135,6 +139,16 @@ HOOKS: list[tuple] = [
         "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture",
         prepare_k3_capture_kernels,
         HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.MoonViT3dEncoder.__init__",
+        attach_k3_vision_runner,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3_vl.KimiK3VisionTower._forward_eager",
+        encode_with_k3_vision_runner,
+        HookType.AROUND,
     ),
     (
         "sglang.srt.layers.attn_residual._aggregate",
