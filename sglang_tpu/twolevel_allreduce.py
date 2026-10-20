@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two-level one-shot Pallas all-reduce for single-token TP decode tensors.
+"""Two-level one-shot Pallas all-reduce for small TP decode / verify tensors.
 
 XLA's all-reduce of a [1, H] bf16 decode activation over a multi-host TP group
 is latency bound: on a tpu7x 2x2x4 slice (TP32, 8 TensorCores per host) it took
@@ -14,8 +14,9 @@ Measured on that slice: 13.0 us at H=7168, 15.3 us at H=10752.
 
 Opt-in via SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE. It applies to the TP group
 only, when TP spans the whole world (no DP / PP / extra ranks) so TP ranks are
-host-major, for bf16 [1, H] tensors with H a multiple of 128; everything else
-keeps the original all-reduce.
+host-major, for bf16 [M, H] tensors with M <= MAX_ROWS and H a multiple of 128
+(decode batches and speculative verify rows); everything else keeps the
+original all-reduce.
 """
 
 import functools
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 # Largest packed payload (elements) one call reduces.
 MAX_ELEMS = 16 * 16384
+# Most rows one tensor may have. Measured on a tpu7x 2x2x4 slice (TP32), bf16
+# [M, 7168], kernel vs XLA's all-reduce per call: M=1 12.7 vs 25.8 us, 2 14.0
+# vs 20.7, 4 18.7 vs 22.7, 8 28.4 vs 128.3, 16 48.4 vs 129.8, 32 98.4 vs 132.0.
+MAX_ROWS = 32
 # Rows of 128 lanes each tensor's block is aligned to in the packed buffer.
 _ALIGN_ROWS = 16
 # Barrier-semaphore namespace of this kernel. The fused GMM reduce-scatter uses
@@ -102,7 +107,7 @@ def _kernel(*refs, n: int, rows: tuple, offs: tuple, world: int, local: int):
 
 def twolevel_all_reduce_local(*xs, world: int, local: int):
     """Per-rank body; call inside ``shard_map`` over a 1-D mesh axis "model"
-    whose index order is the TP rank order (host-major). Each x is [1, H]."""
+    whose index order is the TP rank order (host-major). Each x is [M, H]."""
     import jax
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -110,7 +115,7 @@ def twolevel_all_reduce_local(*xs, world: int, local: int):
 
     n = len(xs)
     groups = world // local
-    # One token: each [1, H] row is exchanged as dense (H / 128, 128) tiles; a
+    # Each [M, H] tensor is exchanged as dense (M * H / 128, 128) tiles; a
     # (1, H) row measured 1-4 us slower to exchange. The kernel relayouts in
     # VMEM: as XLA reshapes around the call it added two ~0.8 us ops per tensor.
     rows = tuple(x.shape[0] * x.shape[1] // 128 for x in xs)
@@ -256,26 +261,27 @@ def register_from_parallel_state() -> None:
     register(world, local)
     logger.info(
         "Two-level Pallas all-reduce on: TP %d = %d hosts x %d ranks. It takes "
-        "single-token bf16 TP all-reduces (and Kimi-K3's merged MoE reduce); "
-        "everything else keeps XLA's all-reduce.",
+        "bf16 TP all-reduces of up to %d rows (and Kimi-K3's merged MoE "
+        "reduce); everything else keeps XLA's all-reduce.",
         world,
         world // local,
         local,
+        MAX_ROWS,
     )
     compile_bs = server_args.tpu_compile_bs
-    if compile_bs and 1 not in compile_bs:
+    if compile_bs and min(compile_bs) > MAX_ROWS:
         logger.warning(
-            "Two-level Pallas all-reduce is on but the TPU compile batch sizes "
-            "%s have no batch size 1, so no compiled decode step takes it.",
+            "Two-level Pallas all-reduce is on but every TPU compile batch size "
+            "in %s is above %d rows, so no compiled decode step takes it.",
             compile_bs,
+            MAX_ROWS,
         )
 
 
 def eligible(t: torch.Tensor) -> bool:
-    # One decode token only: at 4 rows XLA's all-reduce measured faster.
     return (
         t.dim() == 2
-        and t.shape[0] == 1
+        and 0 < t.shape[0] <= MAX_ROWS
         and t.dtype == torch.bfloat16
         and t.shape[1] % 128 == 0
         and t.numel() <= MAX_ELEMS

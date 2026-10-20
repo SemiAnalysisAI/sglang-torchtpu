@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - non-TPU host
 
 @unittest.skipUnless(len(_DEVICES) >= 4, "requires >= 4 TPU devices")
 class TestTwoLevelAllReduce(CustomTestCase):
-    def _run(self, widths, local, seed):
+    def _run(self, widths, local, seed, rows=1):
         from jax.sharding import Mesh
         from jax.sharding import PartitionSpec as P
 
@@ -34,9 +34,10 @@ class TestTwoLevelAllReduce(CustomTestCase):
         world = len(_DEVICES)
         mesh = Mesh(np.array(_DEVICES), ("model",))
         rng = np.random.default_rng(seed)
-        # Each rank's [1, H] input is one row of a [world, H] array.
+        # Each rank's [rows, H] input is one block of a [world * rows, H] array.
         xs = [
-            jnp.asarray(rng.standard_normal((world, h)), jnp.bfloat16) for h in widths
+            jnp.asarray(rng.standard_normal((world * rows, h)), jnp.bfloat16)
+            for h in widths
         ]
         n = len(xs)
         fn = jax.jit(
@@ -51,13 +52,13 @@ class TestTwoLevelAllReduce(CustomTestCase):
         outs = fn(*xs)
         outs = outs if n > 1 else (outs,)
         for x, out in zip(xs, outs):
-            want = np.asarray(x, np.float32).sum(axis=0)
-            got = np.asarray(out, np.float32)
-            self.assertEqual(got.shape, (world, x.shape[1]))
+            h = x.shape[1]
+            want = np.asarray(x, np.float32).reshape(world, rows, h).sum(axis=0)
+            got = np.asarray(out, np.float32).reshape(world, rows, h)
             # Every rank holds the same sum; the cross-host partial is bf16.
             for r in range(world):
                 err = np.abs(got[r] - want).max() / np.abs(want).max()
-                self.assertLess(err, 2e-2, f"local={local} rank={r} H={x.shape[1]}")
+                self.assertLess(err, 2e-2, f"local={local} rank={r} H={h} rows={rows}")
             np.testing.assert_array_equal(got, np.broadcast_to(got[0], got.shape))
 
     def test_single_tensor(self):
@@ -65,6 +66,19 @@ class TestTwoLevelAllReduce(CustomTestCase):
         # local=1: one rank per "host", so only the cross-host phase runs.
         for local in sorted({world, world // 2, 2, 1}):
             self._run((7168,), local, seed=local)
+
+    def test_multi_row(self):
+        # Decode batches and speculative verify rows, up to MAX_ROWS; each row
+        # must reduce on its own (a row mix-up would still sum to the total).
+        from sglang_tpu.twolevel_allreduce import MAX_ROWS
+
+        world = len(_DEVICES)
+        for rows in (2, 8, MAX_ROWS):
+            self._run((7168,), world // 2, seed=200 + rows, rows=rows)
+
+    def test_multi_row_packed_pair(self):
+        world = len(_DEVICES)
+        self._run((3584, 7168), world // 2, seed=300, rows=8)
 
     def test_packed_pair(self):
         # Kimi-K3 TP32: routed latent (3584) + shared-expert output (7168).

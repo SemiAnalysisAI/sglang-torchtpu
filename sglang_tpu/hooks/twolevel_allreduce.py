@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two-level Pallas all-reduce for single-token TP decode tensors (opt-in).
+"""Two-level Pallas all-reduce for small TP decode / verify tensors (opt-in).
 
 all_reduce
   Why: XLA's all-reduce of a [1, H] bf16 decode activation over a multi-host

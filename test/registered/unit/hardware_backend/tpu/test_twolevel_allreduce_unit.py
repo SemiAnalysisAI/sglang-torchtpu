@@ -19,12 +19,17 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestEligibility(CustomTestCase):
-    def test_single_token_bf16_lane_aligned(self):
-        self.assertTrue(tl.eligible(torch.zeros(1, 7168, dtype=torch.bfloat16)))
+    def test_bf16_lane_aligned_up_to_max_rows(self):
+        for rows in (1, 4, 8, tl.MAX_ROWS):
+            with self.subTest(rows=rows):
+                self.assertTrue(
+                    tl.eligible(torch.zeros(rows, 7168, dtype=torch.bfloat16))
+                )
 
     def test_rejects_others(self):
         for t in (
-            torch.zeros(4, 7168, dtype=torch.bfloat16),  # more than one token
+            torch.zeros(tl.MAX_ROWS + 1, 7168, dtype=torch.bfloat16),
+            torch.zeros(0, 7168, dtype=torch.bfloat16),
             torch.zeros(1, 7168, dtype=torch.float32),
             torch.zeros(1, 7100, dtype=torch.bfloat16),  # not a 128 multiple
             torch.zeros(7168, dtype=torch.bfloat16),
@@ -113,10 +118,10 @@ class TestRegistration(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "same on every rank"):
                     self._register(enabled, seen=seen)
 
-    def test_warns_without_a_bs1_compile_bucket(self):
+    def test_warns_when_every_compile_bucket_is_too_large(self):
         with self.assertLogs(tl.logger, "WARNING") as logs:
-            self._register(True, compile_bs=(4, 8))
-        self.assertIn("no batch size 1", "\n".join(logs.output))
+            self._register(True, compile_bs=(tl.MAX_ROWS * 2,))
+        self.assertIn("above", "\n".join(logs.output))
 
 
 class TestMergedMoeAllReduceDefault(CustomTestCase):
