@@ -98,7 +98,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | GLM-5.2 / GLM-5.3 | FP8 | 1 host tp8+ep8 | **Experimental** | DSA sparse-MLA kernels, shared with GLM-5.3-Flash. The `glm_5_3.sh` recipe was removed as an orphan in #1432. No registered test. |
 | DeepSeek-V4 | FP8 | — | **Experimental** | Compressor, indexer, sparse attention, SparseCore top-k landed. No on-device test. FP4 indexer and online compression rejected. |
 | Kimi-K2.5 | INT4 | shares the K2.6 path | **Experimental** | MoonViT vision tower compiled per image. No K2.5-specific test. |
-| Kimi-K3 / K3-Linear | bf16 | 1 host (tiny config) | **Experimental** | Largest per-model TPU code path (KDA attention). Only a dummy-weight compile smoke runs; no real checkpoint served in CI. |
+| Kimi-K3 / K3-Linear | MXFP4 experts (compressed-tensors), bf16 elsewhere | 4 hosts tp32 (recipes); 1 host (tiny config) in CI | **Experimental** | Largest per-model TPU code path (MLA + KDA attention). Recipes for serving, the decode megakernel and DSpark speculative decoding (on the experimental TPU spec worker). CI runs only a dummy-weight compile smoke (PR gate, and the single-host nightly in plugin mode); no real-weight test is registered. The radix cache is off: KDA has no prefix checkpoints on TPU yet. |
 | Gemma 4 (31B, 26B-A4B) | bf16 | 1 host | **Experimental** | Text and vision. Accuracy and perf suites registered; red at the time of writing. Moves to Supported when green. |
 | Wan2.2-TI2V-5B (diffusion) | bf16 | 1 chip; multi-host collectives | **Experimental** | Runs through the generic diffusion engine; external nightly only, no recent green. |
 | Llama, Qwen3 dense (other sizes), Qwen3-MoE (other sizes), Kimi-Linear | — | — | **Experimental** | Generic TPU path with no model-specific test. |
@@ -113,7 +113,7 @@ All kernels are tuned for TPU7x. The Pallas kernels check for TPU v4 or newer, b
 | Batched RPA (`pallas_tpu_rpa_batched`) | CI (unit, PCP e2e) | — | **Experimental** | Required backend for prefill and decode context parallel. No sinks, no spec decode. |
 | Paged MLA (`pallas_tpu_mla`) | CI (unit) | Nightly (DeepSeek) | **Supported** | Absorbed path. fp8 KV opt-in until accuracy is validated. |
 | GDN / hybrid linear attention | Nightly (Qwen3.5) | — | **Supported** | Mamba-style state pool; no host offload of GDN state. |
-| KDA (Kimi-K3) | CI (unit) | — | **Experimental** | Kernel tested; no real-weight e2e. |
+| KDA (Kimi-K3) | CI (unit, dummy-weight e2e) | — | **Experimental** | Kernel tested; no real-weight e2e in CI. No prefix checkpoints, so no radix cache. |
 | Sliding window, hybrid SWA, attention sinks | Nightly (gpt-oss) | Nightly | **Supported** | Sinks on RPA v3 only. |
 | Flash attention (`pallas_tpu_flash`) | — | — | **Experimental** | Original backend, flat pool, no fp8 KV scale. Kept for comparison. |
 
