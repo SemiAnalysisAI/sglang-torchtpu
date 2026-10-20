@@ -1,14 +1,17 @@
-"""Kimi-K3's TPU vision runner computes what the tower's own layers compute.
+"""Kimi-K3's TPU vision runner computes what the tower and projector compute.
 
-The runner drives the encoder layers' weights with segment-id attention and
-real-arithmetic RoPE; these check it against the layers' eager forward (per
-image SDPA, complex RoPE) on real Kimi-K3 layers, with several images packed
-and a padded tail, plus the policy's bucket ladder and unpadding. CPU tensors;
-a segment-masked SDPA stands in for the Pallas flash kernel.
+The runner stages each image on the host (merge-window order, bicubic
+position-embedding taps, RoPE tables, segment ids) at a fixed patch bucket and
+runs patch embedding, encoder, merge and projector as one program. These
+check it against the tower's own eager forward (interpolated position
+embedding, per-image SDPA, complex RoPE, temporal-pool merger) and the
+projector, on a real Kimi-K3 tower with several images, plus the bucket
+ladder and the eager fall-back. CPU tensors; a segment-masked SDPA stands in
+for the Pallas flash kernel.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -17,14 +20,15 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
-    KimiK3VisionTpuCompilePolicy,
     KimiK3VitTpuCompileRunner,
+    merge_window_order,
+    patch_buckets,
     rotate_interleaved,
 )
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit", chips=1)
 
-HEADS, HEAD_DIM, HIDDEN = 2, 16, 24
+HEADS, HEAD_DIM, HIDDEN, PATCH = 2, 16, 24, 4
 
 
 class _SegmentSdpa:
@@ -44,27 +48,55 @@ class _SegmentSdpa:
         return out.transpose(0, 1)
 
 
-def _encoder():
-    from sglang.srt.models.kimi_k3_vl import MoonViT3dEncoder
+def _unwrapped(fn):
+    # The TPU plugin may have wrapped these with its hooks; test the originals.
+    return getattr(fn, "__wrapped__", fn)
 
+
+def _model():
+    from sglang.srt.models.kimi_k3_vl import (
+        KimiK3MultiModalProjector,
+        KimiK3VisionTower,
+    )
+
+    config = SimpleNamespace(
+        merge_kernel_size=(2, 2),
+        patch_size=PATCH,
+        merge_type="sd2_tpool",
+        hidden_size=HIDDEN,
+        num_attention_heads=HEADS,
+        num_hidden_layers=2,
+        intermediate_size=48,
+        init_pos_emb_height=6,
+        init_pos_emb_width=5,
+        init_pos_emb_time=4,
+        pos_emb_type="divided_fixed",
+        pos_emb_interpolation_mode="bicubic",
+        qkv_hidden_size=HEADS * HEAD_DIM,
+        norm_type="rmsnorm",
+        attn_bias=False,
+        linear_bias=False,
+        mm_hidden_size=HIDDEN,
+        text_hidden_size=32,
+        projector_ln_eps=1e-5,
+    )
     torch.manual_seed(0)
-    encoder = MoonViT3dEncoder(
-        hidden_dim=HIDDEN,
-        num_layers=2,
-        block_cfg={
-            "num_heads": HEADS,
-            "hidden_dim": HIDDEN,
-            "qkv_hidden_size": HEADS * HEAD_DIM,
-            "mlp_dim": 48,
-            "norm_type": "rmsnorm",
-            "attn_bias": False,
-            "linear_bias": False,
-        },
-    ).float()
+    tower = KimiK3VisionTower(config).float()
+    projector = KimiK3MultiModalProjector(config).float()
     with torch.no_grad():
-        for param in encoder.parameters():
-            param.copy_(torch.randn_like(param) * 0.2)
-    return encoder
+        for module in (tower, projector):
+            for param in module.parameters():
+                param.copy_(torch.randn_like(param) * 0.2)
+    runner = KimiK3VitTpuCompileRunner(tower.encoder, attention_cls=_SegmentSdpa)
+    runner.bind(tower, projector)
+    return tower, projector, runner
+
+
+def _reference(tower, projector, pixels, grids):
+    features = _unwrapped(type(tower)._forward_eager)(
+        tower, pixels, grids, grid_thw_list=grids.tolist()
+    )
+    return _unwrapped(type(projector).forward)(projector, features)
 
 
 class TestKimiK3VitRunner(CustomTestCase):
@@ -78,55 +110,43 @@ class TestKimiK3VitRunner(CustomTestCase):
         got = rotate_interleaved(x, freqs_cis.real, freqs_cis.imag)
         torch.testing.assert_close(got, want)
 
-    def test_runner_matches_the_layers_eager_forward(self):
-        encoder = _encoder()
-        runner = KimiK3VitTpuCompileRunner(encoder, attention_cls=_SegmentSdpa)
-        # Two images (4x4 and 2x6 patches), packed as the tower packs them.
-        grids = torch.tensor([[1, 4, 4], [1, 2, 6]])
-        seq = 16 + 12
-        x = torch.randn(seq, HIDDEN)
-        with torch.no_grad():
-            want = encoder(x, grids)
-            freqs = encoder.rope_2d.get_freqs_cis(grids, x.device)
-            cu = torch.tensor([0, 16, seq], dtype=torch.int32)
-            got = runner.run(x, freqs.real, freqs.imag, cu)
-        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    def test_window_order_is_the_mergers_order(self):
+        from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 
-    def test_padding_never_reaches_real_patches(self):
-        encoder = _encoder()
-        runner = KimiK3VitTpuCompileRunner(encoder, attention_cls=_SegmentSdpa)
-        policy = KimiK3VisionTpuCompilePolicy(encoder, owner=encoder)
-        policy._patch_buckets = [36]
-        policy.compiled_fn = MagicMock(side_effect=runner.forward)
-        policy.eager_fn = MagicMock(side_effect=runner.forward)
-        policy._install_run_adapter(runner)
-        grids = torch.tensor([[1, 4, 4], [1, 2, 6]])
-        x = torch.randn(28, HIDDEN)
+        h, w = 4, 6
+        x = torch.arange(h * w, dtype=torch.float32)[:, None]
+        (merged,) = tpool_patch_merger(x, torch.tensor([[1, h, w]]))
+        torch.testing.assert_close(merged.reshape(-1), x[merge_window_order(h, w), 0])
+
+    def test_staged_runner_matches_tower_and_projector(self):
+        tower, projector, runner = _model()
+        runner._patch_buckets = [36, 64]
+        # A grid that interpolates the 6x5 position embedding, one that
+        # shrinks it, and padding in both buckets.
+        grids = torch.tensor([[1, 4, 6], [1, 2, 2], [1, 8, 6]])
+        n = int(grids.prod(dim=1).sum())
+        pixels = torch.randn(n, 3, PATCH, PATCH)
         with torch.no_grad():
-            freqs = encoder.rope_2d.get_freqs_cis(grids, x.device)
-            want = encoder(x, grids)
-            got = runner.run(
-                x,
-                freqs.real.contiguous(),
-                freqs.imag.contiguous(),
-                torch.tensor([0, 16, 28], dtype=torch.int32),
-            )
-        # One compiled call per image, each padded to the 36-patch bucket.
-        shapes = [call.args[0].shape[0] for call in policy.compiled_fn.call_args_list]
-        self.assertEqual(shapes, [36, 36])
-        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+            want = _reference(tower, projector, pixels, grids)
+            got = runner.run_images(pixels, [tuple(g) for g in grids.tolist()])
+        self.assertEqual([t.shape[0] for t in got], [6, 1, 12])
+        torch.testing.assert_close(torch.cat(got), want, rtol=1e-4, atol=1e-4)
+
+    def test_video_and_oversized_images_take_the_eager_path(self):
+        _, _, runner = _model()
+        runner._patch_buckets = [16]
+        pixels = torch.randn(32, 3, PATCH, PATCH)
+        self.assertIsNone(runner.run_images(pixels, [(2, 4, 4)]))
+        self.assertIsNone(runner.run_images(pixels[:24], [(1, 4, 6)]))
 
     def test_buckets_align_to_the_merger(self):
-        policy = KimiK3VisionTpuCompilePolicy(_encoder(), owner=None)
         with envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1024):
-            buckets = policy.compute_patch_buckets()
-        self.assertEqual(buckets, [g * g for g in range(14, 33, 2)])
+            self.assertEqual(patch_buckets(), [g * g for g in range(14, 33, 2)])
         with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("256, 36"):
-            policy._patch_buckets = None
-            self.assertEqual(policy.compute_patch_buckets(), [36, 256])
+            self.assertEqual(patch_buckets(), [36, 256])
         with envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("25"):
             with self.assertRaisesRegex(ValueError, "divisible by 4"):
-                policy.compute_patch_buckets()
+                patch_buckets()
 
 
 if __name__ == "__main__":
