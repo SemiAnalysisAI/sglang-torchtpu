@@ -17,13 +17,14 @@ import numpy as np
 import reference
 
 PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
+DOUBLE_PREFETCH_REVISION = "61edd0e421a877158f7bfdfdfd2ae6133173cbfc"
 
 
-def load_candidate(root, baseline_output=None):
+def load_candidate(root, baseline_output=None, revision=PIPELINE_BASELINE_REVISION):
     relative = "sglang_tpu/attention/pallas/kpool_compress.py"
     path = root / relative
     if baseline_output is not None:
-        path = baseline_output / "single_prefetch.py"
+        path = baseline_output / f"baseline-{revision[:12]}.py"
         path.write_bytes(
             subprocess.check_output(
                 [
@@ -31,7 +32,7 @@ def load_candidate(root, baseline_output=None):
                     "-C",
                     str(root),
                     "show",
-                    f"{PIPELINE_BASELINE_REVISION}:{relative}",
+                    f"{revision}:{relative}",
                 ]
             )
         )
@@ -60,13 +61,16 @@ def inputs(pages, tokens, decode):
     return raw, tail
 
 
-def benchmark_case(candidate, baseline, pages, tokens, decode, opts, output):
+def benchmark_case(
+    candidate, baseline, double_prefetch, pages, tokens, decode, opts, output
+):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     print("CASE_START", name, flush=True)
     raw, tail = inputs(pages, tokens, decode)
     variants = {
         "reference": reference.computation,
         "single_prefetch": baseline,
+        "double_prefetch": double_prefetch,
         "candidate": candidate,
     }
     states = {}
@@ -161,6 +165,10 @@ def benchmark_case(candidate, baseline, pages, tokens, decode, opts, output):
             / rows["candidate"]["median_ms"],
             "pipeline_speedup_pending_accuracy": rows["single_prefetch"]["median_ms"]
             / rows["candidate"]["median_ms"],
+            "pooling_tile_speedup_pending_accuracy": rows["double_prefetch"][
+                "median_ms"
+            ]
+            / rows["candidate"]["median_ms"],
             "device_profile": str(output / name / "xprof"),
         }
         print("CASE_RESULT", json.dumps(result), flush=True)
@@ -195,6 +203,9 @@ def main():
             raise RuntimeError("This benchmark requires a TPU")
         candidate, digest = load_candidate(root)
         baseline, baseline_digest = load_candidate(root, opts.output)
+        double_prefetch, double_digest = load_candidate(
+            root, opts.output, DOUBLE_PREFETCH_REVISION
+        )
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -202,6 +213,8 @@ def main():
             candidate_sha256=digest,
             pipeline_baseline_revision=PIPELINE_BASELINE_REVISION,
             pipeline_baseline_sha256=baseline_digest,
+            double_prefetch_revision=DOUBLE_PREFETCH_REVISION,
+            double_prefetch_sha256=double_digest,
             devices=[str(d) for d in jax.devices()],
             device_kind=jax.devices()[0].device_kind,
             runtime={
@@ -216,7 +229,14 @@ def main():
         ):
             result["cases"].append(
                 benchmark_case(
-                    candidate, baseline, pages, tokens, decode, opts, opts.output
+                    candidate,
+                    baseline,
+                    double_prefetch,
+                    pages,
+                    tokens,
+                    decode,
+                    opts,
+                    opts.output,
                 )
             )
             (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))

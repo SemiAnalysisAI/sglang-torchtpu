@@ -28,6 +28,17 @@ def _hadamard128(value):
     return value
 
 
+def _pool32(raw, ape):
+    """Bound the softmax live set to eight pools."""
+    raw = raw.astype(jnp.float32)
+    keys = raw[:, :128].reshape((8, 4, 128))
+    scores = raw[:, 128:].reshape((8, 4, 128)) + ape[None, :, :]
+    scores -= jnp.max(scores, axis=1, keepdims=True)
+    weight = jnp.exp(scores)
+    weight /= jnp.sum(weight, axis=1, keepdims=True)
+    return jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+
+
 def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows):
     """One descriptor per aligned raw tile containing a newly closed pool."""
     batch = kv_lens.shape[0]
@@ -66,6 +77,7 @@ def _kernel(
     out_ref,
     raw_buf,
     out_buf,
+    pooled_buf,
     read_sem,
     write_sem,
     old_sem,
@@ -75,7 +87,7 @@ def _kernel(
     del old_ref  # out_ref aliases this input, including untouched bytes.
     words = out_ref.bitcast(jnp.uint32)
     count = count_ref[0]
-    pools, word_rows = tile_rows // 4, tile_rows // 16
+    word_rows = tile_rows // 16
 
     def read(i):
         return pltpu.make_async_copy(
@@ -102,15 +114,17 @@ def _kernel(
     def _page(i, slot):
         read(i).wait()
 
-        # This full-page grouping passed Mosaic layout inference in the
-        # isolated and full-kernel probes. The input tile is all consumed.
-        raw = raw_buf[slot].astype(jnp.float32)
-        keys = raw[:, :128].reshape((pools, 4, 128))
-        scores = raw[:, 128:].reshape((pools, 4, 128)) + ape_ref[...][None, :, :]
-        scores -= jnp.max(scores, axis=1, keepdims=True)
-        weight = jnp.exp(scores)
-        weight /= jnp.sum(weight, axis=1, keepdims=True)
-        pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+        if tile_rows == 32:
+            pooled = _pool32(raw_buf[slot], ape_ref[...])
+        else:
+            # Retain the larger DMA while bounding pooling's register live
+            # set. The VMEM staging also bounds values carried across loops.
+            @pl.loop(0, tile_rows // 32)
+            def _pool_chunk(chunk):
+                value = _pool32(raw_buf[slot, pl.ds(chunk * 32, 32), :], ape_ref[...])
+                pooled_buf[pl.ds(chunk * 8, 8), :] = value
+
+            pooled = pooled_buf[...]
 
         # Every raw Ref load precedes this refill. Subsequent stages only use
         # SSA values; no consumer rereads the overwritten VMEM generation.
@@ -226,6 +240,7 @@ def compress_and_store(
             scratch_shapes=(
                 pltpu.VMEM((2, tile_rows, 256), jnp.bfloat16),
                 pltpu.VMEM((2, tile_rows // 16, 256), jnp.uint32),
+                pltpu.VMEM((tile_rows // 4, 128), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA,
