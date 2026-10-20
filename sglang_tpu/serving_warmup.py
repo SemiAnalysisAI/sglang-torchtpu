@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import singledispatch
 from typing import TYPE_CHECKING
 
 import torch
@@ -115,6 +116,7 @@ def warmup_sampling(model_runner: ModelRunner) -> None:
     )
 
 
+@singledispatch
 def warmup_request_relay(future_map: FutureMap, max_batch_size: int) -> None:
     """Exercise AR bookkeeping on scratch storage with the real relay layout."""
     if not future_map.spec_algo.is_none():
