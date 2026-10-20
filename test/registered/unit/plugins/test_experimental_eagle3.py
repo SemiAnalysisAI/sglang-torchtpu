@@ -342,6 +342,7 @@ class TestExperimentalEagle3(CustomTestCase):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.device = "cpu"
         worker.num_drafts = 2
+        worker.num_verify_rows = 3
         worker._dp_attention = False
         policy = object.__new__(DecoderTpuCompilePolicy)
         policy.b_bucketer = policy.t_bucketer = Bucketer("rows", [2])
