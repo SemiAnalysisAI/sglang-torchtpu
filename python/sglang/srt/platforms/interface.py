@@ -253,6 +253,12 @@ class SRTPlatform(DeviceMixin):
         so SWA segment frees require host indices."""
         return False
 
+    def supports_bf16_mm_fp32_out(self) -> bool:
+        """Whether ``torch.mm(a, b, out_dtype=torch.float32)`` on bf16 operands
+        runs natively, as one GEMM with an fp32 result and no fp32 copy of
+        either operand."""
+        return False
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------

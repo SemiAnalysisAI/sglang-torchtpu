@@ -1201,6 +1201,10 @@ class TpuSRTPlatform(SRTPlatform):
         # host-resident req_to_token table hands its segment frees host indices.
         return True
 
+    def supports_bf16_mm_fp32_out(self) -> bool:
+        # XLA lowers it to one dot with an fp32 result, at the bf16 GEMM's cost.
+        return True
+
     def supports_overlap_streams(self) -> bool:
         # torch_tpu serialises all device work on a single implicit PJRT queue:
         # cross-stream ordering (wait_stream / wait_event) is a no-op and a

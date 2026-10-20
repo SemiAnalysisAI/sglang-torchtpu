@@ -543,6 +543,13 @@ class MoEGate(nn.Module):
             hidden_size=config.hidden_size,
             weight_dtype=self.weight.dtype,
         )
+        from sglang.srt.platforms import current_platform
+
+        # Platforms that run bf16 x bf16 -> fp32 natively compute the logits
+        # that way off CUDA (read once: forward runs under torch.compile).
+        self.bf16_mm_fp32_out = (
+            not _is_cuda and current_platform.supports_bf16_mm_fp32_out()
+        )
         # Rows up to which the ROCm split-K router serves the gate (-1: never)
         self.rocm_router_max_tokens = (
             _hip_moe.router_max_tokens(self, config, is_hash_moe) if _is_hip else -1
@@ -579,10 +586,9 @@ class MoEGate(nn.Module):
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-        elif _is_tpu:
+        elif self.bf16_mm_fp32_out:
             # bf16 x bf16 -> fp32, as linear_bf16_fp32 on CUDA: bf16 logits
-            # reorder near-tied experts. XLA emits one dot with an fp32 result,
-            # no fp32 copy of the weight, at the bf16 GEMM's cost.
+            # reorder near-tied experts.
             logits = torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
         elif not _is_cuda:
             logits = F.linear(hidden_states, self.weight, None)
