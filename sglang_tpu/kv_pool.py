@@ -965,24 +965,108 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # ------------------------------------------------------------------ #
-    # CPU offload / restore — unsupported on the paged MLA layout
+    # CPU offload / restore (retraction backup)
     # ------------------------------------------------------------------ #
+    #
+    # A page [page_size // kv_packing, kv_packing, dim] stores its tokens in
+    # order (token t at row t // kv_packing, lane t % kv_packing), so a layer
+    # viewed as [num_pages * page_size, dim] is indexed by token id.
 
-    def get_cpu_copy(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
-            "layout: the base MLATokenToKVPool implementation indexes the KV "
-            "buffer by token id, which assumes the flat [size, 1, kv_cache_dim] "
-            "layout, not this pool's [num_pages, page_size // kv_packing, "
-            "kv_packing, dim] paged buffer. TODO: map token id -> (page, slot) "
-            "for the 4-D index before enabling offload with pallas_tpu_mla."
-        )
+    def _synchronize_device(self) -> None:
+        if torch.device(self.device).type != "cpu":
+            torch.accelerator.synchronize()
 
-    def load_cpu_copy(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
-            "layout (see TpuFusedMLATokenToKVPool.get_cpu_copy)."
-        )
+    def _token_rows(self, layer: int) -> torch.Tensor:
+        buf = self.kv_buffer[layer]
+        return buf.view(buf.shape[0] * self.page_size, buf.shape[-1])
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Copy the latent rows of the tokens ``indices`` out to host.
+
+        Returns ``cpu_offloading_chunk_size`` chunks of ``[tokens, dim]`` per
+        layer, the format `load_cpu_copy` and `filter_cpu_copy` read.
+        """
+        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        self._synchronize_device()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer in range(self.layer_num):
+            rows = self._token_rows(layer)
+            kv_cache_cpu.append(
+                [
+                    rows.index_select(0, indices[i : i + chunk_size]).to("cpu")
+                    for i in range(0, len(indices), chunk_size)
+                ]
+            )
+        self._synchronize_device()
+        return kv_cache_cpu
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        """Write a `get_cpu_copy` payload back to the tokens ``indices``.
+
+        Pages go through `write_pages_torch`, which updates the layer buffer
+        in place (an eager scatter would reallocate it and strand its
+        registrations); a page ``indices`` only partly covers is read back
+        first and merged.
+        """
+        from sglang_tpu.kv_page_write import write_pages_torch
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        # Position of each row's page within the full / partial page batches.
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_buffer[0].device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+
+        self._synchronize_device()
+        for layer in range(self.layer_num):
+            rows = torch.cat(kv_cache_cpu[layer], dim=0)
+            assert rows.shape[0] == indices.numel()
+            dst = self.kv_buffer[layer]
+            page_shape = dst.shape[1:]
+            if full_blocks.numel():
+                pages = torch.empty(
+                    (full_blocks.numel(), page, rows.shape[-1]), dtype=rows.dtype
+                )
+                pages[full_page_pos, full_offsets] = rows[full_rows]
+                pages = pages.view(-1, *page_shape).to(device, non_blocking=True)
+                write_pages_torch(full_blocks, pages, dst)
+            if part_blocks.numel():
+                pages = dst[part_blocks].view(-1, page, rows.shape[-1])
+                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
+                    device, non_blocking=True
+                )
+                write_pages_torch(part_blocks, pages.view(-1, *page_shape), dst)
+        self._synchronize_device()
+
+    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
+        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``."""
+        chunk_size = self.cpu_offloading_chunk_size
+        filtered = []
+        for layer_chunks in kv_cache_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+            rows = torch.cat(layer_chunks, dim=0)[row_mask]
+            filtered.append(
+                [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
+            )
+        return filtered
 
     def get_mla_kv_buffer(self, *args, **kwargs):
         raise NotImplementedError(

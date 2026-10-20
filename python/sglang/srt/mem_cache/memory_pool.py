@@ -1473,7 +1473,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
-        self.mamba_allocator = MambaSlotAllocator(
+        # A pool may supply its own slot allocator (e.g. one that defers reuse
+        # of slots a running forward may still write).
+        make_slot_allocator = getattr(
+            self.mamba_pool, "make_slot_allocator", MambaSlotAllocator
+        )
+        self.mamba_allocator = make_slot_allocator(
             size=mamba_size,
             device=self.mamba_pool.slot_allocator_device,
         )

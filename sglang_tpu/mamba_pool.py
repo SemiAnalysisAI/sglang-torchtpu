@@ -44,6 +44,7 @@ from sglang.srt.configs.mamba_utils import (
     BaseLinearStateParams,
     KimiLinearStateShape,
 )
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.memory_pool import MambaPool, get_tensor_size_bytes
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -124,6 +125,64 @@ class TpuPerLayerState(msgspec.Struct, frozen=True):
     def mem_usage_bytes(self) -> int:
         # get_tensor_size_bytes recurses through nested lists.
         return get_tensor_size_bytes(self.conv) + get_tensor_size_bytes(self.temporal)
+
+
+class TpuMambaSlotAllocator(MambaSlotAllocator):
+    """Slot allocator that defers reusing a slot a running forward may write.
+
+    Under overlap scheduling a request that finished while forward N was
+    formed is still in forward N, which writes its state slot after the slot
+    is freed. A DMA into the reused slot -- the state a PD decode receives --
+    can land before that write and be lost, so frees during an in-flight
+    forward are held on the KV free fence (``kv_free_fence.py``) exactly like
+    the paged KV allocator's pages.
+    """
+
+    kv_free_fence = None
+
+    def __init__(self, size: int, device: str):
+        from sglang_tpu.kv_free_fence import HeldPages
+
+        self.held_pages = HeldPages()
+        super().__init__(size, device)
+
+    def available_size(self) -> int:
+        return len(self.free_slots) + self.held_pages.num_pages
+
+    def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        fence = self.kv_free_fence
+        short = need_size - len(self.free_slots)
+        if fence is not None and 0 < short <= self.held_pages.num_pages:
+            if fence.in_forward_write_target:
+                # Device compute runs in launch order, so this forward writes last.
+                self.free_slots = torch.cat(
+                    (self.held_pages.borrow(short), self.free_slots)
+                )
+            else:
+                # Other allocations may be DMA targets; wait for the forwards
+                # that may still write the held slots, which releases them.
+                fence.wait_for_in_flight()
+        return super()._do_alloc(need_size)
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        fence = self.kv_free_fence
+        tag = None if fence is None else fence.hold_tag(num_pages=free_index.numel())
+        if tag is None:
+            super().free(free_index)
+        else:
+            self.held_pages.push(tag, free_index.reshape(-1).clone())
+
+    def release_held_pages(self, completed: int) -> None:
+        for slots in self.held_pages.pop_released(completed):
+            super().free(slots)
+
+    def clear(self):
+        super().clear()
+        from sglang_tpu.kv_free_fence import HeldPages
+
+        self.held_pages = HeldPages()
 
 
 class TpuMambaPool(MambaPool):
@@ -277,6 +336,11 @@ class TpuMambaPool(MambaPool):
         # Allocation, radix ownership and COW pair collection are host work.
         # Keeping IDs here avoids variable-size TPU casts/pads and host readbacks.
         return "cpu"
+
+    def make_slot_allocator(self, *, size: int, device: str) -> TpuMambaSlotAllocator:
+        """The pool's slot allocator; kept here so the KV free fence finds it."""
+        self.slot_allocator = TpuMambaSlotAllocator(size, device)
+        return self.slot_allocator
 
     @classmethod
     def cache_bytes_per_request(cls, cache_params):
@@ -483,25 +547,59 @@ class TpuMambaPool(MambaPool):
             copy_bucket_size(max_requests),
         )
 
-    # The two below are inherited from MambaPool, which indexes the layer axis
-    # as `state[:, slots]` on a stacked tensor. This pool has no layer axis to
-    # index -- state is one tensor per layer -- so the inherited versions would
-    # silently address the *slot* axis instead. Host offload of GDN state is
-    # unsupported on TPU, so they raise rather than pretend.
+    # MambaPool's host-copy methods index the layer axis of a stacked
+    # [num_layers, slots, ...] tensor (`state[:, slots]`); this pool keeps one
+    # tensor per layer, so they are reimplemented over `_copy_states()`.
 
+    def _slot_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """Host rows holding the slots ``indices``: every checkpoint row of each."""
+        slots = indices.reshape(-1).to(device="cpu", dtype=torch.long)
+        if self.checkpoint_width == 1:
+            return slots
+        steps = torch.arange(self.checkpoint_width, dtype=torch.long)
+        return (slots[:, None] * self.checkpoint_width + steps).reshape(-1)
+
+    @torch.no_grad()
     def get_cpu_copy(self, indices):
-        raise NotImplementedError(
-            "Host-offload of GDN state is not supported on TPU: TpuMambaPool "
-            "stores one tensor per layer, not a stacked [num_layers, ...] pool, "
-            "so MambaPool.get_cpu_copy's `[:, indices]` does not apply."
-        )
+        """Host copy of the slots ``indices`` (retraction backup).
 
+        Returns one ``[rows, ...]`` tensor per state tensor, in transfer-entry
+        order, and the slots' checkpoint offsets under speculation.
+        """
+        rows = self._slot_rows(indices)
+        states = self._copy_states()
+        device_rows = rows.to(states[0].device)
+        copies = [state.index_select(0, device_rows).to("cpu") for state in states]
+        offsets = None
+        if self.checkpoint_read_offsets is not None:
+            slots = indices.reshape(-1).to(self.device, dtype=torch.long)
+            offsets = self.checkpoint_read_offsets.index_select(0, slots).to("cpu")
+        return copies, offsets
+
+    @torch.no_grad()
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        raise NotImplementedError(
-            "Host-offload of GDN state is not supported on TPU: TpuMambaPool "
-            "stores one tensor per layer, not a stacked [num_layers, ...] pool, "
-            "so MambaPool.load_cpu_copy's `[:, indices]` does not apply."
-        )
+        """Write a `get_cpu_copy` payload back into the slots ``indices``.
+
+        On TPU each state tensor is written through the in-place page-write
+        kernel: an eager scatter would reallocate the tensor's buffer and
+        strand every registration of it (the compiled step's donated inputs,
+        a PD transfer engine).
+        """
+        from sglang_tpu.kv_page_write import write_pages_torch
+
+        copies, offsets = mamba_cache_cpu
+        states = self._copy_states()
+        if len(copies) != len(states):
+            raise ValueError(
+                f"Mamba state backup holds {len(copies)} tensors; the pool has "
+                f"{len(states)}"
+            )
+        device_rows = self._slot_rows(indices).to(states[0].device)
+        for state, rows in zip(states, copies):
+            write_pages_torch(device_rows, rows.to(state.device), state)
+        if offsets is not None:
+            slots = indices.reshape(-1).to(self.device, dtype=torch.long)
+            self.checkpoint_read_offsets.index_copy_(0, slots, offsets.to(self.device))
 
     def _iter_transfer_state_entries(self):
         """One [state_slots, ...] tensor per layer, laid out as get_state.
@@ -516,6 +614,21 @@ class TpuMambaPool(MambaPool):
             self.mamba_cache.temporal, self.mamba_layer_ids, strict=True
         ):
             yield "temporal", tensor, 0, layer_id
+
+    def get_state_slice_axes(self) -> List[int]:
+        """Per-row axis each state tensor is TP-sharded on, in the order of
+        get_state (conv channels, then recurrent heads)."""
+        return [axis for _, _, axis, _ in self._iter_transfer_state_entries()]
+
+    def get_state_conv_shard_groups(self) -> List[Optional[List[int]]]:
+        """Full widths of the sub-blocks (q | k | v) each conv tensor's channel
+        axis concatenates, each TP-sharded on its own; None for recurrent
+        tensors and when the model gives no decomposition."""
+        groups = self.conv_shard_groups
+        return [
+            list(groups) if kind == "conv" and groups is not None else None
+            for kind, _, _, _ in self._iter_transfer_state_entries()
+        ]
 
     def committed_row(self, slot: int) -> int:
         """State row a P/D transfer reads or writes for slot.
