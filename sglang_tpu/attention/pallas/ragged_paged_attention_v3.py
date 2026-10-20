@@ -42,6 +42,12 @@ from sglang_tpu.attention.pallas.util import (
     next_power_of_2,
 )
 
+from sglang_tpu.envs import envs as _tpu_envs
+
+# head_dim is padded to this before it becomes the KV cache's minor (lane) axis; must match
+# TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT. 128 keeps every shape as upstream.
+KV_HEAD_DIM_ALIGN = _tpu_envs.SGLANG_TPU_KV_HEAD_DIM_ALIGN.get()
+
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 # The kernel's softmax runs in base 2: logits, m and sinks are scaled by log2(e).
 LOG2E = 1.4426950408889634
@@ -251,7 +257,7 @@ def get_vmem_estimate_bytes(
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
         bkv_stride += 1
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
 
     total_bits = (
         # bkv_x2_ref
@@ -305,7 +311,7 @@ def get_kv_cache_shape(
         page_size,
         align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
         kv_packing,
-        align_to(actual_head_dim, 128),
+        align_to(actual_head_dim, KV_HEAD_DIM_ALIGN),
     )
 
 
@@ -411,7 +417,7 @@ def _ragged_paged_attention_kernel_loop(
     assert o_hbm_ref.dtype == q_dtype
     assert get_dtype_packing(q_dtype) == q_packing
     assert get_dtype_packing(kv_dtype) == kv_packing
-    assert head_dim % 128 == 0
+    assert head_dim % KV_HEAD_DIM_ALIGN == 0
     assert bkv_sz % page_size == 0
     assert bkv_sz % bkv_csz == 0, f"bkv_sz={bkv_sz} not divisible by bkv_csz={bkv_csz}"
     bkv_p = bkv_sz // page_size
@@ -803,6 +809,10 @@ def _ragged_paged_attention_kernel_loop(
         assert get_dtype_packing(ref.dtype) == 1
         assert len(ref.shape) == 2
         r, l = ref.shape  # noqa
+        if l < 128:  # KV_HEAD_DIM_ALIGN 64: one token row per load, nothing to fold
+            assert step == 1
+            vec = ref[pl.ds(start, sz)]
+            return pltpu.bitcast(vec, dtype) if dtype is not None else vec
         assert l % 128 == 0
         folds = l // 128
         ref = ref.reshape(r * folds, 128)
@@ -823,6 +833,10 @@ def _ragged_paged_attention_kernel_loop(
         assert ref.shape == val.shape
         assert len(ref.shape) == 2
         r, l = ref.shape  # noqa
+        if l < 128:
+            assert step == 1
+            ref[pl.ds(start, sz)] = val
+            return
         assert l % 128 == 0
         folds = l // 128
         ref = ref.reshape(r * folds, 128)
@@ -877,6 +891,8 @@ def _ragged_paged_attention_kernel_loop(
         if src.shape == shape:
             return src
         assert src.shape[:-1] == shape[:-1]
+        if shape[-1] < src.shape[-1]:  # lane-replicated stats onto a 64-lane head_dim
+            return src[..., : shape[-1]]
         assert src.shape[-1] % 128 == 0
         target_minor = align_to(shape[-1], src.shape[-1])
         return jnp.concatenate(
@@ -1272,7 +1288,7 @@ def merge_kv(
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
 
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
     kv = jnp.pad(
         jnp.concat([k, v], axis=-1).reshape(
             max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
@@ -1304,7 +1320,7 @@ def prepare_inputs(
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
     q = (
         jnp.pad(
             q.reshape(
@@ -1385,7 +1401,7 @@ def prepare_kv_cache_fused(
         actual_head_dim,
     ) = kv_cache_fused.shape
     # assert actual_num_kv_heads_interleaved_per_packing % 2 == 0
-    head_dim = align_to(actual_head_dim, 128)
+    head_dim = align_to(actual_head_dim, KV_HEAD_DIM_ALIGN)
 
     kv_cache_fused_processed = jnp.pad(
         kv_cache_fused,
@@ -1637,7 +1653,7 @@ def get_default_block_sizes(
 
     kv_packing = get_dtype_packing(kv_dtype)
     num_kv_heads_x2 = next_power_of_2(align_to(actual_num_kv_heads * 2, kv_packing))
-    head_dim = align_to(head_dim, 128)
+    head_dim = align_to(head_dim, KV_HEAD_DIM_ALIGN)
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     num_q_heads_per_kv_head = next_power_of_2(actual_num_q_heads_per_kv_head)
 

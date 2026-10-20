@@ -67,6 +67,10 @@ class TpuEnvs:
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Fused KV pool and RPA v3 pad head_dim to this before it becomes the minor (lane)
+    # axis. 64 halves an unpacked head_dim-64 pool; fp8 then reaches 256 B per token at
+    # two KV heads per rank. Must stay >= the sublane x packing tile.
+    SGLANG_TPU_KV_HEAD_DIM_ALIGN = EnvInt(128)
     # Fused-RS NVFP4 experts keep the checkpoint's e4m3 block scales and apply the
     # per-expert global scales after each dot: half the scale bytes of folded bf16.
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
