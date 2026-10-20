@@ -2561,7 +2561,10 @@ class KimiK3DecoderLayer(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
-        self._trim_padded_attn = require_mlp_sync()
+        # TPU attention runs on padded token buckets on every batch (padded
+        # rows write to the reserved page 0), and a trim length read from the
+        # batch's host lists would specialize the compiled graph on each one.
+        self._trim_padded_attn = require_mlp_sync() and not _is_tpu
         # A layer runs MoE (vs a plain dense MLP) iff it is past the dense
         # prefix and on the MoE cadence — same predicate the mlp construction
         # below uses.
@@ -3014,7 +3017,8 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._trim_padded_attn = require_mlp_sync()
+        # Matches the decoder layers' trim (off on TPU, see there).
+        self._trim_padded_attn = require_mlp_sync() and not _is_tpu
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
