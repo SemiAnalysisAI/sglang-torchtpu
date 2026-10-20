@@ -26,7 +26,6 @@ when the batch composition changes; only the scheduler-facing result is live bs.
 
 from __future__ import annotations
 
-import contextlib
 import itertools
 from abc import abstractmethod
 from collections.abc import Callable
@@ -64,6 +63,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.spec_common import adjust_verify_logits
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -85,15 +85,11 @@ from sglang_tpu.experimental.sampling.sampling_batch_info import (
     HostPaddedSamplingInfo,
     is_host_padded,
 )
+from sglang_tpu.experimental.speculative.chain_verifier import ChainVerifier
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.experimental.speculative.spec_ops import (
-    accept_drafts_greedy,
-    accept_drafts_sampled,
-    accept_drafts_sampled_filtered,
-    accept_drafts_target_only,
     build_verify_tokens,
-    finalize_accept,
     live_result_rows,
     pad_state_rows,
     select_verify_rows,
@@ -109,6 +105,7 @@ from sglang_tpu.experimental.speculative.spec_types import (
     map_carry,
 )
 from sglang_tpu.experimental.speculative.spec_utils import overridden_fields
+from sglang_tpu.experimental.speculative.state_layout import SpecStateLayout
 from sglang_tpu.mamba_pool import (
     TpuMambaPool,
     committed_read_offsets,
@@ -138,6 +135,8 @@ class TpuSpecWorker(BaseSpecWorker):
     the batch.spec_info / verify ForwardBatch formats. verify, decode dispatch
     and result packing are shared.
     """
+
+    verifier = ChainVerifier()
 
     def __init__(
         self,
@@ -298,7 +297,7 @@ class TpuSpecWorker(BaseSpecWorker):
         def zeros(*shape: int) -> torch.Tensor:
             return torch.zeros(shape, dtype=torch.int64, device=self.device)
 
-        return finalize_accept(
+        return self.verifier.ops.finalize_accept(
             zeros(padded_bs, self.num_drafts),
             zeros(padded_bs),
             zeros(padded_bs),
@@ -418,47 +417,13 @@ class TpuSpecWorker(BaseSpecWorker):
         assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
             self.num_verify_rows
         ), "verify logits must keep the batch bucket rows"
-        if bucket.temperatures is None or bucket.top_ks is None:
-            num_correct_drafts, bonus_tokens = accept_drafts_greedy(
-                target_logits, draft_result.draft_tokens, draft_result.num_verify_drafts
-            )
-            site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
-        elif draft_result.draft_logits is None:
-            # A deterministic draft is a one-hot q: TPU EAGLE's target-only rule.
-            num_correct_drafts, bonus_tokens = accept_drafts_target_only(
-                target_logits,
-                draft_result.draft_tokens,
-                draft_result.num_verify_drafts,
-                bucket.temperatures,
-                bucket.top_ks,
-                bucket.top_ps,
-                bucket.min_ps,
-                self._accept_threshold_single,
-                self._accept_threshold_acc,
-            )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
-        elif bucket.need_filters:
-            num_correct_drafts, bonus_tokens = accept_drafts_sampled_filtered(
-                target_logits,
-                draft_result.draft_tokens,
-                draft_result.num_verify_drafts,
-                draft_result.draft_logits.float(),
-                bucket.temperatures,
-                bucket.top_ks,
-                bucket.top_ps,
-                bucket.min_ps,
-            )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
-        else:
-            num_correct_drafts, bonus_tokens = accept_drafts_sampled(
-                target_logits,
-                draft_result.draft_tokens,
-                draft_result.num_verify_drafts,
-                draft_result.draft_logits.float(),
-                bucket.temperatures,
-                bucket.top_ks,
-            )
-            site = SpecTpSyncSite.SPEC_ACCEPT_SAMPLE
+        num_correct_drafts, bonus_tokens, site = self.verifier.accept(
+            target_logits=target_logits,
+            draft_result=draft_result,
+            bucket=bucket,
+            threshold_single=self._accept_threshold_single,
+            threshold_acc=self._accept_threshold_acc,
+        )
         draft_tokens = draft_result.draft_tokens
         if self._simulate_acc_len > 0:
             num_correct_drafts, bonus_tokens, draft_tokens = self._simulated_accept(
@@ -467,7 +432,7 @@ class TpuSpecWorker(BaseSpecWorker):
         # Sampled acceptance draws per-rank randoms; ranks must commit rank 0's outcome.
         self._tp_sync.sync(site, num_correct_drafts)
         self._tp_sync.sync(site, bonus_tokens)
-        accept = finalize_accept(
+        accept = self.verifier.ops.finalize_accept(
             draft_tokens,
             num_correct_drafts,
             bonus_tokens,
@@ -869,8 +834,10 @@ class TpuSpecWorker(BaseSpecWorker):
             temperatures,
             top_ks,
         )
-        warmup_compiled_op(accept_drafts_sampled, *args)
-        warmup_compiled_op(accept_drafts_sampled_filtered, *args, top_ps, min_ps)
+        warmup_compiled_op(self.verifier.ops.accept_drafts_sampled, *args)
+        warmup_compiled_op(
+            self.verifier.ops.accept_drafts_sampled_filtered, *args, top_ps, min_ps
+        )
 
     def _warmup_relay_and_results(self) -> None:
         """FutureMap relay and result D2H run per live bs outside any compiled op."""
@@ -1037,43 +1004,7 @@ class TpuSpecWorker(BaseSpecWorker):
         assert b_bucketer is not None
         return b_bucketer
 
-    @staticmethod
-    def _bucket_view(
-        batch: ScheduleBatch,
-        *,
-        bucket_state: SpecState,
-        verify_input: TpuSpecVerifyInput,
-        kv_rows: int,
-        **overrides: Any,
-    ) -> contextlib.AbstractContextManager[ScheduleBatch]:
-        """batch with its row fields at the bucket, restored on exit, for code that reads them.
-
-        init_new snapshots these; feeding the bucket rows leaves the shim nothing
-        to pad. Padded rows hold pool row 0 and host KV length 0, inactive in RPA;
-        seq_lens_cpu bounds the KV length once kv_rows rows past seq_lens are
-        written. overrides set (and restore) further batch fields.
-        """
-        padded_bs = bucket_state.seq_lens.shape[0]
-        assert verify_input.req_pool_indices_cpu.shape[0] == padded_bs
-        seq_lens_cpu, seq_lens_sum = verify_input.padded_kv_lens_after_rows(kv_rows)
-        multimodal_inputs = batch.multimodal_inputs
-        if multimodal_inputs is not None:
-            # Spec M-RoPE positions read one entry per (bucket) row.
-            multimodal_inputs = multimodal_inputs + [None] * (
-                padded_bs - len(multimodal_inputs)
-            )
-        view_fields = {
-            "multimodal_inputs": multimodal_inputs,
-            "seq_lens": bucket_state.seq_lens,
-            "seq_lens_cpu": seq_lens_cpu,
-            "seq_lens_sum": seq_lens_sum,
-            # Ignored by direct compile on TPU; None keeps the shim from padding it per bs.
-            "orig_seq_lens": None,
-            "req_pool_indices": bucket_state.req_pool_indices,
-            "req_pool_indices_cpu": verify_input.req_pool_indices_cpu,
-            **overrides,
-        }
-        return overridden_fields(batch, **view_fields)
+    _bucket_view = staticmethod(SpecStateLayout.bucket_view)
 
     def _build_verify_batch(
         self,
@@ -1149,8 +1080,13 @@ class TpuSpecWorker(BaseSpecWorker):
             # prepare_for_verify leaves TPU attention metadata to the runner.
             skip_attn_backend_init=False,
         )
-        # Custom logit processors, penalties and logit bias are rejected up front.
-        return target_out.logits_output
+        logits_output = target_out.logits_output
+        adjust_verify_logits(
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=batch.sampling_info,
+            draft_token_num=self.num_verify_rows,
+        )
+        return logits_output
 
     @staticmethod
     def _live_result_rows(
