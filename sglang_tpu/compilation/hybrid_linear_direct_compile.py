@@ -60,6 +60,10 @@ def hybrid_linear_kv_pool_state(
     return HybridLinearKVPoolState(full_kv_pool=full_kv_pool, mamba_pool=mamba_pool)
 
 
+def has_linear_attention(model: nn.Module) -> bool:
+    return any(isinstance(module, RadixLinearAttention) for module in model.modules())
+
+
 def _conv_weight_owners(
     model: nn.Module,
 ) -> list[tuple[RadixLinearAttention, nn.Module]]:

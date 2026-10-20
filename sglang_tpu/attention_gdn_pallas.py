@@ -30,6 +30,7 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -40,7 +41,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -474,6 +475,43 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
+        self._slot_memo: Optional[tuple] = None
+
+    def _slot_indices(
+        self, req_pool_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(int64 slot ids, int32 slot ids) of the batch's requests.
+
+        An unchanged batch reuses the last result: the gather and the cast are
+        two launches per round otherwise. Valid only while every write to the
+        request-to-slot table is an eager in-place op (it is written when a
+        request is allocated), which bumps ``_version``; a write from inside a
+        compiled graph would not, and must clear ``_slot_memo``.
+        """
+        pool = self.req_to_token_pool
+        table = pool.req_index_to_mamba_index_mapping
+        memo = self._slot_memo
+        if (
+            memo is not None
+            and memo[0]() is req_pool_indices
+            and memo[1] == req_pool_indices._version
+            and memo[2] == table._version
+        ):
+            return memo[3], memo[4]
+        slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
+        slots_i32 = slots.to(torch.int32)
+        # int64 for the verify commit's index_copy_ (the table itself is int32).
+        if slots.dtype != torch.int64:
+            slots = slots.long()
+        if pool.mamba_v2p_table is None:
+            self._slot_memo = (
+                weakref.ref(req_pool_indices),
+                req_pool_indices._version,
+                table._version,
+                slots,
+                slots_i32,
+            )
+        return slots, slots_i32
 
     def _warmup_slot_bookkeeping(self) -> None:
         """Slot allocation's mapping write and clear_slots, once per new-request count."""
@@ -489,6 +527,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 )
                 pool.mamba_pool.clear_slots(slots)
             mapping[0:1].cpu()
+            if get_disagg().disaggregation_mode != "null":
+                # The P/D state payload reads one row by Python int, a constant
+                # baked into each program, so every row is a separate program.
+                for row in range(mapping.shape[0]):
+                    mapping[row].cpu()
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device
@@ -544,10 +587,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
         # Slot ids; the op clamps the -1 pad in-graph (see build_gdn_pallas_op).
-        slots = self._translate_mamba_indices(
-            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-        )
-        self._state_indices = slots.to(torch.int32)
+        slots, self._state_indices = self._slot_indices(forward_batch.req_pool_indices)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.

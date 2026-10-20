@@ -169,8 +169,7 @@ def write_cache_indices(
         # host-resident — the write becomes a trivial CPU scatter with no recompile,
         # at the cost of a per-forward `page_indices` H2D copy in the attention
         # backend. Static analysis predicts host-resident is a regression (the slot
-        # indices are device-produced and device-consumed; see
-        # docs/tpu-prs/PR_BODY-write-cache-vectorize.md), but the two approaches
+        # indices are device-produced and device-consumed), but the two approaches
         # should be measured (TTFT / throughput) to confirm.
         _write_req_to_token_vectorized(
             req_to_token_pool.req_to_token,
@@ -217,6 +216,7 @@ def get_last_loc(
         "pallas_tpu_rpa_v3",
         "pallas_tpu_rpa_batched",
         "pallas_tpu_mla",
+        "pallas_tpu_mla_sparse",
         "pallas_tpu_flash",
     )
     uses_triton_dispatch = (

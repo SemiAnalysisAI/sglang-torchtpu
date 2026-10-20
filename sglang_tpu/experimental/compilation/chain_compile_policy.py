@@ -11,6 +11,10 @@ from typing import Any
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStates,
+    pack_aux_hidden_states,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -19,13 +23,18 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, process_model_config
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.attention_rank_inputs import (
     get_attention_rank_tensors,
     use_attention_rank_tensors,
 )
+from sglang_tpu.compilation.decoder_compile_policy import (
+    Qwen3VLDecoderTpuCompilePolicy,
+)
+from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
@@ -53,6 +62,9 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # A multimodal target hands the draft prompt its embeds (input_embeds), a
+        # separate program; text-only requests still take the plain one.
+        self._target_is_multimodal = process_model_config().is_multimodal
         self._eager_backbone_forward: Callable[..., Any] | None = None
         self._eager_model_forward: Callable[..., Any] | None = None
         self._eager_logits_forward: Callable[..., Any] | None = None
@@ -115,6 +127,7 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
         self,
         trace: Callable[..., Any],
         specialization_key: Callable[..., tuple[Any, ...]],
+        model_extra_tensor_attrs: tuple[str, ...] = (),
     ) -> Callable[..., Any]:
         """direct_compile trace(attention_metadata, ..., attention_rank_tensors=...)."""
         from sglang_tpu.compilation.direct_compile import direct_compile
@@ -128,7 +141,10 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             trace,
             specialization_key=specialization_key,
             model=self.model_runner.model,
-            model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
+            model_extra_tensor_attrs=(
+                *self.get_model_extra_tensor_attrs(),
+                *model_extra_tensor_attrs,
+            ),
             kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
         )
@@ -173,10 +189,23 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
                 return eager_model(input_ids, positions, forward_batch, *args, **kwargs)
 
         return self._direct_compile_draft(
-            trace, specialization_key=self._direct_compile_specialization_key
+            trace, specialization_key=self._draft_forward_specialization_key
         )
 
-    def compile_fused_draft(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+    def _draft_forward_specialization_key(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[Any, ...]:
+        return (
+            *self._direct_compile_specialization_key(*args, **kwargs),
+            kwargs.get("input_embeds") is not None,
+        )
+
+    def compile_fused_draft(
+        self,
+        fn: Callable[..., Any],
+        *,
+        model_extra_tensor_attrs: tuple[str, ...] = (),
+    ) -> Callable[..., Any]:
         """One program per (batch bucket, sampled) for the whole draft chain."""
         if self.tracer != "direct":
             return torch.compile(
@@ -204,7 +233,11 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
             # args[5] is temperatures: None for an all-greedy batch.
             return (forward_batch.batch_size, args[5] is None)
 
-        call = self._direct_compile_draft(trace, specialization_key=specialization_key)
+        call = self._direct_compile_draft(
+            trace,
+            specialization_key=specialization_key,
+            model_extra_tensor_attrs=model_extra_tensor_attrs,
+        )
         return functools.wraps(fn)(call)
 
     def _make_dummy_forward_batch(
@@ -326,31 +359,85 @@ class TpuChainSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
     def _precompile_draft_prompt_extend(self, target_feature_size: int) -> None:
         assert self.t_bucketer is not None
         bs = self._extend_compile_cap()
-        token_buckets = [t for t in self.t_bucketer.buckets if t >= bs]
+        variants = (
+            ("plain", "input_embeds") if self._target_is_multimodal else ("plain",)
+        )
+        shapes = [
+            (num_tokens, variant)
+            for num_tokens in self.t_bucketer.buckets
+            if num_tokens >= bs
+            for variant in variants
+        ]
         logger.info(
-            "[spec compile policy] %s DRAFT EXTEND(LAST): %d shapes (bs=%d, tokens=%s)",
+            "[spec compile policy] %s DRAFT EXTEND(LAST): %d shapes (bs=%d, tokens=%s, variants=%s)",
             self.algo_label,
-            len(token_buckets),
+            len(shapes),
             bs,
-            token_buckets,
+            sorted({num_tokens for num_tokens, _ in shapes}),
+            list(variants),
         )
 
-        def run(num_tokens: int) -> str:
+        def run(shape: tuple[int, str]) -> str:
+            num_tokens, variant = shape
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.EXTEND,
+                variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
                 spec_info=chain_draft_forward_input(
                     hidden_states=self._dummy_hidden(num_tokens, target_feature_size),
                     width=1,
                 ),
             )
-            return f"tokens={num_tokens}, bs={bs}"
+            return f"tokens={num_tokens}, bs={bs}, variant={variant}"
 
-        self._precompile_shapes(
-            f"{self.algo_label} DRAFT EXTEND(LAST)", token_buckets, run
+        self._precompile_shapes(f"{self.algo_label} DRAFT EXTEND(LAST)", shapes, run)
+
+    def _make_warmup_inputs(
+        self,
+        *,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: SpecInput | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if variant != "input_embeds":
+            return super()._make_warmup_inputs(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                variant=variant,
+                capture_hidden_mode=capture_hidden_mode,
+                spec_info=spec_info,
+            )
+        args, kwargs = super()._make_warmup_inputs(
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
         )
+        # The draft prompt of a multimodal batch, as TpuChainSpecWorker folds it.
+        forward_batch = args[2]
+        embed_tokens = self.model_runner.model.get_input_embeddings()
+        forward_batch.input_embeds = torch.zeros(
+            (num_tokens, embed_tokens.embedding_dim),
+            dtype=embed_tokens.weight.dtype,
+            device=self.model_runner.device,
+        )
+        return args, kwargs
+
+    def _precompile_extend(self) -> list[PendingCall]:
+        # A multimodal target still places host-built image rows eagerly per token
+        # bucket in its EXTEND(FULL) prefills.
+        if isinstance(self, Qwen3VLDecoderTpuCompilePolicy) and self._uses_input_embeds(
+            self.owner
+        ):
+            self._precompile_mm_embed_placement()
+        return super()._precompile_extend()
 
     def _dummy_hidden(self, rows: int, width: int) -> torch.Tensor:
         return torch.zeros(
@@ -365,9 +452,13 @@ def _hidden_only_logits(
     hidden_states: torch.Tensor,
     lm_head: torch.nn.Module,
     logits_metadata: Any,
+    aux_hidden_states: AuxHiddenStates | None = None,
     *args: Any,
     **kwargs: Any,
 ) -> LogitsProcessorOutput:
     """FULL capture's hidden, as LogitsProcessor returns it, without the logits."""
     del input_ids, lm_head, logits_metadata, args, kwargs
+    # An EAGLE3 draft captures its pre-norm hidden as aux, not the normed logits input.
+    if aux_hidden_states is not None:
+        hidden_states = pack_aux_hidden_states(aux_hidden_states)
     return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)

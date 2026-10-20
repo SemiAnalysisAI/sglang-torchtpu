@@ -1219,6 +1219,9 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_last_match_len: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # Matched prefix length at this request's first radix insert; stale SWA
+        # window demotion stops here (SGLANG_OPT_SWA_EVICT_STALE_WINDOWS_FIRST).
+        self.swa_stale_window_floor: Optional[int] = None
         # Logical-page KV sharding: rotation base of the chain this request
         # extends (owner of position-page P is (base + P) % shard_size).
         # Refreshed at every sharded alloc — read through last_node, or drawn
@@ -1990,6 +1993,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
+        self.swa_stale_window_floor = None
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
@@ -4044,17 +4048,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # The next query, at seqlen - 1, reads down to seqlen - 1 - W;
+                    # past cache_protected_len the prefix SWA lock is unused, so it
+                    # can become evictable. Skip decode_batch_idx 0, while the
+                    # overlapped prefill may still read it.
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
                         and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
                         is not None
                         and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
+                        and req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - req.kv.cache_protected_len
+                        >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
                             req.last_node, req.lock_receipt

@@ -29,7 +29,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 import importlib.util
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -48,6 +48,7 @@ class _BackendNoInit(TpuGDNAttnBackend):
     def __init__(self):  # noqa: D107  (deliberately skips super().__init__)
         self._distribution_cache = {}
         self._query_start_loc_cache = {}
+        self._slot_memo = None
         self._spec_window = 1
         self._read_offsets_pool = None
         self._read_offsets = None
@@ -126,6 +127,9 @@ class TestGDNSinglePassFlags(CustomTestCase):
             mamba2_layer_cache=lambda _: cache,
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
         )
         batch = SimpleNamespace(
             seq_lens=torch.full((bs,), 5),
@@ -184,6 +188,9 @@ class TestGDNVerifyMetadata(CustomTestCase):
             mamba_pool=SimpleNamespace(select_checkpoints=Mock()),
             get_mamba_indices=lambda indices: indices,
             translate_mamba_indices=lambda indices: indices,
+            # Read by the slot-id memo (TpuGDNAttnBackend._slot_indices).
+            req_index_to_mamba_index_mapping=torch.zeros(1, dtype=torch.int32),
+            mamba_v2p_table=None,
         )
         return backend
 
@@ -242,6 +249,51 @@ class TestGDNVerifyMetadata(CustomTestCase):
                 torch.tensor([1]),
                 None,
             )
+
+
+class _RowReadRecorder:
+    """Mapping stand-in that records each row read by a Python int."""
+
+    def __init__(self, rows: int):
+        self.shape = (rows,)
+        self.device = torch.device("cpu")
+        self.int_rows: list[int] = []
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            self.int_rows.append(index)
+        return torch.zeros(1, dtype=torch.int32)
+
+    def __setitem__(self, index, value):
+        pass
+
+
+class TestGDNSlotBookkeepingWarmup(CustomTestCase):
+    """The P/D state payload reads mapping[req_pool_idx] with a Python int, which
+    compiles one program per row; warmup must cover every row a request can hold."""
+
+    def _warm_rows(self, disaggregation_mode: str) -> list[int]:
+        backend = _BackendNoInit()
+        mapping = _RowReadRecorder(rows=5)
+        backend.req_to_token_pool = SimpleNamespace(
+            size=4,
+            req_index_to_mamba_index_mapping=mapping,
+            mamba_pool=SimpleNamespace(clear_slots=Mock()),
+        )
+        with patch(
+            "sglang_tpu.attention_gdn_pallas.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode=disaggregation_mode),
+        ):
+            backend._warmup_slot_bookkeeping()
+        return mapping.int_rows
+
+    def test_pd_servers_warm_every_mapping_row(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self.assertEqual(sorted(self._warm_rows(mode)), list(range(5)))
+
+    def test_aggregated_server_skips_row_reads(self):
+        self.assertEqual(self._warm_rows("null"), [])
 
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")

@@ -37,6 +37,7 @@ from typing import List, Optional
 import msgspec
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.configs.mamba_utils import (
     BaseLinearStateParams,
     KimiLinearStateShape,
@@ -47,6 +48,17 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024**3
+
+
+@compiled_op()
+def committed_read_offsets(read_offsets, indices, steps):
+    """(int64 slots, int32 read offsets) select_checkpoints commits, in one
+    launch. Negative steps (inactive requests) and the null slot keep their
+    previous offset."""
+    indices = indices.to(torch.int64)
+    steps = steps.to(torch.int32)
+    previous = read_offsets.index_select(0, indices)
+    return indices, torch.where((indices > 0) & (steps >= 0), steps, previous)
 
 
 class TpuPerLayerState(msgspec.Struct, frozen=True):
@@ -138,6 +150,9 @@ class TpuMambaPool(MambaPool):
         n_v, d_v, d_k = cache_params.shape.temporal
 
         num_mamba_layers = len(mamba_layer_ids)
+        # Read by the inherited P/D state-registration helpers.
+        self.mamba_layer_ids = list(mamba_layer_ids)
+        self.conv_shard_groups = cache_params.shape.conv_shard_groups
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -239,11 +254,11 @@ class TpuMambaPool(MambaPool):
         """Record the state after the final accepted verify input, without copying HBM."""
         if self.checkpoint_read_offsets is None:
             raise RuntimeError("GDN checkpoint storage was not allocated")
-        indices = indices.to(device=self.device, dtype=torch.int64)
-        offsets = last_correct_step_indices.to(device=self.device, dtype=torch.int32)
-        previous = self.checkpoint_read_offsets.index_select(0, indices)
-        # Negative steps denote inactive requests. The null slot stays inert.
-        offsets = torch.where((indices > 0) & (offsets >= 0), offsets, previous)
+        indices, offsets = committed_read_offsets(
+            self.checkpoint_read_offsets,
+            indices.to(self.device),
+            last_correct_step_indices.to(self.device),
+        )
         self.checkpoint_read_offsets.index_copy_(0, indices, offsets)
 
     def clear_slots(self, indices: torch.Tensor):
@@ -351,14 +366,11 @@ class TpuMambaPool(MambaPool):
             copy_bucket_size(max_requests),
         )
 
-    # The four below are inherited from MambaPool, which indexes the layer axis
+    # The two below are inherited from MambaPool, which indexes the layer axis
     # as `state[:, slots]` on a stacked tensor. This pool has no layer axis to
     # index -- state is one tensor per layer -- so the inherited versions would
-    # silently address the *slot* axis instead. The two RDMA ones additionally
-    # walk `vars(self.mamba_cache)`, which a msgspec.Struct does not support.
-    # None is reachable on TPU today (host/hierarchical cache and RDMA
-    # disaggregation are both unsupported here), so they raise rather than
-    # pretend.
+    # silently address the *slot* axis instead. Host offload of GDN state is
+    # unsupported on TPU, so they raise rather than pretend.
 
     def get_cpu_copy(self, indices):
         raise NotImplementedError(
@@ -374,17 +386,24 @@ class TpuMambaPool(MambaPool):
             "so MambaPool.load_cpu_copy's `[:, indices]` does not apply."
         )
 
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU: "
-            "TpuMambaPool stores one tensor per layer, so the per-layer strides "
-            "MambaPool.get_contiguous_buf_infos derives from a stacked buffer "
-            "do not exist."
-        )
+    def _iter_transfer_state_entries(self):
+        """One [state_slots, ...] tensor per layer, laid out as get_state.
 
-    def get_state_dim_per_tensor(self):
-        raise NotImplementedError(
-            "RDMA registration of GDN state is not supported on TPU; see "
-            "TpuMambaPool.get_contiguous_buf_infos. The TP-sliceable axis this "
-            "reports as dim 2 of a stacked buffer is dim 1 of a per-layer one."
-        )
+        P/D registration reads these. Slice axes follow the kernel-native
+        layouts: conv [slots, K-1, 1, conv_dim], recurrent [slots, n_v, d_k, d_v].
+        """
+        for conv in self.mamba_cache.conv:
+            for tensor, layer_id in zip(conv, self.mamba_layer_ids, strict=True):
+                yield "conv", tensor, 2, layer_id
+        for tensor, layer_id in zip(
+            self.mamba_cache.temporal, self.mamba_layer_ids, strict=True
+        ):
+            yield "temporal", tensor, 0, layer_id
+
+    def committed_row(self, slot: int) -> int:
+        """State row a P/D transfer reads or writes for slot.
+
+        Extend leaves its state in checkpoint row 0, and P/D decode resets the
+        slot's read offset to 0 before its first verify, so both sides use row 0.
+        """
+        return slot * self.checkpoint_width

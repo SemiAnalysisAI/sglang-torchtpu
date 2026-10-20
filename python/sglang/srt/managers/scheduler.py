@@ -534,7 +534,7 @@ class Scheduler(
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
-        bootstrap.init_parallel_runtime(
+        self.distributed_init_time = bootstrap.init_parallel_runtime(
             server_args=server_args,
             device=get_device().device,
             dist_port=self.nccl_port,
@@ -727,13 +727,21 @@ class Scheduler(
         self.scheduler_startup_begin = time.perf_counter()
 
     def init_startup_timing_summary(self) -> None:
+        startup_end = time.perf_counter()
+        post_sync_startup_begin = self.tp_worker.model_runner.post_sync_startup_begin
         self.startup_time = build_scheduler_startup_time(
             target_load_weight=self.tp_worker.weight_load_time,
             draft_load_weight=(
                 0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
             ),
             kv_cache_allocation=self.kv_cache_allocation_time,
-            scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
+            scheduler_e2e=startup_end - self.scheduler_startup_begin,
+            distributed_init=self.distributed_init_time,
+            post_sync_startup=(
+                None
+                if post_sync_startup_begin is None
+                else startup_end - post_sync_startup_begin
+            ),
             target_cuda_graph=self.tp_worker.graph_time_usage,
             draft_cuda_graph=(
                 None

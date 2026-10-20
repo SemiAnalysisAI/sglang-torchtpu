@@ -108,6 +108,37 @@ class TestTpuMambaPool(CustomTestCase):
             (pool.size + 1) * 4 * pool.cache_bytes_per_request(cp),
         )
 
+    def test_pd_state_entries_follow_per_layer_layout(self):
+        """P/D registers one entry per per-layer tensor, in get_state order, with
+        the TP slice axis of the kernel-native layout; the transfer row of a slot
+        is its checkpoint row 0, whatever the checkpoint width."""
+        cp = _make_cache_params(
+            self.N_KQ, self.N_V, self.D_K, self.D_V, self.K, self.LAYERS
+        )
+        pool = TpuMambaPool(
+            size=3,
+            spec_state_size=3,
+            cache_params=cp,
+            mamba_layer_ids=self.LAYERS,
+            device="cpu",
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        )
+        state = pool.get_state()
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(ptrs, [t.data_ptr() for t in state])
+        self.assertEqual(lens, [t.nbytes for t in state])
+        self.assertEqual(item_lens, [t[0].nbytes for t in state])
+        num_conv = len(pool.mamba_cache.conv) * len(self.LAYERS)
+        self.assertEqual(pool.get_state_layer_ids(), self.LAYERS * (len(state) // 3))
+        conv_dim = pool.mamba_cache.conv[0][0].shape[-1]
+        self.assertEqual(
+            pool.get_state_dim_per_tensor(),
+            [conv_dim] * num_conv + [self.N_V] * len(self.LAYERS),
+        )
+        self.assertEqual(pool.committed_row(3), 12)
+        self.assertEqual(self._pool().committed_row(3), 3)
+
     def test_disabled_replayssm_surface_covers_base(self):
         """Disabling ReplaySSM must mean "present and inert", not "absent".
 

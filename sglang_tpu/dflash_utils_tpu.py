@@ -230,6 +230,27 @@ def dflash_verify_bookkeeping_torch(
     return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
 
+def _tp_size() -> int:
+    return (
+        int(get_parallel().tp_group.world_size)
+        if model_parallel_is_initialized()
+        else 1
+    )
+
+
+def register_argmax_draft_top_k(lm_head: nn.Module) -> None:
+    """Register the distributed TopK op argmax_draft_tokens_tpu traces under TP."""
+    # The target registers it when compiling its logits processor, which a P/D
+    # decode engine never does; tracing would otherwise build it in the forward.
+    tp_size = _tp_size()
+    if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
+        from sglang_tpu.distributed_topk_pallas import (
+            register_pallas_distributed_top_k_op,
+        )
+
+        register_pallas_distributed_top_k_op(tp_size)
+
+
 def argmax_draft_tokens_tpu(
     *,
     lm_head: nn.Module,
@@ -260,11 +281,7 @@ def argmax_draft_tokens_tpu(
     if not should_apply_lm_head_quant_method(lm_head, lm_head.quant_method):
         hs = hs.to(lm_head.weight.dtype)
 
-    tp_size = (
-        int(get_parallel().tp_group.world_size)
-        if model_parallel_is_initialized()
-        else 1
-    )
+    tp_size = _tp_size()
     # Through the head's own quant method, so a quantized head serves the draft too.
     local_logits = lm_head.quant_method.apply(lm_head, hs)
     if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
