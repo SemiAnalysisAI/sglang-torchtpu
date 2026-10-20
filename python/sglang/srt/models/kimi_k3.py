@@ -3795,6 +3795,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
     # Text-only prefill takes the same direct path (the policy warms the
     # "text_ids" extend variant for it); image prefill keeps the routine.
     text_prefill_in_language_model = _is_tpu
+    # Serves DP attention under TPU compilation: forward() puts every rank on
+    # the input_embeds program when any DP group prefills an image
+    # (is_tpu_mm_extend_in_batch), the logits processor is compiled with the
+    # language model, and the replicated vision tower has no collectives.
+    serves_dp_attention = _is_tpu
 
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
