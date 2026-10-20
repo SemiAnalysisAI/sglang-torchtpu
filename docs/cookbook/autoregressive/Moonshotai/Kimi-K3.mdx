@@ -676,7 +676,46 @@ python3 -m sglang.launch_server \
 ```
 {/* /render_recipe */}
 
-#### 3.7.4 Decode megakernel (one request)
+#### 3.7.4 Measured performance
+
+Four tpu7x hosts, a server launched as in 3.7.1, `benchmark/tpu/bench_serving.sh`
+with random token ids (`--random-range-ratio 1.0`, 4 requests per concurrency
+level). Measured 2026-10-20 with `torch_tpu` 0.2.0 and `libtpu` 0.0.50.
+
+| Workload | Requests in flight | TTFT median / P99 | TPOT median / P99 | Output tok/s (peak) | Total tok/s | Requests/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8k in / 1k out | 1 | 1509 / 1512 ms | 7.94 / 7.94 ms | 106 (126) | 957 | 0.10 |
+| 1k in / 1k out | 1 | 208 / 213 ms | 7.81 / 7.83 ms | 125 (129) | 249 | 0.12 |
+| 1k in / 8k out | 1 | 207 / 213 ms | 7.86 / 7.90 ms | 127 (129) | 143 | 0.02 |
+| 1k in / 1k out | 4 | 575 / 781 ms | 15.85 / 16.43 ms | 244 (264) | 487 | 0.24 |
+
+- TPOT is flat across context length at one request (7.8-7.9 ms from 1k to 9k
+  tokens), so a single stream decodes at about 126 tokens/s.
+- Output tok/s counts the whole request, prefill included; the peak is the
+  decode rate.
+- At concurrency 4, each request decodes at about 63 tokens/s and the server at
+  about 250.
+- The DSpark recipe (3.7.3) has no published numbers yet. For DSpark with the
+  decode megakernel, see 3.7.6.
+
+#### 3.7.5 Accuracy
+
+Measured with the commands in 3.7.1 (the long-reasoning runs at
+`--context-length 65536`).
+
+| Benchmark | Setting | Score |
+| --- | --- | --- |
+| GSM8K | 1319 questions, greedy | **0.977** |
+| AIME26 | 30 problems x 4 samples, temperature 0.6, top_p 0.95, 61440 tokens | **pass@1 90.0%, maj@4 100%** |
+| MMMU-Pro (standard, 10 options) | 200 sampled questions, 16384 tokens | **81.0%** |
+
+- The K3 kernels cost no measurable accuracy: with them off, the same runs score
+  GSM8K 0.976 and AIME26 pass@1 85.0% (maj@4 95.8%).
+- DSpark (3.7.3) and the decode megakernel (3.7.6) score 0.978 on GSM8K.
+- Judge long reasoning on sampled, repeated runs: a single greedy pass on AIME26
+  swings by more than ten points between builds that score the same when sampled.
+
+#### 3.7.6 Decode megakernel (one request)
 
 The decode megakernel (#1577) runs all 93 decoder layers as one Pallas call per
 step, with the cross-rank reductions and the next layer's weight prefetch inside
@@ -686,33 +725,24 @@ and prefill chunks run through the same kernel in 8-token row blocks. It uses
 fp8 dense weights and bf16 reduction transport
 (`SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX`), at GSM8K 0.978.
 
-It can be served two ways.
+8k in / 1k out at one request:
 
-**Standalone megakernel server (fastest).** An OpenAI-compatible server
-(`/v1/chat/completions`, `/v1/completions`) that runs the kernel without
-sglang's scheduler, 64 decode steps per device call: greedy decoding only, one
-request at a time. Run on every host; the API comes up on the host of JAX
-process 0:
+| Serving | TTFT | TPOT | TPOT vs default path |
+| --- | --- | --- | --- |
+| sglang + megakernel + DSpark | 13.8 s | **3.56 ms** | **2.2x** |
+| Standalone megakernel server | 10.75 s | **4.61 ms** | **1.7x** |
+| Default path (3.7.1) | 1.51 s | 7.94 ms | 1.0x |
 
-```bash
-bash sglang_tpu/k3_megakernel/server/run4h.sh k3mk --port 30000 -- \
-    --ckpt /path/to/Kimi-K3 --layers 93 --expert-load stream \
-    --relax dense_fp8,pair_oproj,bf16_transport
-```
+- TPOT grows by about 0.1 ms per 1k tokens of context. On a 3-token prompt the
+  standalone server decodes at 3.80 ms, within 0.03 ms of the kernel step.
+- Long prompts prefill more slowly than on the default path, because the chunks
+  run through the decode kernel.
+- On real text DSpark gains more than on random ids: 20 GSM8K questions take
+  41 s with DSpark and 85 s without (2.1x end to end), at an accept length of
+  5.47.
 
-| Workload | TTFT | TPOT | Decode tok/s | Total tok/s | TPOT vs default path |
-| --- | --- | --- | --- | --- | --- |
-| 3 in / 1k out | 36 ms | **3.80 ms** | 263 | 261 | **2.1x** |
-| 1k in / 1k out | 1.28 s | **3.91 ms** | 256 | 388 | **2.0x** |
-| 1k in / 8k out | 1.28 s | **4.25 ms** | 235 | 256 | **1.8x** |
-| 8k in / 1k out | 10.75 s | **4.61 ms** | 217 | 596 | **1.7x** |
-
-The 3-token row is the shortest context: there the server's 3.80 ms is within
-0.03 ms of the kernel step itself. TPOT grows by about 0.1 ms per 1k tokens of
-context.
-
-**Through sglang, with DSpark.** The sglang server with the megakernel serves
-the full sglang API, and DSpark runs its target verify through the kernel too:
+**Through sglang, with DSpark.** Serves the full sglang API; DSpark runs its
+target verify through the kernel too:
 
 {/* render_recipe config=recipe/configs/kimi_k3/dspark_mk.py profile=long_8k1k_c1 */}
 **Hardware**: 4 tpu7x hosts (32 TensorCores), tp32/ep8.
@@ -771,14 +801,8 @@ python3 -m sglang.launch_server \
 ```
 {/* /render_recipe */}
 
-| Workload | TTFT | TPOT | TPOT vs default path |
-| --- | --- | --- | --- |
-| 8k in / 1k out | 13.8 s | **3.56 ms** | **2.2x** |
-| 1k in / 8k out | 1.67 s | **3.45 ms** | **2.3x** |
-
-On real text DSpark gains more than on random ids: 20 GSM8K questions take
-41 s with DSpark and 85 s without (2.1x end to end), at an accept length of
-5.47. Without DSpark, drop the speculative flags:
+Without DSpark, drop the speculative flags. sglang's per-step host work then
+shows (5.97 ms TPOT, 1.3x the default path); it is being reduced.
 
 {/* render_recipe config=recipe/configs/kimi_k3/server_mk.py profile=long_8k1k_c1 */}
 **Hardware**: 4 tpu7x hosts (32 TensorCores), tp32/ep8.
@@ -830,48 +854,14 @@ python3 -m sglang.launch_server \
 ```
 {/* /render_recipe */}
 
-Without DSpark, sglang's per-step host work shows: 5.97 ms TPOT at 8k / 1k
-(1.3x the default path), which is being reduced.
+**Standalone megakernel server.** An OpenAI-compatible server
+(`/v1/chat/completions`, `/v1/completions`) that runs the kernel without
+sglang's scheduler, 64 decode steps per device call: greedy decoding only, one
+request at a time. Run on every host; the API comes up on the host of JAX
+process 0:
 
-Measured with random token ids at one request, 2026-10-19/20; the default path
-is the 3.7.5 row for the same workload. Long prompts prefill more slowly than on
-the default path, because the chunks run through the decode kernel.
-
-#### 3.7.5 Measured performance
-
-Four tpu7x hosts, a server launched as in 3.7.1, `benchmark/tpu/bench_serving.sh`
-with random token ids (`--random-range-ratio 1.0`, 4 requests per concurrency
-level). Measured 2026-10-20 with `torch_tpu` 0.2.0 and `libtpu` 0.0.50.
-
-| Workload | Requests in flight | TTFT median / P99 | TPOT median / P99 | Output tok/s (peak) | Total tok/s | Requests/s |
-| --- | --- | --- | --- | --- | --- | --- |
-| 8k in / 1k out | 1 | 1509 / 1512 ms | 7.94 / 7.94 ms | 106 (126) | 957 | 0.10 |
-| 1k in / 1k out | 1 | 208 / 213 ms | 7.81 / 7.83 ms | 125 (129) | 249 | 0.12 |
-| 1k in / 8k out | 1 | 207 / 213 ms | 7.86 / 7.90 ms | 127 (129) | 143 | 0.02 |
-| 1k in / 1k out | 4 | 575 / 781 ms | 15.85 / 16.43 ms | 244 (264) | 487 | 0.24 |
-
-- TPOT is flat across context length at one request (7.8-7.9 ms from 1k to 9k
-  tokens), so a single stream decodes at about 126 tokens/s.
-- Output tok/s counts the whole request, prefill included; the peak is the
-  decode rate.
-- At concurrency 4, each request decodes at about 63 tokens/s and the server at
-  about 250.
-- The DSpark recipe (3.7.3) has no published numbers yet. For DSpark with the
-  decode megakernel, see 3.7.4.
-
-#### 3.7.6 Accuracy
-
-Measured with the commands in 3.7.1 (the long-reasoning runs at
-`--context-length 65536`).
-
-| Benchmark | Setting | Score |
-| --- | --- | --- |
-| GSM8K | 1319 questions, greedy | **0.977** |
-| AIME26 | 30 problems x 4 samples, temperature 0.6, top_p 0.95, 61440 tokens | **pass@1 90.0%, maj@4 100%** |
-| MMMU-Pro (standard, 10 options) | 200 sampled questions, 16384 tokens | **81.0%** |
-
-- The K3 kernels cost no measurable accuracy: with them off, the same runs score
-  GSM8K 0.976 and AIME26 pass@1 85.0% (maj@4 95.8%).
-- DSpark (3.7.3) and the decode megakernel (3.7.4) score 0.978 on GSM8K.
-- Judge long reasoning on sampled, repeated runs: a single greedy pass on AIME26
-  swings by more than ten points between builds that score the same when sampled.
+```bash
+bash sglang_tpu/k3_megakernel/server/run4h.sh k3mk --port 30000 -- \
+    --ckpt /path/to/Kimi-K3 --layers 93 --expert-load stream \
+    --relax dense_fp8,pair_oproj,bf16_transport
+```
