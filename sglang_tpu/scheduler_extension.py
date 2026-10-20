@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.backend_extension import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang_tpu.envs import envs as tpu_envs
 
 
 class TpuSchedulerExtension(SchedulerExtension):
@@ -27,7 +28,7 @@ class TpuSchedulerExtension(SchedulerExtension):
 
         cls = TpuFutureMap
         if (
-            envs.SGLANG_TPU_HOST_PADDING.get()
+            tpu_envs.SGLANG_TPU_HOST_PADDING.get()
             and algorithm.is_none()
             and getattr(req_to_token_pool, "_tpu_relay_bucketer", None) is not None
         ):
