@@ -67,6 +67,11 @@ class RaidenKVCacheGroups:
     state: List[torch.Tensor] = field(default_factory=list)
     # Maps a request's mamba slot to the state row a transfer moves.
     committed_state_row: Optional[Callable[[int], int]] = None
+    # Per state tensor: the per-row axis TP shards, and the full widths of the
+    # sub-blocks sharded independently along it (None when it is one block);
+    # what a decode at a narrower attention TP reassembles its rows from.
+    state_slice_axes: List[int] = field(default_factory=list)
+    state_conv_groups: List[Optional[List[int]]] = field(default_factory=list)
 
 
 def get_raiden_kv_caches(
@@ -142,11 +147,15 @@ def get_raiden_kv_caches(
 
     state: List[torch.Tensor] = []
     committed_state_row = None
+    state_slice_axes: List[int] = []
+    state_conv_groups: List[Optional[List[int]]] = []
     if isinstance(pool, HybridLinearKVPool) and isinstance(
         pool.mamba_pool, TpuMambaPool
     ):
         state = pool.mamba_pool.get_state()
         committed_state_row = pool.mamba_pool.committed_row
+        state_slice_axes = pool.mamba_pool.get_state_slice_axes()
+        state_conv_groups = pool.mamba_pool.get_state_conv_shard_groups()
 
     for name, group in (("full KV", full), ("SWA KV", swa), ("GDN state", state)):
         block_counts = {int(buf.shape[0]) for buf in group}
@@ -164,4 +173,6 @@ def get_raiden_kv_caches(
         num_draft_swa=num_draft_swa,
         state=state,
         committed_state_row=committed_state_row,
+        state_slice_axes=state_slice_axes,
+        state_conv_groups=state_conv_groups,
     )

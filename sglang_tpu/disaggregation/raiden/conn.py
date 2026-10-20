@@ -86,6 +86,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardChunkReady,
     ReshardReady,
     ReshardReq,
+    ReshardState,
     RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
@@ -151,6 +152,10 @@ class RaidenKVManager(
     _state_kv_caches: Tuple[Any, ...] = ()
     _state_engine_max_blocks = 0
     _committed_state_row: Optional[Callable[[int], int]] = None
+    # Per state tensor: its TP-sharded axis and conv sub-block widths, for
+    # assembling a resharded room's rows.
+    _state_slice_axes: Tuple[int, ...] = ()
+    _state_conv_groups: Tuple[Optional[List[int]], ...] = ()
     state_raiden_endpoint: Optional[str] = None
 
     def __init__(
@@ -172,6 +177,7 @@ class RaidenKVManager(
             ReshardChunk.TAG: self._on_reshard_chunk,
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
+            ReshardState.TAG: self._on_reshard_state,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
@@ -356,6 +362,14 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
+        if not swa and getattr(self.kv_args, "is_hybrid_mla_backend", False):
+            # An MLA latent page is the same on every attention-TP rank, so
+            # it moves whole rather than as a head slice.
+            from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+                WholeBlockGeometry,
+            )
+
+            return WholeBlockGeometry(src_attn_tp, dst_attn_tp, tensor[0].nbytes)
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
@@ -376,6 +390,8 @@ class RaidenKVManager(
         self._swa_kv_caches = list(kv_caches.swa)
         self._state_kv_caches = tuple(kv_caches.state)
         self._committed_state_row = kv_caches.committed_state_row
+        self._state_slice_axes = tuple(kv_caches.state_slice_axes)
+        self._state_conv_groups = tuple(kv_caches.state_conv_groups)
         if self._state_kv_caches and self._committed_state_row is None:
             raise RuntimeError("Raiden GDN state tensors need a committed-row mapping")
         if self._pipeline_enabled:
@@ -1250,6 +1266,7 @@ class RaidenKVManager(
                     self._prefill.send_block_set,
                     self._prefill.send_swa_blocks,
                     self._prefill.send_state_rows,
+                    self._prefill.reshard_state,
                     self._prefill.send_aux,
                     self._prefill.decode_addr,
                     self._prefill.reshard_req,
@@ -1287,6 +1304,8 @@ class RaidenKVManager(
                     self._decode.reshard_meta,
                     self._decode.reshard_sources,
                     self._decode.reshard_swa_sources,
+                    self._decode.reshard_state_sources,
+                    self._decode.state_uploads,
                 ):
                     table.pop(room, None)
                 for table in (
