@@ -423,7 +423,8 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(attention_backend="pallas_tpu_mla")
         self._apply(args)
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
-        self.assertEqual(self._resolved(args, "page_size"), 64)
+        # The MLA kernel's tuned blocks are keyed on 128-token pages.
+        self.assertEqual(self._resolved(args, "page_size"), 128)
 
     def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
         # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
@@ -703,6 +704,166 @@ class TestDsaValidation(CustomTestCase):
                 attention_backend="pallas_tpu_mla_sparse",
                 tpu_compile_tracer="direct",
             )
+
+
+class TestModelServingArgs(CustomTestCase):
+    """apply_server_args_defaults settles, before any weight loads, the per-model
+    setups TPU used to refuse only after the load (or serve differently)."""
+
+    _args = TestTpuPlatformServerDefaults._args
+    _resolved = TestTpuPlatformServerDefaults._resolved
+
+    def _apply(
+        self,
+        args,
+        *,
+        mla=True,
+        state=True,
+        gdn=False,
+        arch="KimiK3ForConditionalGeneration",
+        context_len=4096,
+    ):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MLA if mla else AttentionArch.MHA,
+            hf_config=SimpleNamespace(architectures=[arch]),
+            context_len=context_len,
+        )
+        fields = dict(
+            mamba_ssm_dtype=None,
+            disable_radix_cache=False,
+            disaggregation_decode_enable_radix_cache=False,
+            torch_compile_max_bs=None,
+            speculative_num_draft_tokens=None,
+        )
+        for name, value in fields.items():
+            if not hasattr(args, name):
+                setattr(args, name, value)
+        with (
+            patch(
+                "sglang_tpu.tpu_platform._load_model_config",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_builder.uses_ssm_state",
+                return_value=state,
+            ),
+            patch(
+                "sglang.srt.configs.hybrid_arch.hybrid_gdn_config",
+                return_value=object() if gdn else None,
+            ),
+        ):
+            TestTpuPlatformServerDefaults._apply(self, args)
+
+    def test_kda_serves_without_the_radix_cache(self):
+        args = self._args(attention_backend="pallas_tpu_mla")
+        self._apply(args)
+        self.assertTrue(self._resolved(args, "disable_radix_cache"))
+
+    def test_gdn_keeps_the_radix_cache(self):
+        args = self._args()
+        self._apply(args, mla=False, gdn=True, arch="Qwen3NextForCausalLM")
+        self.assertFalse(self._resolved(args, "disable_radix_cache"))
+
+    def test_kda_refuses_an_explicit_decode_radix_cache(self):
+        args = self._args(
+            attention_backend="pallas_tpu_mla",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="raiden",
+            disaggregation_decode_enable_radix_cache=True,
+        )
+        with self.assertRaisesRegex(ValueError, "decode-enable-radix-cache"):
+            self._apply(args)
+
+    def test_state_dtype_other_than_float32_is_refused(self):
+        self._apply(self._args(mamba_ssm_dtype="float32"))
+        with self.assertRaisesRegex(ValueError, "mamba-ssm-dtype bfloat16"):
+            self._apply(self._args(mamba_ssm_dtype="bfloat16"))
+        # Irrelevant without linear-attention state.
+        self._apply(self._args(mamba_ssm_dtype="bfloat16"), state=False)
+
+    def test_mla_needs_the_raiden_transfer_backend(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                args = self._args(
+                    disaggregation_mode=mode, disaggregation_transfer_backend="tpu"
+                )
+                with self.assertRaisesRegex(ValueError, "transfer-backend raiden"):
+                    self._apply(args)
+        self._apply(
+            self._args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="tpu"
+            ),
+            mla=False,
+            state=False,
+        )
+
+    def test_linear_attention_state_refuses_raiden_pipeline_transfer(self):
+        args = self._args(
+            disaggregation_mode="decode", disaggregation_transfer_backend="raiden"
+        )
+        with envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.override(True):
+            with self.assertRaisesRegex(ValueError, "pipeline transfer"):
+                self._apply(args)
+        self._apply(
+            self._args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="raiden"
+            )
+        )
+
+    def test_multimodal_kimi_k3_refuses_compiled_dp_attention(self):
+        args = self._args(
+            tp_size=4, attn_dp_size=2, enable_dp_lm_head=True, enable_torch_compile=True
+        )
+        # The model module stands in: the check reads one class attribute.
+        models = ModuleType("sglang.srt.models.kimi_k3")
+        models.KimiK3ForConditionalGeneration = type("KimiK3", (), {})
+        with patch.dict(sys.modules, {"sglang.srt.models.kimi_k3": models}):
+            with self.assertRaisesRegex(ValueError, "DP attention"):
+                self._apply(args)
+            models.KimiK3ForConditionalGeneration.serves_dp_attention = True
+            self._apply(
+                self._args(
+                    tp_size=4,
+                    attn_dp_size=2,
+                    enable_dp_lm_head=True,
+                    enable_torch_compile=True,
+                )
+            )
+        # The text-only class has no such restriction.
+        self._apply(
+            self._args(
+                tp_size=4,
+                attn_dp_size=2,
+                enable_dp_lm_head=True,
+                enable_torch_compile=True,
+            ),
+            arch="KimiK3LinearForCausalLM",
+        )
+
+    def test_mla_defaults_to_128_token_pages(self):
+        args = self._args(attention_backend="pallas_tpu_mla")
+        self._apply(args)
+        self.assertEqual(self._resolved(args, "page_size"), 128)
+
+    def test_a_page_table_that_cannot_fit_in_smem_is_refused(self):
+        # 262144-token context at 128-token pages: 2049 pages per sequence, so
+        # at most 127 sequences fit the 1 MiB budget.
+        def args(max_bs):
+            return self._args(
+                attention_backend="pallas_tpu_mla",
+                enable_torch_compile=True,
+                torch_compile_max_bs=max_bs,
+            )
+
+        self._apply(args(127), context_len=262144)
+        with self.assertRaisesRegex(ValueError, r"torch-compile-max-bs \(<= 127"):
+            self._apply(args(128), context_len=262144)
+        # Uncompiled, the table is sized per batch.
+        uncompiled = args(128)
+        uncompiled.enable_torch_compile = False
+        self._apply(uncompiled, context_len=262144)
 
 
 class TestTpuPlatformDecodeContextParallel(CustomTestCase):
