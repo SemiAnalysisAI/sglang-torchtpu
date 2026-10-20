@@ -1,11 +1,13 @@
-"""DFlash speculative decoding on Kimi-K3 (TPU experimental spec worker).
+"""Block-draft speculative decoding on Kimi-K3: DFlash and DSpark (TPU
+experimental spec worker).
 
 The experimental worker verifies a block draft through the KDA checkpointed
-state path, which it already uses for DSpark. This serves the shared tiny
-Kimi-K3 checkpoint (kimi_k3_tiny_harness.py) at TP4 with a tiny random-weight
-DFlash draft built here: one Qwen3-style decoder layer over target layers 1, 4
-and 7. TP4 also exercises the gathered argmax the draft takes where the Pallas
-distributed TopK has no kernel (it covers TP 8 and 16; Kimi-K3 serves at TP32).
+state path. This serves the shared tiny Kimi-K3 checkpoint
+(kimi_k3_tiny_harness.py) at TP4 with tiny random-weight drafts built here:
+one Qwen3-style decoder layer over target layers 1, 4 and 7, plus, for DSpark,
+its vanilla Markov head. TP4 also exercises the gathered argmax the DFlash
+draft takes where the Pallas distributed TopK has no kernel (it covers TP 8
+and 16; Kimi-K3 serves at TP32).
 
 Speculative decoding is lossless in exact arithmetic. Here a verify step
 scores its tokens through an extend-shaped forward, not the decode program,
@@ -32,7 +34,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(
-    est_time=900,
+    est_time=1300,
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "kimi-k3", "spec", "experimental-spec", "compile"],
@@ -41,14 +43,17 @@ register_tpu_ci(
 PORT = 21000
 BASE_URL = f"http://127.0.0.1:{PORT}"
 MAX_NEW_TOKENS = 32
+# Verify rows per request: DFlash's block, or DSpark's gamma draft tokens + 1.
 BLOCK_SIZE = 4
+DSPARK_MARKOV_RANK = 32
 TARGET_LAYER_IDS = [1, 4, 7]
 
 
-def build_draft(root: str, target: str) -> None:
-    """A random DFlash draft for the tiny Kimi-K3, in the published layout
-    (fc over the captured target layers, hidden_norm, Qwen3 decoder layers,
-    norm; embedding and LM head come from the target)."""
+def build_draft(root: str, target: str, *, dspark: bool = False) -> None:
+    """A random block draft for the tiny Kimi-K3, in the published layout (fc
+    over the captured target layers, hidden_norm, Qwen3 decoder layers, norm;
+    embedding and LM head come from the target). DSpark adds a vanilla Markov
+    head; under SGLANG_RAGGED_VERIFY_MODE=static it has no confidence head."""
     import torch
     from safetensors.torch import save_file
 
@@ -56,9 +61,9 @@ def build_draft(root: str, target: str) -> None:
     hidden, vocab = text["hidden_size"], text["vocab_size"]
     heads, kv_heads, head_dim, inter = 8, 2, 128, 2048
     config = {
-        "architectures": ["DFlashDraftModel"],
+        "architectures": ["DSparkDraftModel" if dspark else "DFlashDraftModel"],
         "model_type": "qwen3",
-        "block_size": BLOCK_SIZE,
+        "block_size": BLOCK_SIZE - 1 if dspark else BLOCK_SIZE,
         # Any id the target's vocabulary embeds.
         "dflash_config": {
             "mask_token_id": vocab - 1,
@@ -81,6 +86,15 @@ def build_draft(root: str, target: str) -> None:
         "vocab_size": vocab,
         "dtype": "bfloat16",
     }
+    if dspark:
+        config["markov_rank"] = DSPARK_MARKOV_RANK
+        config["markov_head_type"] = "vanilla"
+        config["dspark_config"] = {
+            "markov_rank": DSPARK_MARKOV_RANK,
+            "markov_head_type": "vanilla",
+            "mask_token_id": vocab - 1,
+            "target_layer_ids": TARGET_LAYER_IDS,
+        }
     os.makedirs(root, exist_ok=True)
     json.dump(config, open(os.path.join(root, "config.json"), "w"), indent=2)
     g = torch.Generator().manual_seed(0)
@@ -108,6 +122,9 @@ def build_draft(root: str, target: str) -> None:
         p + "mlp.up_proj.weight": rand(inter, hidden),
         p + "mlp.down_proj.weight": rand(hidden, inter),
     }
+    if dspark:
+        tensors["markov_head.markov_w1.weight"] = rand(vocab, DSPARK_MARKOV_RANK)
+        tensors["markov_head.markov_w2.weight"] = rand(vocab, DSPARK_MARKOV_RANK)
     save_file(tensors, os.path.join(root, "model.safetensors"))
 
 
@@ -136,44 +153,60 @@ def _generate(ids: list[int], max_new_tokens: int) -> tuple[list[int], dict]:
     return body["output_ids"], body["meta_info"]
 
 
-class TestKimiK3TinyDFlash(CustomTestCase):
-    def test_dflash_verify_matches_plain_decoding(self):
-        workdir = tempfile.TemporaryDirectory(prefix="kimi_k3_dflash_")
-        self.addCleanup(workdir.cleanup)
-        target = os.path.join(workdir.name, "target")
-        draft = os.path.join(workdir.name, "draft")
-        build_model(target)
-        build_draft(draft, target)
-        logs = workdir.name
+SPEC_ARGS = {
+    "DFLASH": ["--speculative-num-draft-tokens", str(BLOCK_SIZE)],
+    "DSPARK": ["--speculative-dspark-block-size", str(BLOCK_SIZE - 1)],
+}
+SPEC_ENV = {
+    "DFLASH": {"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"},
+    "DSPARK": {
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1",
+        # The verify-row layout the Kimi-K3 DSpark recipe serves with.
+        "SGLANG_RAGGED_VERIFY_MODE": "static",
+    },
+}
 
-        process, log = launch(target, PORT, [], f"{logs}/plain.log")
+
+class TestKimiK3TinyBlockSpec(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workdir = tempfile.TemporaryDirectory(prefix="kimi_k3_block_spec_")
+        cls.target = os.path.join(cls.workdir.name, "target")
+        build_model(cls.target)
+        process, log = launch(cls.target, PORT, [], f"{cls.workdir.name}/plain.log")
         try:
-            plain = [tuple(_generate(prefix, 2)[0]) for prefix in PREFIXES]
+            cls.plain = [tuple(_generate(prefix, 2)[0]) for prefix in PREFIXES]
             # The plain server's extend-vs-decode agreement on the same token.
-            extend = [
+            cls.extend = [
                 _generate(prefix + [t1], 1)[0][0]
-                for prefix, (t1, _) in zip(PREFIXES, plain)
+                for prefix, (t1, _) in zip(PREFIXES, cls.plain)
             ]
         finally:
             kill_process_tree(process.pid, wait_timeout=60)
             log.close()
 
+    @classmethod
+    def tearDownClass(cls):
+        cls.workdir.cleanup()
+
+    def _check(self, algorithm: str) -> None:
+        draft = os.path.join(self.workdir.name, f"draft_{algorithm.lower()}")
+        build_draft(draft, self.target, dspark=algorithm == "DSPARK")
         process, log = launch(
-            target,
+            self.target,
             PORT,
             [
                 "--speculative-algorithm",
-                "DFLASH",
+                algorithm,
                 "--speculative-draft-model-path",
                 draft,
-                "--speculative-num-draft-tokens",
-                str(BLOCK_SIZE),
-                # The draft is dense MHA beside the MLA target, as for DSpark.
+                *SPEC_ARGS[algorithm],
+                # The draft is dense MHA beside the MLA target.
                 "--speculative-draft-attention-backend",
                 "pallas_tpu_rpa_v3",
             ],
-            f"{logs}/dflash.log",
-            env={"SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "1"},
+            f"{self.workdir.name}/{algorithm.lower()}.log",
+            env=SPEC_ENV[algorithm],
         )
         try:
             served = [_generate(prefix, 2) for prefix in PREFIXES]
@@ -183,18 +216,24 @@ class TestKimiK3TinyDFlash(CustomTestCase):
             kill_process_tree(process.pid, wait_timeout=60)
             log.close()
 
-        total = len(PREFIXES)
+        plain, total = self.plain, len(PREFIXES)
         first = sum(tuple(ids)[0] == p[0] for (ids, _), p in zip(served, plain))
         second = sum(tuple(ids) == p for (ids, _), p in zip(served, plain))
-        extend_agree = sum(e == p[1] for e, p in zip(extend, plain))
+        extend_agree = sum(e == p[1] for e, p in zip(self.extend, plain))
         print(
-            f"first token {first}/{total}; verify step {second}/{total}; "
-            f"plain extend vs decode {extend_agree}/{total}; "
+            f"{algorithm}: first token {first}/{total}; verify step "
+            f"{second}/{total}; plain extend vs decode {extend_agree}/{total}; "
             f"spec_verify_ct {meta.get('spec_verify_ct')}"
         )
         self.assertGreater(meta.get("spec_verify_ct", 0), 0, "no draft verified")
         self.assertEqual(first, total)
         self.assertGreaterEqual(second, extend_agree - total // 10)
+
+    def test_dflash_verify_matches_plain_decoding(self):
+        self._check("DFLASH")
+
+    def test_dspark_verify_matches_plain_decoding(self):
+        self._check("DSPARK")
 
 
 if __name__ == "__main__":
