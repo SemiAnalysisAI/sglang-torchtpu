@@ -912,6 +912,55 @@ class TestCompiledForwardShim(CustomTestCase):
         torch.testing.assert_close(seen_by_graph[0][:3], embeds)
         torch.testing.assert_close(fb.mm_input_embeds[:3], embeds)
 
+    def test_routed_experts_capture_skipped_in_extend_only(self):
+        """The graph must see skip_capture=True for every extend and False for
+        decode, warmup and serving alike, so each program traces one value."""
+        capturer = SimpleNamespace(skip_capture=False)
+        seen_by_graph = []
+
+        def compiled(input_ids, positions, forward_batch, *args, **kwargs):
+            seen_by_graph.append(capturer.skip_capture)
+            return torch.zeros(8, 4)
+
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        modes = ("extend", "decode", "target_verify", "idle", "mixed")
+        with patch(
+            "sglang_tpu.compilation.compiled_forward_shim.get_global_experts_capturer",
+            return_value=capturer,
+        ):
+            for mode in modes:
+                fb = self._forward_batch(
+                    input_ids=torch.arange(8, dtype=torch.int32),
+                    forward_mode=_ForwardModeMock(mode),
+                )
+                shim(None, None, fb)
+        self.assertEqual(seen_by_graph, [True, False, True, False, True])
+
+    def test_draft_worker_leaves_routed_experts_capture_alone(self):
+        # Capture is target-only; a draft forward must not flip the target's flag.
+        capturer = SimpleNamespace(skip_capture=False)
+        policy = DecoderTpuCompilePolicy()
+        policy.model_runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            is_draft_worker=True,
+        )
+        shim = CompiledForwardShim(lambda *args, **kwargs: torch.zeros(8, 4), policy)
+        with patch(
+            "sglang_tpu.compilation.compiled_forward_shim.get_global_experts_capturer",
+            return_value=capturer,
+        ):
+            shim(
+                None,
+                None,
+                self._forward_batch(
+                    input_ids=torch.arange(8, dtype=torch.int32),
+                    forward_mode=_ForwardModeMock("extend"),
+                ),
+            )
+        self.assertFalse(capturer.skip_capture)
+
     def test_recompilation_check_runs_when_forward_raises(self):
         """A compile that raises mid-forward must still be reported."""
         error = torch._dynamo.exc.RecompileError("fail_on_recompile")

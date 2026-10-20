@@ -146,8 +146,13 @@ class BaseTopkCapturer:
             device,
             name=name,
         )
+        # Set by a platform before a forward that must not capture. That forward
+        # writes nothing, reports its rows as -1 (unknown), and clears the flag.
+        self.skip_capture = False
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        if self.skip_capture:
+            return
         self.device_cache.capture(layer_id, topk_indices)
 
     def destroy(self):
@@ -209,6 +214,9 @@ class BaseTopkCapturer:
         else:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
+        if self.skip_capture:
+            slice_gpu = torch.full_like(slice_gpu, -1)
+            self.skip_capture = False
         if no_copy_to_cpu:
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(

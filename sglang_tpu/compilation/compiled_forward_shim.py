@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils.common import ceil_align, next_power_of_2, print_warning_once
 from sglang_tpu._logging import get_logger
 from sglang_tpu.compilation.bucketer import (
@@ -853,6 +854,17 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
     snapshot_recompilation_baseline()
 
 
+def _skip_routed_experts_capture_in_extend(forward_batch: Any) -> None:
+    # Capturing routed experts inside compiled extend programs corrupts those
+    # programs (both the captured ids and the forward itself) for some token
+    # buckets; decode programs are unaffected. Extend rows are reported as -1.
+    # Set on every target forward, warmup included, so each program is traced
+    # with the value it sees when serving.
+    capturer = get_global_experts_capturer()
+    if capturer is not None:
+        capturer.skip_capture = forward_batch.forward_mode.is_extend()
+
+
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
@@ -1031,6 +1043,8 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        if not self._draft_worker:
+            _skip_routed_experts_capture_in_extend(forward_batch)
         keep_padded = self.policy.keep_outputs_padded(forward_batch)
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
