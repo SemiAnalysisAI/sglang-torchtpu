@@ -4,7 +4,7 @@ This guide reproduces, with open components only, a cache hit-rate loss in sglan
 `write_back` copy-ahead window, and the fix for it. It is written to be followed step by step, by an
 engineer or an agent, on a single tpu7x-8 host.
 
-Four server configurations ("arms") serve the same synthetic agentic multi-turn load for one hour each:
+Five server configurations ("arms") serve the same synthetic agentic multi-turn load for one hour each:
 
 | Arm | sglang-torchtpu commit | Write policy | Copy-ahead window |
 |---|---|---|---|
@@ -12,9 +12,10 @@ Four server configurations ("arms") serve the same synthetic agentic multi-turn 
 | B | `deec4fbada` (main) | write_back | off |
 | C | `deec4fbada` (main) | write_back | on (default) |
 | D | `041f406ea1`, the first commit of [sgl-project/sglang-torchtpu#1586](https://github.com/sgl-project/sglang-torchtpu/pull/1586) | write_back | on (default), with the fix |
+| E | `78f109fc3f`, both commits of #1586 | write_back | on (default), with the fix and the follow-up |
 
-What to look for: C has a lower cache hit rate than B from the first ten minutes, and D brings it back
-to B's level. [Expected results](#9-expected-results) gives the numbers and what counts as reproduced.
+What to look for: C has a lower cache hit rate than B from the first ten minutes, and D and E bring it
+back to B's level. [Expected results](#9-expected-results) gives the numbers and what counts as reproduced.
 
 ## 1. Prerequisites
 
@@ -65,6 +66,7 @@ editable, so switching commits switches the code; restart the server after a swi
 git clone https://github.com/sgl-project/sglang-torchtpu.git ~/sglang-torchtpu
 . ~/repro_env.sh
 git fetch origin 041f406ea1044528805864d31b42e60b07c7bc56    # arm D's commit
+git fetch origin 78f109fc3f19aa6356625c48c7cc20a931adeec1    # arm E's commit
 git checkout deec4fbada                                     # arms A, B, C
 cp python/pyproject_tpu.toml python/pyproject.toml
 pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
@@ -81,8 +83,10 @@ For arm D:
 The only runtime difference
 between the two commits is `sglang_tpu/hicache_write_back_copy_ahead.py` (the commit also adds a unit
 test); nothing needs reinstalling. If that commit is ever unreachable, apply this package's
-`arm_d_full_pin.patch` on `deec4fbada` instead. #1586 has later commits that were not measured here; use
-`041f406ea1` exactly.
+`arm_d_full_pin.patch` on `deec4fbada` instead. For arm E, check out
+`78f109fc3f19aa6356625c48c7cc20a931adeec1` the same way; it adds #1586's second commit (targeted
+synchronous waits, a retry for short evictions, and an SWA share of the window), again only in that
+module. If #1586 gains later commits, they were not measured here.
 
 Copy this package's server config into the checkout. Keep it there across checkouts:
 `git checkout` leaves an untracked file in place.
@@ -121,6 +125,7 @@ From the repository root. Every arm sets the model, the fixed-date template and 
 | B | `HICACHE_WRITE_POLICY=write_back SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS=0 SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1` |
 | C | `HICACHE_WRITE_POLICY=write_back SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1` |
 | D | `HICACHE_WRITE_POLICY=write_back SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1` (at commit `041f406ea1`) |
+| E | `HICACHE_WRITE_POLICY=write_back SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM=1` (at commit `78f109fc3f`) |
 
 - On main, the copy-ahead window is on by default for `write_back`. Arm B turns it off with
   `SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS=0`. Arm A sets the same variable; it has no effect
@@ -173,6 +178,7 @@ Check that the arm is configured as intended before starting the load:
 | C, D | `grep -c "HiCache write_back copy-ahead: 32768 tokens" server_$ARM.log` | at least `1` |
 | C | `grep -c "def _pin_full_host" sglang_tpu/hicache_write_back_copy_ahead.py` | `0` |
 | D | `grep -c "def _pin_full_host" sglang_tpu/hicache_write_back_copy_ahead.py` | `1` |
+| E | `grep -c "def wait_for_acks" sglang_tpu/hicache_write_back_copy_ahead.py` | `1` (`0` on D) |
 
 and `git rev-parse HEAD` prints the arm's commit.
 
@@ -270,6 +276,7 @@ your build can differ. Full tables, including HiCache counters, are in [results.
 | B | 4,797 | 73.1 | 69, 79, 70, 78, 70, 72 | 1,880 |
 | C | 2,235 / 2,217 | 10.7 / 10.6 | 9-15 in every bucket | 1,697 / 1,674 |
 | D | 5,497 / 5,112 | 71.2 / 72.9 | 70, 76, 67, 75, 70, 68 (first run) | 732 / 600 |
+| E | 4,970 | 72.4 | 67, 77, 71, 75, 73, 72 | 853 |
 
 Counts as reproduced when all of these hold:
 
@@ -315,6 +322,7 @@ per arm (PA-PD are arms A-D with `--prefill-only`):
 | PB | 6,202 | 72.3 | 67,081 (18,645) | 20.7 / 35.8 / 71.0 | 2,716 |
 | PC | 2,131 | 9.5 | 23,211 (21,000) | 68.0 / 95.4 / 108.3 | 3,187 |
 | PD | 5,797 | 72.0 | 62,502 (17,538) | 23.0 / 36.7 / 69.3 | 1,839 |
+| PE | 5,651 | 71.8 | 60,823 (17,171) | 22.4 / 38.9 / 69.6 | 1,186 |
 
 Hit % per 10 minutes: PA 10, 62, 78, 76, 74, 74; PB 10, 77, 78, 79, 79, 70; PC 8-11 in every bucket;
 PD 10, 76, 78, 79, 78, 75. The first 10 minutes are nearly cold in every arm (in PB, 455 requests with

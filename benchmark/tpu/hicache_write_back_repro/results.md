@@ -1,7 +1,9 @@
 # Results: gpt-oss-120b on one tpu7x-8 host, 2026-10-20
 
 Six one-hour runs, in parallel on six tpu7x-8 hosts, with the setup in [REPRODUCE.md](REPRODUCE.md):
-arms A-D, plus a repeat of C and of D (C2, D2) to show the run-to-run spread. The copy-ahead module ran
+arms A-D, plus a repeat of C and of D (C2, D2) to show the run-to-run spread. Arm E (both #1586
+commits, the copy-ahead module exactly as at `78f109fc3f`) ran later the same day, in both modes, on
+the same kind of host. The copy-ahead module ran
 the same code as the commits named in REPRODUCE.md (plus a test-only switch selecting the merged pin
 for C and the fixed pin for D); other cache code differed only in features that
 are off by default, and other parts of the stack differed, so absolute throughput on another build can
@@ -17,6 +19,7 @@ write_back arms. Table from `compare.py`.
 | C2 (repeat of C) | 2,217 | 0.616 | 10.6 | 6.4 / 4.2 / 89.4 | 245 | 67.2 / 101.4 / 124.0 | 1,674 |
 | D write_back, window on, fix | 5,497 | 1.527 | 71.2 | 3.0 / 68.2 / 28.8 | 335 | 29.1 / 41.9 / 56.7 | 732 |
 | D2 (repeat of D) | 5,112 | 1.420 | 72.9 | 2.9 / 70.0 / 27.1 | 282 | 31.7 / 45.3 / 61.3 | 600 |
+| E write_back, window on, both #1586 commits | 4,970 | 1.381 | 72.4 | 3.1 / 69.2 / 27.6 | 364 | 29.8 / 47.3 / 59.5 | 853 |
 
 Hit % per 10 minutes:
 
@@ -45,6 +48,9 @@ hour and finished within 44 s. 97% of replies ended at `max_tokens`.
   against 120M. It serves 53% fewer requests than B.
 - **The fix (D) restores B's hit rate** (71.2% and 72.9% against 73.1%) and keeps the window's
   benefit: eviction time falls from 1,880 s to 600-732 s, and D serves 7-15% more requests than B.
+- **E (both #1586 commits) also restores B's hit rate** (72.4%, prefill-only 71.8%) with eviction time
+  853 s (prefill-only 1,186 s against 1,839 s for PD). Its requests (4,970) fall inside D's
+  run-to-run spread, so the second commit gives no measurable throughput change on this load.
 - The repeats agree: C and C2 within 1% on requests, D and D2 within about 7-8%.
 - write_through (A) and write_back without the window (B) are close on this load: B has a higher hit
   rate and serves 4% fewer requests.
@@ -61,6 +67,7 @@ The same four arms with the client's `--prefill-only` (one output token per requ
 | PB write_back, window off | 6,202 | 72.3 | 67,081 | 18,645 | 20.7 / 35.8 / 71.0 | 21.3 / 39.2 / 78.8 | 2,716 |
 | PC write_back, window on (main) | 2,131 | 9.5 | 23,211 | 21,000 | 68.0 / 95.4 / 108.3 | 69.9 / 96.7 / 112.7 | 3,187 |
 | PD write_back, window on, fix | 5,797 | 72.0 | 62,502 | 17,538 | 23.0 / 36.7 / 69.3 | 23.6 / 39.3 / 75.8 | 1,839 |
+| PE write_back, window on, both #1586 commits | 5,651 | 71.8 | 60,823 | 17,171 | 22.4 / 38.9 / 69.6 | 24.1 / 41.7 / 75.2 | 1,186 |
 
 | Minutes | PA | PB | PC | PD |
 |---|---|---|---|---|
