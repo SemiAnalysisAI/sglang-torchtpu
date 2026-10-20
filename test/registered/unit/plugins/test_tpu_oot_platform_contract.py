@@ -374,6 +374,22 @@ class TestTpuOOTPlatformContract(CustomTestCase):
         )
         self.assertIn(
             (
+                "sglang.srt.distributed.parallel_state.GroupCoordinator.all_reduce",
+                twolevel_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
+                "sglang.srt.models.kimi_k3.merged_moe_all_reduce",
+                twolevel_merged_moe_all_reduce,
+                HookType.AROUND,
+            ),
+            HOOKS,
+        )
+        self.assertIn(
+            (
                 "sglang.srt.layers.moe.topk.TopK.__init__",
                 register_router_topk,
                 HookType.AFTER,
