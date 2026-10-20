@@ -37,10 +37,10 @@ from sglang.srt.speculative.uno_info import UnoDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
 from sglang_tpu.experimental.speculative.block_spec_worker import (
     TpuBlockSpecWorker,
 )
-from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -66,7 +66,7 @@ DRAFT_INPUTS = (
     FrozenKVMTPDraftInput,
     DFlashDraftInputV2,
     UnoDraftInput,
-    HostPaddedDraftInput,
+    HostPaddedBlockDraftInput,
 )
 
 _PROTOCOL_INTERNALS = frozenset({"_is_protocol", "_is_runtime_protocol", "_abc_impl"})
