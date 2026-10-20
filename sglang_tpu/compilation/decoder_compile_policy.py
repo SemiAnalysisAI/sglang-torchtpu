@@ -876,9 +876,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if not isinstance(kv_pool, HybridLinearKVPool):
             return kv_pool
         from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            has_linear_attention,
             hybrid_linear_kv_pool_state,
         )
 
+        # An MTP draft shares the target's GDN state but runs no GDN layer; lifting it
+        # swaps in new buffers per forward and Raiden keeps the stale registered ones.
+        if not has_linear_attention(self.model_runner.model):
+            return kv_pool.full_kv_pool
         return hybrid_linear_kv_pool_state(
             kv_pool=kv_pool, req_to_token_pool=self.model_runner.req_to_token_pool
         )

@@ -34,7 +34,7 @@ FusedDraft = Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
 
 
 class TpuChainDraftWorker(TpuDraftWorker):
-    """A draft that proposes one token per forward from a carried hidden (MTP).
+    """A draft that proposes one token per forward from a carried hidden (MTP, EAGLE3).
 
     The subclass validates its draft model, attaches the target modules and maps
     draft logits to target tokens. This class owns the carried hidden and runs
@@ -43,11 +43,14 @@ class TpuChainDraftWorker(TpuDraftWorker):
     Attributes:
       carry_size: Width of the draft hidden carried between forwards.
       target_feature_size: Width of the target feature the draft reads on
-        committed rows (MTP: the target final hidden).
+        committed rows (MTP: the target final hidden; EAGLE3: its aux layers).
+      fused_draft_tensor_attrs: Non-parameter draft-model tensors the fused draft
+        reads (direct_compile model_extra_tensor_attrs).
     """
 
     carry_size: int
     target_feature_size: int
+    fused_draft_tensor_attrs: tuple[str, ...] = ()
 
     def __init__(self, target_runner: ModelRunner) -> None:
         super().__init__(target_runner)
@@ -95,7 +98,10 @@ class TpuChainDraftWorker(TpuDraftWorker):
 
     def precompile_draft(self) -> None:
         compile_policy = self._compile_policy()
-        self._fused_draft = compile_policy.compile_fused_draft(self._fused_draft_steps)
+        self._fused_draft = compile_policy.compile_fused_draft(
+            self._fused_draft_steps,
+            model_extra_tensor_attrs=self.fused_draft_tensor_attrs,
+        )
         compile_policy.precompile_draft(
             self.model_runner.attn_backend,
             target_feature_size=self.target_feature_size,

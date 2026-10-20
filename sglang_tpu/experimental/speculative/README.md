@@ -26,19 +26,17 @@ BaseSpecWorker (core)
 └── TpuSpecWorker                       shared verify, bucketing, warmups
     ├── TpuChainSpecWorker              autoregressive: one draft forward per token
     │     └─ has-a TpuChainDraftWorker
-    │                 └── TpuMtpDraftWorker      MTP (NEXTN)
-    ├── TpuBlockSpecWorker              block-parallel: one forward over [r, m, ..., m]
-    │     └─ has-a TpuBlockDraftWorker
-    │                 ├── TpuDflashDraftWorker   DFlash and DFlash2
-    │                 └── TpuDsparkDraftWorker   DSpark
-    └── TpuEagle3Worker                 EAGLE3   (TODO: move under TpuChainSpecWorker)
-          └─ has-a EagleDraftWorker (core)
+    │                 ├── TpuMtpDraftWorker      MTP (NEXTN)
+    │                 └── TpuEagle3DraftWorker   EAGLE3
+    └── TpuBlockSpecWorker              block-parallel: one forward over [r, m, ..., m]
+          └─ has-a TpuBlockDraftWorker
+                      ├── TpuDflashDraftWorker   DFlash and DFlash2
+                      └── TpuDsparkDraftWorker   DSpark
 
 TpuDraftWorker (ABC)  ── TpuChainDraftWorker, TpuBlockDraftWorker
 
 SpecInput (core) ── HostPaddedDraftInput ── HostPaddedChainDraftInput
-                                          ├─ HostPaddedBlockDraftInput
-                                          └─ HostPaddedEagleDraftInput
+                                          └─ HostPaddedBlockDraftInput
 ```
 
 The worker *has a* drafter instead of *being* one: the family fixes the step
@@ -53,12 +51,11 @@ family worker maps the algorithm to its drafter.
 - **DSpark is a sibling of DFlash, not a subclass.** Its model also subclasses
   `DFlashDraftModel`, but its sampling (Markov bias on the base logits) shares
   no code with DFlash's, so both derive from `TpuBlockDraftWorker`.
-- **EAGLE3 is-a chain (TODO).** EAGLE3 drafts one token per forward from the
-  carried hidden, the same as MTP, so it belongs under `TpuChainSpecWorker` with
-  a `TpuChainDraftWorker` drafter. Today it subclasses `TpuSpecWorker` directly
-  and drives core's `EagleDraftWorker`, so its draft loop, commit and compile
-  policy (`TpuEagle3SpecDecodeCompilePolicyMixin`) duplicate the chain family's.
-  Do not add fixes to it; move it to the chain family.
+- **EAGLE3 is-a chain.** EAGLE3 drafts one token per forward from the carried
+  hidden, the same as MTP, so `TpuChainSpecWorker` serves it with a
+  `TpuEagle3DraftWorker`. Only the drafter differs: its carry is the draft's
+  pre-norm hidden, and committed rows read the target's concatenated aux hidden
+  states through the draft's fc.
 
 Inheritance kept for reuse, not because it is-a (do not extend the pattern):
 
@@ -111,11 +108,31 @@ policy mixin, and routes all three.
   `at serving time` line. `test_tpu_qwen3_8_27b_singlehost_mtp_recompile.py` is
   the template. `..._SITES=1` locates the source line of a compile, but never
   benchmark with it on.
+- P/D: `test_tpu_qwen3_8b_pd_singlehost_dspark_recompile.py` and
+  `test_tpu_qwen3_8_27b_pd_singlehost_{mtp,dflash2}_recompile.py` run the same
+  check on both engines.
 - Accuracy: GSM8K with spec on matches spec off. Performance: A/B on identical
   server flags.
 
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP and mixed prefill/decode DP steps. Neither family supports DP
-attention, and the chain family does not support PD disaggregation or a draft
-sliding window. Each raises at startup.
+attention, and the chain family (MTP) does not support a draft sliding window.
+Each raises at startup.
+
+## P/D disaggregation
+
+Both raiden roles serve every algorithm with the same spec flags.
+
+- Decode seed: `build_disagg_*_input` (`../../hooks/experimental_spec.py`) builds
+  it on host; core's builders stack it on device at the live bs, one compile per
+  bs. MTP ships its carry as the EAGLE hidden seed, and decode writes it back
+  into the carry table.
+- Hybrid GDN targets: raiden moves each request's committed GDN state row on a
+  third engine next to the KV, and the decode seed resets the slot's
+  checkpoint read offset.
+- KV free fence: commit writes draft KV after the accept outputs the result
+  copies, so commit and extend return an output of their last KV write as
+  `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV
+  writer's own output), and the async result copy copies it. A separate read of
+  the KV buffer would add a program per step.
