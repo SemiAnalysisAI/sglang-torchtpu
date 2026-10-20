@@ -221,10 +221,9 @@ def handle_model_specific_adjustments(server_args: Any):
     validate_declarations(server_args, model_overrides)
     server_args._resolved_overrides.extend(model_overrides)
 
-    if model_arch in (
-        "KimiLinearForCausalLM",
-        "KimiK3ForConditionalGeneration",
-    ):
+    from sglang.srt.arg_groups.kimi_k3_hook import KIMI_HYBRID_ARCHITECTURES
+
+    if model_arch in KIMI_HYBRID_ARCHITECTURES:
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
             apply_kimi_k3_spec_backend_defaults,

@@ -14,6 +14,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Architectures whose decoder is the Kimi hybrid (KDA + attention) stack: the
+# multimodal Kimi-K3 wrapper, its text-only entry (the expert-pack runtime
+# serves it), and Kimi-Linear.
+KIMI_HYBRID_ARCHITECTURES = (
+    "KimiLinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
 
 def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     """Apply speculative backend defaults for Kimi hybrid models."""

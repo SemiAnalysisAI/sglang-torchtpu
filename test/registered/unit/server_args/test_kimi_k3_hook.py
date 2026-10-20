@@ -42,5 +42,17 @@ class TestKimiK3SpecBackendDefaults(CustomTestCase):
             apply_kimi_k3_spec_backend_defaults(_args(speculative_algorithm=None))
 
 
+class TestKimiHybridArchitectures(CustomTestCase):
+    def test_every_kimi_k3_entry_class_gets_the_hybrid_hooks(self):
+        """The text-only entry runs the same KDA decoder as the multimodal one
+        (and is what the expert-pack runtime serves), so it needs the same
+        spec-decode and linear-attention defaults and refusals."""
+        from sglang.srt.arg_groups.kimi_k3_hook import KIMI_HYBRID_ARCHITECTURES
+        from sglang.srt.models.kimi_k3 import EntryClass
+
+        for cls in EntryClass:
+            self.assertIn(cls.__name__, KIMI_HYBRID_ARCHITECTURES)
+
+
 if __name__ == "__main__":
     unittest.main()
