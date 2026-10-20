@@ -832,17 +832,25 @@ The HTTP API comes up on the host of JAX process 0.
 
 #### 3.7.5 Measured performance
 
-Four tpu7x hosts, `benchmark/tpu/bench_serving.sh` with random token ids, on a
-server launched as in 3.7.1. Measured 2026-10-20 with `torch_tpu` 0.2.0 and
-`libtpu` 0.0.50.
+Four tpu7x hosts, a server launched as in 3.7.1, `benchmark/tpu/bench_serving.sh`
+with random token ids (`--random-range-ratio 1.0`, 4 requests per concurrency
+level). Measured 2026-10-20 with `torch_tpu` 0.2.0 and `libtpu` 0.0.50.
 
-| Workload | Requests in flight | TTFT p50 | TPOT p50 | Decode tok/s | Total tok/s |
-| --- | --- | --- | --- | --- | --- |
-| 8k in / 1k out | 1 | 1508 ms | 7.94 ms | 126 | 957 |
-| 1k in / 1k out | 1 | 209 ms | 7.82 ms | 128 | 249 |
-| 1k in / 1k out | 4 | 548 ms | 15.90 ms | 252 | 487 |
-| 1k in / 8k out | 1 | 208 ms | 7.86 ms | 127 | 143 |
-| DSpark, `long_8k1k_c1` | 1 | - | - | - | not yet published |
+| Workload | Requests in flight | TTFT median / P99 | TPOT median / P99 | Output tok/s (peak) | Total tok/s | Requests/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8k in / 1k out | 1 | 1509 / 1512 ms | 7.94 / 7.94 ms | 106 (126) | 957 | 0.10 |
+| 1k in / 1k out | 1 | 208 / 213 ms | 7.81 / 7.83 ms | 125 (129) | 249 | 0.12 |
+| 1k in / 8k out | 1 | 207 / 213 ms | 7.86 / 7.90 ms | 127 (129) | 143 | 0.02 |
+| 1k in / 1k out | 4 | 575 / 781 ms | 15.85 / 16.43 ms | 244 (264) | 487 | 0.24 |
+
+- TPOT is flat across context length at one request (7.8-7.9 ms from 1k to 9k
+  tokens), so a single stream decodes at about 126 tokens/s.
+- Output tok/s counts the whole request, prefill included; the peak is the
+  decode rate.
+- At concurrency 4, each request decodes at about 63 tokens/s and the server at
+  about 250.
+- The DSpark recipe (3.7.3) has no published numbers yet. For DSpark with the
+  decode megakernel, see 3.7.4.
 
 #### 3.7.6 Accuracy
 
@@ -859,6 +867,14 @@ server.
 | AIME26 | 30 problems x 1 sample, same sampling | 90.0% | - | 2026-10-18 |
 | MMMU-Pro (standard, 10 options) | 200 sampled questions, 16384 tokens | 81.0% | - | 2026-10-17 |
 | MMMU-Pro (standard, 10 options) | the 41 of those 200 that both runs answered | 36 / 41 | 34 / 41 | 2026-10-17 |
+
+GSM8K (1319 questions, greedy) on each serving path:
+
+| Path | GSM8K | Measured on |
+| --- | --- | --- |
+| default path (3.7.1), `torch_tpu` 0.2.0 | 0.977 | 2026-10-20 |
+| default path with DSpark (static fp8 and host-split off, 4 requests in flight) | 0.978 | 2026-10-18 |
+| decode megakernel, standalone server (3.7.4) | 0.978 | 2026-10-20 |
 
 - The AIME26 x 4 and MMMU-Pro runs predate the host-split GEMVs (#1478); the
   AIME26 x 1 run has every kernel in the commands above.
