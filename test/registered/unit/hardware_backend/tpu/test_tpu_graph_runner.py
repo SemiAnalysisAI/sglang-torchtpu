@@ -443,6 +443,34 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertTrue(issubclass(policy, Eagle3SpecDecodeCompilePolicyMixin))
         self.assertFalse(issubclass(policy, TpuChainSpecDecodeCompilePolicyMixin))
 
+    def test_experimental_worker_takes_native_mtp_to_the_chain_policy(self):
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                pp_size=1, speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        with tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+
+    def test_pipelined_native_mtp_keeps_the_compatibility_policy(self):
+        # The chain worker serves one pipeline stage; PP targets stay on core's EAGLE.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            server_args=SimpleNamespace(
+                pp_size=2, speculative_num_steps=3, speculative_algorithm="EAGLE"
+            ),
+        )
+        with (
+            get_context().override_server_args(pp_size=2),
+            tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+        ):
+            cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertFalse(issubclass(cls, TpuChainSpecDecodeCompilePolicyMixin))
+
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
         mr = SimpleNamespace(

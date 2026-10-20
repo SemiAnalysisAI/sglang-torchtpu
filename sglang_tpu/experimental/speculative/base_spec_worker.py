@@ -43,7 +43,7 @@ from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enab
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs_from_tensors
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -1367,12 +1367,6 @@ def _sampled_row_filters(sampling_info: SamplingBatchInfo) -> dict[str, bool]:
         "need_top_p": bool((sampled & (top_ps < 1.0)).any()),
         "need_min_p": bool((sampled & (min_ps > 0.0)).any()),
     }
-
-
-def _live_rows(tensor: torch.Tensor, bs: int) -> torch.Tensor:
-    # The result-copy thread reads these after the next step is queued; a [:bs]
-    # view would then need its own program behind that step, so copy it here.
-    return tensor if tensor.shape[0] == bs else tensor[:bs].clone()
 
 
 def _apply_grammar_mask(
