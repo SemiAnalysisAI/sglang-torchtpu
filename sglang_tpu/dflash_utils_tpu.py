@@ -19,6 +19,7 @@ from torch import nn
 from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.distributed import model_parallel_is_initialized
 from sglang.srt.runtime_context import get_parallel
+from sglang_tpu.kernels.distributed_topk import SUPPORTED_WORLD_SIZES
 from sglang_tpu.spec_op_warmup import (
     make_dflash_verify_argmax_args,
     make_dflash_verify_bookkeeping_args,
@@ -285,13 +286,16 @@ def argmax_draft_tokens_tpu(
     # Through the head's own quant method, so a quantized head serves the draft too.
     local_logits = lm_head.quant_method.apply(lm_head, hs)
     if tp_size > 1 and supports_distributed_tpu_top_k(lm_head, top_k=1):
-        _, global_token_ids = distributed_tpu_top_k(
-            local_logits,
-            TpuVocabShard.from_lm_head(lm_head),
-            k=1,
-            group=get_parallel().tp_group,
-        )
-        tokens = global_token_ids.squeeze(-1).to(torch.long)
+        if tp_size in SUPPORTED_WORLD_SIZES:
+            _, global_token_ids = distributed_tpu_top_k(
+                local_logits,
+                TpuVocabShard.from_lm_head(lm_head),
+                k=1,
+                group=get_parallel().tp_group,
+            )
+            tokens = global_token_ids.squeeze(-1).to(torch.long)
+        else:
+            tokens = _gathered_argmax(local_logits, lm_head)
         return tokens.view(bs, block_size - 1)
 
     shard = getattr(lm_head, "shard_indices", None)
@@ -304,6 +308,34 @@ def argmax_draft_tokens_tpu(
     if org_vocab_start > 0:
         tokens.add_(org_vocab_start)
     return tokens.view(bs, block_size - 1)
+
+
+def shard_best(local_logits: torch.Tensor, shard) -> torch.Tensor:
+    """Each row's best (logit, global token id) on this rank's vocab shard,
+    as an f32 [rows, 2] (ids stay exact in f32 far past any vocabulary)."""
+    num_org = int(shard.num_org_elements)
+    values, index = local_logits[:, :num_org].float().max(dim=-1)
+    ids = (index + int(shard.org_vocab_start_index)).to(torch.float32)
+    return torch.stack((values, ids), dim=-1)
+
+
+def pick_global_best(gathered: torch.Tensor) -> torch.Tensor:
+    """Global argmax ids from every rank's [rows, 2] bests, [tp, rows, 2]:
+    the first maximum in rank order, torch.argmax's tie-break, since lower
+    ranks hold lower token ids."""
+    best_rank = torch.argmax(gathered[..., 0], dim=0)
+    best = torch.gather(gathered[..., 1], 0, best_rank.unsqueeze(0)).squeeze(0)
+    return best.to(torch.long)
+
+
+def _gathered_argmax(local_logits: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """Exact global argmax over a vocab-sharded head at a TP size the Pallas
+    distributed TopK has no kernel for (it covers TP 8 and 16; Kimi-K3 serves
+    at TP32): every rank's shard best, all-gathered as the logits processor
+    gathers full logits at those sizes."""
+    pairs = shard_best(local_logits, lm_head.shard_indices)
+    gathered = get_parallel().tp_group.all_gather(pairs.unsqueeze(0), dim=0)
+    return pick_global_best(gathered)
 
 
 def _dflash_device_accept_eligible(
