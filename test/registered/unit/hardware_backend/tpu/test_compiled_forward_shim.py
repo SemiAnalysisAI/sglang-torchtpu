@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.radix_attention import padded_extend_real_tokens
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -267,8 +268,7 @@ class TestHostStagedPrefillInputs(CustomTestCase):
                         "0", "", array("q", range(n + 3)), SamplingParams(), False
                     )
                     req.refresh_fill_ids()
-                    req.prefix_indices = torch.arange(3)
-                    req.set_extend_range(3, n + 3)
+                    req.prefix_len, req.extend_end = 3, n + 3
                     expected_mrope = torch.arange(3, n + 3).repeat(3, 1)
                     if has_image:
                         spatial_offsets = torch.tensor([[0], [10], [20]])
@@ -832,6 +832,7 @@ class TestCompiledForwardShim(CustomTestCase):
     def _forward_batch(**kwargs):
         defaults = {
             "is_prefill_only": False,
+            "global_num_token_non_padded_cpu": None,
             "mm_input_embeds": None,
             "input_embeds": None,
             "seq_lens": torch.zeros(4, dtype=torch.int32),
@@ -850,6 +851,33 @@ class TestCompiledForwardShim(CustomTestCase):
         }
         defaults.update(kwargs)
         return SimpleNamespace(**defaults)
+
+    def test_extend_host_extent_does_not_recompile_and_is_restored(self):
+        def model(input_ids, positions, batch):
+            real = padded_extend_real_tokens(input_ids, batch)
+            return input_ids + (1 if real is None else real)
+
+        compiled = torch.compile(model, backend="eager", fullgraph=True)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        batch = object.__new__(ForwardBatch)
+        vars(batch).update(vars(self._forward_batch(forward_mode=ForwardMode.EXTEND)))
+        tokens = torch.arange(16)
+        shim(tokens, tokens, batch)
+        for live in (3, 6, 16):
+            with self.subTest(live=live):
+                batch.global_num_token_non_padded_cpu = live
+                with torch.compiler.set_stance("fail_on_recompile"):
+                    output = shim(tokens + live, tokens, batch)
+                torch.testing.assert_close(output, tokens + live + 1)
+                self.assertEqual(batch.global_num_token_non_padded_cpu, live)
+
+        def failed(*args):
+            raise RuntimeError("forward failed")
+
+        failing = CompiledForwardShim(failed, policy=DecoderTpuCompilePolicy())
+        with self.assertRaisesRegex(RuntimeError, "forward failed"):
+            failing(tokens, tokens, batch)
+        self.assertEqual(batch.global_num_token_non_padded_cpu, 16)
 
     def test_hidden_state_boundary_keeps_mm_embeds_on_the_batch(self):
         """A boundary that returns hidden states (Gemma4, Qwen3.5 wrappers) has
@@ -1887,6 +1915,7 @@ class TestShimInputLogprobPath(CustomTestCase):
     def _fb(mode="extend", return_logprob=True, starts=(0, 0)):
         return SimpleNamespace(
             is_prefill_only=False,
+            global_num_token_non_padded_cpu=None,
             mm_input_embeds=None,
             input_embeds=None,
             spec_info=None,
