@@ -40,7 +40,7 @@ from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.block_spec_worker import (
     TpuBlockSpecWorker,
 )
-from sglang_tpu.experimental.speculative.dflash_info import HostPaddedDraftInput
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
