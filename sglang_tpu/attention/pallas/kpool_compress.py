@@ -122,7 +122,9 @@ def _kernel(
             @pl.loop(0, tile_rows // 32)
             def _pool_chunk(chunk):
                 value = _pool32(raw_buf[slot, pl.ds(chunk * 32, 32), :], ape_ref[...])
-                pooled_buf[pl.ds(chunk * 8, 8), :] = value
+                # BF16 staging tiles require 16-row alignment in this runtime;
+                # FP32 permits an 8-row store. Preserve the BF16 rounding above.
+                pooled_buf[pl.ds(chunk * 8, 8), :] = value.astype(jnp.float32)
 
             pooled = pooled_buf[...]
 
@@ -240,7 +242,7 @@ def compress_and_store(
             scratch_shapes=(
                 pltpu.VMEM((2, tile_rows, 256), jnp.bfloat16),
                 pltpu.VMEM((2, tile_rows // 16, 256), jnp.uint32),
-                pltpu.VMEM((tile_rows // 4, 128), jnp.bfloat16),
+                pltpu.VMEM((tile_rows // 4, 128), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA,
