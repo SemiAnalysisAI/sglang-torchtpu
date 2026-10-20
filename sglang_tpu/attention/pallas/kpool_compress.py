@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """K4/D128 pooling directly from raw pages into the native pooled cache.
 
-One tile computes 32 pools from a raw page. Raw reads and output writes use
-two buffers. Output read-modify-write starts only after the preceding store
-finishes, including when two requests share a physical destination block.
+One tile computes 8 or 32 pools. Both raw buffers are primed; a consumed
+slot is refilled while later stages use its SSA values. Output read-modify-write
+starts only after the preceding store finishes, including shared destination blocks.
 """
+
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -26,27 +28,30 @@ def _hadamard128(value):
     return value
 
 
-def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens):
-    """One descriptor for each raw page containing a newly closed pool."""
+def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows):
+    """One descriptor per aligned raw tile containing a newly closed pool."""
     batch = kv_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     req = jnp.minimum(jnp.searchsorted(cu_q_lens[1:], tok, side="right"), batch - 1)
     start = kv_lens[req] - (cu_q_lens[req + 1] - cu_q_lens[req])
     pos = start + tok - cu_q_lens[req]
     closing = (tok < cu_q_lens[distribution[2]]) & (pos % 4 == 3)
-    first = closing & ((pos % 128 == 3) | (tok - cu_q_lens[req] < 4))
-    # Each request contributes at most two boundary pages plus q_len // 128.
-    capacity = min(num_tokens, num_tokens // 128 + 2 * batch)
+    first = closing & ((pos % tile_rows == 3) | (tok - cu_q_lens[req] < 4))
+    # Each request contributes at most two boundary tiles plus q_len // tile_rows.
+    capacity = min(num_tokens, num_tokens // tile_rows + 2 * batch)
     chosen = jnp.nonzero(first, size=capacity, fill_value=0)[0]
     r, page = req[chosen], pos[chosen] // 128
+    tile_start = pos[chosen] // tile_rows * tile_rows
+    raw_offset = tile_start % 128
     pages_per_seq = page_indices.shape[0] // batch
     desc = jnp.stack(
         (
             page_indices[r * pages_per_seq + page],
             page_indices[r * pages_per_seq + page // 4],
-            (page % 4) * 8,
-            start[chosen] - page * 128,
-            kv_lens[r] - page * 128,
+            (page % 4) * 8 + raw_offset // 16,
+            start[chosen] - tile_start,
+            kv_lens[r] - tile_start,
+            raw_offset,
         )
     ).astype(jnp.int32)
     return jnp.sum(first, dtype=jnp.int32)[None], desc
@@ -64,43 +69,53 @@ def _kernel(
     read_sem,
     write_sem,
     old_sem,
+    *,
+    tile_rows,
 ):
     del old_ref  # out_ref aliases this input, including untouched bytes.
     words = out_ref.bitcast(jnp.uint32)
     count = count_ref[0]
+    pools, word_rows = tile_rows // 4, tile_rows // 16
 
     def read(i):
         return pltpu.make_async_copy(
-            raw_ref.at[desc_ref[0, i]], raw_buf.at[i % 2], read_sem.at[i % 2]
+            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[5, i], tile_rows), :],
+            raw_buf.at[i % 2],
+            read_sem.at[i % 2],
         )
 
     def write(i):
         return pltpu.make_async_copy(
             out_buf.at[i % 2],
-            words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8), 0, :],
+            words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], word_rows), 0, :],
             write_sem.at[i % 2],
         )
 
-    @pl.when(count > 0)
-    def _prime():
-        read(0).start()
+    for initial in range(2):
+
+        @pl.when(count > initial)
+        def _prime(initial=initial):
+            read(initial).start()
 
     def _page(i, slot):
         read(i).wait()
 
-        @pl.when(i + 1 < count)
-        def _prefetch():
-            read(i + 1).start()
-
         # This full-page grouping passed Mosaic layout inference in the
-        # isolated and full-kernel probes. Its 64 KiB input is all consumed.
+        # isolated and full-kernel probes. The input tile is all consumed.
         raw = raw_buf[slot].astype(jnp.float32)
-        keys = raw[:, :128].reshape((32, 4, 128))
-        scores = raw[:, 128:].reshape((32, 4, 128)) + ape_ref[...][None, :, :]
+        keys = raw[:, :128].reshape((pools, 4, 128))
+        scores = raw[:, 128:].reshape((pools, 4, 128)) + ape_ref[...][None, :, :]
         scores -= jnp.max(scores, axis=1, keepdims=True)
         weight = jnp.exp(scores)
         weight /= jnp.sum(weight, axis=1, keepdims=True)
         pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+
+        # Every raw Ref load precedes this refill. Subsequent stages only use
+        # SSA values; no consumer rereads the overwritten VMEM generation.
+        @pl.when(i + 2 < count)
+        def _refill():
+            read(i + 2).start()
+
         rotated = _hadamard128(pooled.astype(jnp.float32))
         rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
         amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
@@ -117,9 +132,13 @@ def _kernel(
         )
         scale_words = pltpu.bitcast(scale_bytes, jnp.uint32)
         packed = jnp.concatenate((key_words, scale_words), axis=1)
-        mask = jnp.zeros((8, 1), jnp.uint32)
+        mask = jnp.zeros((word_rows, 256), jnp.uint32)
         for lane in range(4):
-            ends = jnp.arange(8, dtype=jnp.int32)[:, None] * 16 + lane * 4 + 3
+            ends = (
+                jax.lax.broadcasted_iota(jnp.int32, (word_rows, 256), 0) * 16
+                + lane * 4
+                + 3
+            )
             live = (ends >= desc_ref[3, i]) & (ends < desc_ref[4, i])
             mask = mask | (
                 jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (lane * 8)
@@ -131,10 +150,10 @@ def _kernel(
         def _prior_store():
             write(i - 1).wait()
 
-        @pl.when((desc_ref[3, i] > 3) | (desc_ref[4, i] < 128))
+        @pl.when((desc_ref[3, i] > 3) | (desc_ref[4, i] < tile_rows))
         def _preserve():
             old = pltpu.make_async_copy(
-                words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8), 0, :],
+                words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], word_rows), 0, :],
                 out_buf.at[slot],
                 old_sem,
             )
@@ -142,7 +161,7 @@ def _kernel(
             old.wait()
             out_buf[slot, :, :] = (out_buf[slot, :, :] & ~mask) | (packed & mask)
 
-        @pl.when((desc_ref[3, i] <= 3) & (desc_ref[4, i] >= 128))
+        @pl.when((desc_ref[3, i] <= 3) & (desc_ref[4, i] >= tile_rows))
         def _overwrite():
             out_buf[slot, :, :] = packed
 
@@ -186,11 +205,12 @@ def compress_and_store(
         raise ValueError("expected BF16 raw cache and uint8 pooled cache")
     if not num_tokens:
         return pooled_cache
+    tile_rows = 32 if num_tokens < 128 else 128
     count, desc = _descriptors(
-        kv_lens, page_indices, cu_q_lens, distribution, num_tokens
+        kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows
     )
     return pl.pallas_call(
-        _kernel,
+        partial(_kernel, tile_rows=tile_rows),
         out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -202,8 +222,8 @@ def compress_and_store(
             ),
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
-                pltpu.VMEM((2, 128, 256), jnp.bfloat16),
-                pltpu.VMEM((2, 8, 256), jnp.uint32),
+                pltpu.VMEM((2, tile_rows, 256), jnp.bfloat16),
+                pltpu.VMEM((2, tile_rows // 16, 256), jnp.uint32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA,

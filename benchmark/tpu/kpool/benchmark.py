@@ -16,9 +16,25 @@ import jax.numpy as jnp
 import numpy as np
 import reference
 
+PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
 
-def load_candidate(root):
-    path = root / "sglang_tpu/attention/pallas/kpool_compress.py"
+
+def load_candidate(root, baseline_output=None):
+    relative = "sglang_tpu/attention/pallas/kpool_compress.py"
+    path = root / relative
+    if baseline_output is not None:
+        path = baseline_output / "single_prefetch.py"
+        path.write_bytes(
+            subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "show",
+                    f"{PIPELINE_BASELINE_REVISION}:{relative}",
+                ]
+            )
+        )
     spec = importlib.util.spec_from_file_location("kpool_candidate", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -44,25 +60,37 @@ def inputs(pages, tokens, decode):
     return raw, tail
 
 
-def benchmark_case(candidate, pages, tokens, decode, opts, output):
+def benchmark_case(candidate, baseline, pages, tokens, decode, opts, output):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     print("CASE_START", name, flush=True)
     raw, tail = inputs(pages, tokens, decode)
-    variants = {"reference": reference.computation, "candidate": candidate}
+    variants = {
+        "reference": reference.computation,
+        "single_prefetch": baseline,
+        "candidate": candidate,
+    }
     states = {}
     try:
         for label, function in variants.items():
+
+            def entry(*args, _fn=function):
+                return _fn(*args)
+
+            entry.__name__ = f"kpool_{label}"
             cache = jnp.zeros((pages, 32, 4, 256), jnp.uint8)
             cache.block_until_ready()
             start = time.perf_counter()
             compiled = (
-                jax.jit(function, static_argnums=(7, 8), donate_argnums=(1,))
+                jax.jit(entry, static_argnums=(7, 8), donate_argnums=(1,))
                 .lower(raw, cache, *tail, tokens, 4)
                 .compile()
             )
             compile_s = time.perf_counter() - start
-            hlo = compiled.as_text()
-            (output / f"{name}-{label}.hlo.txt").write_text(hlo)
+            hlo_error = None
+            try:
+                (output / f"{name}-{label}.hlo.txt").write_text(compiled.as_text())
+            except jax.errors.JaxRuntimeError:
+                hlo_error = traceback.format_exc()
             memory = compiled.memory_analysis()
             stats = {
                 field: getattr(memory, field, None)
@@ -87,6 +115,7 @@ def benchmark_case(candidate, pages, tokens, decode, opts, output):
                 "samples": [],
                 "compile_seconds": compile_s,
                 "memory": stats,
+                "hlo_export_error": hlo_error,
             }
             print("COMPILED", name, label, json.dumps(stats), flush=True)
         # Alternate order each round to reduce systematic drift on one allocation.
@@ -112,7 +141,15 @@ def benchmark_case(candidate, pages, tokens, decode, opts, output):
                 "compile_seconds": state["compile_seconds"],
                 "memory": state["memory"],
                 "pooled_cache_buffer_reused": True,
+                "hlo_export_error": state["hlo_export_error"],
             }
+        # Profile separate invocations so profiler collection does not enter
+        # the host-blocking latency samples. Device timing is analyzed later.
+        with jax.profiler.trace(str(output / name / "xprof")):
+            for _ in range(5):
+                for state in states.values():
+                    state["cache"] = state["call"](raw, state["cache"], *tail)
+                    state["cache"].block_until_ready()
         result = {
             "name": name,
             "pages": pages,
@@ -122,6 +159,9 @@ def benchmark_case(candidate, pages, tokens, decode, opts, output):
             "variants": rows,
             "speedup_pending_accuracy": rows["reference"]["median_ms"]
             / rows["candidate"]["median_ms"],
+            "pipeline_speedup_pending_accuracy": rows["single_prefetch"]["median_ms"]
+            / rows["candidate"]["median_ms"],
+            "device_profile": str(output / name / "xprof"),
         }
         print("CASE_RESULT", json.dumps(result), flush=True)
         return result
@@ -154,11 +194,14 @@ def main():
         if jax.default_backend() != "tpu":
             raise RuntimeError("This benchmark requires a TPU")
         candidate, digest = load_candidate(root)
+        baseline, baseline_digest = load_candidate(root, opts.output)
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
             ).strip(),
             candidate_sha256=digest,
+            pipeline_baseline_revision=PIPELINE_BASELINE_REVISION,
+            pipeline_baseline_sha256=baseline_digest,
             devices=[str(d) for d in jax.devices()],
             device_kind=jax.devices()[0].device_kind,
             runtime={
@@ -166,15 +209,15 @@ def main():
                 for name in ("jax", "jaxlib", "libtpu", "numpy")
             },
         )
-        # Small case first catches compile/runtime failures before large buffers.
+        # Two fixed representative points; AOT covers compilation separately.
         for pages, tokens, decode in (
-            (17, 256, False),
             (14849, 32, True),
-            (14849, 2048, False),
             (14849, 8192, False),
         ):
             result["cases"].append(
-                benchmark_case(candidate, pages, tokens, decode, opts, opts.output)
+                benchmark_case(
+                    candidate, baseline, pages, tokens, decode, opts, opts.output
+                )
             )
             (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
         result["status"] = "completed_pending_accuracy"
