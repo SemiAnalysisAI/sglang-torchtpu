@@ -555,6 +555,48 @@ def _register_attention_backends() -> None:
 
         return TpuPallasMlaAttnBackend(runner)
 
+    from sglang_tpu.attention_pallas_rpa_base import (
+        TpuPallasRpaMultiStepDraftBackend,
+    )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_v3")
+    def create_pallas_tpu_rpa_v3_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_rpa_v3 import TpuPallasRpaV3AttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaV3AttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_rpa_batched")
+    def create_pallas_tpu_rpa_batched_draft_backend(
+        runner, topk, speculative_num_steps
+    ):
+        from sglang_tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasRpaBatchedAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla")
+    def create_pallas_tpu_mla_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla import TpuPallasMlaAttnBackend
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasMlaAttnBackend
+        )
+
+    @register_draft_attention_backend("pallas_tpu_mla_sparse")
+    def create_pallas_tpu_mla_sparse_draft_backend(runner, topk, speculative_num_steps):
+        from sglang_tpu.attention_pallas_mla_sparse import (
+            TpuPallasSparseMlaAttnBackend,
+        )
+
+        return TpuPallasRpaMultiStepDraftBackend(
+            runner, topk, speculative_num_steps, TpuPallasSparseMlaAttnBackend
+        )
+
     @register_attention_backend("pallas_tpu_mla_sparse")
     def create_pallas_tpu_mla_sparse_backend(runner):
         from sglang_tpu.attention_pallas_mla_sparse import (
