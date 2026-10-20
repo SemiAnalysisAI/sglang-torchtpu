@@ -104,6 +104,7 @@ from sglang_tpu.dflash_utils_tpu import (
     build_tpu_draft_extend_metadata,
     dflash_verify_argmax_torch,
     dflash_verify_bookkeeping_torch,
+    gather_dflash_candidate_window,
 )
 
 _is_npu = is_npu()
@@ -592,6 +593,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 pad_bs=self._maybe_pad_draft_bs,
             )
             if _is_tpu
+            else None
+        )
+        # A hybrid-SWA draft keeps its KV in slots of the target's SWA pool, which
+        # its context writes reach through the target's full-to-SWA mapping.
+        self._draft_kv_is_swa = bool(self.draft_model_runner.is_hybrid_swa)
+        if self._draft_kv_is_swa and not _is_tpu:
+            raise NotImplementedError("A hybrid-SWA DFLASH draft needs the TPU writer")
+        self._verify_swa_block_selector = (
+            DeviceVerifyBlockSelector(
+                device=self.device,
+                block_size=int(self.block_size),
+                pad_bs=self._maybe_pad_draft_bs,
+            )
+            if self._draft_kv_is_swa
             else None
         )
         self._embed_module: torch.nn.Module | None = None
@@ -1211,6 +1226,67 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 bs=bs,
             )
+        )
+
+    def _extend_swa_cache_loc(
+        self, *, batch: ScheduleBatch, num_tokens: int
+    ) -> torch.Tensor:
+        """SWA-pool slots of an extend batch's new tokens, where a hybrid-SWA draft
+        writes its context. Read off the host req_to_token rather than out_cache_loc,
+        which lives on device."""
+        full_to_swa = (
+            self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        )
+        req_to_token = batch.req_to_token_pool.req_to_token
+        if req_to_token.device.type != "cpu":
+            return full_to_swa[batch.out_cache_loc.cpu()].to(self.device)
+        rows = torch.as_tensor(batch.req_pool_indices_cpu).tolist()
+        slots = torch.cat(
+            [
+                req_to_token[row, prefix : prefix + extend]
+                for row, prefix, extend in zip(
+                    rows, batch.prefix_lens, batch.extend_lens
+                )
+            ]
+        )
+        # Padding rows of out_cache_loc point at slot 0, which writers skip.
+        swa_slots = torch.zeros(num_tokens, dtype=torch.int64)
+        swa_slots[: slots.numel()] = full_to_swa[slots.to(torch.int64)]
+        return swa_slots.to(self.device, non_blocking=True)
+
+    def _verify_swa_cache_locs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        prefix_lens: torch.Tensor,
+        committed_lens: Optional[torch.Tensor],
+        verify_out_cache_loc_2d: torch.Tensor,
+        bs: int,
+    ) -> torch.Tensor:
+        """SWA-pool slots of the verify block, where a hybrid-SWA draft writes its context.
+
+        With a pre-gathered window (committed_lens set), batch.seq_lens_cpu holds the
+        committed base that window came from: the same window is translated on the
+        host and picked on device. Otherwise the chosen slots round-trip through it.
+        """
+        full_to_swa = (
+            self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        )
+        if committed_lens is None:
+            return full_to_swa[verify_out_cache_loc_2d.cpu()].to(self.device)
+        window = gather_dflash_candidate_window(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices_cpu[:bs],
+            batch.seq_lens_cpu[:bs],
+            int(self.block_size),
+        )
+        return self._verify_swa_block_selector.select(
+            candidates=full_to_swa[window].to(
+                self.device, dtype=torch.int64, non_blocking=True
+            ),
+            committed_lens=committed_lens,
+            prefix_lens=prefix_lens,
+            bs=bs,
         )
 
     def __getattr__(self, name):
@@ -1931,6 +2007,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc: torch.Tensor,
         positions: torch.Tensor,
         cache_loc_2d: torch.Tensor | None = None,
+        swa_cache_loc: torch.Tensor | None = None,
+        swa_cache_loc_2d: torch.Tensor | None = None,
         commit_lens: torch.Tensor | None = None,
         extend_lens: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
@@ -1945,6 +2023,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
 
         if _is_tpu:
+            if self._draft_kv_is_swa:
+                # A hybrid-SWA draft writes the target's SWA slots of the same tokens.
+                if cache_loc_2d is not None:
+                    assert swa_cache_loc_2d is not None
+                    cache_loc_2d = swa_cache_loc_2d
+                else:
+                    assert swa_cache_loc is not None
+                    cache_loc = swa_cache_loc
             return self.append_target_hidden_to_draft_kv_by_loc_tpu(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
@@ -2217,6 +2303,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             dflash_write_draft_kv,
         )
 
+        kv_pool = self.draft_model_runner.token_to_kv_pool
+        if self._draft_kv_is_swa:
+            # Every draft layer lives in the SWA sub-pool; callers pass SWA slots.
+            kv_pool = kv_pool.swa_kv_pool
+
         target_hidden, cache_loc, positions, cache_loc_2d, commit_lens = (
             self._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
                 target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
@@ -2240,7 +2331,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             dflash_write_draft_kv(
                 draft_model=self.draft_model,
-                kv_pool=self.draft_model_runner.token_to_kv_pool,
+                kv_pool=kv_pool,
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
@@ -2715,6 +2806,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_kv_write_tail = self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,
+                swa_cache_loc=(
+                    self._extend_swa_cache_loc(
+                        batch=batch, num_tokens=int(batch.out_cache_loc.numel())
+                    )
+                    if self._draft_kv_is_swa
+                    else None
+                ),
                 positions=positions,
                 extend_lens=ctx_lens,
             )
@@ -2903,6 +3001,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        verify_swa_loc_2d = (
+            self._verify_swa_cache_locs(
+                batch=batch,
+                prefix_lens=prefix_lens,
+                committed_lens=(
+                    draft_input.tpu_committed_lens
+                    if verify_cache_candidates is not None
+                    else None
+                ),
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                bs=bs,
+            )
+            if self._draft_kv_is_swa
+            else None
+        )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -3360,6 +3473,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=target_hidden,
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
+            swa_cache_loc_2d=verify_swa_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )
