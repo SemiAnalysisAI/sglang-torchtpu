@@ -15,6 +15,7 @@ from sglang.srt.layers.radix_attention import padded_extend_real_tokens
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -238,7 +239,13 @@ class TestHostStagedPrefillInputs(CustomTestCase):
         runner = SimpleNamespace(
             device="meta",
             is_draft_worker=False,
-            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda _: None),
+            kv_index_translator=KVIndexTranslator(
+                req_to_token=torch.zeros((1, 64), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=None,
+                page_size=1,
+                device="cpu",
+            ),
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             model_config=SimpleNamespace(
                 model_is_mrope=True, requires_mm_token_modalities=False

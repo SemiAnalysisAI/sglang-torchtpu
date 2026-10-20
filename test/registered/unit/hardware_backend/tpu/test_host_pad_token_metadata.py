@@ -929,6 +929,8 @@ class TestHostPadFieldSelection(CustomTestCase):
                     grammar=None,
                     finished=lambda: False,
                     skip_radix_cache_insert=True,
+                    prefix_len=0,
+                    extend_end=0,
                 )
                 for token in (11, 22, 33)
             ],
