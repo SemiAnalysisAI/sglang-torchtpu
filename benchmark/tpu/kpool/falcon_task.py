@@ -14,6 +14,7 @@ def manifest(
     wheelhouse_prefix=None,
     mode="performance",
     hold_seconds=0,
+    aot_cases=None,
 ):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
@@ -29,10 +30,13 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
   --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/benchmark"
 """
     if mode == "aot":
+        cases = ""
+        if aot_cases:
+            cases = " --cases " + " ".join(shlex.quote(case) for case in aot_cases)
         workload = f"""echo PHASE_AOT
 git fetch --depth=1 origin 75a03373e46643a9373cf9bcd1ed7fdfd794385d
 out="${{ARTIFACT_LOCAL_DIR:?}}/rank-${{FALCON_RANK:-0}}/aot"
-timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"
+timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"{cases}
 tar -C "$out" -czf /tmp/tpu_logs/kpool-aot.tar.gz .
 echo AOT_ARTIFACT_READY
 sleep {hold_seconds}
@@ -112,6 +116,7 @@ def main():
     parser.add_argument("--wheelhouse-prefix")
     parser.add_argument("--mode", choices=("performance", "aot"), default="performance")
     parser.add_argument("--hold-seconds", type=int, default=0)
+    parser.add_argument("--aot-cases", nargs="+")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -122,6 +127,7 @@ def main():
                 args.wheelhouse_prefix,
                 args.mode,
                 args.hold_seconds,
+                args.aot_cases,
             ),
             indent=2,
         )

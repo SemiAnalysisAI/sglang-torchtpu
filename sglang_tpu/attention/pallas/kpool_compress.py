@@ -65,7 +65,7 @@ def _kernel(
     def write(i):
         return pltpu.make_async_copy(
             out_buf.at[i % 2],
-            words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8)],
+            words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8), 0, :],
             write_sem.at[i % 2],
         )
 
@@ -73,9 +73,7 @@ def _kernel(
     def _prime():
         read(0).start()
 
-    @pl.loop(0, count)
-    def _page(i):
-        slot = i % 2
+    def _page(i, slot):
         read(i).wait()
 
         @pl.when(i + 1 < count)
@@ -142,19 +140,29 @@ def _kernel(
         @pl.when((desc_ref[3, i] > 3) | (desc_ref[4, i] < 128))
         def _preserve():
             old = pltpu.make_async_copy(
-                words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8)],
+                words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], 8), 0, :],
                 out_buf.at[slot],
                 old_sem,
             )
             old.start()
             old.wait()
-            out_buf[slot, :, 0, :] = (out_buf[slot, :, 0, :] & ~mask) | (packed & mask)
+            out_buf[slot, :, :] = (out_buf[slot, :, :] & ~mask) | (packed & mask)
 
         @pl.when((desc_ref[3, i] <= 3) & (desc_ref[4, i] >= 128))
         def _overwrite():
-            out_buf[slot, :, 0, :] = packed
+            out_buf[slot, :, :] = packed
 
         write(i).start()
+
+    # Packed BF16 strided loads require static indices in this compiler.
+    # Unroll only the two-slot period; the number of pages stays dynamic.
+    @pl.loop(0, pl.cdiv(count, 2))
+    def _pair(pair):
+        for slot in range(2):
+
+            @pl.when(pair * 2 + slot < count)
+            def _active(slot=slot):
+                _page(pair * 2 + slot, slot)
 
     @pl.when(count > 0)
     def _drain():
@@ -206,7 +214,7 @@ def compress_and_store(
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.VMEM((2, 128, 256), jnp.bfloat16),
-                pltpu.VMEM((2, 8, 1, 256), jnp.uint32),
+                pltpu.VMEM((2, 8, 256), jnp.uint32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA,

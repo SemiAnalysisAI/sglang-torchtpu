@@ -21,6 +21,8 @@ CASES = (
     "reshape_pool",
     "reshape_pack",
     "reshape_mask",
+    "reshape_mask_bool",
+    "reshape_output",
     "original_small",
     "reference_decode",
     "candidate_decode",
@@ -51,6 +53,24 @@ def build(case, root, out):
                 for lane in range(1, 4):
                     value |= records[:, lane, :] << (lane * 8)
                 y[...] = value
+
+        elif case == "reshape_mask_bool":
+            shape, output, dtype = (32,), (8, 1), jnp.uint32
+
+            def kernel(x, y):
+                live = (x[...] > 0).reshape(8, 4, 1)
+                mask = jnp.where(live[:, 0, :], jnp.uint32(255), jnp.uint32(0))
+                for lane in range(1, 4):
+                    mask |= jnp.where(
+                        live[:, lane, :], jnp.uint32(255), jnp.uint32(0)
+                    ) << (lane * 8)
+                y[...] = mask
+
+        elif case == "reshape_output":
+            shape, output, dtype = (8, 256), (8, 1, 256), jnp.uint32
+
+            def kernel(x, y):
+                y[:, 0, :] = x[...]
 
         else:
             shape, output, dtype = (32,), (8, 1), jnp.int32
@@ -156,7 +176,9 @@ def worker(opts):
         (out / "optimized_hlo.txt").write_text(compiled.as_text())
         result["memory"] = str(compiled.memory_analysis())
         result["final_llo"] = [
-            str(p.relative_to(out)) for p in out.rglob("*final_bundles.txt")
+            str(p.relative_to(out))
+            for p in out.rglob("*final_bundles.txt")
+            if "schedule-analysis_" not in p.name
         ]
         result["status"] = "compiled" if result["final_llo"] else "missing_llo"
     except Exception:
