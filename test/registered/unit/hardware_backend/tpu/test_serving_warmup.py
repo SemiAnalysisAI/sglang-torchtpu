@@ -1,5 +1,6 @@
 """State isolation for eager TPU serving warmups."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -7,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,7 +71,8 @@ def test_sampling_warmup_restores_rng_on_success_and_failure(fail):
     assert torch.equal(torch.random.get_rng_state(), before)
 
 
-def test_request_relay_warmup_preserves_live_storage():
+@pytest.mark.parametrize("debug_assert", (False, True))
+def test_request_relay_warmup_preserves_live_storage(debug_assert):
     tokens = torch.full((9,), -1, dtype=torch.int64)
     lengths = torch.full((9,), -2, dtype=torch.int64)
     stores = []
@@ -87,7 +90,16 @@ def test_request_relay_warmup_preserves_live_storage():
         req_pool_size=9,
         _store=store,
     )
-    serving_warmup.warmup_request_relay(relay, 3)
+    with (
+        patch.object(overlap_utils, "_DEBUG_ASSERT", debug_assert),
+        patch.object(
+            overlap_utils,
+            "_assert_nonneg_and_invalidate",
+            wraps=inspect.unwrap(overlap_utils._assert_nonneg_and_invalidate),
+        ) as invalidate,
+    ):
+        serving_warmup.warmup_request_relay(relay, 3)
+    assert invalidate.call_count == (6 if debug_assert else 0)
     assert torch.equal(tokens, torch.full_like(tokens, -1))
     assert torch.equal(lengths, torch.full_like(lengths, -2))
     assert {indices.numel() for indices, _ in stores} == {1, 2, 3}

@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers import overlap_utils
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -135,7 +136,13 @@ def warmup_request_relay(future_map: FutureMap, max_batch_size: int) -> None:
                 future_map._store(new_seq_lens, indices, next_lens)
                 new_seq_lens.cpu()
                 future_map._store(output_tokens, indices, tokens)
-                output_tokens[indices].cpu()
+                values = output_tokens[indices]
+                if overlap_utils._DEBUG_ASSERT:
+                    overlap_utils._assert_nonneg_and_invalidate(
+                        values, output_tokens, indices
+                    )
+                    output_tokens.cpu()
+                values.cpu()
             # The next decode increments both int32 and int64 length fields,
             # then computes positions from the relay's gathered int64 lengths.
             (torch.ones(bs, dtype=torch.int32).to(device) + 1).cpu()
