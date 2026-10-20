@@ -135,8 +135,15 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> None:
         super().__init__()
         parallel = get_parallel()
-        if parallel.pp_size > 1:
-            raise NotImplementedError("TpuSpecWorker does not support PP.")
+        # A PD prefill only extends; the last stage hosts the draft (TpuPipelineStageWorker the rest).
+        if parallel.pp_size > 1 and (
+            get_disagg().disaggregation_mode != "prefill"
+            or not parallel.pp_group.is_last_rank
+        ):
+            raise NotImplementedError(
+                "TpuSpecWorker supports PP only on the last stage of a "
+                "--disaggregation-mode prefill server."
+            )
         self._target_worker = target_worker
         runner = target_worker.model_runner
         self._bsearch_filtering = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
@@ -329,10 +336,13 @@ class TpuSpecWorker(BaseSpecWorker):
         """
 
     @abstractmethod
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
+    ) -> GenerationBatchResult:
         """Extend: target forward on new prompt tokens, seed the draft context, set next_draft_input.
 
         next_draft_input.kv_fence_tail must be an output of the last KV write.
+        pp_proxy_tensors carries the previous stage's activations on the last PP stage.
 
         Why: new prompt tokens have no draft context yet, and the first decode
         step reads its root token from next_draft_input.
@@ -522,7 +532,7 @@ class TpuSpecWorker(BaseSpecWorker):
     ) -> GenerationBatchResult:
         self._check_supported(batch=batch, pp_proxy_tensors=pp_proxy_tensors)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            result = self.extend(batch)
+            result = self.extend(batch, pp_proxy_tensors=pp_proxy_tensors)
         elif batch.forward_mode.is_idle():
             if self._dp_attention and max(batch.global_num_tokens or (0,)) > 0:
                 # DP peers decode: enter their step's collectives too.
@@ -1180,8 +1190,10 @@ class TpuSpecWorker(BaseSpecWorker):
     def _check_supported(
         self, *, batch: ScheduleBatch, pp_proxy_tensors: PPProxyTensors | None
     ) -> None:
-        if pp_proxy_tensors is not None:
-            raise NotImplementedError("TpuSpecWorker does not support PP.")
+        if pp_proxy_tensors is not None and not (
+            batch.forward_mode.is_extend() or batch.is_extend_in_batch
+        ):
+            raise NotImplementedError("TpuSpecWorker under PP only extends.")
         if batch.has_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
         if batch.return_logprob:

@@ -32,6 +32,7 @@ from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftI
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
+    initialize_host_batch,
     kimi_spec_defaults,
 )
 
@@ -124,14 +125,14 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             stack.callback(restore)
 
-    def batch(self, rows, spec_algorithm=SpeculativeAlgorithm.DSPARK):
+    def batch(self, rows, spec_algorithm=SpeculativeAlgorithm.DSPARK, overlap=True):
         batch = ScheduleBatch.init_new(
             [_req(0.1 * (i + 1)) for i in range(len(rows))],
             SimpleNamespace(device="cpu"),
             None,
             None,
             SimpleNamespace(is_encoder_decoder=False, vocab_size=32),
-            enable_overlap=True,
+            enable_overlap=overlap,
             spec_algorithm=spec_algorithm,
         )
         batch.req_pool_indices_cpu = torch.tensor(rows)
@@ -177,6 +178,23 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(len(forwarded), 5)
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
+
+    def test_pd_prefill_without_overlap_filters_core_rows(self):
+        """A PP PD prefill filters its chunked extend batch without overlap; FutureMap
+        owns no rows there, so the filter must keep core's rows and the seed's."""
+        with patch(
+            "sglang_tpu.hooks.experimental_spec.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ):
+            batch = self.batch([2, 5, 8], overlap=False)
+        batch.spec_info = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.tensor([7, 8, 9]), new_seq_lens=batch.seq_lens
+        )
+        batch.filter_batch(keep_indices=[0, 2])
+        self.assertEqual(batch.req_pool_indices.tolist(), [2, 8])
+        self.assertEqual(batch.seq_lens.tolist(), [10, 12])
+        self.assertEqual(batch.spec_info.bonus_tokens.tolist(), [7, 9])
+        self.assertEqual(batch.spec_info.new_seq_lens.tolist(), [10, 12])
 
     def test_host_padding_follows_the_worker_not_the_algorithm(self):
         """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
@@ -421,7 +439,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         core_batch = SimpleNamespace(spec_algorithm=mtp, spec_info=draft_input)
         core_prepare = lambda batch: prepared.append("core")  # noqa: E731
         core_fence = lambda algo, *, copies_draft_tail: True  # noqa: E731
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+        last_stage = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=True))
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            patch("sglang_tpu.hooks.spec_worker.get_parallel", return_value=last_stage),
+        ):
             self.assertFalse(is_experimental_spec_worker(SpeculativeAlgorithm.EAGLE3))
             self.assertIs(
                 select_experimental_spec_worker(None, mtp, None), TpuChainSpecWorker
@@ -465,6 +487,55 @@ class TestExperimentalSpecHooks(CustomTestCase):
             ):
                 self.assertTrue(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch, "core"])
+
+    def test_pp_stages_before_the_last_get_no_draft(self):
+        """Under PP only the last stage hosts the draft; an earlier stage building one
+        would bind the target embedding or lm_head its stage does not hold."""
+        from sglang_tpu.experimental.speculative.pipeline_stage_worker import (
+            TpuPipelineStageWorker,
+        )
+        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+
+        earlier_stage = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=False))
+        algorithms = (
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        )
+        with patch(
+            "sglang_tpu.hooks.spec_worker.get_parallel", return_value=earlier_stage
+        ):
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+                for algorithm in algorithms:
+                    self.assertIs(
+                        select_experimental_spec_worker(None, algorithm, None),
+                        TpuPipelineStageWorker,
+                    )
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+                for algorithm in algorithms:
+                    self.assertIsNone(
+                        select_experimental_spec_worker(None, algorithm, None)
+                    )
+
+    def test_only_a_pd_prefill_host_pads_without_overlap(self):
+        """PP runs a PD prefill without overlap; decode relays through FutureMap,
+        so a non-overlap decode must still refuse host padding."""
+        batch = SimpleNamespace(enable_overlap=False)
+        with patch("sglang_tpu.experimental._host_batch_padder", _pad):
+            for mode, allowed in (
+                ("prefill", True),
+                ("decode", False),
+                ("null", False),
+            ):
+                with patch(
+                    "sglang_tpu.hooks.experimental_spec.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ):
+                    if allowed:
+                        self.assertIs(initialize_host_batch(batch).host_pad_bs, _pad)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "overlap"):
+                            initialize_host_batch(SimpleNamespace(enable_overlap=False))
 
     def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
         def original(server_args):

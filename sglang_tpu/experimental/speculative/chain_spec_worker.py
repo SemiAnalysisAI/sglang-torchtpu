@@ -31,6 +31,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_disagg, get_spec, process_model_config
 from sglang.srt.server_args import ServerArgs
@@ -287,9 +288,13 @@ class TpuChainSpecWorker(TpuSpecWorker):
         # The draft rows' forward writes the step's last KV; last_hidden is its output.
         return CommitResult(state=next_state, kv_fence_tail=last_hidden)
 
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
+    ) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
         if not batch.reqs:

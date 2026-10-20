@@ -22,6 +22,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    PPProxyTensors,
 )
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
@@ -202,9 +203,13 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         return CommitResult(state=next_state, kv_fence_tail=kv_fence_tail)
 
-    def extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def extend(
+        self, batch: ScheduleBatch, *, pp_proxy_tensors: PPProxyTensors | None
+    ) -> GenerationBatchResult:
         result = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         self._tp_sync.sync(SpecTpSyncSite.SPEC_TARGET, result.next_token_ids)
         # Sampling ran at the batch bucket; the scheduler takes live rows.

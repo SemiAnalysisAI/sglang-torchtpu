@@ -302,9 +302,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "attention on non-NPU devices."
         )
 
-    if cfg.pp_size != 1:
+    # check_pipeline_parallel_compat decides which platforms serve a DFLASH PP prefill.
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; "
+            "decode and non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
