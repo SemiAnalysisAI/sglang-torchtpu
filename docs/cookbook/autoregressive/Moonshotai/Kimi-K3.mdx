@@ -695,8 +695,16 @@ level). Measured 2026-10-20 with `torch_tpu` 0.2.0 and `libtpu` 0.0.50.
   decode rate.
 - At concurrency 4, each request decodes at about 63 tokens/s and the server at
   about 250.
-- The DSpark recipe (3.7.3) has no published numbers yet. For DSpark with the
-  decode megakernel, see 3.7.6.
+
+With the DSpark recipe (3.7.3), one request:
+
+| Workload | TPOT median | Accept length | TPOT vs without DSpark |
+| --- | --- | --- | --- |
+| 8k in / 1k out (random ids) | **4.19 ms** | 4.2-4.6 | **1.9x** |
+| GSM8K questions (chat) | **3.92 ms** | 5.2-6.0 | **2.0x** |
+
+DSpark gains more on real text, where the draft is accepted more often. For
+DSpark with the decode megakernel, see 3.7.6.
 
 #### 3.7.5 Accuracy
 
