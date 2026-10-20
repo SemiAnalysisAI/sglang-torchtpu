@@ -1,0 +1,7 @@
+jax==0.10.2
+jaxlib==0.10.2
+libtpu==0.0.50
+numpy==2.3.5
+ml-dtypes==0.6.0
+scipy==1.18.1
+opt_einsum==3.4.0
