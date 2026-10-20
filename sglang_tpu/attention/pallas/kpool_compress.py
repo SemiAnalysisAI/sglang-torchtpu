@@ -92,40 +92,15 @@ def _kernel(
         def _prefetch():
             read(i + 1).start()
 
-        # Keep the compute tiles two-dimensional. Group members are separate
-        # [pool, feature] values, not a size-four sublane dimension introduced
-        # by reshaping [128, 128] to [32, 4, 128].
-        # Follow batched_rpa's uint32 Ref + 128-column strided-load pattern.
-        # A word holds two consecutive BF16 token rows. In the flattened
-        # view, each pool occupies four rows: key01, gate01, key23, gate23.
-        raw_words = raw_buf.at[slot].bitcast(jnp.uint32).reshape(128, 128)
-        keys, gates = [], []
-        for pair in range(2):
-            key_pair = raw_words[pl.ds(pair * 2, 32, 4), :]
-            gate_pair = raw_words[pl.ds(pair * 2 + 1, 32, 4), :]
-            for half in range(2):
-                keys.append(
-                    pltpu.bitcast(
-                        (key_pair >> (half * 16)).astype(jnp.uint16), jnp.bfloat16
-                    ).astype(jnp.float32)
-                )
-                gates.append(
-                    pltpu.bitcast(
-                        (gate_pair >> (half * 16)).astype(jnp.uint16), jnp.bfloat16
-                    ).astype(jnp.float32)
-                )
-        scores = [gates[member] + ape_ref[pl.ds(member, 1), :] for member in range(4)]
-        maximum = jnp.maximum(
-            jnp.maximum(scores[0], scores[1]), jnp.maximum(scores[2], scores[3])
-        )
-        weight = [jnp.exp(score - maximum) for score in scores]
-        denominator = (weight[0] + weight[1]) + (weight[2] + weight[3])
-        weighted = [
-            (weight[member] / denominator) * keys[member] for member in range(4)
-        ]
-        pooled = ((weighted[0] + weighted[1]) + (weighted[2] + weighted[3])).astype(
-            jnp.bfloat16
-        )
+        # This full-page grouping passed Mosaic layout inference in the
+        # isolated and full-kernel probes. Its 64 KiB input is all consumed.
+        raw = raw_buf[slot].astype(jnp.float32)
+        keys = raw[:, :128].reshape((32, 4, 128))
+        scores = raw[:, 128:].reshape((32, 4, 128)) + ape_ref[...][None, :, :]
+        scores -= jnp.max(scores, axis=1, keepdims=True)
+        weight = jnp.exp(scores)
+        weight /= jnp.sum(weight, axis=1, keepdims=True)
+        pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
         rotated = _hadamard128(pooled.astype(jnp.float32))
         rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
         amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
@@ -173,8 +148,7 @@ def _kernel(
 
         write(i).start()
 
-    # Packed BF16 strided loads require static indices in this compiler.
-    # Unroll only the two-slot period; the number of pages stays dynamic.
+    # Keep the two-slot period explicit; the number of pages stays dynamic.
     @pl.loop(0, pl.cdiv(count, 2))
     def _pair(pair):
         for slot in range(2):
