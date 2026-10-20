@@ -19,6 +19,7 @@ import traceback
 from pathlib import Path
 
 CASES = (
+    "hadamard128",
     "reshape_pool",
     "reshape_pack",
     "reshape_mask",
@@ -38,6 +39,19 @@ def build(case, root, out):
     import jax.numpy as jnp
     import reference
     from jax.experimental import pallas as pl
+
+    if case == "hadamard128":
+        spec = importlib.util.spec_from_file_location(
+            "kpool_candidate", root / "sglang_tpu/attention/pallas/kpool_compress.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def kernel(x, y):
+            y[...] = module._hadamard128(x[...])
+
+        shape = jax.ShapeDtypeStruct((32, 128), jnp.float32)
+        return pl.pallas_call(kernel, out_shape=shape, name=case), (shape,), ()
 
     if case.startswith("reshape_"):
         if case == "reshape_pool":
