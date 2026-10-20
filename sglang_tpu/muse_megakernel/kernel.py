@@ -145,6 +145,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
     kv_packed: bool = False
+    # fp8 pools at SGLANG_TPU_KV_HEAD_DIM_ALIGN=64 (two heads unpacked, pool_padded_head_dim ==
+    # head_dim): each 32-bit lane word holds [K_h0, V_h0, K_h1, V_h1]; the chunk unpack rebuilds
+    # the packed bf16 tile, so attention runs the packed path.
+    kv_fp8: bool = False
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
@@ -180,7 +184,19 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def pool_kv_heads(self):
-        return 1 if self.kv_packed else self.kv_heads
+        return 1 if (self.kv_packed or self.kv_fp8) else self.kv_heads
+
+    @property
+    def packed_attn(self):
+        # attention sees one row per token, every local head side by side
+        return self.kv_packed or self.kv_fp8
+
+    @property
+    def pool_row(self):
+        # one token's pool row (heads, K/V slots, lanes) and its dtype
+        if self.kv_fp8:
+            return (1, 2 * self.kv_heads, self.head_dim), jnp.float8_e4m3fn
+        return (self.pool_kv_heads, 2, self.pool_padded_head_dim), jnp.bfloat16
 
     @property
     def kv_ring(self):
@@ -209,6 +225,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         assert (
             not self.kv_packed
             or self.kv_heads * self.head_dim == self.pool_padded_head_dim
+        )
+        assert not self.kv_fp8 or (
+            not self.kv_packed
+            and self.kv_heads == 2
+            and self.pool_padded_head_dim == self.head_dim
         )
         return self
 
@@ -795,15 +816,12 @@ def scratch_plan(cfg: MKConfig):
         ("f_send", pltpu.VMEM((R, c.hidden_local // 2), jnp.uint32)),
         (
             "kv_chunk",
-            pltpu.VMEM(
-                (c.kv_ring, cpt, c.pool_kv_heads, 2, c.pool_padded_head_dim),
-                jnp.bfloat16,
-            ),
+            pltpu.VMEM((c.kv_ring, cpt, *c.pool_row[0]), c.pool_row[1]),
         ),
         ("kv_chunk_sems", pltpu.SemaphoreType.DMA((c.kv_ring, c.chunk_pages))),
         (
             "kv_row",
-            pltpu.VMEM((R, c.pool_kv_heads, 2, c.pool_padded_head_dim), jnp.bfloat16),
+            pltpu.VMEM((R, *c.pool_row[0]), c.pool_row[1]),
         ),
         ("kv_row_sem", pltpu.SemaphoreType.DMA((1,))),
         ("uniq", pltpu.SMEM((R * K + 8,), jnp.int32)),
@@ -1047,11 +1065,26 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             qn = jnp.where(use_rope, _rope_roll(qn, hq, hd, cos_x, sin_x), qn)
             kn = jnp.where(use_rope, _rope_roll(kn, hkv, hd, cos_x, sin_x), kn)
             # the pool's bf16 rounding of K/V, as in the native path (K after norm+rope)
-            kb, vb = kn.astype(jnp.bfloat16), vv.astype(jnp.bfloat16)
-            zpad = jnp.zeros((R, pd - hd), jnp.bfloat16)
+            kv_dt = c.pool_row[1]
+            kb = kn.astype(kv_dt).astype(jnp.bfloat16)
+            vb = vv.astype(kv_dt).astype(jnp.bfloat16)
             # ---- this step's K/V rows go out to newkv (scattered into the pools by kv_write_call);
             # attention reads them from VMEM, the cache only for positions before them.
             for r in range(R):
+                if c.kv_fp8:  # [K_h0, V_h0, K_h1, V_h1], one lane word per head-dim element
+                    S["kv_row"][r] = (
+                        jnp.concatenate(
+                            [
+                                x[r : r + 1, h * hd : (h + 1) * hd]
+                                for h in range(hkv)
+                                for x in (kb, vb)
+                            ],
+                            axis=0,
+                        )
+                        .reshape(1, 2 * hkv, hd)
+                        .astype(kv_dt)
+                    )
+                    continue
                 if (
                     c.kv_packed
                 ):  # the projection row already holds the heads side by side
@@ -1059,6 +1092,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         [kb[r : r + 1], vb[r : r + 1]], axis=0
                     ).reshape(1, 2, pd)
                     continue
+                zpad = jnp.zeros((R, pd - hd), jnp.bfloat16)
                 parts = []
                 for h in range(hkv):
                     parts.append(
@@ -1194,7 +1228,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             def qrow(h, t, gi):
                 x = qrows[t : t + 1, (h * g + gi) * hd : (h * g + gi + 1) * hd]
-                if not c.kv_packed:
+                if not c.packed_attn:
                     return x
                 z = jnp.zeros((1, hd), x.dtype)
                 return jnp.concatenate(
@@ -1223,12 +1257,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             init = (
                 jnp.full((hkv * qg, 1), NEG, jnp.float32),
                 jnp.zeros((hkv * qg, 1), jnp.float32),
-                jnp.zeros((hkv * qg, pd), jnp.float32),
+                jnp.zeros((hkv * qg, c.kv_dim if c.packed_attn else pd), jnp.float32),
             )
             col = jax.lax.broadcasted_iota(jnp.int32, (1, cpt * ph), 1)
             colhead = col % ph
             coltok = col // ph
-            kdim = pd if c.kv_packed else hd
+            kdim = c.kv_dim if c.packed_attn else hd
 
             def online(carry, s_, v):
                 m, lsum, acc = carry
@@ -1255,9 +1289,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         .bitcast(jnp.uint32)
                         .reshape(cpt * ph, pd)[...]
                     )  # rows (token, h)
-                    kk = pltpu.bitcast((u & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
-                    vk = pltpu.bitcast((u >> 16).astype(jnp.uint16), jnp.bfloat16)
-                live = None if c.kv_packed else colhead == rowhead
+                    if c.kv_fp8:  # byte j of a token's lane word is slot j of [K0, V0, K1, V1]
+                        def slot_bf16(j):
+                            b = (u >> (8 * j)).astype(jnp.uint8)
+                            return pltpu.bitcast(b, jnp.float8_e4m3fn).astype(jnp.bfloat16)
+
+                        kk = jnp.concatenate([slot_bf16(2 * h) for h in range(hkv)], axis=1)
+                        vk = jnp.concatenate([slot_bf16(2 * h + 1) for h in range(hkv)], axis=1)
+                    else:
+                        kk = pltpu.bitcast((u & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
+                        vk = pltpu.bitcast((u >> 16).astype(jnp.uint16), jnp.bfloat16)
+                live = None if c.packed_attn else colhead == rowhead
                 if not clean:
                     keypos = coltok + ci * cpt
                     pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
@@ -1339,7 +1381,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             q8 = -(-q // 8) * 8
             krows = rows_at(S["kb_s"], r0, q).astype(jnp.bfloat16)
             vrows = rows_at(S["vb_s"], r0, q).astype(jnp.bfloat16)
-            if c.kv_packed:
+            if c.packed_attn:
                 zrows = (
                     jnp.zeros((q8 - q, c.kv_dim), jnp.bfloat16) if q8 > q else None
                 )  # Mosaic has no 0-row vectors
@@ -1389,7 +1431,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
             lanes = (
                 (lambda h: slice(h * hd, (h + 1) * hd))
-                if c.kv_packed
+                if c.packed_attn
                 else (lambda h: slice(0, hd))
             )
             for t in range(q):
@@ -1955,7 +1997,7 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
         out_shape = [
             jax.ShapeDtypeStruct((cfg.rows, cfg.hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((cfg.rows, aux_w), jnp.bfloat16),
-            jax.ShapeDtypeStruct(newkv_shape(cfg), jnp.bfloat16),
+            jax.ShapeDtypeStruct(newkv_shape(cfg), cfg.pool_row[1]),
         ]
         # The pools are read-only here. With any remote DMA in the kernel XLA treats the call
         # as a collective and copies every aliased operand: the in-place write is kv_write_call.
@@ -1979,7 +2021,7 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
 
 
 def newkv_shape(cfg: MKConfig):
-    return (cfg.n_layers, cfg.rows, cfg.pool_kv_heads, 2, cfg.pool_padded_head_dim)
+    return (cfg.n_layers, cfg.rows, *cfg.pool_row[0])
 
 
 def kv_write_call(cfg: MKConfig):
