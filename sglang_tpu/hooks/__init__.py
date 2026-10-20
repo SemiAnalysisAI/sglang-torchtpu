@@ -30,7 +30,10 @@ from sglang_tpu.hooks.glm_flash_megakernel import (
     route_glm_flash_megakernel,
 )
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
-from sglang_tpu.hooks.kda_weights import bind_glm5_next_kda_weights
+from sglang_tpu.hooks.kda_weights import (
+    bind_glm5_next_kda_weights,
+    rehome_kimi_k3_kda_weights,
+)
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -125,6 +128,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.models.glm5_next.Glm5NextForConditionalGeneration.load_weights",
         bind_glm5_next_kda_weights,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.models.kimi_k3.KimiK3LinearForCausalLM.post_load_weights",
+        rehome_kimi_k3_kda_weights,
         HookType.AFTER,
     ),
     (
