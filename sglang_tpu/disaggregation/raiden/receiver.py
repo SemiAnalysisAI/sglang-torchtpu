@@ -1165,7 +1165,8 @@ class RaidenReceiverMixin:
         slots, and writes in place: an eager scatter would reallocate the
         state tensors the transfer engine and the compiled step hold.
         """
-        decode = self._decode
+        # A prefill-side manager has no decode state.
+        decode = getattr(self, "_decode", None)
         if decode is None or not decode.state_uploads:
             return
         import torch

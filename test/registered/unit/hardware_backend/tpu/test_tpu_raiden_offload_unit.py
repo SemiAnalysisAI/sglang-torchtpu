@@ -1050,7 +1050,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
 
         mgr._register_reshard_request.assert_called_once_with(
-            31, [8, 9], [6, 7], None, [{}, {}]
+            31, [8, 9], [6, 7], None, [{}, {}], local_state_rows=()
         )
 
     def test_hybrid_swa_reshard_prefix_hit_settles_both_engines(self):
