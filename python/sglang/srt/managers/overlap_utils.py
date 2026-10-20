@@ -92,7 +92,9 @@ def _stage_prefill_tokens(batch):
     )
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap]
+) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
@@ -100,7 +102,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """
     batch.mm_input_ids_cpu = None
     if batch.prefill_input_ids_cpu is not None:
-        future_map.prepare_prefill_inputs(batch)
+        # A prefill-only caller may pass no future map (it relays no decode tokens).
+        if future_map is not None:
+            future_map.prepare_prefill_inputs(batch)
         prefill_gpu = _stage_prefill_tokens(batch)
         if batch.mix_running_indices is not None:
             # Keep mix_running_indices (= the mixed-in running batch's req_pool_indices, freed
