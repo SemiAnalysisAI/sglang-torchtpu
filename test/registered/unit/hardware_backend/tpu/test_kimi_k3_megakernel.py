@@ -231,6 +231,17 @@ class TestStartupContract(CustomTestCase):
         self.assertNotIn("tpu_compile_bs", _declared_by_megakernel(args))
 
 
+class TestRankAgreement(CustomTestCase):
+    def test_ranks_that_would_build_different_programs_are_refused(self):
+        from sglang_tpu.kimi_k3_megakernel.config import check_ranks_agree
+
+        plain = (8, 9344, False, 93, 163840)
+        check_ranks_agree(plain, [plain] * 4)
+        tuned = (8, 9344, True, 93, 163840)
+        with self.assertRaisesRegex(RuntimeError, "rank 2: .*True"):
+            check_ranks_agree(plain, [plain, plain, tuned, plain])
+
+
 class TestSlotTable(CustomTestCase):
     def test_release_moves_the_last_row_into_the_hole(self):
         table = SlotTable(max_rows=4)

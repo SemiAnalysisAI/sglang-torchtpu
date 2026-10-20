@@ -41,6 +41,23 @@ def row_buckets(max_rows: int) -> list[int]:
     return [bucket for bucket in ROW_BUCKETS if bucket <= max_rows]
 
 
+def check_ranks_agree(local: tuple, gathered: list[tuple]) -> None:
+    """Refuse a launch whose TP ranks would build different megakernels.
+
+    Every rank reads its own environment and server args, and the program the
+    tuned recipe, the row count or the context selects carries the TP
+    collectives, so ranks that disagree would wait on each other's
+    collectives forever or decode garbage.
+    """
+    if any(other != local for other in gathered):
+        by_rank = ", ".join(f"rank {r}: {g}" for r, g in enumerate(gathered))
+        raise RuntimeError(
+            f"{_FLAG}: TP ranks disagree on the megakernel's (rows, context, "
+            f"tuned recipe, layers, vocab); set the same server args and "
+            f"SGLANG_TPU_OPT_K3_MEGAKERNEL_TUNED_RECIPE on every host. {by_rank}"
+        )
+
+
 def _model_architectures(cfg) -> list[str]:
     from sglang.srt.utils.hf_transformers.config import get_config
 

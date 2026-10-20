@@ -29,7 +29,13 @@ from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolic
 from sglang_tpu.envs import envs as tpu_envs
 
 from ._vendor.kimi.load import selected_local_shapes
-from .config import EP_SIZE, TP_SIZE, megakernel_context, row_buckets
+from .config import (
+    EP_SIZE,
+    TP_SIZE,
+    check_ranks_agree,
+    megakernel_context,
+    row_buckets,
+)
 from .policy import megakernel_policy
 from .program import make_decode_program, state_shapes
 from .runner import KimiK3MegakernelRunner
@@ -127,6 +133,13 @@ def build_runner(
     rows = get_schedule().max_running_requests
     context = megakernel_context(context_length)
     tuned = tpu_envs.SGLANG_TPU_OPT_K3_MEGAKERNEL_TUNED_RECIPE.get()
+    # Before the expert restack: a disagreeing rank fails fast, not after it.
+    local = (rows, context, tuned, layers, config.vocab_size)
+    gathered = [None] * parallel.tp_size
+    torch.distributed.all_gather_object(
+        gathered, local, group=parallel.tp_group.cpu_group
+    )
+    check_ranks_agree(local, gathered)
 
     experts = stack_routed_experts(_moe_layers(language_model), device)
     current_platform.synchronize()
