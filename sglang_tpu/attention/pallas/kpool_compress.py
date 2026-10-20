@@ -51,7 +51,7 @@ def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, til
             (page % 4) * 8 + raw_offset // 16,
             start[chosen] - tile_start,
             kv_lens[r] - tile_start,
-            raw_offset,
+            raw_offset // tile_rows,
         )
     ).astype(jnp.int32)
     return jnp.sum(first, dtype=jnp.int32)[None], desc
@@ -79,7 +79,9 @@ def _kernel(
 
     def read(i):
         return pltpu.make_async_copy(
-            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[5, i], tile_rows), :],
+            # Keep alignment visible after scalar-prefetched descriptors cross
+            # the call boundary: row 5 holds a tile index, not a byte/row offset.
+            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[5, i] * tile_rows, tile_rows), :],
             raw_buf.at[i % 2],
             read_sem.at[i % 2],
         )
