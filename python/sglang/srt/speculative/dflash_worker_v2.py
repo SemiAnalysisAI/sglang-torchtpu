@@ -2874,14 +2874,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=device,
             )
 
-        if self._pads_to_batch_buckets:
-            # Feed the bucket-padded buffer so the compiled artifact stays on a
-            # static shape, then trim the ghost rows back off.
-            input_embeds = self.embed_draft_block_ids(
-                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
-            )[: bs * block_size]
-        else:
-            input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
+        if fused_block is None:
+            if self._pads_to_batch_buckets:
+                # Feed the bucket-padded buffer so the compiled artifact stays on a
+                # static shape, then trim the ghost rows back off.
+                input_embeds = self.embed_draft_block_ids(
+                    block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
+                )[: bs * block_size]
+            else:
+                input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
