@@ -79,6 +79,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _runner_shards_cp_extend(model) -> bool:
+    """Whether this runner shards an active CP extend at the model boundary.
+
+    A platform whose compiled forward shards the extend keeps it out. Under CP-TP
+    group sharing the model owns the layout in forward(), unless it delegates the
+    boundary here through prepare_cp_inputs (GLM).
+    """
+    return current_platform.runs_eager_extend_cp() and (
+        not get_parallel().enable_cp_tp_group_sharing
+        or getattr(model, "prepare_cp_inputs", None) is not None
+    )
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
@@ -358,13 +371,7 @@ class EagerRunner(BaseRunner):
             else "extend"
         )
         with device_timer_ctx(model_runner.device_timer, category):
-            if cp_active and (
-                not get_parallel().enable_cp_tp_group_sharing
-                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
-                or current_platform.runs_eager_extend_cp()
-            ):
-                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
-                # Other group-sharing models keep owning the layout in forward().
+            if cp_active and _runner_shards_cp_extend(model_runner.model):
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
