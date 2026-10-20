@@ -482,8 +482,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler.scheduler_extension = SchedulerExtension()
-        # The PP wave asks the extension for a transport from the target runner.
+        # The PP wave asks the extension for a transport from the target runner
+        # and the scheduler's groups; the shared extension builds none.
         scheduler.tp_worker = SimpleNamespace(model_runner=None)
+        scheduler.tp_group = scheduler.world_group = None
         # Fork-only scheduler state read by the PP loops.
         scheduler.use_overlap_streams = True
         scheduler._pending_chunked_abort_req = None
