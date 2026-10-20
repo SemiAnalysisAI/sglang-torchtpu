@@ -607,6 +607,7 @@ class TestCompiledForwardShim(CustomTestCase):
             "top_logprobs_nums": None,
             "token_ids_logprobs": None,
             "extend_input_logprob_token_ids_gpu": None,
+            "extend_input_logprob_token_ids_cpu": None,
             "extend_seq_lens_cpu": None,
             "extend_logprob_start_lens_cpu": None,
             "capture_hidden_mode": CaptureHiddenMode.NULL,
@@ -1415,6 +1416,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(shim(None, None, fb), "out")
         counter.wait.assert_called_once_with()
@@ -1432,6 +1434,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(shim(None, None, fb), "out")
 
@@ -1448,6 +1451,7 @@ class TestHiCacheReloadGate(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
 
         with unittest.mock.patch("torch.compiler.is_compiling", return_value=True):
@@ -1594,6 +1598,7 @@ class TestPinFields(CustomTestCase):
             top_logprobs_nums=[5],
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=torch.zeros(3),
+            extend_input_logprob_token_ids_cpu=torch.zeros(3),
         )
         saved = _pin_fields(fb, _PINNED_LOGPROB_FIELDS)
 
@@ -1610,6 +1615,7 @@ class TestPinFields(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
         )
         self.assertEqual(_pin_fields(fb, _PINNED_LOGPROB_FIELDS), {})
 
@@ -1619,6 +1625,7 @@ class TestPinFields(CustomTestCase):
             "top_logprobs_nums": [3],
             "token_ids_logprobs": [[7]],
             "extend_input_logprob_token_ids_gpu": None,
+            "extend_input_logprob_token_ids_cpu": None,
         }
         fb = SimpleNamespace(**original)
         _restore_fields(fb, _pin_fields(fb, _PINNED_LOGPROB_FIELDS))
@@ -1659,6 +1666,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_input_logprob_token_ids_gpu=None,
+            extend_input_logprob_token_ids_cpu=None,
             extend_seq_lens_cpu=[4, 4],
             extend_logprob_start_lens_cpu=list(starts),
             capture_hidden_mode=CaptureHiddenMode.NULL,

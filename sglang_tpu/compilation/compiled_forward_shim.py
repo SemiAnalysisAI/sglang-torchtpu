@@ -466,6 +466,7 @@ _PINNED_LOGPROB_FIELDS: dict[str, Any] = {
     "top_logprobs_nums": None,
     "token_ids_logprobs": None,
     "extend_input_logprob_token_ids_gpu": None,
+    "extend_input_logprob_token_ids_cpu": None,
 }
 
 

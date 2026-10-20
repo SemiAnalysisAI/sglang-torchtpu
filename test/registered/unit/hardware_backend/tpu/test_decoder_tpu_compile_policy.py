@@ -906,11 +906,12 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         model_runner = SimpleNamespace(
             device="cpu",
+            dtype=torch.bfloat16,
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
-            model_config=SimpleNamespace(context_len=4096),
+            model_config=SimpleNamespace(context_len=4096, hidden_size=8),
             server_args=SimpleNamespace(
                 prefill_max_requests=prefill_max_requests,
                 unsafe_save_torch_compile_bundle=None,
@@ -977,7 +978,13 @@ class TestInstallExtendCap(_PolicyTestCase):
                         patch.object(policy, "_precompile_decode", return_value=[]),
                     ):
                         policy.precompile()
-                    warmup.assert_called_once_with(2048, "cpu")
+                    warmup.assert_called_once_with(
+                        2048,
+                        "cpu",
+                        max_batch_size=16,
+                        hidden_size=8,
+                        hidden_dtype=torch.bfloat16,
+                    )
 
     def test_non_dp_uses_configured_prefill_cap(self):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=False)
@@ -2210,6 +2217,43 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     """``_run_one`` wires the synthesized batch through the same chain
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
+
+    def test_inner_decoder_warmup_runs_outer_logits_after_pending_result(self):
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                mr = _model_runner()
+                policy = _make_policy(mr)
+                hidden = torch.zeros(64, 8)
+                output = PendingCall(lambda: hidden) if queued else hidden
+                policy.owner = SimpleNamespace(forward=MagicMock(return_value=output))
+                policy._input_logprob_processor = MagicMock()
+                mr.model.lm_head = None
+                mr.model.logits_processor = MagicMock(
+                    return_value=LogitsProcessorOutput(
+                        next_token_logits=torch.zeros(4, 8)
+                    )
+                )
+                with (
+                    envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True),
+                    patch(
+                        "sglang_tpu.compilation.decoder_compile_policy._materialize_out"
+                    ) as materialize,
+                ):
+                    pending = policy._run_one(
+                        num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+                    )
+                    if queued:
+                        mr.model.logits_processor.assert_not_called()
+                        materialize.assert_not_called()
+                        pending.wait()
+                materialize.assert_called_once()
+                mr.model.logits_processor.assert_called_once()
+                args = mr.model.logits_processor.call_args.args
+                self.assertIs(args[1], hidden)
+                self.assertTrue(args[3].return_logprob)
+                self.assertEqual(
+                    args[3].extend_input_logprob_token_ids_cpu.device.type, "cpu"
+                )
 
     def test_pipeline_profile_executes_outer_model_synchronously(self):
         mr = _model_runner()

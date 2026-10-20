@@ -658,6 +658,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 previous.vocab_size,
                 previous.chunking_group,
                 skip_chunking=logits_processor.do_tensor_parallel_all_gather_dp_attn,
+                model=self.model_runner.model,
             )
             logits_processor.input_logprob_processor = self._input_logprob_processor
 
@@ -912,6 +913,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Prompt-logprob inputs are rejected on compiled TPU. Ignore this
             # request-only tensor before direct compile flattens ForwardBatch.
             "forward_batch.extend_input_logprob_token_ids_gpu",
+            "forward_batch.extend_input_logprob_token_ids_cpu",
             # These host mirrors are consumed before the compiled model.
             "forward_batch.req_pool_indices_cpu",
             "forward_batch.seq_lens_cpu",
@@ -1354,7 +1356,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if disagg_mode != "decode":
             if self._input_logprob_processor is not None:
                 pending += self._input_logprob_processor.precompile(
-                    self.t_bucketer.max_val, self.model_runner.device
+                    self.t_bucketer.max_val,
+                    self.model_runner.device,
+                    max_batch_size=self._extend_compile_cap(),
+                    hidden_size=self.model_runner.model_config.hidden_size,
+                    hidden_dtype=self.model_runner.dtype,
                 )
             pending += self._precompile_extend()
             self._assert_cp_family_compiled()
@@ -1722,9 +1728,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             forward_batch.return_logprob = True
             forward_batch.top_logprobs_nums = [0] * bs
             forward_batch.token_ids_logprobs = [None] * bs
-            forward_batch.extend_input_logprob_token_ids_gpu = torch.zeros(
+            forward_batch.extend_input_logprob_token_ids_cpu = torch.zeros(
                 num_tokens, dtype=torch.int64
-            ).to(self.model_runner.device)
+            )
+            forward_batch.extend_input_logprob_token_ids_gpu = (
+                forward_batch.extend_input_logprob_token_ids_cpu.to(
+                    self.model_runner.device
+                )
+            )
 
         model = self.model_runner.model
         # Set the DP metadata before the pad shim runs, just like serving does,
@@ -1771,6 +1782,23 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 )
             else:
                 out = call_with_reserved_frame_stack(entry.forward, *args, **kwargs)
+            if (
+                self._input_logprob_processor is not None
+                and not self._compiles_logits_processor()
+                and mode.is_extend()
+                and not mode.is_target_verify()
+                and spec_info is None
+            ):
+                # An inner decoder returns hidden states; the outer model owns
+                # the eager logits tail and is not called by this warmup.
+                def finish_prompt_logits(hidden_states):
+                    return self._warmup_eager_logits(hidden_states, forward_batch)
+
+                out = (
+                    out.then(finish_prompt_logits)
+                    if isinstance(out, PendingCall)
+                    else finish_prompt_logits(out)
+                )
             if isinstance(out, PendingCall):
                 return out.then(
                     lambda result: _materialize_out(
@@ -1788,6 +1816,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
         return None
+
+    def _warmup_eager_logits(self, hidden_states, forward_batch):
+        model = self.model_runner.model
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         return _unpad_decoder_outputs(outputs, forward_batch)

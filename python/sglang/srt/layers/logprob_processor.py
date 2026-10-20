@@ -548,6 +548,10 @@ class InputLogprobProcessor:
             and not _deterministic_inference_enabled()
         )
 
+    def prune_states(self, hidden_states, ranges):
+        """Select the logical prompt rows before chunked logprob processing."""
+        return torch.cat([hidden_states[start:end] for start, end in ranges])
+
     def forward(
         self,
         pruned_states: torch.Tensor,
