@@ -13,7 +13,10 @@ try:
     import torch
     import torch_tpu  # noqa: F401
 
-    _HAS_TPU = torch.tpu.is_available()
+    # torch.tpu.is_available() reports False under pytest even with chips
+    # attached; a tensor on the device is the test that matters.
+    torch.empty(1, device="tpu")
+    _HAS_TPU = True
 except Exception:  # pragma: no cover - non-TPU host
     _HAS_TPU = False
 

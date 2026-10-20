@@ -579,6 +579,11 @@ class MoEGate(nn.Module):
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+        elif _is_tpu:
+            # bf16 x bf16 -> fp32, as linear_bf16_fp32 on CUDA: bf16 logits
+            # reorder near-tied experts. XLA emits one dot with an fp32 result,
+            # no fp32 copy of the weight, at the bf16 GEMM's cost.
+            logits = torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
         elif not _is_cuda:
             logits = F.linear(hidden_states, self.weight, None)
         else:
