@@ -7,7 +7,6 @@ Remove when: upstream provides backend factories for these staging decisions.
 """
 
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_schedule
-from sglang_tpu.envs import envs
 from sglang_tpu.host_padding import _can_stage_forward_metadata, _enabled
 
 
