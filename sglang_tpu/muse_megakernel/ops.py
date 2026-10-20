@@ -355,7 +355,10 @@ class MuseMegakernel(torch.nn.Module):
             cand = msgspec.structs.replace(
                 cand, ring_slots=slots, stream_depth=slots - 1
             )
-            if K.scratch_vmem_bytes(cand) <= _SCRATCH_VMEM_BUDGET:
+            if K.scratch_vmem_bytes(cand) <= _SCRATCH_VMEM_BUDGET - (
+                # the page-block unpack's temporaries; measured 1.2 MiB over at 32 rows
+                _SAL_VMEM_HEADROOM if kv_sal else 0
+            ):
                 return cand
         raise ValueError(
             f"no Muse megakernel ring fits the VMEM budget at {rows} rows of {q}"
@@ -516,6 +519,7 @@ def _register_op() -> None:
 # (verify attention): 24 rows of 6 compile at 46.8 MiB declared, 32 rows of 8 overflowed the
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
+_SAL_VMEM_HEADROOM = 2 * 2**20
 _DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4))
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster only at 48.
