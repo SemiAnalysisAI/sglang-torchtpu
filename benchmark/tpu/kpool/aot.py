@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 from pathlib import Path
@@ -24,6 +25,7 @@ CASES = (
     "reshape_mask_bool",
     "reshape_output",
     "original_small",
+    "original_mask_fix",
     "reference_decode",
     "candidate_decode",
     "reference_prefill",
@@ -83,8 +85,8 @@ def build(case, root, out):
         )
         return call, (jax.ShapeDtypeStruct(shape, dtype),), ()
 
-    pages = 17 if case == "original_small" else 14849
-    tokens = 256 if case == "original_small" else 32 if "decode" in case else 8192
+    pages = 17 if case.startswith("original_") else 14849
+    tokens = 256 if case.startswith("original_") else 32 if "decode" in case else 8192
     specs = tuple(
         jax.ShapeDtypeStruct(shape, dtype)
         for shape, dtype in (
@@ -101,7 +103,7 @@ def build(case, root, out):
         fn = reference.computation
     else:
         path = root / "sglang_tpu/attention/pallas/kpool_compress.py"
-        if case == "original_small":
+        if case.startswith("original_"):
             path = out / "original.py"
             path.write_bytes(
                 subprocess.check_output(
@@ -117,6 +119,22 @@ def build(case, root, out):
                     ]
                 )
             )
+            if case == "original_mask_fix":
+                source = path.read_text()
+                start = source.index("        ends = jnp.arange(32,")
+                end = source.index("        # Serialize", start)
+                source = (
+                    source[:start]
+                    + """        mask = jnp.zeros((8, 1), jnp.uint32)
+        for lane in range(4):
+            ends = jnp.arange(8, dtype=jnp.int32)[:, None] * 16 + lane * 4 + 3
+            live = (ends >= desc_ref[3, i]) & (ends < desc_ref[4, i])
+            mask |= jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (lane * 8)
+
+"""
+                    + source[end:]
+                )
+                path.write_text(source)
         spec = importlib.util.spec_from_file_location("kpool_candidate", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -173,7 +191,13 @@ def worker(opts):
             (out / "stablehlo.mlir").write_text(lowered.as_text())
             compiled = lowered.compile()
         result["compile_seconds"] = time.perf_counter() - start
-        (out / "optimized_hlo.txt").write_text(compiled.as_text())
+        result["compile_complete"] = True
+        try:
+            (out / "optimized_hlo.txt").write_text(compiled.as_text())
+        except jax.errors.JaxRuntimeError:
+            # Some libtpu executables fail HLO text deserialization after
+            # successful code generation. Preserve the independent LLO result.
+            result["optimized_hlo_export_error"] = traceback.format_exc()
         result["memory"] = str(compiled.memory_analysis())
         result["final_llo"] = [
             str(p.relative_to(out))
@@ -196,6 +220,7 @@ def main():
     parser.add_argument("--target", default="tpu7x:2x2x1")
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
     parser.add_argument("--worker", choices=CASES)
+    parser.add_argument("--archive", type=Path)
     opts = parser.parse_args()
     if opts.worker:
         worker(opts)
@@ -235,6 +260,34 @@ def main():
         (opts.output / "summary.json").write_text(json.dumps(summary, indent=2))
         print("AOT_CASE_RESULT", json.dumps(result), flush=True)
     print("AOT_SUMMARY", json.dumps(summary), flush=True)
+    if opts.archive:
+        # Keep complete final LLO and the matching pre-delay companion. The
+        # full set of compiler intermediate dumps remains in the task artifact.
+        names = {
+            "summary.json",
+            "result.json",
+            "manifest.json",
+            "compile.log",
+            "stablehlo.mlir",
+            "optimized_hlo.txt",
+        }
+        files = [
+            path
+            for path in opts.output.rglob("*")
+            if path.is_file()
+            and (
+                path.name in names
+                or path.name.endswith(
+                    ("-final_bundles.txt", "-packed-bundles-post-ra.txt")
+                )
+            )
+        ]
+        temporary = opts.archive.with_suffix(opts.archive.suffix + ".tmp")
+        with tarfile.open(temporary, "w:gz") as archive:
+            for path in sorted(files):
+                archive.add(path, arcname=path.relative_to(opts.output))
+        temporary.replace(opts.archive)
+        print("AOT_ARTIFACT_READY", str(opts.archive), flush=True)
 
 
 if __name__ == "__main__":
