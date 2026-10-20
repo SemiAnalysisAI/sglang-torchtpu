@@ -9,6 +9,7 @@ from copy import deepcopy
 
 from benchmark.tpu.recipe.configs.kimi_k3.dspark import CONFIG as DSPARK_CONFIG
 from benchmark.tpu.recipe.configs.kimi_k3.server_mk import CONFIG as MK_CONFIG
+from benchmark.tpu.recipe.configs.kimi_k3.server_mk import PER_OP_ONLY_ENV
 
 CONFIG = deepcopy(DSPARK_CONFIG)
 CONFIG["server_args"].update(
@@ -20,3 +21,5 @@ CONFIG["server_args"].update(
 CONFIG["runtime_env"].update(
     {k: v for k, v in MK_CONFIG["runtime_env"].items() if "MEGAKERNEL" in k}
 )
+for key in PER_OP_ONLY_ENV:
+    CONFIG["runtime_env"].pop(key)

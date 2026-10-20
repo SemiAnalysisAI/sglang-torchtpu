@@ -25,6 +25,19 @@ CONFIG["server_args"].update(
         "mem_fraction_static": 0.9,
     }
 )
+# The kernel replaces the decoder layers these per-op kernels speed up; the
+# measured runs left them off.
+PER_OP_ONLY_ENV = (
+    "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD",
+    "SGLANG_TPU_K3_STATIC_FP8",
+    "SGLANG_TPU_ENABLE_K3_HOST_SPLIT_GEMV",
+    "SGLANG_TPU_ENABLE_TWOLEVEL_ALLREDUCE",
+    "SGLANG_K3_MERGE_MOE_ALLREDUCE",
+    "SGLANG_TPU_ENABLE_K3_ATTN_RES_KERNEL",
+    "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER",
+)
+for key in PER_OP_ONLY_ENV:
+    CONFIG["runtime_env"].pop(key)
 CONFIG["runtime_env"].update(
     {
         "SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL": "1",
