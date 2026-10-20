@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -81,6 +82,7 @@ from sglang_tpu.compilation.spec_decode_compile_policy_eagle3 import (
     SpecDecoderTpuCompilePolicy,
 )
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.input_logprobs import TpuInputLogprobProcessor
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.sampler import select_logits_output_mode
 from sglang_tpu.top_k import (
@@ -881,10 +883,19 @@ class TestDecoderOutputUnpadding(CustomTestCase):
 
 
 class TestInstallExtendCap(_PolicyTestCase):
-    def _install_policy(self, *, prefill_max_requests, dp_attention):
+    def _install_policy(
+        self,
+        *,
+        prefill_max_requests,
+        dp_attention,
+        inner_decoder=False,
+        logits_processor=None,
+    ):
         model = SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+            model=SimpleNamespace(forward=MagicMock()),
+            logits_processor=logits_processor,
         )
         # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
@@ -894,6 +905,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
+            device="cpu",
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
@@ -907,7 +919,9 @@ class TestInstallExtendCap(_PolicyTestCase):
         )
         t_bucketer = Bucketer(name="Token", buckets=[64, 2048])
         b_bucketer = Bucketer(name="Bs", buckets=[16, 32, 64])
-        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model.model if inner_decoder else model
+        )
         policy.backend = "eager"
 
         with (
@@ -928,6 +942,42 @@ class TestInstallExtendCap(_PolicyTestCase):
             self.assertTrue(policy.install())
 
         return policy
+
+    def test_prompt_processor_installs_and_prewarms_for_eager_logits(self):
+        for inner_decoder in (False, True):
+            for enabled in (False, True):
+                with self.subTest(inner_decoder=inner_decoder, enabled=enabled):
+                    original = InputLogprobProcessor(8)
+                    logits = SimpleNamespace(
+                        input_logprob_processor=original,
+                        compute_input_logprobs=True,
+                        do_tensor_parallel_all_gather_dp_attn=True,
+                    )
+                    with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
+                        policy = self._install_policy(
+                            prefill_max_requests=16,
+                            dp_attention=False,
+                            inner_decoder=inner_decoder,
+                            logits_processor=logits,
+                        )
+                    self.assertEqual(logits.compute_input_logprobs, inner_decoder)
+                    if not enabled:
+                        self.assertIs(logits.input_logprob_processor, original)
+                        self.assertIsNone(policy._input_logprob_processor)
+                        continue
+                    processor = logits.input_logprob_processor
+                    self.assertIsInstance(processor, TpuInputLogprobProcessor)
+                    self.assertIs(policy._input_logprob_processor, processor)
+                    self.assertTrue(processor.skip_chunking)
+                    with (
+                        patch.object(
+                            processor, "precompile", return_value=[]
+                        ) as warmup,
+                        patch.object(policy, "_precompile_extend", return_value=[]),
+                        patch.object(policy, "_precompile_decode", return_value=[]),
+                    ):
+                        policy.precompile()
+                    warmup.assert_called_once_with(2048, "cpu")
 
     def test_non_dp_uses_configured_prefill_cap(self):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=False)

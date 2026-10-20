@@ -644,24 +644,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
+        logits_processor = getattr(self.model_runner.model, "logits_processor", None)
+        pp_group = self.model_runner.pp_group
+        if (
+            logits_processor is not None
+            and not is_draft_worker
+            and (pp_group is None or pp_group.is_last_rank)
+            and envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+        ):
+            # Inner-decoder policies also need the eager prompt-logprob tail.
+            previous = logits_processor.input_logprob_processor
+            self._input_logprob_processor = TpuInputLogprobProcessor(
+                previous.vocab_size,
+                previous.chunking_group,
+                skip_chunking=logits_processor.do_tensor_parallel_all_gather_dp_attn,
+            )
+            logits_processor.input_logprob_processor = self._input_logprob_processor
+
         cp_logits_installed = False
         if self._compiles_logits_processor():
-            logits_processor = getattr(
-                self.model_runner.model, "logits_processor", None
-            )
             if logits_processor is not None:
                 # Keep data-dependent prompt logprobs outside the compiled forward.
                 logits_processor.compute_input_logprobs = False
-                if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get():
-                    previous = logits_processor.input_logprob_processor
-                    self._input_logprob_processor = TpuInputLogprobProcessor(
-                        previous.vocab_size,
-                        previous.chunking_group,
-                        skip_chunking=logits_processor.do_tensor_parallel_all_gather_dp_attn,
-                    )
-                    logits_processor.input_logprob_processor = (
-                        self._input_logprob_processor
-                    )
                 if self._cp_strategy is not None:
                     install_cp_logits_forward(logits_processor)
                     cp_logits_installed = True
