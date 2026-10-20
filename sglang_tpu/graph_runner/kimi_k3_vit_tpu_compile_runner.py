@@ -269,6 +269,11 @@ class KimiK3VitTpuCompileRunner:
         image needs the tower's eager path (video, or past the ladder)."""
         return self._run_staged(pixels, shapes, self._bucket_for, self.forward)
 
+    def can_stage(self, shapes: Sequence[tuple[int, int, int]]) -> bool:
+        """Whether every image fits the staged path (single frame, in the
+        ladder). Host-only, so every rank of a group answers the same."""
+        return all(t == 1 and self._bucket_for(h * w) is not None for t, h, w in shapes)
+
     def _run_staged(
         self, pixels, shapes, bucket_for, fn
     ) -> Optional[list[torch.Tensor]]:
@@ -350,3 +355,82 @@ class KimiK3VisionTpuCompilePolicy(VisionTpuCompilePolicy):
 
     def unpad_outputs(self, result: Any, ctx: Any):
         raise NotImplementedError("use run_images")
+
+
+# --- data-parallel encoding (--mm-enable-dp-encoder) ------------------------
+
+
+def dp_encode_plan(
+    shapes: Sequence[tuple[int, int, int]], world: int
+) -> list[list[int]]:
+    """The images each of ``world`` ranks encodes, balanced by patch count
+    (the assignment the CUDA DP runner uses). Host-only and deterministic, so
+    every rank of a group derives the same plan."""
+    from sglang.srt.multimodal.mm_utils import get_dp_encoder_lb_assignment
+
+    sizes = [t * h * w for t, h, w in shapes]
+    order, counts, _ = get_dp_encoder_lb_assignment(sizes, world)
+    plan, start = [], 0
+    for count in counts:
+        plan.append(order[start : start + count])
+        start += count
+    return plan
+
+
+def dp_encode_local(
+    run_images, pixels: torch.Tensor, shapes, plan, rank: int, width: int, dtype
+) -> torch.Tensor:
+    """This rank's share, packed into the ``[max_rows, width]`` host buffer
+    every rank contributes to the gather (zero rows past its own)."""
+    offsets = [0]
+    for t, h, w in shapes:
+        offsets.append(offsets[-1] + t * h * w)
+    rows = [h * w // _MERGE_AREA for _, h, w in shapes]
+    max_rows = max(sum(rows[i] for i in mine) for mine in plan)
+    local = torch.zeros(max_rows, width, dtype=dtype)
+    mine = plan[rank]
+    if mine:
+        pixels_mine = torch.cat([pixels[offsets[i] : offsets[i + 1]] for i in mine])
+        outputs = run_images(pixels_mine, [shapes[i] for i in mine])
+        filled = torch.cat(outputs) if outputs else local[:0]
+        local[: filled.shape[0]] = filled.to(dtype)
+    return local
+
+
+def dp_encode_assemble(gathered: torch.Tensor, shapes, plan) -> list[torch.Tensor]:
+    """Every image's features, in request order, from ``[world, max_rows,
+    width]`` gathered rank buffers."""
+    rows = [h * w // _MERGE_AREA for _, h, w in shapes]
+    features: list = [None] * len(shapes)
+    for rank, mine in enumerate(plan):
+        offset = 0
+        for i in mine:
+            features[i] = gathered[rank, offset : offset + rows[i]]
+            offset += rows[i]
+    return features
+
+
+def host_all_gather(local: torch.Tensor, group) -> torch.Tensor:
+    """All-gather a host tensor over a GroupCoordinator's gloo group, as bytes
+    (gloo has no bfloat16), into ``[world, *local.shape]``."""
+    import torch.distributed as dist
+
+    raw = local.contiguous().view(torch.uint8)
+    buffers = [torch.empty_like(raw) for _ in range(group.world_size)]
+    dist.all_gather(buffers, raw, group=group.cpu_group)
+    return torch.stack(buffers).view(local.dtype).view(group.world_size, *local.shape)
+
+
+def encode_data_parallel(runner, pixels, shapes, group, width, dtype) -> list:
+    """Each rank of ``group`` encodes its share of the images on the
+    collective-free staged runner; the projected features meet on the host.
+
+    No device collective is involved: device collectives issued eagerly from
+    some ranks, or inside rank-divergent fused programs, are what hung the
+    device-gather DP runner on TPU.
+    """
+    plan = dp_encode_plan(shapes, group.world_size)
+    local = dp_encode_local(
+        runner.run_images, pixels, shapes, plan, group.rank_in_group, width, dtype
+    )
+    return dp_encode_assemble(host_all_gather(local, group), shapes, plan)

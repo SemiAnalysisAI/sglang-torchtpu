@@ -21,6 +21,9 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
     KimiK3VitTpuCompileRunner,
+    dp_encode_assemble,
+    dp_encode_local,
+    dp_encode_plan,
     merge_window_order,
     patch_buckets,
     rotate_interleaved,
@@ -131,6 +134,30 @@ class TestKimiK3VitRunner(CustomTestCase):
             got = runner.run_images(pixels, [tuple(g) for g in grids.tolist()])
         self.assertEqual([t.shape[0] for t in got], [6, 1, 12])
         torch.testing.assert_close(torch.cat(got), want, rtol=1e-4, atol=1e-4)
+
+    def test_data_parallel_encoding_matches_replicated(self):
+        """--mm-enable-dp-encoder: each rank encodes its share and the shares
+        meet on the host; every image comes back exactly as replicated
+        encoding gives it, including on a rank that gets no image."""
+        _, _, runner = _model()
+        runner._patch_buckets = [36, 64]
+        shapes = [(1, 4, 6), (1, 2, 2), (1, 8, 6), (1, 2, 4)]
+        n = sum(t * h * w for t, h, w in shapes)
+        pixels = torch.randn(n, 3, PATCH, PATCH)
+        with torch.no_grad():
+            want = runner.run_images(pixels, shapes)
+            for world in (2, 3, 5):
+                plan = dp_encode_plan(shapes, world)
+                self.assertEqual(sorted(i for mine in plan for i in mine), [0, 1, 2, 3])
+                buffers = [
+                    dp_encode_local(
+                        runner.run_images, pixels, shapes, plan, rank, 32, torch.float32
+                    )
+                    for rank in range(world)
+                ]
+                got = dp_encode_assemble(torch.stack(buffers), shapes, plan)
+                for g, w in zip(got, want):
+                    torch.testing.assert_close(g, w, rtol=0, atol=0)
 
     def test_video_and_oversized_images_take_the_eager_path(self):
         _, _, runner = _model()

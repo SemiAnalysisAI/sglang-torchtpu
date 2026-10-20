@@ -17,8 +17,10 @@ pass_through_projected_features
        the host and runs tower + projector on the runner -- compiled per padded
        bucket under --enable-torch-compile, the same math eagerly otherwise --
        and AROUND KimiK3MultiModalProjector.forward passes those already
-       projected features through. Video grids and images past the ladder keep
-       the tower's own eager path.
+       projected features through. With --mm-enable-dp-encoder and several
+       images, each rank of the batch's TP group encodes its share and the
+       features meet on the host over gloo, with no device collective. Video
+       grids and images past the ladder keep the tower's own eager path.
   Upstream PR or issue: none; the CUDA path has its own graph runner
        (KimiK3ViTCudaGraphRunner) selected inside the tower.
   Remove when: the tower selects its accelerator runner through a platform
@@ -81,10 +83,40 @@ def encode_with_k3_vision_runner(
         return eager()
     shapes = _resolve_grid_thw_list(grid_thws, grid_thw_list)
     # One device-to-host copy; the runner stages every image on the host.
-    outputs = runner.run_images(pixel_values.cpu(), shapes)
+    pixels = pixel_values.cpu()
+    group = _dp_encoder_group(len(shapes))
+    if group is not None and runner.can_stage(shapes):
+        from sglang_tpu.graph_runner.kimi_k3_vit_tpu_compile_runner import (
+            encode_data_parallel,
+        )
+
+        projector = runner.projector
+        return ProjectedImageFeatures(
+            encode_data_parallel(
+                runner,
+                pixels,
+                shapes,
+                group,
+                width=projector.post_norm.weight.shape[0],
+                dtype=projector.post_norm.weight.dtype,
+            )
+        )
+    outputs = runner.run_images(pixels, shapes)
     if outputs is None:
         return eager()
     return ProjectedImageFeatures(outputs)
+
+
+def _dp_encoder_group(num_images: int):
+    """The group that shares one batch's images under --mm-enable-dp-encoder,
+    or None: off, one image (nothing to share), or a group of one."""
+    from sglang.srt.layers.dp_attention import get_dp_tp_group
+    from sglang.srt.runtime_context import get_mm
+
+    if num_images < 2 or not get_mm().mm_enable_dp_encoder:
+        return None
+    group = get_dp_tp_group()
+    return group if group.world_size > 1 else None
 
 
 def pass_through_projected_features(
