@@ -68,10 +68,6 @@ PROFILES = {
     "long_8k1k_c64": _profile(
         input_tokens=8192, output_tokens=1024, concurrency=64, prefill_tokens=8192
     ),
-    # Agentic: a long shared prefix re-sent each turn, so the pool holds whole
-    # conversations and the radix cache does the work. One point, not the bench
-    # matrix's agentic leg, which ramps toward a per-model target context and
-    # sweeps concurrency (recipe/bench_matrix/config.sh).
     # Few requests on a model too large for more: a 1024-token prefill chunk and
     # a bs1 bucket next to the bs4 one, so a lone request decodes unpadded.
     "chat_1k1k_c4": _profile(
@@ -91,6 +87,10 @@ PROFILES = {
         prefill_tokens=1024,
         decode_bs=(1,),
     ),
+    # Agentic: a long shared prefix re-sent each turn, so the pool holds whole
+    # conversations and the radix cache does the work. One point, not the bench
+    # matrix's agentic leg, which ramps toward a per-model target context and
+    # sweeps concurrency (recipe/bench_matrix/config.sh).
     "agentic": _profile(
         input_tokens=32768, output_tokens=1024, concurrency=16, prefill_tokens=8192
     ),
