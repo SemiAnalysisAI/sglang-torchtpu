@@ -11,8 +11,8 @@ Five server configurations ("arms") serve the same synthetic agentic multi-turn 
 | A | `deec4fbada` (main) | write_through | off |
 | B | `deec4fbada` (main) | write_back | off |
 | C | `deec4fbada` (main) | write_back | on (default) |
-| D | `041f406ea1`, the first commit of [sgl-project/sglang-torchtpu#1586](https://github.com/sgl-project/sglang-torchtpu/pull/1586) | write_back | on (default), with the fix |
-| E | `78f109fc3f`, both commits of #1586 | write_back | on (default), with the fix and the follow-up |
+| D | `041f406ea1`, [sgl-project/sglang-torchtpu#1586](https://github.com/sgl-project/sglang-torchtpu/pull/1586) | write_back | on (default), with the fix |
+| E | `78f109fc3f`, [sgl-project/sglang-torchtpu#1612](https://github.com/sgl-project/sglang-torchtpu/pull/1612), stacked on #1586 | write_back | on (default), with the fix and the follow-up |
 
 What to look for: C has a lower cache hit rate than B from the first ten minutes, and D and E bring it
 back to B's level. [Expected results](#9-expected-results) gives the numbers and what counts as reproduced.
@@ -84,9 +84,9 @@ The only runtime difference
 between the two commits is `sglang_tpu/hicache_write_back_copy_ahead.py` (the commit also adds a unit
 test); nothing needs reinstalling. If that commit is ever unreachable, apply this package's
 `arm_d_full_pin.patch` on `deec4fbada` instead. For arm E, check out
-`78f109fc3f19aa6356625c48c7cc20a931adeec1` the same way; it adds #1586's second commit (targeted
+`78f109fc3f19aa6356625c48c7cc20a931adeec1` the same way; it adds #1612's commit on top of #1586 (targeted
 synchronous waits, a retry for short evictions, and an SWA share of the window), again only in that
-module. If #1586 gains later commits, they were not measured here.
+module. If either PR gains later commits, they were not measured here.
 
 Copy this package's server config into the checkout. Keep it there across checkouts:
 `git checkout` leaves an untracked file in place.
