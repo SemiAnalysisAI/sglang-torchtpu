@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import weakref
 from types import SimpleNamespace
 
 import torch
@@ -103,6 +104,16 @@ class TestInputTopLogprobs(unittest.TestCase):
                             rtol=0,
                             atol=0,
                         )
+                        projected = []
+
+                        def get_logits(hidden, head, meta, **kwargs):
+                            # A completed chunk must not keep a vocabulary-sized
+                            # output alive while the next projection allocates.
+                            self.assertTrue(all(ref() is None for ref in projected))
+                            logits = hidden.clone()
+                            projected.append(weakref.ref(logits))
+                            return logits
+
                         results.append(
                             processor.forward(
                                 pruned,
@@ -110,7 +121,7 @@ class TestInputTopLogprobs(unittest.TestCase):
                                 inputs,
                                 sequence,
                                 None,
-                                lambda hidden, head, meta, **kwargs: hidden,
+                                get_logits,
                                 metadata,
                                 skip_chunking_for_dp_attn=skip_chunking,
                             )

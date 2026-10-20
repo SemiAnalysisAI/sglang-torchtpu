@@ -332,6 +332,7 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
             else:
                 values = torch.nn.functional.log_softmax(logits, dim=-1)
                 normalizer = None
+            del logits
             selected = select(values, _device_indices(selected_ids, rows, device))
             chunk_slice = slice(token_to_seq_idx[start], token_to_seq_idx[end - 1] + 1)
             lengths = logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice]
@@ -375,6 +376,9 @@ class TpuInputLogprobProcessor(InputLogprobProcessor):
                 row_max, row_sum = (tensor.cpu() for tensor in normalizer)
                 chosen = (chosen.float() - row_max) - row_sum
             token_chunks.append(chosen[local_input_rows])
+            # The next LM-head projection needs its own full-vocabulary output.
+            # Release this chunk after its small host results have completed.
+            del states, values, selected, normalizer
         return (
             LogprobResult(
                 token_logprobs=torch.cat(token_chunks),
