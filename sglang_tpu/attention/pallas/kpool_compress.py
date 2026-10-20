@@ -82,13 +82,27 @@ def _kernel(
         def _prefetch():
             read(i + 1).start()
 
-        raw = raw_buf[slot].astype(jnp.float32)
-        keys = raw[:, :128].reshape((32, 4, 128))
-        scores = raw[:, 128:].reshape((32, 4, 128)) + ape_ref[...][None, :, :]
-        scores = scores - jnp.max(scores, axis=1, keepdims=True)
-        weight = jnp.exp(scores)
-        weight = weight / jnp.sum(weight, axis=1, keepdims=True)
-        pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+        # Keep the compute tiles two-dimensional. Group members are separate
+        # [pool, feature] values, not a size-four sublane dimension introduced
+        # by reshaping [128, 128] to [32, 4, 128].
+        scores = [
+            raw_buf[slot, pl.ds(member, 32, 4), 128:].astype(jnp.float32)
+            + ape_ref[pl.ds(member, 1), :]
+            for member in range(4)
+        ]
+        maximum = jnp.maximum(
+            jnp.maximum(scores[0], scores[1]), jnp.maximum(scores[2], scores[3])
+        )
+        weight = [jnp.exp(score - maximum) for score in scores]
+        denominator = (weight[0] + weight[1]) + (weight[2] + weight[3])
+        weighted = [
+            (weight[member] / denominator)
+            * raw_buf[slot, pl.ds(member, 32, 4), :128].astype(jnp.float32)
+            for member in range(4)
+        ]
+        pooled = ((weighted[0] + weighted[1]) + (weighted[2] + weighted[3])).astype(
+            jnp.bfloat16
+        )
         rotated = jax.lax.dot_general(
             pooled,
             h_ref[...],
@@ -101,25 +115,22 @@ def _kernel(
         exponent = jnp.ceil(jnp.log2(amax / 448.0))
         scale = jnp.exp2(exponent)
         q = jnp.clip(rotated / scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-        key_bytes = pltpu.bitcast(q, jnp.uint8).astype(jnp.uint32)
-        records = jnp.concatenate(
-            (
-                key_bytes,
-                (exponent + 127).astype(jnp.uint32),
-                jnp.zeros((32, 127), dtype=jnp.uint32),
-            ),
-            axis=1,
-        ).reshape((8, 4, 256))
-        packed = records[:, 0, :]
-        for lane in range(1, 4):
-            packed = packed | (records[:, lane, :] << (lane * 8))
-        ends = jnp.arange(32, dtype=jnp.int32) * 4 + 3
-        live = ((ends >= desc_ref[3, i]) & (ends < desc_ref[4, i])).reshape((8, 4, 1))
-        mask = jnp.where(live[:, 0, :], jnp.uint32(255), jnp.uint32(0))
-        for lane in range(1, 4):
+        # Pallas bitcast packs consecutive rows in the second-last dimension,
+        # matching the cache's [quad, 4, byte] -> [quad, 1, word] Ref view.
+        key_words = pltpu.bitcast(q, jnp.uint32)
+        scale_bytes = jnp.where(
+            jnp.arange(128)[None, :] == 0,
+            (exponent + 127).astype(jnp.uint8),
+            jnp.uint8(0),
+        )
+        scale_words = pltpu.bitcast(scale_bytes, jnp.uint32)
+        packed = jnp.concatenate((key_words, scale_words), axis=1)
+        mask = jnp.zeros((8, 1), jnp.uint32)
+        for lane in range(4):
+            ends = jnp.arange(8, dtype=jnp.int32)[:, None] * 16 + lane * 4 + 3
+            live = (ends >= desc_ref[3, i]) & (ends < desc_ref[4, i])
             mask = mask | (
-                jnp.where(live[:, lane, :], jnp.uint32(255), jnp.uint32(0))
-                << (lane * 8)
+                jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (lane * 8)
             )
 
         # Serialize the *read* too. A later tile may update different bytes

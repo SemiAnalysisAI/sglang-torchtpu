@@ -7,20 +7,42 @@ import re
 import shlex
 
 
-def manifest(revision, cluster, wheelhouse_bucket=None, wheelhouse_prefix=None):
+def manifest(
+    revision,
+    cluster,
+    wheelhouse_bucket=None,
+    wheelhouse_prefix=None,
+    mode="performance",
+    hold_seconds=0,
+):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
     if bool(wheelhouse_bucket) != bool(wheelhouse_prefix):
         raise ValueError("Set both wheelhouse bucket and prefix, or neither")
+    if mode not in ("performance", "aot") or not 0 <= hold_seconds <= 1800:
+        raise ValueError("Invalid task mode or artifact retrieval window")
     install = "python -m pip install -r benchmark/tpu/kpool/requirements.txt"
     if wheelhouse_bucket:
         install += " --no-index --find-links=/wheelhouse"
+    workload = """echo PHASE_BENCHMARK
+timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
+  --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/benchmark"
+"""
+    if mode == "aot":
+        workload = f"""echo PHASE_AOT
+git fetch --depth=1 origin 75a03373e46643a9373cf9bcd1ed7fdfd794385d
+out="${{ARTIFACT_LOCAL_DIR:?}}/rank-${{FALCON_RANK:-0}}/aot"
+timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"
+tar -C "$out" -czf /tmp/tpu_logs/kpool-aot.tar.gz .
+echo AOT_ARTIFACT_READY
+sleep {hold_seconds}
+"""
     script = f"""set -euo pipefail
 ulimit -c 0
 export TMPDIR=/tmp/tpu_logs/tmp
 export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
 export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
-export JAX_PLATFORMS=tpu
+export JAX_PLATFORMS={"cpu" if mode == "aot" else "tpu"}
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export PYTHONUNBUFFERED=1
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
@@ -36,9 +58,7 @@ echo PHASE_INSTALL
 python3 -m venv "$task_root/venv"
 export PATH="$task_root/venv/bin:$PATH"
 {install}
-echo PHASE_BENCHMARK
-timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
-  --output "${{ARTIFACT_LOCAL_DIR:?}}/rank-${{FALCON_RANK:-0}}/benchmark"
+{workload}
 """
     task = {
         "image": "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1",
@@ -48,6 +68,18 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
         "device_topo": "2x2x1",
         "command": "bash -c " + shlex.quote(script),
     }
+    if mode == "aot":
+        task.update(
+            device_type="cpu",
+            device_count=1,
+            resources={
+                "cpu_request": "8",
+                "cpu_limit": "8",
+                "memory_request": "16Gi",
+                "memory_limit": "16Gi",
+            },
+        )
+        del task["device_topo"]
     if wheelhouse_bucket:
         task["mounts"] = [
             {
@@ -61,7 +93,7 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             }
         ]
     return {
-        "name": f"kpool-perf-{revision[:12]}",
+        "name": f"kpool-{mode}-{revision[:12]}",
         "cluster_name": cluster,
         "exp_type": "BENCHMARK",
         "artifact_type": "GCS",
@@ -78,6 +110,8 @@ def main():
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--wheelhouse-bucket")
     parser.add_argument("--wheelhouse-prefix")
+    parser.add_argument("--mode", choices=("performance", "aot"), default="performance")
+    parser.add_argument("--hold-seconds", type=int, default=0)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -86,6 +120,8 @@ def main():
                 args.cluster,
                 args.wheelhouse_bucket,
                 args.wheelhouse_prefix,
+                args.mode,
+                args.hold_seconds,
             ),
             indent=2,
         )
