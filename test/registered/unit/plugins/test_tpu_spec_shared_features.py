@@ -228,7 +228,7 @@ class TestSharedFeatures(CustomTestCase):
         worker.device = "cpu"
         worker._b_bucketer = lambda: SimpleNamespace(buckets=[2, 4])
         worker._warmup_seeded_accept = lambda pbs, vocab_size: None
-        worker.target_worker = SimpleNamespace(
+        worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=40))
         )
         warmed = []
