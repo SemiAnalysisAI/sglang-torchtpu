@@ -159,6 +159,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
             "next_token_global_top_k_logits",
             "next_token_global_top_k_token_ids",
             "next_draft_tokens",
+            "input_token_logprobs",
         ):
             value = getattr(out, field, None)
             if isinstance(value, torch.Tensor):
@@ -1690,6 +1691,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 raise ValueError(f"Invalid warmup logits mode: {logits_output_mode}")
         self._seed_dummy_req_to_token(forward_batch)
 
+        if (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and spec_info is None
+        ):
+            # FULL capture alone does not exercise the eager prompt-logprob
+            # tail. Run that tail at each configured extend bucket too.
+            forward_batch.return_logprob = True
+            forward_batch.top_logprobs_nums = [0] * bs
+            forward_batch.token_ids_logprobs = [None] * bs
+            forward_batch.extend_input_logprob_token_ids_gpu = torch.zeros(
+                num_tokens, dtype=torch.int64
+            ).to(self.model_runner.device)
+
         model = self.model_runner.model
         # Set the DP metadata before the pad shim runs, just like serving does,
         # so precompile traces the same DP graph serving uses. Without it,
@@ -1838,6 +1854,20 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Construct a dummy ForwardBatch at the target bucket shape."""
         tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
         layout = self._dummy_layout(mode, num_tokens, bs, tokens_per_req)
+        if (
+            envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and spec_info is None
+        ):
+            # The ordinary dummy layout has one live token per request. Prompt
+            # logprobs consume the live lengths, so cover the whole token bucket.
+            layout = _DummyForwardBatchFields.cp_extend(
+                [num_tokens - bs + 1] + [1] * (bs - 1),
+                device=self.model_runner.device,
+                slot=self._dummy_kv_slot(),
+                out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
+            )
         return self._forward_batch_from_layout(
             layout,
             bs=bs,

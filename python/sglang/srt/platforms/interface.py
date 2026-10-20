@@ -261,6 +261,18 @@ class SRTPlatform(DeviceMixin):
         """One-time backend initialization.  Called in each worker."""
         pass
 
+    def precompile_sampling(self, model_runner) -> None:
+        """Submit sampling graphs while the model compilation queue is open."""
+        pass
+
+    def prewarm_sampling(self, model_runner) -> None:
+        """Warm platform sampling operations after model graph compilation."""
+        pass
+
+    def prewarm_request_relay(self, future_map, max_batch_size: int) -> None:
+        """Warm platform request bookkeeping after relay storage is created."""
+        pass
+
     def on_warmup_complete(self) -> None:
         """Called once on the scheduler thread, the first time it goes idle after
         a forward (the server warmup request has drained), or before the event

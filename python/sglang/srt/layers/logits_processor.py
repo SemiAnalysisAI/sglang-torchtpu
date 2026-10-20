@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.logprob_processor import (
+    BatchedTopLogprobs,
     InputLogprobProcessor,
     LogprobStage,
     get_token_ids_logprobs_raw,
@@ -233,6 +234,7 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    batched_output_top_logprobs: Optional[BatchedTopLogprobs] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -332,6 +334,15 @@ class LogitsProcessorOutput:
             self.next_token_global_top_k_token_ids = (
                 self.next_token_global_top_k_token_ids[:global_top_k_rows]
             )
+
+    def copy_batched_output_top_logprobs(self, copy_fn) -> None:
+        if self.batched_output_top_logprobs is None:
+            return
+        (
+            self.next_token_top_logprobs_val,
+            self.next_token_top_logprobs_idx,
+        ) = self.batched_output_top_logprobs.copy_to_cpu(copy_fn)
+        self.batched_output_top_logprobs = None
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:

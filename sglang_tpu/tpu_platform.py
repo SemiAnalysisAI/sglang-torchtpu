@@ -17,8 +17,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.utils import LazyImport
 from sglang_tpu._logging import get_logger
+from sglang_tpu.compilation.recompilation_checker import (
+    maybe_enable_site_tracing,
+    snapshot_recompilation_baseline,
+)
 from sglang_tpu.compilation.scoped_cache_guard import arm_cache_guard
 
 if TYPE_CHECKING:
@@ -30,6 +35,9 @@ logger = get_logger(__name__)
 # Platform discovery runs before worker bootstrap configures torch_tpu.
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
+warmup_sampling = LazyImport("sglang_tpu.serving_warmup", "warmup_sampling")
+precompile_sampling = LazyImport("sglang_tpu.serving_warmup", "precompile_sampling")
+warmup_request_relay = LazyImport("sglang_tpu.serving_warmup", "warmup_request_relay")
 
 
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
@@ -1285,13 +1293,19 @@ class TpuSRTPlatform(SRTPlatform):
         self._backend_initialized = True
         _register_models()
 
+    def precompile_sampling(self, model_runner) -> None:
+        precompile_sampling(model_runner)
+
+    def prewarm_sampling(self, model_runner) -> None:
+        warmup_sampling(model_runner)
+
+    def prewarm_request_relay(self, future_map, max_batch_size: int) -> None:
+        warmup_request_relay(future_map, max_batch_size)
+
     def on_warmup_complete(self) -> None:
         """Arm native admission and freeze torch.compile after warmup."""
-        from sglang.srt.runtime_context import get_exec, get_spec
-        from sglang_tpu.compilation.recompilation_checker import (
-            maybe_enable_site_tracing,
-        )
-
+        # Sampling and request-relay warmup finish after the model graph baseline.
+        snapshot_recompilation_baseline()
         # Native admission also covers eager programs outside torch.compile.
         arm_cache_guard()
         # Dispatch modes are thread-local; this runs on the scheduler thread.

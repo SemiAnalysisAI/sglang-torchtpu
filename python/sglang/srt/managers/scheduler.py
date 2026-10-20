@@ -1121,6 +1121,7 @@ class Scheduler(
 
             warmup_scope = collect_warmups()
         with warmup_scope:
+            current_platform.precompile_sampling(self.tp_worker.model_runner)
             self.tp_worker.init_cuda_graphs()
             if self.draft_worker is not None:
                 self.draft_worker.init_cuda_graphs()
@@ -1173,6 +1174,7 @@ class Scheduler(
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
+            current_platform.prewarm_sampling(model_runner)
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool(
@@ -1720,6 +1722,10 @@ class Scheduler(
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
+        )
+        current_platform.prewarm_request_relay(
+            self.future_map,
+            min(self.max_running_requests, get_exec().graph.torch_compile_max_bs),
         )
 
         self._confidence_budget_prepare = None

@@ -2230,6 +2230,29 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
 
+    def test_prompt_logprob_warmup_exercises_eager_tail_only_when_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                mr = _model_runner()
+                policy = _make_policy(mr)
+                with patch.object(
+                    envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB,
+                    "get",
+                    return_value=enabled,
+                ):
+                    policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+                batch = mr.model.forward.call_args.args[2]
+                metadata = LogitsMetadata.from_forward_batch(batch)
+                self.assertEqual(metadata.extend_return_logprob, enabled)
+                if enabled:
+                    self.assertEqual(sum(metadata.extend_seq_lens_cpu), 64)
+                    self.assertEqual(sum(metadata.extend_logprob_pruned_lens_cpu), 64)
+                    self.assertEqual(metadata.top_logprobs_nums, [0] * 4)
+                    self.assertEqual(metadata.token_ids_logprobs, [None] * 4)
+                    self.assertEqual(
+                        metadata.extend_input_logprob_token_ids_gpu.shape, (64,)
+                    )
+
     def test_draft_warmup_keeps_target_dp_gather_width(self):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.runtime_context import get_flags
@@ -2254,6 +2277,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
         global_top_k_logits = torch.zeros(1)
         global_top_k_token_ids = torch.zeros(1, dtype=torch.int32)
+        input_token_logprobs = torch.zeros(4)
         kv0 = torch.ones(1)
         kv1 = torch.ones(1) * 2
         pool = SimpleNamespace(
@@ -2289,6 +2313,7 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
                     next_token_logits=None,
                     next_token_global_top_k_logits=global_top_k_logits,
                     next_token_global_top_k_token_ids=global_top_k_token_ids,
+                    input_token_logprobs=input_token_logprobs,
                 ),
                 forward_batch.attn_backend,
                 forward_batch.token_to_kv_pool,
@@ -2296,7 +2321,14 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         sync.assert_called_once()
         tensors, kwargs = sync.call_args
         self.assertEqual(
-            tensors[0], [global_top_k_logits, global_top_k_token_ids, kv0, kv1]
+            tensors[0],
+            [
+                global_top_k_logits,
+                global_top_k_token_ids,
+                input_token_logprobs,
+                kv0,
+                kv1,
+            ],
         )
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))

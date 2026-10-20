@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -30,15 +30,22 @@ class TestTpuWarmupCompleteStance(unittest.TestCase):
         self.addCleanup(override.restore)
 
     def _warmup_complete(self, *, allow_spec_recompile):
+        lifecycle = Mock()
         with (
             envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(allow_spec_recompile),
             patch(f"{_TPU_MOD}.torch.compiler.set_stance") as set_stance,
-            patch(f"{_CHECKER_MOD}.maybe_enable_site_tracing") as site_tracing,
+            patch(f"{_TPU_MOD}.maybe_enable_site_tracing") as site_tracing,
             patch(f"{_TPU_MOD}.arm_cache_guard") as native_guard,
+            patch(f"{_TPU_MOD}.snapshot_recompilation_baseline") as snapshot,
         ):
+            lifecycle.attach_mock(snapshot, "snapshot")
+            lifecycle.attach_mock(native_guard, "native_guard")
+            lifecycle.attach_mock(site_tracing, "site_tracing")
             TpuSRTPlatform().on_warmup_complete()
-        native_guard.assert_called_once_with()
-        site_tracing.assert_called_once_with()
+        self.assertEqual(
+            lifecycle.mock_calls,
+            [call.snapshot(), call.native_guard(), call.site_tracing()],
+        )
         return set_stance
 
     def test_spec_freezes_recompiles_by_default(self):

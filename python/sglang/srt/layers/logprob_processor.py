@@ -34,6 +34,23 @@ class LogprobStage(Enum):
 
 
 @dataclasses.dataclass
+class BatchedTopLogprobs:
+    """Device output kept batched until the result-copy stream submits D2H."""
+
+    values: torch.Tensor
+    indices: torch.Tensor
+    lengths: List[int]
+
+    def copy_to_cpu(self, copy_fn) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        values = copy_fn(self.values)
+        indices = copy_fn(self.indices)
+        return (
+            [values[row, :k] for row, k in enumerate(self.lengths)],
+            [indices[row, :k] for row, k in enumerate(self.lengths)],
+        )
+
+
+@dataclasses.dataclass
 class LogprobResult:
     """Logprob fields produced by Input/OutputLogprobProcessor.
 
@@ -45,6 +62,7 @@ class LogprobResult:
     token_logprobs: Optional[torch.Tensor] = None
     top_logprobs_val: Optional[List] = None
     top_logprobs_idx: Optional[List] = None
+    batched_top_logprobs: Optional[BatchedTopLogprobs] = None
     token_ids_logprobs_val: Optional[List] = None
     token_ids_logprobs_idx: Optional[List] = None
     input_copy_done: Optional[torch.cuda.Event] = None
@@ -61,6 +79,8 @@ class LogprobResult:
         logits_output.input_logprobs_copy_done = self.input_copy_done
 
     def write_output_to(self, logits_output: LogitsProcessorOutput) -> None:
+        if self.batched_top_logprobs is not None:
+            logits_output.batched_output_top_logprobs = self.batched_top_logprobs
         if self.token_logprobs is not None:
             logits_output.next_token_logprobs = self.token_logprobs
         if self.top_logprobs_val is not None:
@@ -915,6 +935,16 @@ class OutputLogprobProcessor:
     logit processors, NaN sanitizing) are injected via ``preprocess_fn``.
     """
 
+    def _compute_top_logprobs(
+        self,
+        result: LogprobResult,
+        logprobs: torch.Tensor,
+        top_logprobs_nums: List[int],
+    ) -> None:
+        result.top_logprobs_val, result.top_logprobs_idx = get_top_logprobs(
+            logprobs, top_logprobs_nums, no_copy_to_cpu=True
+        )
+
     def compute_logprobs(
         self,
         logprobs: torch.Tensor,
@@ -927,10 +957,7 @@ class OutputLogprobProcessor:
 
         result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            self._compute_top_logprobs(result, logprobs, top_logprobs_nums)
 
         if any(x is not None for x in token_ids_logprobs):
             (
@@ -983,10 +1010,7 @@ class OutputLogprobProcessor:
         result = LogprobResult()
         # Handle top logprobs if requested
         if needs_top_logprobs:
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            self._compute_top_logprobs(result, logprobs, top_logprobs_nums)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
