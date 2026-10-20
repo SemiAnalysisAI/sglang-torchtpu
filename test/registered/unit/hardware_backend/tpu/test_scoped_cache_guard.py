@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+import subprocess
+import sys
 import unittest
 import weakref
 from threading import get_ident
@@ -9,10 +12,45 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.compilation import scoped_cache_guard
 from sglang_tpu.envs import envs
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestScopedCacheGuard(unittest.TestCase):
+    def test_guard_first_import_can_discover_the_tpu_platform(self):
+        # A fresh interpreter reproduces padding -> guard -> SGLang discovery.
+        # Stub only hardware discovery so this import check also runs on CPU CI.
+        program = """
+import importlib.metadata
+from types import SimpleNamespace
+
+original_entry_points = importlib.metadata.entry_points
+def entry_points(*args, **kwargs):
+    if kwargs.get("group") == "sglang.srt.platforms":
+        return [SimpleNamespace(
+            name="tpu",
+            load=lambda: lambda: "sglang_tpu.tpu_platform.TpuSRTPlatform",
+        )]
+    return original_entry_points(*args, **kwargs)
+importlib.metadata.entry_points = entry_points
+
+from sglang_tpu.compilation.scoped_cache_guard import allow_tpu_recompilation
+from sglang_tpu.tpu_platform import arm_cache_guard
+arm_cache_guard()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            env={
+                **os.environ,
+                "SGLANG_PLATFORM": "tpu",
+                "SGLANG_TPU_ERROR_ON_RECOMPILES": "0",
+                "JAX_PLATFORMS": "cpu",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def setUp(self):
         self.enterContext(envs.SGLANG_TPU_ERROR_ON_RECOMPILES.override(False))
         self.native = SimpleNamespace(

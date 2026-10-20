@@ -24,7 +24,6 @@ from sglang_tpu.compilation.recompilation_checker import (
     maybe_enable_site_tracing,
     snapshot_recompilation_baseline,
 )
-from sglang_tpu.compilation.scoped_cache_guard import arm_cache_guard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -33,6 +32,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # Platform discovery runs before worker bootstrap configures torch_tpu.
+# Padding can import the guard first, which itself triggers platform discovery.
+arm_cache_guard = LazyImport(
+    "sglang_tpu.compilation.scoped_cache_guard", "arm_cache_guard"
+)
 rank_slice = LazyImport("sglang_tpu.rank_local", "rank_slice")
 traced_rank = LazyImport("sglang_tpu.rank_local", "traced_rank")
 warmup_sampling = LazyImport("sglang_tpu.serving_warmup", "warmup_sampling")
