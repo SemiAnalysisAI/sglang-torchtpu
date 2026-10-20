@@ -145,10 +145,12 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
     kv_packed: bool = False
-    # fp8 pools at SGLANG_TPU_KV_HEAD_DIM_ALIGN=64 (two heads unpacked, pool_padded_head_dim ==
-    # head_dim): each 32-bit lane word holds [K_h0, V_h0, K_h1, V_h1]; the chunk unpack rebuilds
-    # the packed bf16 tile, so attention runs the packed path.
-    kv_fp8: bool = False
+    # SEQ_ALONG_LANE pools (TpuSeqAlongLaneKVPool, batched RPA, page >= 256): a page block is
+    # [2 * kv_heads, head_dim // pk, pk, page_size] with slots [K_h0, V_h0, K_h1, ...], tokens on
+    # lanes and pk consecutive head dims per 32-bit word. Attention runs the packed path on K/V
+    # transposed to [kv_dim, tokens]; kv_write_call merges new token columns into their pages.
+    kv_sal: bool = False
+    kv_sal_fp8: bool = False
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
@@ -184,19 +186,33 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def pool_kv_heads(self):
-        return 1 if (self.kv_packed or self.kv_fp8) else self.kv_heads
+        return 1 if (self.kv_packed or self.kv_sal) else self.kv_heads
 
     @property
     def packed_attn(self):
         # attention sees one row per token, every local head side by side
-        return self.kv_packed or self.kv_fp8
+        return self.kv_packed or self.kv_sal
 
     @property
-    def pool_row(self):
-        # one token's pool row (heads, K/V slots, lanes) and its dtype
-        if self.kv_fp8:
-            return (1, 2 * self.kv_heads, self.head_dim), jnp.float8_e4m3fn
-        return (self.pool_kv_heads, 2, self.pool_padded_head_dim), jnp.bfloat16
+    def kv_dtype(self):
+        return jnp.float8_e4m3fn if self.kv_sal_fp8 else jnp.bfloat16
+
+    @property
+    def sal_pack(self):
+        # head dims per 32-bit word of a SEQ_ALONG_LANE page block
+        return 4 if self.kv_sal_fp8 else 2
+
+    @property
+    def sal_words(self):
+        # 32-bit word rows of one SEQ_ALONG_LANE page block: (slot, word) pairs
+        return 2 * self.kv_heads * self.head_dim // self.sal_pack
+
+    @property
+    def kv_block(self):
+        # one page block (SEQ_ALONG_LANE) or one token's row (fused) of a layer's pool
+        if self.kv_sal:
+            return (2 * self.kv_heads, self.head_dim // self.sal_pack, self.sal_pack, self.page_size)
+        return (self.pool_kv_heads, 2, self.pool_padded_head_dim)
 
     @property
     def kv_ring(self):
@@ -226,10 +242,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             not self.kv_packed
             or self.kv_heads * self.head_dim == self.pool_padded_head_dim
         )
-        assert not self.kv_fp8 or (
+        assert not self.kv_sal or (
             not self.kv_packed
-            and self.kv_heads == 2
-            and self.pool_padded_head_dim == self.head_dim
+            and self.page_size % LANE == 0
+            and self.head_dim % (8 * self.sal_pack) == 0
         )
         return self
 
@@ -816,12 +832,16 @@ def scratch_plan(cfg: MKConfig):
         ("f_send", pltpu.VMEM((R, c.hidden_local // 2), jnp.uint32)),
         (
             "kv_chunk",
-            pltpu.VMEM((c.kv_ring, cpt, *c.pool_row[0]), c.pool_row[1]),
+            pltpu.VMEM((c.kv_ring, c.chunk_pages, *c.kv_block), c.kv_dtype)
+            if c.kv_sal
+            else pltpu.VMEM((c.kv_ring, cpt, *c.kv_block), jnp.bfloat16),
         ),
         ("kv_chunk_sems", pltpu.SemaphoreType.DMA((c.kv_ring, c.chunk_pages))),
         (
             "kv_row",
-            pltpu.VMEM((R, *c.pool_row[0]), c.pool_row[1]),
+            pltpu.VMEM((c.sal_words, R), jnp.uint32)
+            if c.kv_sal
+            else pltpu.VMEM((R, *c.kv_block), jnp.bfloat16),
         ),
         ("kv_row_sem", pltpu.SemaphoreType.DMA((1,))),
         ("uniq", pltpu.SMEM((R * K + 8,), jnp.int32)),
@@ -1065,26 +1085,32 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             qn = jnp.where(use_rope, _rope_roll(qn, hq, hd, cos_x, sin_x), qn)
             kn = jnp.where(use_rope, _rope_roll(kn, hkv, hd, cos_x, sin_x), kn)
             # the pool's bf16 rounding of K/V, as in the native path (K after norm+rope)
-            kv_dt = c.pool_row[1]
-            kb = kn.astype(kv_dt).astype(jnp.bfloat16)
-            vb = vv.astype(kv_dt).astype(jnp.bfloat16)
+            kb = kn.astype(c.kv_dtype).astype(jnp.bfloat16)
+            vb = vv.astype(c.kv_dtype).astype(jnp.bfloat16)
             # ---- this step's K/V rows go out to newkv (scattered into the pools by kv_write_call);
             # attention reads them from VMEM, the cache only for positions before them.
-            for r in range(R):
-                if c.kv_fp8:  # [K_h0, V_h0, K_h1, V_h1], one lane word per head-dim element
-                    S["kv_row"][r] = (
-                        jnp.concatenate(
-                            [
-                                x[r : r + 1, h * hd : (h + 1) * hd]
-                                for h in range(hkv)
-                                for x in (kb, vb)
-                            ],
-                            axis=0,
+            if c.kv_sal:  # [slot * words + word, row]: an identity matmul transposes exactly
+                eye = (
+                    jax.lax.broadcasted_iota(jnp.int32, (hd, hd), 0)
+                    == jax.lax.broadcasted_iota(jnp.int32, (hd, hd), 1)
+                ).astype(jnp.bfloat16)
+                S["kv_row"][...] = jnp.concatenate(
+                    [
+                        pltpu.bitcast(
+                            jax.lax.dot_general(
+                                eye,
+                                x[:, h * hd : (h + 1) * hd],
+                                (((1,), (1,)), ((), ())),
+                                preferred_element_type=jnp.float32,
+                            ).astype(c.kv_dtype),
+                            jnp.uint32,
                         )
-                        .reshape(1, 2 * hkv, hd)
-                        .astype(kv_dt)
-                    )
-                    continue
+                        for h in range(hkv)
+                        for x in (kb, vb)
+                    ],
+                    axis=0,
+                )
+            for r in range(0 if c.kv_sal else R):
                 if (
                     c.kv_packed
                 ):  # the projection row already holds the heads side by side
@@ -1172,6 +1198,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 pages.append(jnp.where(is_global, pf_ref[ent], psw_ref[ent]))
             return pages
 
+        def chunk_dst(slot, pi):
+            # SEQ_ALONG_LANE: a whole page block; fused: the page's token rows
+            if c.kv_sal:
+                return S["kv_chunk"].at[slot, pi]
+            return S["kv_chunk"].at[slot, pl.ds(pi * ps, ps)]
+
         def issue_range(l, j, ci0, slot0, n, is_global):
             """Chunks ``ci0 .. ci0+n`` of request j into ring slots ``slot0 ..``: ONE layer
             branch-tree walk whose leaf is a small runtime loop, so the 62
@@ -1183,7 +1215,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     for pi, page in enumerate(chunk_pages_of(j, ci0 + u, is_global)):
                         pltpu.make_async_copy(
                             ref.at[page],
-                            S["kv_chunk"].at[slot, pl.ds(pi * ps, ps)],
+                            chunk_dst(slot, pi),
                             S["kv_chunk_sems"].at[slot, pi],
                         ).start()
                     return carry
@@ -1196,7 +1228,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             for pi in range(c.chunk_pages):
                 pltpu.make_async_copy(
                     KV[0].at[0],
-                    S["kv_chunk"].at[slot, pl.ds(pi * ps, ps)],
+                    chunk_dst(slot, pi),
                     S["kv_chunk_sems"].at[slot, pi],
                 ).wait()
 
@@ -1264,7 +1296,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             coltok = col // ph
             kdim = c.kv_dim if c.packed_attn else hd
 
-            def online(carry, s_, v):
+            def online(carry, s_, v, v_t=False):
+                """``v_t``: v is [kv_dim, tokens] (SEQ_ALONG_LANE chunks), else [tokens, dim]."""
                 m, lsum, acc = carry
                 with _scope("softmax"):
                     m_new = jnp.maximum(m, jnp.max(s_, axis=1, keepdims=True))
@@ -1272,8 +1305,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     pexp = jnp.exp(s_ - m_new)
                     lsum = lsum * corr + jnp.sum(pexp, axis=1, keepdims=True)
                 with _scope("pv"):
-                    acc = acc[:, : v.shape[1]] * corr + jnp.dot(
-                        pexp.astype(jnp.bfloat16), v, preferred_element_type=jnp.float32
+                    acc = acc[:, : v.shape[0 if v_t else 1]] * corr + jax.lax.dot_general(
+                        pexp.astype(jnp.bfloat16),
+                        v,
+                        (((1,), (1 if v_t else 0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
                     )
                 return m_new, lsum, acc
 
@@ -1283,20 +1319,36 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 slot = i % KR
                 ci = first_ch + i
                 with _scope("kv_unpack"):
-                    u = (
-                        S["kv_chunk"]
-                        .at[slot]
-                        .bitcast(jnp.uint32)
-                        .reshape(cpt * ph, pd)[...]
-                    )  # rows (token, h)
-                    if c.kv_fp8:  # byte j of a token's lane word is slot j of [K0, V0, K1, V1]
-                        def slot_bf16(j):
-                            b = (u >> (8 * j)).astype(jnp.uint8)
-                            return pltpu.bitcast(b, jnp.float8_e4m3fn).astype(jnp.bfloat16)
-
-                        kk = jnp.concatenate([slot_bf16(2 * h) for h in range(hkv)], axis=1)
-                        vk = jnp.concatenate([slot_bf16(2 * h + 1) for h in range(hkv)], axis=1)
+                    if c.kv_sal:  # page block -> rows slot * hd + dim, tokens on lanes
+                        kts, vts = [], []
+                        for pi in range(c.chunk_pages):
+                            w = (
+                                S["kv_chunk"]
+                                .at[slot, pi]
+                                .bitcast(jnp.uint32)
+                                .reshape(c.sal_words, ps)[...]
+                            )
+                            x = pltpu.bitcast(w, c.kv_dtype).astype(jnp.bfloat16)
+                            kts.append(
+                                jnp.concatenate(
+                                    [x[2 * h * hd : (2 * h + 1) * hd] for h in range(hkv)], axis=0
+                                )
+                            )
+                            vts.append(
+                                jnp.concatenate(
+                                    [x[(2 * h + 1) * hd : (2 * h + 2) * hd] for h in range(hkv)],
+                                    axis=0,
+                                )
+                            )
+                        kk = jnp.concatenate(kts, axis=1)  # [kv_dim, cpt]
+                        vk = jnp.concatenate(vts, axis=1)
                     else:
+                        u = (
+                            S["kv_chunk"]
+                            .at[slot]
+                            .bitcast(jnp.uint32)
+                            .reshape(cpt * ph, pd)[...]
+                        )  # rows (token, h)
                         kk = pltpu.bitcast((u & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
                         vk = pltpu.bitcast((u >> 16).astype(jnp.uint16), jnp.bfloat16)
                 live = None if c.packed_attn else colhead == rowhead
@@ -1311,8 +1363,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     s_ = (
                         jax.lax.dot_general(
                             q2,
-                            kk[:, :kdim],
-                            (((1,), (1,)), ((), ())),
+                            kk if c.kv_sal else kk[:, :kdim],
+                            (((1,), (0 if c.kv_sal else 1,)), ((), ())),
                             preferred_element_type=jnp.float32,
                         )
                         * c.attn_scale
@@ -1353,7 +1405,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 s_b, v_b = chunk_scores(
                     i1 if clean else jnp.minimum(i1, n_ch - 1), valid_b, clean
                 )
-                return online(carry2[0], s_a, v_a), online(carry2[1], s_b, v_b)
+                return (
+                    online(carry2[0], s_a, v_a, v_t=c.kv_sal),
+                    online(carry2[1], s_b, v_b, v_t=c.kv_sal),
+                )
 
             # Global-layer chunks before a request's last one lie wholly in the past of every
             # verify row: chunks [0, n_clean) need only the cross-head mask.
@@ -1997,7 +2052,7 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
         out_shape = [
             jax.ShapeDtypeStruct((cfg.rows, cfg.hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((cfg.rows, aux_w), jnp.bfloat16),
-            jax.ShapeDtypeStruct(newkv_shape(cfg), cfg.pool_row[1]),
+            jax.ShapeDtypeStruct(newkv_shape(cfg), jnp.uint32 if cfg.kv_sal else jnp.bfloat16),
         ]
         # The pools are read-only here. With any remote DMA in the kernel XLA treats the call
         # as a collective and copies every aliased operand: the in-place write is kv_write_call.
@@ -2021,12 +2076,85 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
 
 
 def newkv_shape(cfg: MKConfig):
-    return (cfg.n_layers, cfg.rows, *cfg.pool_row[0])
+    if cfg.kv_sal:  # new token columns of a page block, [slot * words + word, row]
+        return (cfg.n_layers, cfg.sal_words, cfg.rows)
+    return (cfg.n_layers, cfg.rows, *cfg.kv_block)
+
+
+def _kv_write_sal_call(cfg: MKConfig):
+    """SEQ_ALONG_LANE pools: a token is one lane column of its page block, so each live request
+    read-modify-writes the (at most two) pages its consecutive rows land in, per layer."""
+    L, R, ps, q = cfg.n_layers, cfg.rows, cfg.page_size, cfg.rows_per_req
+    gl = set(cfg.global_layers)
+    nw = cfg.sal_words
+
+    def kernel(meta_ref, pos_ref, pf_ref, psw_ref, newkv, *rest):
+        kv_out = rest[L : 2 * L]
+        blk, new_v, sems = rest[2 * L], rest[2 * L + 1], rest[2 * L + 2]
+        n_live = meta_ref[0]
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, ps), 1)
+        for j in range(cfg.n_req):
+
+            @pl.when(j * q < n_live)
+            def _(j=j):
+                first, last = pos_ref[j * q] // ps, pos_ref[j * q + q - 1] // ps
+                for l in range(L):
+                    tab = pf_ref if l in gl else psw_ref
+                    cp = pltpu.make_async_copy(newkv.at[l], new_v, sems.at[2])
+                    cp.start()
+                    cp.wait()
+                    for side in range(2):
+                        pg_no = first if side == 0 else last
+
+                        @pl.when((side == 0) | (last != first))
+                        def _(pg_no=pg_no):
+                            ent = jnp.minimum(
+                                j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1
+                            )
+                            page = tab[ent]
+                            rd = pltpu.make_async_copy(kv_out[l].at[page], blk, sems.at[0])
+                            rd.start()
+                            rd.wait()
+                            words = blk.bitcast(jnp.uint32).reshape(nw, ps)
+                            w = words[...]
+                            nv = new_v[...]
+                            for t in range(q):
+                                r = j * q + t
+                                p = pos_ref[r]
+                                hit = (lane == p % ps) & (p // ps == pg_no) & (r < n_live)
+                                w = jnp.where(hit, nv[:, r : r + 1], w)
+                            words[...] = w
+                            wr = pltpu.make_async_copy(blk, kv_out[l].at[page], sems.at[1])
+                            wr.start()
+                            wr.wait()
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    def call(meta, pos, pages_full, pages_swa, newkv, *kv):
+        return pl.pallas_call(
+            kernel,
+            out_shape=[jax.ShapeDtypeStruct(k.shape, k.dtype) for k in kv],
+            in_specs=[smem] * 4 + [hbm] * (1 + L),
+            out_specs=[hbm] * L,
+            scratch_shapes=[
+                pltpu.VMEM(cfg.kv_block, cfg.kv_dtype),
+                pltpu.VMEM((nw, R), jnp.uint32),
+                pltpu.SemaphoreType.DMA((3,)),
+            ],
+            input_output_aliases={5 + i: i for i in range(L)},
+            compiler_params=pltpu.CompilerParams(),
+            name=f"muse_kv_write_sal_r{R}",
+        )(meta, pos, pages_full, pages_swa, newkv, *kv)
+
+    return call
 
 
 def kv_write_call(cfg: MKConfig):
     """``f(meta, pos, pages_full, pages_swa, newkv, *kv) -> kv``: scatter this step's K/V rows
     into every layer's pool in place (no remote DMA, so XLA aliases the pools without a copy)."""
+    if cfg.kv_sal:
+        return _kv_write_sal_call(cfg)
     L, R, ps, q = cfg.n_layers, cfg.rows, cfg.page_size, cfg.rows_per_req
     gl = set(cfg.global_layers)
 

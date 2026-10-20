@@ -22,7 +22,11 @@ from jax.sharding import PartitionSpec as P
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang_tpu.envs import envs as tpu_envs
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, kv_pack_heads
+from sglang_tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    kv_pack_heads,
+)
 from sglang_tpu.muse_megakernel import kernel as K
 
 logger = logging.getLogger(__name__)
@@ -300,6 +304,8 @@ class MuseMegakernel(torch.nn.Module):
         n_page_entries: int,
         page_size: int,
         capture: tuple,
+        kv_sal: bool = False,
+        kv_sal_fp8: bool = False,
     ) -> K.MKConfig:
         g = self.geo
         cfg = K.MKConfig(
@@ -332,8 +338,11 @@ class MuseMegakernel(torch.nn.Module):
             n_req=n_req,
             capture_layers=capture,
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
-            chunk_pages=self.chunk_pages,
-            kv_packed=self.kv_packed,
+            # SEQ_ALONG_LANE pages are >= 256 tokens: keep 512-token chunks
+            chunk_pages=max(1, 512 // page_size) if kv_sal else self.chunk_pages,
+            kv_packed=self.kv_packed and not kv_sal,
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv_sal_fp8,
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound
             y_early=tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16,
@@ -361,6 +370,11 @@ class MuseMegakernel(torch.nn.Module):
             else (pool,)
         )
         for p in pools:
+            if type(p) is TpuSeqAlongLaneKVPool and p.store_dtype in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ):
+                continue
             if (
                 type(p) is not TpuFusedMHATokenToKVPool
                 or p.store_dtype != torch.bfloat16
@@ -471,13 +485,17 @@ def _register_op() -> None:
         from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
         mk = _INSTANCE[0]
+        # SEQ_ALONG_LANE blocks are [pages, 2 * kv_heads, words, pk, page_size]
+        kv_sal = kv[0].shape[1] == 2 * mk.geo.kv_heads and kv[0].shape[-1] >= 128
         cfg = mk.config(
             rows=emb.shape[0],
             q=rows_per_req,
             n_req=n_req,
             n_page_entries=pf.shape[0],
-            page_size=kv[0].shape[1],
+            page_size=kv[0].shape[-1] if kv_sal else kv[0].shape[1],
             capture=tuple(capture),
+            kv_sal=kv_sal,
+            kv_sal_fp8=kv[0].dtype == torch.float8_e4m3fn,
         )
         callable_ = mk.callable_for(cfg)
         with tpu_info_for_cpu_export():
