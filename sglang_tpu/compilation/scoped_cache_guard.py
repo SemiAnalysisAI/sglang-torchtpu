@@ -11,8 +11,8 @@ from typing import ParamSpec, TypeVar
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.utils import LazyImport
+from sglang_tpu.envs import envs
 
 logger = logging.getLogger(__name__)
 # Platform discovery imports this module before the TPU worker sets its rank.

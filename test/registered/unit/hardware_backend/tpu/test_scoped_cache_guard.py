@@ -5,9 +5,9 @@ from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.compilation import scoped_cache_guard
+from sglang_tpu.envs import envs
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
