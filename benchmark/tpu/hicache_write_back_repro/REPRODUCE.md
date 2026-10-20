@@ -276,7 +276,7 @@ your build can differ. Full tables, including HiCache counters, are in [results.
 | B | 4,797 | 73.1 | 69, 79, 70, 78, 70, 72 | 1,880 |
 | C | 2,235 / 2,217 | 10.7 / 10.6 | 9-15 in every bucket | 1,697 / 1,674 |
 | D | 5,497 / 5,112 | 71.2 / 72.9 | 70, 76, 67, 75, 70, 68 (first run) | 732 / 600 |
-| E | 4,970 | 72.4 | 67, 77, 71, 75, 73, 72 | 853 |
+| E | 4,970 / 5,134 | 72.4 / 72.6 | 67, 77, 71, 75, 73, 72 (first run) | 853 / 767 |
 
 Counts as reproduced when all of these hold:
 

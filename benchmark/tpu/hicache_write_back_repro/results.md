@@ -20,6 +20,7 @@ write_back arms. Table from `compare.py`.
 | D write_back, window on, fix | 5,497 | 1.527 | 71.2 | 3.0 / 68.2 / 28.8 | 335 | 29.1 / 41.9 / 56.7 | 732 |
 | D2 (repeat of D) | 5,112 | 1.420 | 72.9 | 2.9 / 70.0 / 27.1 | 282 | 31.7 / 45.3 / 61.3 | 600 |
 | E write_back, window on, #1586 + #1612 | 4,970 | 1.381 | 72.4 | 3.1 / 69.2 / 27.6 | 364 | 29.8 / 47.3 / 59.5 | 853 |
+| E2 (repeat of E) | 5,134 | 1.426 | 72.6 | 3.2 / 69.4 / 27.4 | 347 | 29.3 / 43.6 / 59.5 | 767 |
 
 Hit % per 10 minutes:
 
@@ -48,10 +49,9 @@ hour and finished within 44 s. 97% of replies ended at `max_tokens`.
   against 120M. It serves 53% fewer requests than B.
 - **The fix (D) restores B's hit rate** (71.2% and 72.9% against 73.1%) and keeps the window's
   benefit: eviction time falls from 1,880 s to 600-732 s, and D serves 7-15% more requests than B.
-- **E (#1586 + #1612) also restores B's hit rate** (72.4%, prefill-only 71.8%). Its requests (4,970) are
-  3% below D's lower run and its eviction time is higher (853 s against 600-732 s), while prefill-only
-  eviction time is lower (1,186 s against 1,839 s for PD). One E run only; whether the difference is
-  real is still being measured.
+- **E (#1586 + #1612) also restores B's hit rate** (72.4% and 72.6% in two runs, prefill-only 71.8%).
+  Its requests (4,970 and 5,134) overlap D's 5,112-5,497, and its eviction time is 853 and 767 s. Without
+  #1612's SWA share, requests are the same (5,130) but eviction time rises to 1,199 s.
 - The repeats agree: C and C2 within 1% on requests, D and D2 within about 7-8%.
 - write_through (A) and write_back without the window (B) are close on this load: B has a higher hit
   rate and serves 4% fewer requests.
