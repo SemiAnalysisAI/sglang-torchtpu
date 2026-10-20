@@ -19,6 +19,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.platforms.device_mixin import PlatformEnum
+from sglang.srt.plugins.oot_classes import clear_oot_replacements
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +83,12 @@ class TestTpuPlatformIdentity(CustomTestCase):
 class TestTpuPlatformInitialization(CustomTestCase):
     def setUp(self):
         self.platform = TpuSRTPlatform()
+        # init_backend registers class replacements process-wide, and patching
+        # sys.modules drops the plugin modules a test first imports. A later
+        # test's fresh import then defines new classes, which would collide with
+        # the registered ones, so each test starts and ends with none.
+        clear_oot_replacements()
+        self.addCleanup(clear_oot_replacements)
 
     def test_rejects_backend_initialization_without_worker_world_size(self):
         with (
