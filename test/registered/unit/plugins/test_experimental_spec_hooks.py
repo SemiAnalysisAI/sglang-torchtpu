@@ -464,14 +464,19 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 self.assertTrue(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch, "core"])
 
-    def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
+    def test_kimi_spec_defaults_yield_only_to_experimental_block_drafts(self):
+        """The experimental worker serves DSpark and DFlash block drafts on the
+        KDA verify path; everything else keeps core's refusal."""
+
         def original(server_args):
             raise ValueError("core refused")
 
         for algo, experimental, passes in (
             ("DSPARK", True, True),
             ("DSPARK", False, False),
-            ("DFLASH", True, False),
+            ("DFLASH", True, True),
+            ("DFLASH", False, False),
+            ("EAGLE", True, False),
         ):
             args = SimpleNamespace(speculative_algorithm=algo)
             with (
