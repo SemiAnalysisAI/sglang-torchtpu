@@ -169,27 +169,40 @@ def tp_sum(c: DecodeConfig, partials):
 
 
 def attention(c: DecodeConfig, q, kn, vn, kh, vh, pos, sinks, sliding):
-    """q [B, NQ, D] f32 (unscaled); kn/vn [B, NKV, D] dequantized new K/V; kh/vh [B, T, NKV, D]
-    dequantized history (slot t holds position t); attends history [lo, pos) plus the new token."""
-    B, T = kh.shape[0], kh.shape[1]
+    """q [B*Q, NQ, D] f32 (unscaled); kn/vn [B*Q, NKV, D] dequantized new K/V;
+    kh/vh [B, T, NKV, D] dequantized history (slot t holds position t);
+    query q in 0..Q-1 (at position pos + q) attends history [lo_q, pos) plus causal new tokens 0..q."""
+    B, T, Q = kh.shape[0], kh.shape[1], c.Q
     G = c.NQ // c.NKV
-    qb = (q * c.sm_scale).astype(BF16)
-    k_all = jnp.concatenate([kh, kn[:, None]], 1)  # [B, T+1, NKV, D]
-    v_all = jnp.concatenate([vh, vn[:, None]], 1)
-    t = jnp.arange(T + 1)[None, :]
-    p_ = pos[:, None]
-    lo = jnp.maximum(p_ - (c.window - 1), 0) if sliding else jnp.zeros_like(p_)
-    valid = ((t >= lo) & (t < p_)) | (t == T)  # [B, T+1]
-    kr = jnp.repeat(k_all, G, axis=2).astype(BF16)  # [B, T+1, NQ, D]
+    qb = (q.reshape(B, Q, c.NQ, c.D) * c.sm_scale).astype(BF16)
+    kn_b = kn.reshape(B, Q, c.NKV, c.D)
+    vn_b = vn.reshape(B, Q, c.NKV, c.D)
+    k_all = jnp.concatenate([kh, kn_b], 1)  # [B, T+Q, NKV, D]
+    v_all = jnp.concatenate([vh, vn_b], 1)
+    t_hist = jnp.arange(T)[None, None, :]
+    q_idx = jnp.arange(Q, dtype=pos.dtype)
+    p_q = pos[:, None] + q_idx[None, :]  # [B, Q]
+    lo = (
+        jnp.maximum(p_q[:, :, None] - (c.window - 1), 0)
+        if sliding
+        else jnp.zeros((B, Q, 1), dtype=pos.dtype)
+    )
+    valid_hist = (t_hist >= lo) & (t_hist < pos[:, None, None])  # [B, Q, T]
+    dq = q_idx[:, None] - q_idx[None, :]  # [Q, Q]
+    valid_new = (dq >= 0) & (dq < c.window) if sliding else (dq >= 0)
+    valid = jnp.concatenate(
+        [valid_hist, jnp.broadcast_to(valid_new[None, :, :], (B, Q, Q))], axis=2
+    )  # [B, Q, T+Q]
+    kr = jnp.repeat(k_all, G, axis=2).astype(BF16)  # [B, T+Q, NQ, D]
     vr = jnp.repeat(v_all, G, axis=2).astype(BF16)
-    s = jnp.einsum("bhd,bthd->bht", qb, kr, preferred_element_type=F32)
-    s = jnp.where(valid[:, None, :], s, -jnp.inf)
-    sk = sinks.astype(F32)[None, :, None]
+    s = jnp.einsum("bqhd,bthd->bqht", qb, kr, preferred_element_type=F32)
+    s = jnp.where(valid[:, :, None, :], s, -jnp.inf)
+    sk = sinks.astype(F32)[None, None, :, None]
     m = jnp.maximum(jnp.max(s, -1, keepdims=True), sk)
     p = jnp.exp(s - m)
     l = jnp.sum(p, -1, keepdims=True) + jnp.exp(sk - m)
-    o = jnp.einsum("bht,bthd->bhd", p.astype(BF16), vr, preferred_element_type=F32)
-    return o / l  # [B, NQ, D] f32
+    o = jnp.einsum("bqht,bthd->bqhd", p.astype(BF16), vr, preferred_element_type=F32)
+    return (o / l).reshape(B * Q, c.NQ, c.D)  # [B*Q, NQ, D] f32
 
 
 def moe_partials(c: DecodeConfig, x2, ids, wts, w: LayerWeights):
@@ -285,15 +298,15 @@ def layer(
     sliding: bool,
     margins=None,
 ):
-    """res [B, H] bf16; kh/vh [B, T, NKV, D] in the KV dtype. Returns res, (k_new, v_new)."""
-    B = res.shape[0]
+    """res [B*Q, H] bf16; kh/vh [B, T, NKV, D] in the KV dtype. Returns res, (k_new, v_new)."""
+    BQ = res.shape[0]
     NQ, NKV, D, R = c.NQ, c.NKV, c.D, c.R
     qw, kw = NQ * D, NKV * D
     a = rmsnorm(res, w.ln1, c.eps)
     qkv = mm(a, w.wqkv) + w.bqkv.astype(F32)
-    q = rope(qkv[:, :qw].reshape(B, NQ, D), cos, sin)
-    k = rope(qkv[:, qw : qw + kw].reshape(B, NKV, D), cos, sin)
-    v = qkv[:, qw + kw :].reshape(B, NKV, D)
+    q = rope(qkv[:, :qw].reshape(BQ, NQ, D), cos, sin)
+    k = rope(qkv[:, qw : qw + kw].reshape(BQ, NKV, D), cos, sin)
+    v = qkv[:, qw + kw :].reshape(BQ, NKV, D)
     kq, vq = k.astype(kv_jdtype(c)), v.astype(kv_jdtype(c))
     o = attention(
         c,
@@ -306,7 +319,7 @@ def layer(
         w.sinks,
         sliding,
     )
-    o = o.reshape(B, qw).astype(BF16)
+    o = o.reshape(BQ, qw).astype(BF16)
     ql = qw // R
     parts = [
         mm(o[:, r * ql : (r + 1) * ql], w.wo[r * ql : (r + 1) * ql]) for r in range(R)
@@ -321,18 +334,30 @@ def layer(
 def step(
     c: DecodeConfig, x, pos, k_hist, v_hist, weights: list[LayerWeights], margins=None
 ):
-    """x [B, H] bf16 (embedded token); pos [B]; k_hist/v_hist [L, B, T, NKV, D] (KV dtype).
+    """x [B*Q, H] bf16 (embedded tokens); pos [B]; k_hist/v_hist [L, B, T, NKV, D] (KV dtype).
 
-    Returns hidden [B, H] bf16 before the final norm, and per-layer new K/V [L, B, NKV, D].
-    `margins`: optional list that receives each layer's top-k routing margin [B].
+    Returns hidden [B*Q, H] bf16 before the final norm, and per-layer new K/V [L, B*Q, NKV, D]
+    (plus aux [len(c.capture_layers), B*Q, H] bf16 if `c.capture_layers` is non-empty).
+    `margins`: optional list that receives each layer's top-k routing margin [B*Q].
     """
-    cos, sin = yarn_tables(c, pos)
+    pos_tok = (
+        pos
+        if c.Q == 1
+        else (pos[:, None] + jnp.arange(c.Q, dtype=pos.dtype)[None, :]).reshape(-1)
+    )
+    cos, sin = yarn_tables(c, pos_tok)
     res = x
     kn, vn = [], []
+    cap_map = {0: res} if 0 in c.capture_layers else {}
     for li, w in enumerate(weights):
         res, (k, v) = layer(
             c, res, cos, sin, pos, k_hist[li], v_hist[li], w, c.sliding[li], margins
         )
         kn.append(k)
         vn.append(v)
+        if (li + 1) in c.capture_layers:
+            cap_map[li + 1] = res
+    if c.capture_layers:
+        aux = jnp.stack([cap_map[b] for b in c.capture_layers])
+        return res, jnp.stack(kn), jnp.stack(vn), aux
     return res, jnp.stack(kn), jnp.stack(vn)

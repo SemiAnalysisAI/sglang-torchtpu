@@ -562,6 +562,75 @@ class TestDecodeMapping(CustomTestCase):
         self.assertEqual(txt.count("tpu_custom_call"), 1)
         self.assertNotIn("has_side_effect = true", txt)
 
+    def test_dcp_step_lowering(self):
+        mesh = Mesh(np.array(jax.devices("cpu")[:8]), ("tp",))
+        sds = jax.ShapeDtypeStruct
+        tmap = {
+            torch.bfloat16: jnp.bfloat16,
+            torch.float32: jnp.float32,
+            torch.float8_e4m3fn: jnp.float8_e4m3fn,
+        }
+        for dcp_size in (2, 4):
+            c = A.trace_config(
+                dataclasses.replace(
+                    _cfg(B=2, dcp_size=dcp_size, dcp_swa=True), w_dtype="fp8"
+                ),
+                B=2,
+                pps=4,
+                kv_dtype=jnp.float8_e4m3fn,
+                nb_swa=24,
+                nb_full=24,
+                page=256,
+            )
+            ws = [sds(sh, tmap[dt]) for sh, dt in W.per_rank_specs(c).values()]
+            pools = [
+                sds((24, 256, c.kv_groups, 4, 128), jnp.float8_e4m3fn)
+                for _ in range(c.L)
+            ]
+            args = (
+                [
+                    sds((2, c.H), jnp.bfloat16),
+                    sds((2,), jnp.int32),
+                    sds((8,), jnp.int32),
+                    sds((8,), jnp.int32),
+                    sds((1024, 64), jnp.bfloat16),
+                    sds((1,), jnp.int32),
+                ]
+                + ws
+                + pools
+            )
+
+            def per_rank(x, kl, pi, spi, cs, rank, *rest, c=c, n_ws=len(ws)):
+                return A.per_rank_step(
+                    c,
+                    rank,
+                    x,
+                    kl,
+                    pi,
+                    spi,
+                    cs,
+                    list(rest[:n_ws]),
+                    list(rest[n_ws:]),
+                )
+
+            f = jax.shard_map(
+                per_rank,
+                mesh=mesh,
+                in_specs=(P(),) * len(args),
+                out_specs=(P(),) * 4,
+                check_vma=False,
+            )
+            with _tpu7x_info():
+                txt = (
+                    jax.jit(f)
+                    .trace(*args)
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text()
+                )
+            self.assertEqual(txt.count("stablehlo.bitcast_convert"), 0)
+            self.assertEqual(txt.count("tpu_custom_call"), 1)
+            self.assertNotIn("has_side_effect = true", txt)
+
     def test_uint32_weights_and_noop_step_lowering(self):
         # serving stores code words as uint32: the step must not bitcast (copy) them; the
         # int32 fallback shows the 2 weight-sized bitcast_converts seen in the j-b120d683 run
@@ -712,9 +781,17 @@ def _rel(a, b):
 class TestEndToEndTinyStep(CustomTestCase):
     """Repacked weights + split pools + adapter glue through the megakernel (interpret)."""
 
-    def _run(self, moe_mode, kv_dtype, w_dtype="mxfp4"):
+    def _run(
+        self, moe_mode, kv_dtype, w_dtype="mxfp4", dcp_size=1, dcp_swa=False
+    ):
         B = 4
-        c0 = _cfg(B=B, moe_mode=moe_mode, kv_dtype=kv_dtype)
+        c0 = _cfg(
+            B=B,
+            moe_mode=moe_mode,
+            kv_dtype=kv_dtype,
+            dcp_size=dcp_size,
+            dcp_swa=dcp_swa,
+        )
         ck = _checkpoint(c0, seed=3)
         layers = _global_layers(c0, ck)
         ranks = [_build_rank(c0, ck, r) for r in range(c0.R)]
@@ -813,29 +890,57 @@ class TestEndToEndTinyStep(CustomTestCase):
         )
         rel = _rel(out[:3], ref[:3])
         print(
-            f"serving step {moe_mode}/{kv_dtype}/{c0.w_dtype}: megakernel(repacked, split pools) vs "
+            f"serving step {moe_mode}/{kv_dtype}/{c0.w_dtype} dcp={dcp_size}: megakernel(repacked, split pools) vs "
             f"reference rel {rel:.2e}"
         )
         self.assertLess(rel, 1e-2)
 
-        # KV writes: exactly the live rows' new-token slots changed, holding the reference K/V
-        # (up to the same rounding drift as the hidden state; fp8/bf16 roundings may flip)
+        # KV writes: exactly the live rows' new-token slots changed on owner ranks, holding the reference K/V
         for i, (old, new) in enumerate(zip(pools, new_pools)):
             layer = A.pool_layer_order(c.L)[i]
             pt = pt_swa if c.sliding[layer] else pt_full
+            dcp = c.dcp_size if (not c.sliding[layer] or c.dcp_swa) else 1
             old = np.asarray(old.astype(jnp.float32)).copy()
             new = np.asarray(new.astype(jnp.float32))
             got, want = [], []
             for b in range(3):
                 p = int(pos_ref[b])
-                pg, o = pt[b, p // c.page], p % c.page
-                for r in range(c.R):
-                    got += [new[r, pg, o, 0, 0, : c.D], new[r, pg, o, 0, 1, : c.D]]
-                    want += [
-                        np.asarray(kn_ref[layer, b, r].astype(jnp.float32)),
-                        np.asarray(vn_ref[layer, b, r].astype(jnp.float32)),
-                    ]
-                old[:, pg, o] = new[:, pg, o]
+                pg, o = pt[b, (p // dcp) // c.page], (p // dcp) % c.page
+                if dcp == 1:
+                    for r in range(c.R):
+                        got += [
+                            new[r, pg, o, 0, 0, : c.D],
+                            new[r, pg, o, 0, 1, : c.D],
+                        ]
+                        want += [
+                            np.asarray(kn_ref[layer, b, r].astype(jnp.float32)),
+                            np.asarray(vn_ref[layer, b, r].astype(jnp.float32)),
+                        ]
+                    old[:, pg, o] = new[:, pg, o]
+                else:
+                    owner_d = p % dcp
+                    for r in range(c.R):
+                        if r % dcp != owner_d:
+                            continue
+                        grp_base = (r // dcp) * dcp
+                        for h in range(dcp):
+                            kv_h = grp_base + h
+                            g_idx = h // 2
+                            k_slot = (h % 2) * 2
+                            v_slot = k_slot + 1
+                            got += [
+                                new[r, pg, o, g_idx, k_slot, : c.D],
+                                new[r, pg, o, g_idx, v_slot, : c.D],
+                            ]
+                            want += [
+                                np.asarray(
+                                    kn_ref[layer, b, kv_h].astype(jnp.float32)
+                                ),
+                                np.asarray(
+                                    vn_ref[layer, b, kv_h].astype(jnp.float32)
+                                ),
+                            ]
+                        old[r, pg, o] = new[r, pg, o]
             kv_rel = _rel(np.stack(got), np.stack(want))
             self.assertLess(kv_rel, 2e-2, f"pool {i} (layer {layer})")
             old[:, 0, 0] = new[:, 0, 0]  # the padding row writes the reserved page 0
@@ -848,6 +953,155 @@ class TestEndToEndTinyStep(CustomTestCase):
 
     def test_ep_moe_bf16_kv(self):
         self._run("ep", "bf16")
+
+    def test_dcp2_serving_step(self):
+        self._run("tp", "fp8", w_dtype="fp8", dcp_size=2, dcp_swa=True)
+
+    def test_dcp4_serving_step(self):
+        self._run("tp", "fp8", w_dtype="fp8", dcp_size=4, dcp_swa=True)
+
+    def test_target_verify_q4_with_aux_capture(self):
+        B, Q = 3, 4
+        BQ = B * Q
+        cap = (1, 2)
+        c0 = _cfg(B=B, Q=Q, moe_mode="tp", kv_dtype="fp8", capture_layers=cap)
+        ck = _checkpoint(c0, seed=3)
+        layers = _global_layers(c0, ck)
+        ranks = [_build_rank(c0, ck, r) for r in range(c0.R)]
+        conv = [W.mxfp4_to_fp8(c0, h) for h in ranks]
+        self.assertEqual(sum(b for _, b in conv), 0)
+        ranks = [h for h, _ in conv]
+        c0 = dataclasses.replace(c0, w_dtype="fp8")
+        names = MK.w_names(c0)
+        Wst = [jnp.stack([_to_jax(ranks[r][k]) for r in range(c0.R)]) for k in names]
+
+        rng = np.random.default_rng(5)
+        # Row 0: pos=130, Row 1: pos=62 (crosses page 0 -> page 1 inside Q=4),
+        # Row 2: bucket-padded row where RPA sets kv_lens = 0 + Q = Q
+        pos_live = np.array([130, 62, 0], np.int32)
+        kv_lens = pos_live + Q
+        kv_lens[2] = Q  # bucket padding in TARGET_VERIFY has seq_lens=0 => kv_lens=Q
+        pos_ref = np.where(kv_lens > Q, kv_lens - Q, 0)
+        T = c0.max_pages * c0.page
+        kvdt = REF.kv_jdtype(c0)
+        keys = jax.random.split(jax.random.PRNGKey(9), 3)
+        k_hist = (jax.random.normal(keys[0], (c0.L, B, T, c0.NKV, c0.D)) * 2.0).astype(
+            kvdt
+        )
+        v_hist = jax.random.normal(keys[1], (c0.L, B, T, c0.NKV, c0.D)).astype(kvdt)
+        pt_swa = (1 + rng.permutation(c0.nb_swa - 1)[: B * c0.max_pages]).reshape(
+            B, c0.max_pages
+        )
+        pt_full = (1 + rng.permutation(c0.nb_full - 1)[: B * c0.max_pages]).reshape(
+            B, c0.max_pages
+        )
+        garbage = [
+            rng.normal(size=sp.shape).astype(np.float32) for sp in MK.pool_specs(c0)
+        ]
+        swa, full = MK.build_pools(
+            c0, k_hist, v_hist, pos_ref, pt_swa, pt_full, base=garbage
+        )
+        pools = [swa[:, p] for p in range(c0.L // 2)] + [
+            full[:, p] for p in range(c0.L // 2)
+        ]
+
+        x = jax.random.normal(keys[2], (BQ, c0.H), jnp.float32).astype(jnp.bfloat16)
+        cos_t, sin_t = REF.yarn_tables(c0, jnp.arange(T))
+        cos_sin = jnp.concatenate([cos_t[:, : c0.D // 2], sin_t[:, : c0.D // 2]], -1)
+
+        c = A.trace_config(
+            c0,
+            B=B,
+            Q=Q,
+            pps=c0.max_pages,
+            kv_dtype=kvdt,
+            nb_swa=c0.nb_swa,
+            nb_full=c0.nb_full,
+            page=c0.page,
+            capture_layers=cap,
+        )
+        mesh = Mesh(np.array(jax.devices("cpu")[: c.R]), ("tp",))
+        nw, npl = len(names), len(pools)
+
+        def body(rank, x, kvl, pi, spi, cs, *rest):
+            w = [t[0] for t in rest[:nw]]
+            pl_ = [t[0] for t in rest[nw:]]
+            out, kvn, newpg, off, aux = A.per_rank_step(
+                c, rank[0], x, kvl, pi, spi, cs, w, pl_, interpret=True
+            )
+            new_pools = A.kv_write_layers(newpg, off, kvn, *pl_, interpret=True)
+            return (out, aux, *[p[None] for p in new_pools])
+
+        f = jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P("tp"), P(), P(), P(), P(), P()) + (P("tp"),) * (nw + npl),
+                out_specs=(P(), P()) + (P("tp"),) * npl,
+                check_vma=False,
+            )
+        )
+        res = f(
+            jnp.arange(c.R, dtype=jnp.int32),
+            x,
+            jnp.asarray(kv_lens),
+            jnp.asarray(pt_full.reshape(-1), jnp.int32),
+            jnp.asarray(pt_swa.reshape(-1), jnp.int32),
+            cos_sin,
+            *Wst,
+            *pools,
+        )
+        out, aux, new_pools = res[0], res[1], res[2:]
+        margins = []
+        ref, kn_ref, vn_ref, aux_ref = REF.step(
+            c0, x, jnp.asarray(pos_ref), k_hist, v_hist, layers, margins
+        )
+        live_rows = 2 * Q
+        tie = (
+            np.min(np.stack([np.asarray(m) for m in margins]), axis=0)[:live_rows]
+            < 5e-3
+        )
+        keep = ~tie
+        rel = _rel(out[:live_rows][keep], ref[:live_rows][keep])
+        aux_ref_cat = jnp.concatenate(
+            [aux_ref[i, :live_rows] for i in range(len(cap))], axis=-1
+        )
+        rel_aux = _rel(aux[:live_rows][keep], aux_ref_cat[keep])
+        print(
+            f"serving TARGET_VERIFY Q={Q} cap={cap}: out rel {rel:.2e}, aux rel {rel_aux:.2e} "
+            f"(near-tie rows skipped: {int(tie.sum())})"
+        )
+        self.assertLess(rel, 1e-2)
+        self.assertLess(rel_aux, 1e-2)
+
+        for i, (old, new) in enumerate(zip(pools, new_pools)):
+            layer = A.pool_layer_order(c.L)[i]
+            pt = pt_swa if c.sliding[layer] else pt_full
+            old = np.asarray(old.astype(jnp.float32)).copy()
+            new = np.asarray(new.astype(jnp.float32))
+            got, want = [], []
+            for b in range(2):
+                for q in range(Q):
+                    t_idx = b * Q + q
+                    p = int(pos_ref[b]) + q
+                    pg, o = pt[b, p // c.page], p % c.page
+                    if not tie[t_idx]:
+                        for r in range(c.R):
+                            got += [
+                                new[r, pg, o, 0, 0, : c.D],
+                                new[r, pg, o, 0, 1, : c.D],
+                            ]
+                            want += [
+                                np.asarray(kn_ref[layer, t_idx, r].astype(jnp.float32)),
+                                np.asarray(vn_ref[layer, t_idx, r].astype(jnp.float32)),
+                            ]
+                    old[:, pg, o] = new[:, pg, o]
+            kv_rel = _rel(np.stack(got), np.stack(want))
+            self.assertLess(kv_rel, 2e-2, f"pool {i} (layer {layer})")
+            old[:, 0, 0] = new[:, 0, 0]  # padding row tokens redirected to page 0, off 0
+            np.testing.assert_array_equal(
+                new, old, err_msg=f"pool {i} touched elsewhere"
+            )
 
 
 class TestRuntimeGating(CustomTestCase):
@@ -874,7 +1128,31 @@ class TestRuntimeGating(CustomTestCase):
     def test_static_disable_reasons(self):
         RT, NS, hf, par = self.RT, self.NS, self.hf, self.par
         self.assertIsNone(RT.static_disable_reason(hf, par, None))
-        self.assertIn("speculative", RT.static_disable_reason(hf, par, "EAGLE3"))
+        self.assertIsNone(RT.static_disable_reason(hf, par, "EAGLE3"))
+        self.assertIsNone(RT.static_disable_reason(hf, par, "EAGLE"))
+        self.assertIsNone(
+            RT.static_disable_reason(
+                hf, NS(**{**vars(par), "attn_dcp_size": 2}), None
+            )
+        )
+        self.assertIsNone(
+            RT.static_disable_reason(
+                hf, NS(**{**vars(par), "attn_dcp_size": 4}), None
+            )
+        )
+        self.assertIn(
+            "decode context parallel",
+            RT.static_disable_reason(
+                hf, NS(**{**vars(par), "attn_dcp_size": 8}), None
+            ),
+        )
+        self.assertIn(
+            "decode context parallel",
+            RT.static_disable_reason(
+                hf, NS(**{**vars(par), "attn_dcp_size": 2}), "EAGLE3"
+            ),
+        )
+        self.assertIn("speculative", RT.static_disable_reason(hf, par, "NGRAM"))
         self.assertIn(
             "pp_size",
             RT.static_disable_reason(hf, NS(**{**vars(par), "pp_size": 2}), None),
@@ -893,20 +1171,36 @@ class TestRuntimeGating(CustomTestCase):
     def test_applies_only_to_plain_decode_buckets(self):
         RT, NS = self.RT, self.NS
 
-        def fb(decode=True, spec=None, bs=8):
+        def fb(decode=True, verify=False, spec=None, bs=8):
             return NS(
-                forward_mode=NS(is_decode=lambda: decode),
+                forward_mode=NS(
+                    is_decode=lambda: decode, is_target_verify=lambda: verify
+                ),
                 spec_info=spec,
                 seq_lens=torch.zeros(bs),
             )
 
         ids = torch.zeros(8, dtype=torch.int64)
+        ids_v = torch.zeros(32, dtype=torch.int64)
+        spec_v = NS(topk=1, num_tokens_per_req=4)
         A_ = RT.GptOssDecodeMK.applies
         self.assertTrue(A_(fb(), ids, None, None, []))
+        self.assertTrue(A_(fb(), ids, None, None, [2, 18, 34]))  # aux hidden capture
+        self.assertTrue(
+            A_(fb(decode=False, verify=True, spec=spec_v, bs=8), ids_v, None, None, [2, 18, 34])
+        )  # EAGLE3 target verify
+        self.assertFalse(
+            A_(
+                fb(decode=False, verify=True, spec=NS(topk=2, num_tokens_per_req=4), bs=8),
+                ids_v,
+                None,
+                None,
+                [],
+            )
+        )  # tree attention topk > 1
         self.assertFalse(A_(fb(decode=False), ids, None, None, []))  # extend/mixed/idle
-        self.assertFalse(A_(fb(spec=object()), ids, None, None, []))  # spec decode
+        self.assertFalse(A_(fb(spec=object()), ids, None, None, []))  # decode with spec_info
         self.assertFalse(A_(fb(), ids, torch.zeros(8, 4), None, []))  # input_embeds
-        self.assertFalse(A_(fb(), ids, None, None, [3]))  # aux hidden capture
         big = torch.zeros(128, dtype=torch.int64)
         self.assertFalse(
             A_(fb(bs=128), big, None, None, [])
@@ -1045,13 +1339,13 @@ class TestRunUnderTorchCompile(CustomTestCase):
                 return self.bufs[l]
 
         class Backend:
-            def __init__(self, B):
+            def __init__(self, B, decode_query_size=1):
                 self.token_to_kv_pool = Pool()
                 self.forward_metadata = NS(
                     kv_lens=torch.arange(1, B + 1, dtype=torch.int32),
                     page_indices=torch.arange(B * 2, dtype=torch.int32),
                     swa_page_indices=torch.arange(B * 2, dtype=torch.int32),
-                    decode_query_size=1,
+                    decode_query_size=decode_query_size,
                 )
                 self._dcp = 1
 
@@ -1132,6 +1426,78 @@ class TestRunUnderTorchCompile(CustomTestCase):
                         # eager + compiled run each write once unless writes are ablated
                         want = 0.0 if ablate in ("no_kv_write", "no_mk") else 2.0
                         self.assertEqual(writes, want)
+
+    def test_applies_and_target_verify_fullgraph_with_forward_mode_enum(self):
+        import sys
+        import types
+        from types import SimpleNamespace as NS
+        from unittest import mock
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang_tpu.gptoss_decode_mk import runtime as RT
+
+        B, Q = 4, 4
+        model, Backend = self._model()
+        model.layers_to_capture = [1, 2, 4]
+        backend = Backend(B, decode_query_size=Q)
+        fc = types.ModuleType("sglang.srt.model_executor.forward_context")
+        fc.get_attn_backend = lambda: backend
+        c = dataclasses.replace(_cfg(B=B), L=_FAKE_L, w_dtype="fp8")
+        host = {k: torch.zeros(2, dtype=torch.float32) for k in W.w_names(c)}
+        old_fc = sys.modules.get(fc.__name__)
+        sys.modules[fc.__name__] = fc
+        self.addCleanup(
+            lambda: (
+                sys.modules.pop(fc.__name__, None)
+                if old_fc is None
+                else sys.modules.__setitem__(fc.__name__, old_fc)
+            )
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {RT.ENV_TIMING: "0", RT.ENV_ABLATE: "", RT.ENV_KV_WRITE: "layers"},
+            ),
+            mock.patch.object(
+                RT,
+                "get_step_op",
+                lambda *a, **k: (
+                    lambda *args: (*_fake_step(*args), args[0].repeat(1, 3))
+                ),
+            ),
+            mock.patch.object(
+                RT, "get_kv_write_layers_op", lambda L: _fake_kv_write_layers
+            ),
+        ):
+            mk = RT.GptOssDecodeMK(c, 0, 8, host, "cpu")
+            mk.set_capture_layers(model.layers_to_capture)
+
+            def fwd(ids, fb):
+                if mk.applies(fb, ids, None, None, model.layers_to_capture):
+                    return mk.run(model, ids, fb)
+                return model.embed_tokens(ids)
+
+            torch._dynamo.reset()
+            compiled = torch.compile(fwd, fullgraph=True, backend="eager")
+            with torch.no_grad():
+                fb_ext = NS(
+                    forward_mode=ForwardMode.EXTEND,
+                    spec_info=None,
+                    seq_lens=torch.full((B,), 16, dtype=torch.int32),
+                    residual_stream=None,
+                )
+                out_ext = compiled(torch.arange(B * 4), fb_ext)
+                self.assertEqual(out_ext.shape, (B * 4, 128))
+
+                fb_ver = NS(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    spec_info=NS(topk=1, num_tokens_per_req=Q),
+                    seq_lens=torch.full((B,), 16, dtype=torch.int32),
+                    residual_stream=object(),
+                )
+                out_ver, aux_ver = compiled(torch.arange(B * Q), fb_ver)
+                self.assertEqual(out_ver.shape, (B * Q, 128))
+                self.assertEqual(aux_ver.shape, (B * Q, 3 * 128))
 
 
 if __name__ == "__main__":

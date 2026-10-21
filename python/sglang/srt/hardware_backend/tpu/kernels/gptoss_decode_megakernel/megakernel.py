@@ -176,17 +176,17 @@ def mxfp4_unpack_xla(words, scale):
 
 
 def pool_specs(c: DecodeConfig) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
-    """(swa, full) pools: [R, L/2, num_pages, page, 1, packing, 128] in the KV dtype.
+    """(swa, full) pools: [R, L/2, num_pages, page, kv_groups, packing, 128] in the KV dtype.
 
-    Per rank and layer this is exactly sglang's fused TPU pool `[num_blocks, page,
-    2*kv_heads/packing, packing, head_dim_padded]` with one KV head per rank: K in packing
-    slot 0, V in slot 1 (fp8: slots 2-3 are padding), head_dim 64 zero-padded to 128. On TPU
-    the `packing` slots of one token share a 32-bit word per lane; this kernel reads them the
-    way the stock RPA v3 kernel does (bitcast the VMEM page to uint32, shift, bitcast back).
+    Per rank and layer this is sglang's fused TPU pool `[num_blocks, page,
+    2*kv_heads/packing, packing, head_dim_padded]`. At `dcp_size == 1`, each rank owns
+    1 KV head (`kv_groups = 1`): K in packing slot 0, V in slot 1. At `dcp_size == D > 1`,
+    each rank in a DCP group of `D` ranks stores positions `pos % D == dcp_rank` for all
+    `D` KV heads of that group (`kv_groups = c.kv_groups`).
     """
     dt = kv_jdtype(c)
     sh = lambda nb: jax.ShapeDtypeStruct(
-        (c.R, c.L // 2, nb, c.page, 1, c.kv_packing, 128), dt
+        (c.R, c.L // 2, nb, c.page, c.kv_groups, c.kv_packing, 128), dt
     )
     return sh(c.nb_swa), sh(c.nb_full)
 
@@ -270,24 +270,74 @@ def build_pools(c: DecodeConfig, k_hist, v_hist, pos, pt_swa, pt_full, base=None
     else:
         pools = [np.array(b, np.float32) for b in base]
     pos = np.asarray(pos)
+    D_DCP = c.dcp_size
     for l in range(c.L):
-        pool, pt = (pools[0], pt_swa) if c.sliding[l] else (pools[1], pt_full)
+        sliding = c.sliding[l]
+        pool, pt = (pools[0], pt_swa) if sliding else (pools[1], pt_full)
+        dcp_layer = (D_DCP > 1) and (c.dcp_swa or not sliding)
         for b in range(c.B):
-            for t in range(int(pos[b])):
-                pg = int(pt[b, t // c.page])
-                pool[:, l // 2, pg, t % c.page, 0, :2, :] = 0.0
-                pool[:, l // 2, pg, t % c.page, 0, 0, : c.D] = kh[l, b, t]
-                pool[:, l // 2, pg, t % c.page, 0, 1, : c.D] = vh[l, b, t]
+            if not dcp_layer:
+                for t in range(int(pos[b])):
+                    pg = int(pt[b, t // c.page])
+                    pool[:, l // 2, pg, t % c.page, 0, :2, :] = 0.0
+                    pool[:, l // 2, pg, t % c.page, 0, 0, : c.D] = kh[l, b, t]
+                    pool[:, l // 2, pg, t % c.page, 0, 1, : c.D] = vh[l, b, t]
+            else:
+                for r in range(c.R):
+                    dcp_group = r // D_DCP
+                    dcp_rank = r % D_DCP
+                    h0 = dcp_group * D_DCP
+                    for t in range(int(pos[b])):
+                        if (t % D_DCP) != dcp_rank:
+                            continue
+                        t_local = t // D_DCP
+                        pg = int(pt[b, t_local // c.page])
+                        off = t_local % c.page
+                        pool[r, l // 2, pg, off, :, :, :] = 0.0
+                        for dr in range(D_DCP):
+                            kv_h = h0 + dr
+                            if c.dcp_lane_pack and c.kv_dtype == "fp8":
+                                g = 0
+                                sk, sv = 2 * (dr // 2), 2 * (dr // 2) + 1
+                                c0 = 64 * (dr % 2)
+                                pool[r, l // 2, pg, off, g, sk, c0 : c0 + c.D] = kh[
+                                    l, b, t, kv_h
+                                ]
+                                pool[r, l // 2, pg, off, g, sv, c0 : c0 + c.D] = vh[
+                                    l, b, t, kv_h
+                                ]
+                            elif c.kv_packing == 4:
+                                g = dr // 2
+                                sk, sv = 2 * (dr % 2), 2 * (dr % 2) + 1
+                                pool[r, l // 2, pg, off, g, sk, : c.D] = kh[
+                                    l, b, t, kv_h
+                                ]
+                                pool[r, l // 2, pg, off, g, sv, : c.D] = vh[
+                                    l, b, t, kv_h
+                                ]
+                            else:
+                                g = dr
+                                pool[r, l // 2, pg, off, g, 0, : c.D] = kh[
+                                    l, b, t, kv_h
+                                ]
+                                pool[r, l // 2, pg, off, g, 1, : c.D] = vh[
+                                    l, b, t, kv_h
+                                ]
     return tuple(jnp.asarray(p).astype(dt) for p in pools)
 
 
 def rope_tables(c: DecodeConfig, pos):
     """pos [B] -> cos, sin [BR, 128] f32 (two heads per lane block; sin signed per half)."""
-    cos, sin = yarn_tables(c, pos)
+    pos_tok = (
+        pos
+        if c.Q == 1
+        else (pos[:, None] + jnp.arange(c.Q, dtype=I32)[None, :]).reshape(-1)
+    )
+    cos, sin = yarn_tables(c, pos_tok)
     h = c.D // 2
     sin_s = jnp.concatenate([-sin[:, :h], sin[:, h:]], -1)
     cos, sin_s = jnp.tile(cos, (1, 128 // c.D)), jnp.tile(sin_s, (1, 128 // c.D))
-    pad = ((0, c.BR - c.B), (0, 0))
+    pad = ((0, c.BR - c.BQ), (0, 0))
     return jnp.pad(cos, pad).astype(F32), jnp.pad(sin_s, pad).astype(F32)
 
 
@@ -296,6 +346,7 @@ def rope_tables(c: DecodeConfig, pos):
 
 def _scratch(c: DecodeConfig, mode: str, comm: bool):
     BR, Hp, QWL, NS, T, R = c.BR, c.Hp, c.QWL, c.w_slots, c.tne, c.R
+    KV_G, D_DCP = c.kv_groups, c.dcp_size
     kvdt, ardt = kv_jdtype(c), ar_jdtype(c)
     V = pltpu.VMEM
     s = {
@@ -320,11 +371,11 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
                 "oh": V(
                     (BR * c.NQL, 128), F32
                 ),  # head h's output in its pair-block half
-                "kvn": V((BR, 1, c.kv_packing, 128), kvdt),
+                "kvn": V((BR, KV_G, c.kv_packing, 128), kvdt),
                 "awqkv": V((2, Hp, c.QKVWL), BF16),
                 "awo": V((2, QWL, Hp), BF16),
                 "awsink": V((2, c.NQL, 128), F32),
-                "kvb": V((c.kv_bufs, c.TKMAX, 1, c.kv_packing, 128), kvdt),
+                "kvb": V((c.kv_bufs, c.TKMAX, KV_G, c.kv_packing, 128), kvdt),
                 "sem_kv": pltpu.SemaphoreType.DMA((c.kv_bufs,)),
                 "it_b": pltpu.SMEM((c.NIMAX,), I32),
                 "it_j": pltpu.SMEM((c.NIMAX,), I32),
@@ -333,6 +384,20 @@ def _scratch(c: DecodeConfig, mode: str, comm: bool):
                 ),  # items listed by the last attention prepare
             }
         )
+        if D_DCP > 1:
+            s.update(
+                {
+                    "qh_dcp": V((D_DCP, BR * c.NQL, 128), F32),
+                    "dcp_qkv_send": V((2, BR, QWL + 2 * c.D), BF16),
+                    "dcp_qkv_recv": V((2, D_DCP, BR, QWL + 2 * c.D), BF16),
+                    "dcp_qkv_ssem": pltpu.SemaphoreType.DMA((2, D_DCP - 1)),
+                    "dcp_qkv_rsem": pltpu.SemaphoreType.DMA((2, D_DCP - 1)),
+                    "dcp_lse_send": V((2, D_DCP, 2 * BR * c.NQL, 128), F32),
+                    "dcp_lse_recv": V((2, D_DCP, 2 * BR * c.NQL, 128), F32),
+                    "dcp_lse_ssem": pltpu.SemaphoreType.DMA((2, D_DCP - 1)),
+                    "dcp_lse_rsem": pltpu.SemaphoreType.DMA((2, D_DCP - 1)),
+                }
+            )
     if mode in ("mega", "moe"):
         s.update(
             {
@@ -454,10 +519,13 @@ def build(
     comm = mode == "mega" and c.R > 1  # all-reduce buffers present
     exchange = comm and "ar" not in c.ablate  # remote DMAs actually issued
     AB = set(c.ablate) if mode == "mega" else set()
-    B, BR, L, Hp, H, R = c.B, c.BR, c.L, c.Hp, c.H, c.R
+    B, Q, BQ, BR, L, Hp, H, R = c.B, c.Q, c.BQ, c.BR, c.L, c.Hp, c.H, c.R
     QWL, NQL, EL, NJ, T, NS = c.QWL, c.NQL, c.EL, c.NJ, c.tne, c.w_slots
     PAGE, MP, NWP, NBUF = c.page, c.max_pages, c.NWP, c.kv_bufs
+    KV_G, D_DCP = c.kv_groups, c.dcp_size
     W = c.window
+    CAPS = c.capture_layers if mode == "mega" else ()
+    NCAP = len(CAPS)
     kvdt, ardt = kv_jdtype(c), ar_jdtype(c)
     scale = float(c.sm_scale)
     scratch = _scratch(c, mode, comm)
@@ -490,7 +558,7 @@ def build(
             kv_swa, kv_full = pool_refs[: L // 2], pool_refs[L // 2 :]
         else:
             kv_swa, kv_full = pool_refs
-        n_out = 1 if mode == "moe" else (4 if KW else 2)
+        n_out = 1 if mode == "moe" else ((4 if KW else 2) + (1 if NCAP else 0))
         outs = refs[n_in : n_in + n_out]
         S = dict(zip(s_names, refs[n_in + n_out :]))
         rank = rank_s[0]
@@ -514,6 +582,13 @@ def build(
             vb = pltpu.bitcast(vq, jnp.uint8).astype(U32)
             return kb | (vb << 8)
 
+        def kv_encode_4(k0, v0, k1, v1):
+            b0 = pltpu.bitcast(k0, jnp.uint8).astype(U32)
+            b1 = pltpu.bitcast(v0, jnp.uint8).astype(U32)
+            b2 = pltpu.bitcast(k1, jnp.uint8).astype(U32)
+            b3 = pltpu.bitcast(v1, jnp.uint8).astype(U32)
+            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
         def kv_decode(w):
             if c.kv_dtype == "bf16":
                 k = pltpu.bitcast(w << 16, F32)
@@ -525,32 +600,65 @@ def build(
             # fewer ops per KV block than converting to bf16 first, static LLO count)
             return k, v
 
+        def kv_decode_4(w):
+            k0 = pltpu.bitcast((w & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
+            v0 = pltpu.bitcast(((w >> 8) & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
+            k1 = pltpu.bitcast(((w >> 16) & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
+            v1 = pltpu.bitcast(((w >> 24) & jnp.uint32(0xFF)).astype(jnp.uint8), kvdt)
+            return k0, v0, k1, v1
+
         # On TPU the packed words are read/written through a uint32 view of the VMEM ref, as
         # RPA v3 does (validated by AOT compile only). The TPU interpreter cannot bitcast refs,
         # so interpret mode goes through a value reshape + `pltpu.bitcast`, which has the same
         # (documented) packing semantics: `packing` consecutive second-minor rows -> one word.
-        def load_words(slot, rows):  # first `rows` tokens of KV item buffer `slot`
+        def load_words(slot, rows, g=0):  # first `rows` tokens of KV item buffer `slot`, group `g`
+            if interpret:
+                v = S["kvb"][slot, pl.ds(0, rows), g]
+                return pltpu.bitcast(v.reshape(rows * c.kv_packing, 128), U32)
+            if KV_G == 1:
+                return (
+                    S["kvb"].bitcast(U32).at[slot, pl.ds(0, rows)].reshape(rows, 128)[...]
+                )
+            ref_u32 = S["kvb"].at[slot].bitcast(U32).reshape(c.TKMAX * KV_G, 128)
+            return ref_u32[pl.ds(g, rows, stride=KV_G)]
+
+        def load_words_all(slot, rows):  # contiguous [rows * KV_G, 128] load (zero VMEM stride)
             if interpret:
                 v = S["kvb"][slot, pl.ds(0, rows)]
-                return pltpu.bitcast(v.reshape(rows * c.kv_packing, 128), U32)
+                return pltpu.bitcast(v.reshape(rows * KV_G * c.kv_packing, 128), U32)
             return (
-                S["kvb"].bitcast(U32).at[slot, pl.ds(0, rows)].reshape(rows, 128)[...]
+                S["kvb"]
+                .bitcast(U32)
+                .at[slot, pl.ds(0, rows)]
+                .reshape(rows * KV_G, 128)[...]
             )
 
         def zero_kvb():  # stale-but-finite is all masking needs; VMEM starts arbitrary
             if interpret:
                 S["kvb"][...] = jnp.zeros(S["kvb"].shape, kvdt)
             else:
-                S["kvb"].bitcast(U32).reshape(NBUF * c.TKMAX, 128)[...] = jnp.zeros(
-                    (NBUF * c.TKMAX, 128), U32
+                S["kvb"].bitcast(U32).reshape(NBUF * c.TKMAX * KV_G, 128)[...] = jnp.zeros(
+                    (NBUF * c.TKMAX * KV_G, 128), U32
                 )
 
-        def store_words(ref, w):
+        def zero_kvn():
+            if interpret:
+                S["kvn"][...] = jnp.zeros(S["kvn"].shape, kvdt)
+            else:
+                S["kvn"].bitcast(U32).reshape(BR * KV_G, 128)[...] = jnp.zeros(
+                    (BR * KV_G, 128), U32
+                )
+
+        def store_words(ref, w, g=0):
             rows = w.shape[0]
             if interpret:
-                ref[...] = pltpu.bitcast(w, kvdt).reshape(rows, 1, c.kv_packing, 128)
-            else:
+                ref[:, g] = pltpu.bitcast(w, kvdt).reshape(rows, c.kv_packing, 128)
+            elif KV_G == 1:
                 ref.bitcast(U32).reshape(rows, 128)[...] = w
+            else:
+                ref.bitcast(U32).reshape(rows * KV_G, 128)[
+                    pl.ds(g, rows, stride=KV_G)
+                ] = w
 
         # ---------------------------------------------------------- attention-weight buffer
         def aw_copies(l, slot):
@@ -614,6 +722,34 @@ def build(
                 return rs_copies(slot, me) + ag_copies(slot, me)
             return oneshot_copies(slot, me)
 
+        def dcp_qkv_copies(slot, me):
+            dcp_me = me % D_DCP
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=S["dcp_qkv_send"].at[slot],
+                    dst_ref=S["dcp_qkv_recv"].at[slot, dcp_me],
+                    send_sem=S["dcp_qkv_ssem"].at[slot, off - 1],
+                    recv_sem=S["dcp_qkv_rsem"].at[slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, D_DCP)
+            ]
+
+        def dcp_lse_copies(slot, me):
+            dcp_me = me % D_DCP
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=S["dcp_lse_send"].at[slot, (me ^ off) % D_DCP],
+                    dst_ref=S["dcp_lse_recv"].at[slot, dcp_me],
+                    send_sem=S["dcp_lse_ssem"].at[slot, off - 1],
+                    recv_sem=S["dcp_lse_rsem"].at[slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, D_DCP)
+            ]
+
         NHB = Hp // 128
 
         def ar_start(slot, val, l, used_before):
@@ -623,7 +759,7 @@ def build(
             layer's KV prefetch) before `finish` waits for the 7 peer slots. No per-AR
             barrier: slot reuse is safe because a rank can only reach the next use of a slot
             after receiving every peer's contribution to the other slot in between.
-            With `AR_FOLD` only the B live rows travel, as [B*Hp/128, 128] f32 holding
+            With `AR_FOLD` only the BQ live rows travel, as [BQ*Hp/128, 128] f32 holding
             AR-dtype-rounded values (same sum as an AR-dtype payload).
             """
             if not comm:
@@ -678,8 +814,8 @@ def build(
             if c.AR_FOLD:
                 v = val.astype(ardt).astype(F32)
                 for j in range(NHB):
-                    S["send"][slot, j * B : (j + 1) * B, :] = v[
-                        0:B, j * 128 : (j + 1) * 128
+                    S["send"][slot, j * BQ : (j + 1) * BQ, :] = v[
+                        0:BQ, j * 128 : (j + 1) * 128
                     ]
             else:
                 S["send"][slot] = val.astype(ardt)
@@ -697,13 +833,17 @@ def build(
                 if not c.AR_FOLD:
                     return tot
                 for j in range(NHB):
-                    S["arout"][0:B, j * 128 : (j + 1) * 128] = tot[j * B : (j + 1) * B]
+                    S["arout"][0:BQ, j * 128 : (j + 1) * 128] = tot[
+                        j * BQ : (j + 1) * BQ
+                    ]
                 return S["arout"][...]
 
             return finish
 
         # ---------------------------------------------------------- A: QKV + RoPE
         def phase_a(l, s, kn_idx, pi=None):
+            sliding = (s == 0) if mode == "mega" else c.sliding[l]
+            dcp_layer = (D_DCP > 1) and (c.dcp_swa or not sliding)
             res = S["res"][...]
             var = jnp.sum(res * res, axis=-1, keepdims=True) * (1.0 / H)
             xn = (res * lax.rsqrt(var + c.eps) * vrow(s, V_LN1, Hp)).astype(BF16)
@@ -720,6 +860,8 @@ def build(
             low = lane < 64
             for j in range(QWL // 128):
                 blk = rp(qkv[:, j * 128 : (j + 1) * 128]) * scale  # heads 2j | 2j+1
+                if dcp_layer:
+                    S["dcp_qkv_send"][s, :, j * 128 : (j + 1) * 128] = blk.astype(BF16)
                 for h in (2 * j, 2 * j + 1):
                     qv = pltpu.roll(blk, 64, 1) if h % 2 else blk
                     S["qh"][pl.ds(h, BR, stride=NQL)] = jnp.where(low, qv, 0.0)
@@ -734,35 +876,116 @@ def build(
             for r in range(NQL):
                 S["kr8"][pl.ds(r, BR, stride=NQL)] = kf
                 S["vr8"][pl.ds(r, BR, stride=NQL)] = vf
-            store_words(S["kvn"], kv_encode(kq, vq))
+            if not dcp_layer:
+                if KV_G > 1:
+                    zero_kvn()
+                store_words(S["kvn"], kv_encode(kq, vq), g=0)
+            else:
+                me = lax.axis_index("tp").astype(I32)
+                dcp_me = me % D_DCP
+                dcp_ex = (D_DCP > 1) and ("ar" not in c.ablate)
+                if dcp_ex and mode == "mega":
+
+                    @pl.when(l >= 2)
+                    def _():
+                        for desc in dcp_qkv_copies(s, me):
+                            desc.wait_send()
+
+                S["dcp_qkv_send"][s, :, QWL : QWL + 128] = jnp.where(
+                    low, kf, pltpu.roll(vf, 64, 1)
+                ).astype(BF16)
+                S["dcp_qkv_recv"][s, dcp_me] = S["dcp_qkv_send"][s]
+                qkv_descs = dcp_qkv_copies(s, me) if dcp_ex else []
+                for desc in qkv_descs:
+                    desc.start()
+                for desc in qkv_descs:
+                    desc.wait_recv()
+
+                lane_pack = c.dcp_lane_pack and c.kv_dtype == "fp8"
+                pair_lanes = c.kv_dtype == "fp8"
+                for dr in range(D_DCP):
+                    for j in range(QWL // 128):
+                        blk = S["dcp_qkv_recv"][
+                            s, dr, :, j * 128 : (j + 1) * 128
+                        ].astype(F32)
+                        for h in (2 * j, 2 * j + 1):
+                            qv = pltpu.roll(blk, 64, 1) if h % 2 else blk
+                            if pair_lanes and (dr % 2 == 1):
+                                qv_packed = jnp.where(low, 0.0, pltpu.roll(qv, 64, 1))
+                            else:
+                                qv_packed = jnp.where(low, qv, 0.0)
+                            S["qh_dcp"][dr, pl.ds(h, BR, stride=NQL)] = qv_packed
+
+                if lane_pack:
+                    kv0 = S["dcp_qkv_recv"][s, 0, :, QWL : QWL + 128].astype(F32)
+                    kv1 = S["dcp_qkv_recv"][s, 1, :, QWL : QWL + 128].astype(F32)
+                    k01 = jnp.where(low, kv0, pltpu.roll(kv1, 64, 1)).astype(kvdt)
+                    v01 = jnp.where(low, pltpu.roll(kv0, 64, 1), kv1).astype(kvdt)
+                    if D_DCP == 2:
+                        store_words(S["kvn"], kv_encode(k01, v01), g=0)
+                    else:
+                        kv2 = S["dcp_qkv_recv"][s, 2, :, QWL : QWL + 128].astype(F32)
+                        kv3 = S["dcp_qkv_recv"][s, 3, :, QWL : QWL + 128].astype(F32)
+                        k23 = jnp.where(low, kv2, pltpu.roll(kv3, 64, 1)).astype(kvdt)
+                        v23 = jnp.where(low, pltpu.roll(kv2, 64, 1), kv3).astype(kvdt)
+                        store_words(
+                            S["kvn"], kv_encode_4(k01, v01, k23, v23), g=0
+                        )
+                elif c.kv_packing == 4:
+                    for g in range(D_DCP // 2):
+                        kve = S["dcp_qkv_recv"][s, 2 * g, :, QWL : QWL + 128].astype(F32)
+                        kvo = S["dcp_qkv_recv"][
+                            s, 2 * g + 1, :, QWL : QWL + 128
+                        ].astype(F32)
+                        ke = jnp.where(low, kve, 0.0).astype(kvdt)
+                        ve = jnp.where(low, pltpu.roll(kve, 64, 1), 0.0).astype(kvdt)
+                        ko = jnp.where(low, kvo, 0.0).astype(kvdt)
+                        vo = jnp.where(low, pltpu.roll(kvo, 64, 1), 0.0).astype(kvdt)
+                        store_words(S["kvn"], kv_encode_4(ke, ve, ko, vo), g=g)
+                else:
+                    for dr in range(D_DCP):
+                        kvd = S["dcp_qkv_recv"][s, dr, :, QWL : QWL + 128].astype(F32)
+                        kd = jnp.where(low, kvd, 0.0).astype(kvdt)
+                        vd = jnp.where(low, pltpu.roll(kvd, 64, 1), 0.0).astype(kvdt)
+                        store_words(S["kvn"], kv_encode(kd, vd), g=dr)
+
             d = cp(S["kvn"], outs[1].at[kn_idx], S["sem_m"].at[0])
             d.start()
             if not KW:
                 return (d,)
-            # write each live sequence's packed new-token slot into its page, in place
+            # write each live token's packed new-token slot into its page, in place
             pool_out = outs[2] if s == 0 else outs[3]
 
-            def tok_cp(b):
+            def tok_cp(t):
+                pos_t = pos_s[t // Q] + (t % Q)
+                off_t = ((pos_t // D_DCP) % PAGE) if dcp_layer else (pos_t % PAGE)
+                pg_t = jnp.maximum(newpg_s[s * BQ + t], 0)
                 return cp(
-                    S["kvn"].at[pl.ds(b, 1)],
-                    pool_out.at[pi, newpg_s[s * B + b], pl.ds(pos_s[b] % PAGE, 1)],
+                    S["kvn"].at[pl.ds(t, 1)],
+                    pool_out.at[pi, pg_t, pl.ds(off_t, 1)],
                     S["sem_m"].at[1],
                 )
 
-            def start(b, _):
-                tok_cp(b).start()
+            def start(t, _):
+                @pl.when(newpg_s[s * BQ + t] >= 0)
+                def _():
+                    tok_cp(t).start()
+
                 return 0
 
-            lax.fori_loop(0, B, start, 0)
+            lax.fori_loop(0, BQ, start, 0)
 
             class _WaitAll:
                 @staticmethod
                 def wait():
-                    def w(b, _):
-                        tok_cp(0).wait()
+                    def w(t, _):
+                        @pl.when(newpg_s[s * BQ + t] >= 0)
+                        def _():
+                            tok_cp(0).wait()
+
                         return 0
 
-                    lax.fori_loop(0, B, w, 0)
+                    lax.fori_loop(0, BQ, w, 0)
 
             return (d, _WaitAll)
 
@@ -772,12 +995,26 @@ def build(
             nb = c.nb_swa if sliding else c.nb_full
             NPBL = c.npb_swa if sliding else c.npb
             TKL = NPBL * PAGE
+            dcp_layer = (D_DCP > 1) and (c.dcp_swa or not sliding)
 
             def rng(b):
                 pos = pos_s[b]
                 lo = jnp.maximum(pos - (W - 1), 0) if sliding else jnp.int32(0)
-                plo = lo // PAGE  # first page holding an attended history token
-                npg = jnp.where(pos > 0, (jnp.maximum(pos - 1, 0) // PAGE) - plo + 1, 0)
+                if not dcp_layer:
+                    plo = lo // PAGE  # first page holding an attended history token
+                    npg = jnp.where(
+                        pos > 0, (jnp.maximum(pos - 1, 0) // PAGE) - plo + 1, 0
+                    )
+                else:
+                    dcp_rank = rank % D_DCP
+                    n_owned = (pos + (D_DCP - 1 - dcp_rank)) // D_DCP
+                    lo_local = jnp.maximum(lo + (D_DCP - 1 - dcp_rank), 0) // D_DCP
+                    plo = lo_local // PAGE
+                    npg = jnp.where(
+                        n_owned > lo_local,
+                        ((n_owned - 1) // PAGE) - plo + 1,
+                        0,
+                    )
                 return pos, lo, plo, npg, jnp.maximum((npg + NPBL - 1) // NPBL, 1)
 
             def page_cp(slot, i, page, lp=None):
@@ -848,22 +1085,138 @@ def build(
                 def _():
                     kv_start(k, k)
 
-        def phase_b_run(s, pi, sliding):
+        def phase_b_run(l, s, pi, sliding):
             """Attention for all sequences as one flat stream of the prepared items: KV page
             DMAs run `kv_bufs - 1` items ahead of compute across sequence boundaries; each
             item's pages share one DMA semaphore (one page-sized wait per started page)."""
             rng, kv_start, kv_wait, NPBL, TKL = attn_helpers(pi, sliding)
             n_items = S["nit"][0]
+            QNL = Q * NQL
+            dcp_layer = (D_DCP > 1) and (c.dcp_swa or not sliding)
 
-            tokoff = lax.broadcasted_iota(I32, (NQL, TKL), 1)
-            row8 = lax.broadcasted_iota(I32, (NQL, 128), 0)
-            lane8 = lax.broadcasted_iota(I32, (NQL, 128), 1)
-            odd = (row8 % 2) == 1
-            low = lane8 < 64
-            sink = S["awsink"][s]
-            zeros = jnp.zeros((NQL, 128), F32)
+            tokoff = lax.broadcasted_iota(I32, (QNL, TKL), 1)
+            q_tkl = lax.broadcasted_iota(I32, (QNL, TKL), 0) // NQL
+            row_qnl = lax.broadcasted_iota(I32, (QNL, 128), 0)
+            q_col = row_qnl[:, :1] // NQL
+            lane_qnl = lax.broadcasted_iota(I32, (QNL, 128), 1)
+            odd = (row_qnl % 2) == 1
+            low = lane_qnl < 64
+            sink = S["awsink"][s] if Q == 1 else jnp.tile(S["awsink"][s], (Q, 1))
+            zeros = jnp.zeros((QNL, 128), F32)
 
-            def item(k, carry):
+            if not dcp_layer:
+
+                def item(k, carry):
+                    m, l_, acc = carry
+                    slot = k % NBUF
+                    kv_wait(k, slot)
+
+                    @pl.when(k + NBUF - 1 < n_items)
+                    def _():
+                        kv_start(k + NBUF - 1, (k + NBUF - 1) % NBUF)
+
+                    b, j = S["it_b"][k], S["it_j"][k]
+                    pos, lo, plo, npg, n = rng(b)
+                    rows = pl.ds(pl.multiple_of(b * QNL, QNL), QNL)
+                    qbf = S["qh"][rows].astype(BF16)
+                    first = j == 0
+                    # first item of a sequence: restart the online softmax from sink + new token(s)
+                    if Q == 1:
+                        snew = jnp.sum(
+                            qbf.astype(F32) * S["kr8"][rows], axis=1, keepdims=True
+                        )
+                        m0 = jnp.maximum(sink, snew)
+                        pnew = jnp.exp(snew - m0)
+                        l0 = jnp.exp(sink - m0) + pnew
+                        acc0 = pnew.astype(BF16).astype(F32) * S["vr8"][rows]
+                    else:
+                        qf = qbf.astype(F32)
+                        s_new = []
+                        v_new = []
+                        m0 = sink
+                        for qp in range(Q):
+                            r_qp = pl.ds(pl.multiple_of(b * QNL + qp * NQL, NQL), NQL)
+                            k_qp = jnp.tile(S["kr8"][r_qp], (Q, 1))
+                            v_qp = jnp.tile(S["vr8"][r_qp], (Q, 1))
+                            sq = jnp.sum(qf * k_qp, axis=1, keepdims=True)
+                            v_mask = (
+                                (q_col >= qp) & ((q_col - qp) < W)
+                                if sliding
+                                else (q_col >= qp)
+                            )
+                            sq = jnp.where(v_mask, sq, NEG)
+                            s_new.append((sq, v_mask))
+                            v_new.append(v_qp)
+                            m0 = jnp.maximum(m0, sq)
+                        l0 = jnp.exp(sink - m0)
+                        acc0 = zeros
+                        for (sq, v_mask), v_qp in zip(s_new, v_new):
+                            pq = jnp.where(v_mask, jnp.exp(sq - m0), 0.0)
+                            l0 = l0 + pq
+                            acc0 = acc0 + pq.astype(BF16).astype(F32) * v_qp
+                    m = jnp.where(first, m0, m)
+                    l_ = jnp.where(first, l0, l_)
+                    acc = jnp.where(first, acc0, acc)
+
+                    kt, vt = kv_decode(load_words(slot, TKL, g=0))
+                    sc = lax.dot_general(qbf, kt, NT_DIMS, preferred_element_type=F32)
+                    kpos = (plo + j * NPBL) * PAGE + tokoff
+                    lo_q = (
+                        lo
+                        if Q == 1
+                        else (
+                            jnp.maximum(pos + q_tkl - (W - 1), 0)
+                            if sliding
+                            else jnp.int32(0)
+                        )
+                    )
+                    valid = (kpos >= lo_q) & (kpos < pos)
+                    sc = jnp.where(valid, sc, NEG)
+                    m_new = jnp.maximum(m, jnp.max(sc, axis=1, keepdims=True))
+                    alpha = jnp.exp(m - m_new)
+                    p = jnp.exp(sc - m_new[:, :1])
+                    l_ = alpha * l_ + jnp.sum(p, axis=1, keepdims=True)
+                    acc = alpha * acc + jnp.dot(
+                        p.astype(BF16), vt, preferred_element_type=F32
+                    )
+
+                    @pl.when(j == n - 1)
+                    def _():
+                        o = jnp.where(low, acc / l_, 0.0)
+                        S["oh"][rows] = jnp.where(odd, pltpu.roll(o, 64, 1), o)
+
+                    return m_new, l_, acc
+
+                lax.fori_loop(0, n_items, item, (zeros, zeros, zeros))
+                return
+
+            # DCP attention path: each rank streams its owned 1/D_DCP KV positions across all
+            # D_DCP KV heads in its DCP group, then reduce-scatters partial (acc, m, l_) in VMEM
+            # and merges with its local VMEM {sink} U {new token}.
+            dcp_rank = rank % D_DCP
+            lane_pack = c.dcp_lane_pack and c.kv_dtype == "fp8"
+            pair_lanes = c.kv_dtype == "fp8"
+            N_GROUPS = (D_DCP // 2) if pair_lanes else D_DCP
+            TK_ALL = TKL * N_GROUPS
+            QD = D_DCP * QNL
+            neg_init_qd = jnp.full((QD, 128), NEG, F32)
+            zeros_qd = jnp.zeros((QD, 128), F32)
+            row_qd_tk = lax.broadcasted_iota(I32, (QD, TK_ALL), 0)
+            col_qd_tk = lax.broadcasted_iota(I32, (QD, TK_ALL), 1)
+            dr_qd_tk = row_qd_tk // QNL
+            g_row = (dr_qd_tk // 2) if pair_lanes else dr_qd_tk
+            if lane_pack:
+                g_col = col_qd_tk // TKL
+                tok_c = col_qd_tk % TKL
+            else:
+                g_col = col_qd_tk % KV_G
+                tok_c = col_qd_tk // KV_G
+            row_qd_128 = lax.broadcasted_iota(I32, (QD, 128), 0)
+            low_qd = lax.broadcasted_iota(I32, (QD, 128), 1) < 64
+            odd_dr_qd = ((row_qd_128 // QNL) % 2) == 1
+            low_tk_all = lax.broadcasted_iota(I32, (TK_ALL, 128), 1) < 64
+
+            def item_dcp(k, carry):
                 m, l_, acc = carry
                 slot = k % NBUF
                 kv_wait(k, slot)
@@ -874,40 +1227,107 @@ def build(
 
                 b, j = S["it_b"][k], S["it_j"][k]
                 pos, lo, plo, npg, n = rng(b)
-                rows = pl.ds(pl.multiple_of(b * NQL, NQL), NQL)
-                qbf = S["qh"][rows].astype(BF16)
-                # first item of a sequence: restart the online softmax from sink + new token
-                snew = jnp.sum(qbf.astype(F32) * S["kr8"][rows], axis=1, keepdims=True)
-                m0 = jnp.maximum(sink, snew)
-                pnew = jnp.exp(snew - m0)
+                rows = pl.ds(pl.multiple_of(b * QNL, QNL), QNL)
+                rows_ml = pl.ds(pl.multiple_of((BR + b) * QNL, QNL), QNL)
                 first = j == 0
-                m = jnp.where(first, m0, m)
-                l_ = jnp.where(first, jnp.exp(sink - m0) + pnew, l_)
-                acc = jnp.where(
-                    first, pnew.astype(BF16).astype(F32) * S["vr8"][rows], acc
-                )
+                m = jnp.where(first, neg_init_qd, m)
+                l_ = jnp.where(first, zeros_qd, l_)
+                acc = jnp.where(first, zeros_qd, acc)
 
-                kt, vt = kv_decode(load_words(slot, TKL))
-                sc = lax.dot_general(qbf, kt, NT_DIMS, preferred_element_type=F32)
-                kpos = (plo + j * NPBL) * PAGE + tokoff
-                valid = (kpos >= lo) & (kpos < pos)
+                q_all = jnp.concatenate(
+                    [S["qh_dcp"][dr, rows] for dr in range(D_DCP)], axis=0
+                ).astype(BF16)
+                w_all = load_words_all(slot, TKL)
+                if lane_pack:
+                    if D_DCP == 2:
+                        kt, vt = kv_decode(w_all)
+                    else:
+                        k01, v01, k23, v23 = kv_decode_4(w_all)
+                        kt = jnp.concatenate([k01, k23], axis=0)
+                        vt = jnp.concatenate([v01, v23], axis=0)
+                elif pair_lanes:
+                    k_even, v_even, k_odd, v_odd = kv_decode_4(w_all)
+                    kt = jnp.where(low_tk_all, k_even, pltpu.roll(k_odd, 64, 1))
+                    vt = jnp.where(low_tk_all, v_even, pltpu.roll(v_odd, 64, 1))
+                else:
+                    kt, vt = kv_decode(w_all)
+
+                k_local = (plo + j * NPBL) * PAGE + tok_c
+                kpos = k_local * D_DCP + dcp_rank
+                valid = (kpos >= lo) & (kpos < pos) & (g_row == g_col)
+
+                sc = lax.dot_general(
+                    q_all, kt, NT_DIMS, preferred_element_type=F32
+                )
                 sc = jnp.where(valid, sc, NEG)
                 m_new = jnp.maximum(m, jnp.max(sc, axis=1, keepdims=True))
-                alpha = jnp.exp(m - m_new)
-                p = jnp.exp(sc - m_new[:, :1])
+                m_safe = jnp.where(m_new > NEG * 0.5, m_new, 0.0)
+                alpha = jnp.where(m > NEG * 0.5, jnp.exp(m - m_safe), 0.0)
+                p = jnp.where(valid, jnp.exp(sc - m_safe[:, :1]), 0.0)
                 l_ = alpha * l_ + jnp.sum(p, axis=1, keepdims=True)
-                acc = alpha * acc + jnp.dot(
-                    p.astype(BF16), vt, preferred_element_type=F32
-                )
+                pv = jnp.dot(p.astype(BF16), vt, preferred_element_type=F32)
+                if pair_lanes:
+                    pv = jnp.where(odd_dr_qd, pltpu.roll(pv, 64, 1), pv)
+                pv = jnp.where(low_qd, pv, 0.0)
+                acc = alpha * acc + pv
 
                 @pl.when(j == n - 1)
                 def _():
-                    o = jnp.where(low, acc / l_, 0.0)
-                    S["oh"][rows] = jnp.where(odd, pltpu.roll(o, 64, 1), o)
+                    for dr in range(D_DCP):
+                        r_dr = slice(dr * QNL, (dr + 1) * QNL)
+                        S["dcp_lse_send"][s, dr, rows] = acc[r_dr]
+                        S["dcp_lse_send"][s, dr, rows_ml] = jnp.where(
+                            low, m_new[r_dr], l_[r_dr]
+                        )
 
                 return m_new, l_, acc
 
-            lax.fori_loop(0, n_items, item, (zeros, zeros, zeros))
+            lax.fori_loop(0, n_items, item_dcp, (neg_init_qd, zeros_qd, zeros_qd))
+
+            me = lax.axis_index("tp").astype(I32)
+            dcp_me = me % D_DCP
+            dcp_ex = (D_DCP > 1) and ("ar" not in c.ablate)
+            if dcp_ex and mode == "mega":
+
+                @pl.when(l >= 2)
+                def _():
+                    for desc in dcp_lse_copies(s, me):
+                        desc.wait_send()
+
+            S["dcp_lse_recv"][s, dcp_me] = S["dcp_lse_send"][s, dcp_me]
+            lse_descs = dcp_lse_copies(s, me) if dcp_ex else []
+            for desc in lse_descs:
+                desc.start()
+            for desc in lse_descs:
+                desc.wait_recv()
+
+            row_all = lax.broadcasted_iota(I32, (BR * NQL, 128), 0)
+            lane_all = lax.broadcasted_iota(I32, (BR * NQL, 128), 1)
+            odd_all = (row_all % 2) == 1
+            low_all = lane_all < 64
+            qf_all = S["qh"][...]
+            snew_all = jnp.sum(qf_all * S["kr8"][...], axis=1, keepdims=True)
+            sink_all = jnp.tile(S["awsink"][s], (BR, 1))
+            m_glob = jnp.maximum(sink_all, snew_all)
+            m_peers, l_peers, acc_peers = [], [], []
+            for r in range(D_DCP):
+                ml_r = S["dcp_lse_recv"][s, r, BR * NQL : 2 * BR * NQL]
+                m_r = jnp.where(low_all, ml_r, pltpu.roll(ml_r, 64, 1))
+                l_r = jnp.where(low_all, pltpu.roll(ml_r, 64, 1), ml_r)
+                acc_r = S["dcp_lse_recv"][s, r, 0 : BR * NQL]
+                m_glob = jnp.maximum(m_glob, m_r)
+                m_peers.append(m_r)
+                l_peers.append(l_r)
+                acc_peers.append(acc_r)
+            pnew_all = jnp.exp(snew_all - m_glob)
+            l_glob = jnp.exp(sink_all - m_glob) + pnew_all
+            acc_glob = pnew_all.astype(BF16).astype(F32) * S["vr8"][...]
+            for m_r, l_r, acc_r in zip(m_peers, l_peers, acc_peers):
+                scale_r = jnp.where(m_r > NEG * 0.5, jnp.exp(m_r - m_glob), 0.0)
+                l_glob = l_glob + scale_r * l_r
+                acc_glob = acc_glob + scale_r * acc_r
+            o_all = jnp.where(low_all, acc_glob / l_glob, 0.0)
+            S["oh"][...] = jnp.where(odd_all, pltpu.roll(o_all, 64, 1), o_all)
 
         def phase_c(s):
             # head pair (2j, 2j+1) occupy the two halves of o_proj input block j
@@ -929,7 +1349,7 @@ def build(
                 s, V_BR, 128
             )
             lane = lax.broadcasted_iota(I32, (BR, 128), 1)
-            live = lax.broadcasted_iota(I32, (BR, 128), 0) < B
+            live = lax.broadcasted_iota(I32, (BR, 128), 0) < BQ
             ids, vals = [], []
             for _ in range(c.TOPK):
                 mx = jnp.max(lg, axis=1, keepdims=True)
@@ -1055,7 +1475,19 @@ def build(
             if (
                 comm and not exchange
             ):  # "ar" ablation: peers' slots must hold finite data
-                for k in ("recv", "send", "ag_recv"):
+                for k in (
+                    "recv",
+                    "send",
+                    "ag_recv",
+                    "dcp_qkv_recv",
+                    "dcp_qkv_send",
+                    "dcp_lse_recv",
+                    "dcp_lse_send",
+                ):
+                    if k in S:
+                        S[k][...] = jnp.zeros(S[k].shape, S[k].dtype)
+            elif D_DCP > 1:
+                for k in ("dcp_lse_send", "dcp_lse_recv"):
                     if k in S:
                         S[k][...] = jnp.zeros(S[k].shape, S[k].dtype)
             if comm and c.AR_FOLD:
@@ -1074,6 +1506,12 @@ def build(
             for d in aw_copies(0, 0):
                 d.start()
             S["res"][...] = x_ref[...].astype(F32)
+            for cap_i, b_idx in enumerate(CAPS):
+                if b_idx == 0:
+                    S["xn"][...] = S["res"][...].astype(BF16)
+                    d_cap = cp(S["xn"], outs[-1].at[cap_i], S["sem_m"].at[3])
+                    d_cap.start()
+                    d_cap.wait()
             S["oh"][...] = jnp.zeros((BR * NQL, 128), F32)
             zero_kvb()
 
@@ -1094,7 +1532,7 @@ def build(
                     if "attn" not in AB:
                         kn_descs = phase_a(l, s, l, p)
                         if "attn_kv" not in AB:
-                            phase_b_run(s, p, sliding=(s == 0))
+                            phase_b_run(l, s, p, sliding=(s == 0))
                         for d in kn_descs:
                             d.wait()
                         finish = ar_start(0, phase_c(s), l, True)
@@ -1124,6 +1562,17 @@ def build(
                         S["res"][...] = rnd(S["res"][...] + finish())
                     else:
                         prepare_next()
+                    for cap_i, b_idx in enumerate(CAPS):
+                        if b_idx >= 1 and (b_idx - 1) % 2 == s:
+
+                            @pl.when(p == (b_idx - 1) // 2)
+                            def _(cap_i=cap_i):
+                                S["xn"][...] = S["res"][...].astype(BF16)
+                                d_cap = cp(
+                                    S["xn"], outs[-1].at[cap_i], S["sem_m"].at[3]
+                                )
+                                d_cap.start()
+                                d_cap.wait()
                 return 0
 
             lax.fori_loop(0, L // 2, pair, 0)
@@ -1134,8 +1583,30 @@ def build(
                 for slot in used:
                     for d in ar_copies(slot, me):
                         d.wait_send()
+                if D_DCP > 1 and "attn" not in AB:
+                    dcp_slots = (0, 1) if c.dcp_swa else (1,)
+                    for s_dcp in dcp_slots:
+                        for d in dcp_qkv_copies(s_dcp, me):
+                            d.wait_send()
+                        if "attn_kv" not in AB:
+                            for d in dcp_lse_copies(s_dcp, me):
+                                d.wait_send()
         else:
             l = layer
+            dcp_ex = (D_DCP > 1) and ("ar" not in c.ablate)
+            if mode == "attn" and dcp_ex:
+                me = lax.axis_index("tp").astype(I32)
+                barrier = pltpu.get_barrier_semaphore()
+                for off in range(1, R):
+                    pl.semaphore_signal(
+                        barrier,
+                        1,
+                        device_id=(me ^ off,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                pl.semaphore_wait(barrier, R - 1)
+                for k in ("dcp_lse_send", "dcp_lse_recv"):
+                    S[k][...] = jnp.zeros(S[k].shape, S[k].dtype)
             for d in aw_copies(l, 0):
                 d.start()
             for d in aw_copies(l, 0):
@@ -1146,10 +1617,16 @@ def build(
                 zero_kvb()
                 kn_descs = phase_a(l, 0, 0)
                 phase_b_prepare(l // 2, sliding=c.sliding[l])
-                phase_b_run(0, l // 2, sliding=c.sliding[l])
+                phase_b_run(l, 0, l // 2, sliding=c.sliding[l])
                 for d in kn_descs:
                     d.wait()
                 outs[0][...] = phase_c(0)
+                if dcp_ex and (c.dcp_swa or not c.sliding[l]):
+                    me = lax.axis_index("tp").astype(I32)
+                    for d in dcp_qkv_copies(0, me):
+                        d.wait_send()
+                    for d in dcp_lse_copies(0, me):
+                        d.wait_send()
             else:
                 n_act, base = phase_d(0)
                 outs[0][...] = phase_e(l, n_act, base)
@@ -1159,7 +1636,7 @@ def build(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     in_specs = [smem] * 5 + [vmem] * 3 + [hbm] * (len(WN) + n_pool)
     nkn = L if mode == "mega" else 1
-    kn_shape = jax.ShapeDtypeStruct((nkn, BR, 1, c.kv_packing, 128), kvdt)
+    kn_shape = jax.ShapeDtypeStruct((nkn, BR, KV_G, c.kv_packing, 128), kvdt)
     aliases = {}
     if mode == "mega":
         out_shape = (jax.ShapeDtypeStruct((BR, Hp), BF16), kn_shape)
@@ -1172,12 +1649,16 @@ def build(
             )
             out_specs += (hbm, hbm)
             aliases = {n_in - 2: 2, n_in - 1: 3}
+        if NCAP:
+            out_shape += (jax.ShapeDtypeStruct((NCAP, BR, Hp), BF16),)
+            out_specs += (hbm,)
     elif mode == "attn":
         out_shape = (jax.ShapeDtypeStruct((BR, Hp), F32), kn_shape)
         out_specs = (vmem, hbm)
     else:
         out_shape = jax.ShapeDtypeStruct((BR, Hp), F32)
         out_specs = vmem
+    dcp_ex = (D_DCP > 1) and ("ar" not in c.ablate)
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,
@@ -1186,7 +1667,9 @@ def build(
         scratch_shapes=[scratch[k] for k in s_names],
         input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID if exchange else None,
+            collective_id=COLLECTIVE_ID
+            if (exchange or (mode == "attn" and dcp_ex))
+            else None,
             vmem_limit_bytes=c.vmem_mib * 1024 * 1024,
         ),
         interpret=pltpu.InterpretParams() if interpret else False,
@@ -1197,12 +1680,13 @@ def build(
 def build_kv_scatter(c: DecodeConfig, *, interpret=False):
     """f(newpg, pos, kvnew, kv_swa, kv_full) -> (kv_swa, kv_full), in place.
 
-    `newpg [2*B]`: page of each sequence's new token in the SWA pool (first B) and in the
-    full pool. Writes each live sequence's packed new-token slot `[1, packing, 128]` (K, V)
-    with one HBM->HBM DMA along the (untiled) token dim, as RPA v3's cache update does.
-    Not communicating, so XLA honours the pool aliasing (no pool copy).
+    `newpg [2*B*Q]`: page of each token in the SWA pool (first B*Q) and in the
+    full pool (< 0 on non-owner ranks under DCP). Writes each owned live token's packed
+    new-token slot `[1, kv_groups, packing, 128]` (K, V) with one HBM->HBM DMA along the
+    (untiled) token dim, as RPA v3's cache update does. Not communicating, so XLA honours
+    the pool aliasing (no pool copy).
     """
-    B, L, PAGE = c.B, c.L, c.page
+    BQ, Q, L, PAGE, D_DCP = c.BQ, c.Q, c.L, c.page, c.dcp_size
 
     def kernel(newpg_s, pos_s, kvn, kvs_in, kvf_in, kvs, kvf, sem):
         del kvs_in, kvf_in
@@ -1211,25 +1695,34 @@ def build_kv_scatter(c: DecodeConfig, *, interpret=False):
             for s in (0, 1):
                 l = 2 * p + s
                 pool = kvs if s == 0 else kvf
+                dcp_layer = (D_DCP > 1) and (c.dcp_swa or (s == 1))
 
-                def cp(b):
-                    pos = pos_s[b]
+                def cp(t):
+                    pos_t = pos_s[t // Q] + (t % Q)
+                    off_t = ((pos_t // D_DCP) % PAGE) if dcp_layer else (pos_t % PAGE)
+                    pg_t = jnp.maximum(newpg_s[s * BQ + t], 0)
                     return pltpu.make_async_copy(
-                        kvn.at[l, pl.ds(b, 1)],
-                        pool.at[p, newpg_s[s * B + b], pl.ds(pos % PAGE, 1)],
+                        kvn.at[l, pl.ds(t, 1)],
+                        pool.at[p, pg_t, pl.ds(off_t, 1)],
                         sem.at[0],
                     )
 
-                def start(b, _):
-                    cp(b).start()
+                def start(t, _):
+                    @pl.when(newpg_s[s * BQ + t] >= 0)
+                    def _():
+                        cp(t).start()
+
                     return 0
 
-                def wait(b, _):
-                    cp(0).wait()
+                def wait(t, _):
+                    @pl.when(newpg_s[s * BQ + t] >= 0)
+                    def _():
+                        cp(0).wait()
+
                     return 0
 
-                lax.fori_loop(0, B, start, 0)
-                lax.fori_loop(0, B, wait, 0)
+                lax.fori_loop(0, BQ, start, 0)
+                lax.fori_loop(0, BQ, wait, 0)
             return 0
 
         lax.fori_loop(0, L // 2, pair, 0)
@@ -1253,20 +1746,47 @@ def build_kv_scatter(c: DecodeConfig, *, interpret=False):
     )
 
 
-def page_args(c: DecodeConfig, pos, pt_swa, pt_full):
+def page_args(c: DecodeConfig, pos, pt_swa, pt_full, rank=None):
     """XLA-side page-table glue (tiny): window pages for sliding layers [B*NWP], the full
-    table [B*MP], and the new token's page in each pool [2*B]."""
-    B, MP, NWP = c.B, c.max_pages, c.NWP
-    plo = jnp.maximum(pos - (c.window - 1), 0) // c.page
+    table [B*MP], and the new token(s)' page in each pool [2*B*Q] (-1 on non-owner DCP ranks)."""
+    B, Q, MP, NWP, D_DCP = c.B, c.Q, c.max_pages, c.NWP, c.dcp_size
+    dcp_swa = (D_DCP > 1) and c.dcp_swa
+    if D_DCP > 1:
+        assert rank is not None, "page_args requires `rank` when dcp_size > 1"
+        r0 = rank.reshape(-1)[0] if hasattr(rank, "ndim") and rank.ndim > 0 else rank
+        dcp_rank = (r0 % D_DCP).astype(I32)
+    else:
+        dcp_rank = jnp.int32(0)
+
+    lo = jnp.maximum(pos - (c.window - 1), 0)
+    if not dcp_swa:
+        plo = lo // c.page
+    else:
+        lo_local = jnp.maximum(lo + (D_DCP - 1 - dcp_rank), 0) // D_DCP
+        plo = lo_local // c.page
     widx = jnp.minimum(plo[:, None] + jnp.arange(NWP)[None, :], MP - 1)
     ptw = jnp.take_along_axis(pt_swa, widx, axis=1)
-    cur = (pos // c.page)[:, None]
-    newpg = jnp.concatenate(
-        [
-            jnp.take_along_axis(pt_swa, cur, 1)[:, 0],
-            jnp.take_along_axis(pt_full, cur, 1)[:, 0],
-        ]
-    )
+
+    pos_tok = pos[:, None] + jnp.arange(Q, dtype=I32)[None, :]
+    if not dcp_swa:
+        cur_swa = pos_tok // c.page
+        newpg_swa = jnp.take_along_axis(pt_swa, cur_swa, 1).reshape(-1)
+    else:
+        cur_swa = (pos_tok // D_DCP) // c.page
+        pg_swa = jnp.take_along_axis(pt_swa, cur_swa, 1).reshape(-1)
+        own_swa = (pos_tok.reshape(-1) % D_DCP) == dcp_rank
+        newpg_swa = jnp.where(own_swa, pg_swa, -1)
+
+    if D_DCP == 1:
+        cur_full = pos_tok // c.page
+        newpg_full = jnp.take_along_axis(pt_full, cur_full, 1).reshape(-1)
+    else:
+        cur_full = (pos_tok // D_DCP) // c.page
+        pg_full = jnp.take_along_axis(pt_full, cur_full, 1).reshape(-1)
+        own_full = (pos_tok.reshape(-1) % D_DCP) == dcp_rank
+        newpg_full = jnp.where(own_full, pg_full, -1)
+
+    newpg = jnp.concatenate([newpg_swa, newpg_full])
     return (
         ptw.reshape(-1).astype(I32),
         pt_full.reshape(-1).astype(I32),
@@ -1287,8 +1807,8 @@ def make_step(
 ):
     """Jittable decode step over `mesh` (1-D axis "tp" of size R).
 
-    step(x [B, H] bf16, pos [B] i32, pt_swa [B, MP] i32, pt_full [B, MP] i32, W, kv_swa, kv_full)
-      -> (hidden [B, H] bf16, kv_swa, kv_full)
+    step(x [B*Q, H] bf16, pos [B] i32, pt_swa [B, MP] i32, pt_full [B, MP] i32, W, kv_swa, kv_full)
+      -> (hidden [B*Q, H] bf16, kv_swa, kv_full[, aux [len(c.capture_layers), B*Q, H]])
     W: dict from `pack_weights` (leading axis R). Pools: `pool_specs` (leading axis R).
     xla_ar=True runs per-layer attn/moe kernels with XLA psum in between (fallback).
     """
@@ -1311,15 +1831,18 @@ def make_step(
         else None
     )
     ardt = ar_jdtype(c)
+    has_cap = bool(c.capture_layers) and not xla_ar
 
     def per_rank(rank, x, pos, pt_s, pt_f, W, kv_s, kv_f):
         W = {k: v[0] for k, v in W.items()}
         kv_s, kv_f = kv_s[0], kv_f[0]
         rank = rank.astype(I32)
         pos = pos.astype(I32)
-        pt_s, pt_f, newpg = page_args(c, pos, pt_s.astype(I32), pt_f.astype(I32))
+        pt_s, pt_f, newpg = page_args(
+            c, pos, pt_s.astype(I32), pt_f.astype(I32), rank=rank
+        )
         cos, sin = rope_tables(c, pos)
-        xp = jnp.pad(x, ((0, c.BR - c.B), (0, c.Hp - c.H))).astype(BF16)
+        xp = jnp.pad(x, ((0, c.BR - c.BQ), (0, c.Hp - c.H))).astype(BF16)
         wl = [W[k] for k in w_names(c)]
         if not xla_ar:
             res_ = mega(rank, pos, pt_s, pt_f, newpg, xp, cos, sin, *wl, kv_s, kv_f)
@@ -1345,14 +1868,22 @@ def make_step(
             out, kvn = res.astype(BF16), jnp.concatenate(kvns)
         if sc is not None:
             kv_s, kv_f = sc(newpg, pos, kvn, kv_s, kv_f)
-        return out[: c.B, : c.H], kv_s[None], kv_f[None]
+        if has_cap:
+            return (
+                out[: c.BQ, : c.H],
+                kv_s[None],
+                kv_f[None],
+                res_[-1][:, : c.BQ, : c.H],
+            )
+        return out[: c.BQ, : c.H], kv_s[None], kv_f[None]
 
     w_spec = {k: P("tp") for k in w_names(c)}
+    out_specs = (P(), P("tp"), P("tp"), P()) if has_cap else (P(), P("tp"), P("tp"))
     smap = jax.shard_map(
         per_rank,
         mesh=mesh,
         in_specs=(P("tp"), P(), P(), P(), P(), w_spec, P("tp"), P("tp")),
-        out_specs=(P(), P("tp"), P("tp")),
+        out_specs=out_specs,
         check_vma=False,
     )
 

@@ -75,6 +75,7 @@ _DECODE_CP_SPARSE_CORE_OVERRIDES = (
     # also kept the SparseCore gather offload off.
     "--xla_tpu_offload_gather_to_sparsecore=false",
     "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+    "--xla_gf_vmem_max_outstanding_prefetches=1",
 )
 
 # Smallest KV pool (in tokens) observed safe with the default prefetch depth

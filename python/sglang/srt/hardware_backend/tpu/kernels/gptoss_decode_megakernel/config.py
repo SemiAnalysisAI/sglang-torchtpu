@@ -41,7 +41,8 @@ class DecodeConfig:
     sliding layers read the SWA KV pool, full layers the full KV pool (sglang's SWAKVPool).
     """
 
-    B: int = 1  # batch bucket (static per compile)
+    B: int = 1  # batch bucket (sequences per step, static per compile)
+    Q: int = 1  # tokens per sequence (1 for DECODE, VerifyWidth for TARGET_VERIFY)
     L: int = 36
     H: int = 2880
     NQ: int = 64
@@ -83,11 +84,11 @@ class DecodeConfig:
     # "fp8" (MXFP4 converted offline to e4m3 x per-column power of two: exact, native MXU)
     w_dtype: str = "fp8"
     ar_fold: bool = (
-        True  # B <= 4: all-reduce only the live rows, folded to [B*Hp/128, 128] f32
+        True  # BQ <= 4: all-reduce only the live rows, folded to [BQ*Hp/128, 128] f32
     )
     # "oneshot": push the full partial to all peers (1 round, 7x payload per rank);
     # "rsag": reduce-scatter + all-gather of Hp/R column chunks (2 rounds, ~2.5x fewer bytes);
-    # "auto": rsag for B >= 16 (bandwidth-bound), oneshot below (latency-bound)
+    # "auto": rsag for BQ >= 16 (bandwidth-bound), oneshot below (latency-bound)
     ar_mode: str = "auto"
     ablate: tuple[str, ...] = ()  # see ABLATIONS
     # "scatter": new K/V written by a separate non-collective call (safe default);
@@ -96,15 +97,42 @@ class DecodeConfig:
     # KV pools as L/2 SWA + L/2 full per-layer operands (sglang keeps one tensor per layer;
     # stacking them would copy the pools) instead of two stacked [L/2, ...] operands
     split_pools: bool = False
+    # Layer boundary indices to capture into an auxiliary HBM output (EAGLE3 / DFlash):
+    # index `b` captures the residual stream before layer `b` (i.e. after layer `b - 1`).
+    capture_layers: tuple[int, ...] = ()
+    # Decode context parallelism (DCP): a group of `dcp_size` ranks in the TP mesh splits
+    # each sequence's KV positions by `pos % dcp_size == dcp_rank` and merges partial
+    # softmax accumulators in VMEM via remote DMA.
+    dcp_size: int = 1
+    # Whether SWA layers also use DCP-sharded KV pools (True for SGLang --dcp-size serving
+    # where SWAKVPool shards both pools; False when SWA pools stay unsharded DCP=1).
+    dcp_swa: bool = False
+    # When True at dcp_size=4 and kv_dtype="fp8", packs 2 KV heads into lanes 0..63 and
+    # 64..127 of each fp8 packing slot so all 4 KV heads fit in kv_groups=1 ([page, 1, 4, 128]).
+    dcp_lane_pack: bool = False
+
+    def __post_init__(self) -> None:
+        # At BR >= 256 (e.g. B=64, Q=4), RSAG + activation buffers consume ~18 MiB more VMEM
+        # than at BR=64; double-buffering expert weights (w_slots=2) and KV blocks (kv_bufs=2)
+        # saves 3.71 MiB and keeps total scoped VMEM at 56.3 MiB (< 60.0 MiB TPU v7x limit).
+        if self.BR >= 256 and self.H >= 2880:
+            if self.w_slots > 2:
+                object.__setattr__(self, "w_slots", 2)
+            if self.kv_bufs > 2:
+                object.__setattr__(self, "kv_bufs", 2)
 
     # ------------------------------------------------------------------ derived
+    @property
+    def BQ(self) -> int:  # total tokens across B sequences
+        return self.B * self.Q
+
     @property
     def Hp(self) -> int:
         return rup(self.H)
 
     @property
     def BR(self) -> int:  # activation rows (bf16 sublane tile)
-        return rup(self.B, 16)
+        return rup(self.BQ, 16)
 
     @property
     def NQL(self) -> int:  # query heads per rank
@@ -154,6 +182,14 @@ class DecodeConfig:
         return 4 if self.kv_dtype == "fp8" else 2
 
     @property
+    def kv_groups(self) -> int:  # axis-2 of fused pool [num_blocks, page, kv_groups, packing, 128]
+        if self.dcp_size == 1:
+            return 1
+        if self.dcp_lane_pack and self.kv_dtype == "fp8":
+            return max(1, self.dcp_size // 4)
+        return max(1, (2 * self.dcp_size) // self.kv_packing)
+
+    @property
     def NWP(self) -> int:  # max pages holding the window's history tokens
         return cdiv(self.window - 1, self.page) + 1
 
@@ -178,12 +214,12 @@ class DecodeConfig:
     @property
     def AR_RSAG(self) -> bool:
         return self.R > 1 and (
-            self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.B >= 16)
+            self.ar_mode == "rsag" or (self.ar_mode == "auto" and self.BQ >= 16)
         )
 
     @property
     def AR_FOLD(self) -> bool:
-        return self.ar_fold and self.B <= 4 and not self.AR_RSAG
+        return self.ar_fold and self.BQ <= 4 and not self.AR_RSAG
 
     @property
     def CWA(
@@ -193,7 +229,7 @@ class DecodeConfig:
 
     @property
     def FR(self) -> int:  # folded all-reduce payload rows
-        return rup(self.B * (self.Hp // 128), 8)
+        return rup(self.BQ * (self.Hp // 128), 8)
 
     @property
     def VW(self) -> int:
@@ -208,8 +244,12 @@ class DecodeConfig:
         return self.D**-0.5
 
     def check(self) -> None:
+        assert self.B >= 1 and self.Q >= 1
         assert self.D == 64, "head-pair lane packing assumes head_dim 64"
         assert self.NKV == self.R, "v0: exactly one KV head per rank"
+        assert self.dcp_size in (1, 2, 4) and self.R % self.dcp_size == 0
+        if self.dcp_size > 1:
+            assert self.Q == 1, "DCP currently supports plain decode (Q=1)"
         assert self.NQL % 2 == 0 and self.QWL % 128 == 0
         assert self.L % 2 == 0, "layers come in (sliding, full) pairs"
         assert self.E <= 128 and self.TOPK <= self.E and self.E % self.R == 0
@@ -224,6 +264,7 @@ class DecodeConfig:
             assert self.I % 32 == 0 and self.Hp % 128 == 0
         assert self.page % 8 == 0 and self.kv_bufs >= 2
         assert self.npb_swa >= self.NWP, "sliding layers: one work item per sequence"
+        assert all(0 <= l <= self.L for l in self.capture_layers), self.capture_layers
 
 
 FULL = DecodeConfig()

@@ -98,15 +98,26 @@ def static_disable_reason(hf_config, parallel, spec_algorithm) -> Optional[str]:
         return (
             f"attn dp/cp = {parallel.attn_dp_size}/{parallel.attn_cp_size} (needs 1/1)"
         )
-    if getattr(parallel, "attn_dcp_size", 1) != 1:
-        return f"decode context parallel {parallel.attn_dcp_size} (needs 1)"
+    dcp = getattr(parallel, "attn_dcp_size", 1)
+    if dcp not in (1, 2, 4):
+        return f"decode context parallel {dcp} (needs 1, 2, or 4)"
     if parallel.attn_tp_size != hf_config.num_key_value_heads:
         return (
             f"attn_tp_size={parallel.attn_tp_size}; the kernel needs exactly one KV head "
             f"per rank (TP{hf_config.num_key_value_heads})"
         )
-    if spec_algorithm not in (None, "", "NONE", "none"):
+    spec_name = (
+        ""
+        if spec_algorithm is None
+        else getattr(spec_algorithm, "name", str(spec_algorithm)).upper()
+    )
+    if spec_name not in ("", "NONE", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE"):
         return f"speculative decoding ({spec_algorithm}) is not supported"
+    if dcp > 1 and spec_name not in ("", "NONE"):
+        return (
+            f"decode context parallel {dcp} with speculative decoding "
+            f"({spec_algorithm}) is not supported"
+        )
     if hf_config.num_hidden_layers % 2:
         return "odd layer count"
     want = [
@@ -190,16 +201,19 @@ class WeightTap:
         self.builder = None
         mk = GptOssDecodeMK(self.c, self.rank, self.tp_size, host, device)
         del host
+        if getattr(model, "layers_to_capture", None):
+            mk.set_capture_layers(model.layers_to_capture)
         # registers as a submodule (buffers move with the model)
         model._tpu_decode_mk = mk
         from sglang_tpu.gptoss_decode_mk.weights import per_rank_bytes
 
         logger.info(
-            "GPT-OSS decode megakernel ON (rank %d/%d, %s MoE, %s experts, ar_mode=%s "
+            "GPT-OSS decode megakernel ON (rank %d/%d, dcp=%d, %s MoE, %s experts, ar_mode=%s "
             "ar_fold=%s npb=%d npb_swa=%d kv_bufs=%d ablate=%s): %.2f GiB extra weights per "
-            "rank; DECODE batches <= %d use it, everything else uses the stock layers.",
+            "rank; DECODE and TARGET_VERIFY batches <= %d use it, everything else uses the stock layers.",
             self.rank,
             self.tp_size,
+            self.c.dcp_size,
             self.c.moe_mode,
             self.c.w_dtype,
             self.c.ar_mode,
@@ -235,10 +249,13 @@ def maybe_make_weight_tap(causal_lm: nn.Module) -> Optional[WeightTap]:
     from sglang_tpu.gptoss_decode_mk.weights import config_from_hf
 
     moe_mode = (envs.SGLANG_TPU_GPTOSS_DECODE_MK_MOE.get() or "tp").strip().lower()
+    dcp = int(getattr(parallel, "attn_dcp_size", 1) or 1)
     c = config_from_hf(
         causal_lm.config,
         tp_size=parallel.attn_tp_size,
         moe_mode=moe_mode,
+        dcp_size=dcp,
+        dcp_swa=(dcp > 1),
         **kernel_knobs_from_env(),
     )
     return WeightTap(causal_lm, c, parallel.attn_tp_rank, parallel.attn_tp_size)
@@ -265,10 +282,10 @@ def _signature_fn(names: list[str], n_out: int, body):
 
 def get_step_op(c0, tp_size: int, noop: bool = False):
     """Torch op ``(x, kv_lens, page_indices, swa_page_indices, cos_sin, rank, *W, *pools)
-    -> (hidden [B, H], kvn [L, BR, 1, packing, 128], newpg [2B], off [B])``.
+    -> (hidden [B*Q, H], kvn [L, BR, kv_groups, packing, 128], newpg [2*B*Q], off [B*Q][, aux])``.
 
-    One op for every decode bucket: the JAX function specializes the kernel to the input
-    shapes at export time (B, pages per request, pool sizes, KV dtype), so each bucket
+    One op for every decode/verify bucket: the JAX function specializes the kernel to the input
+    shapes at export time (B, Q, pages per request, pool sizes, KV dtype), so each bucket
     compiles once. Each rank passes its own blocks as replicated (``P()``) operands of a
     ``shard_map`` over the ``"tp"`` mesh, as ``fused_moe_rs_op`` / ``pp_wave`` do.
     """
@@ -293,13 +310,16 @@ def get_step_op(c0, tp_size: int, noop: bool = False):
         + [f"kv_{i}" for i in range(L)]
     )
     nw = len(W_NAMES)
+    n_out = 5 if c0.capture_layers else 4
 
     def per_rank(x, kv_lens, page_indices, swa_page_indices, cos_sin, rank, *rest):
         weights, pools = list(rest[:nw]), list(rest[nw:])
-        B = x.shape[0]
+        B = kv_lens.shape[0]
+        Q = x.shape[0] // B
         c = A.trace_config(
             c0,
             B=B,
+            Q=Q,
             pps=page_indices.shape[0] // B,
             kv_dtype=pools[0].dtype,
             nb_swa=pools[0].shape[0],
@@ -307,11 +327,13 @@ def get_step_op(c0, tp_size: int, noop: bool = False):
             page=pools[0].shape[1],
         )
         logger.info(
-            "GPT-OSS decode megakernel: exporting B=%d pages/req=%d kv=%s "
+            "GPT-OSS decode megakernel: exporting B=%d Q=%d pages/req=%d kv=%s cap=%s "
             "(SMEM ~%d KiB)",
             B,
+            Q,
             c.max_pages,
             c.kv_dtype,
+            c.capture_layers or "-",
             A.smem_bytes_estimate(c) // 1024,
         )
         step = A.per_rank_noop if noop else A.per_rank_step
@@ -320,23 +342,27 @@ def get_step_op(c0, tp_size: int, noop: bool = False):
         )
 
     specs = (P(),) * len(names)
+    out_specs = (P(),) * n_out
     smap = jax.shard_map(
-        per_rank, mesh=mesh, in_specs=specs, out_specs=(P(),) * 4, check_vma=False
+        per_rank, mesh=mesh, in_specs=specs, out_specs=out_specs, check_vma=False
     )
-    fn = _signature_fn(names, 4, smap)
+    fn = _signature_fn(names, n_out, smap)
+    op_name = STEP_OP_NAME + ("_noop" if noop else "")
+    if c0.capture_layers:
+        op_name += "_cap_" + "_".join(str(x) for x in c0.capture_layers)
     op = cpu_export_jax_op(
-        STEP_OP_NAME + ("_noop" if noop else ""),
+        op_name,
         fn,
         mesh=mesh,
         input_partition_specs=specs,
-        output_partition_specs=(P(),) * 4,
+        output_partition_specs=out_specs,
     )
     _STEP_OPS[key] = op
     return op
 
 
 def get_kv_write_op():
-    """Torch op ``kv_write(pg [B], off [B], kvn [BR, 1, packing, 128], pool)`` mutating
+    """Torch op ``kv_write(pg [B*Q], off [B*Q], kvn [BR, kv_groups, packing, 128], pool)`` mutating
     ``pool`` in place (donated + aliased, the ``kv_row_write`` pattern)."""
     global _KV_WRITE_OP
     if _KV_WRITE_OP is not None:
@@ -386,7 +412,7 @@ def _mutating_op_fn(names: list[str], body):
 
 
 def get_kv_write_layers_op(L: int):
-    """Torch op ``kv_write_layers(newpg [2B], off [B], kvn [L, BR, 1, packing, 128],
+    """Torch op ``kv_write_layers(newpg [2*B*Q], off [B*Q], kvn [L, BR, kv_groups, packing, 128],
     kv_0, ..., kv_{L-1})`` mutating all L pools in place with ONE Pallas call (each pool
     donated and aliased to its own output, as RPA v3 does for its single pool)."""
     if L in _KV_WRITE_LAYERS_OPS:
@@ -428,7 +454,7 @@ def get_kv_write_layers_op(L: int):
 
 class GptOssDecodeMK(nn.Module):
     """Holds one rank's megakernel weights (non-persistent buffers, so the compiled graph
-    takes them as inputs like the stock weights) and runs the decode step."""
+    takes them as inputs like the stock weights) and runs the decode/verify step."""
 
     def __init__(self, c, rank: int, tp_size: int, host: dict, device):
         super().__init__()
@@ -452,6 +478,9 @@ class GptOssDecodeMK(nn.Module):
             )
         # register the ops eagerly, outside any torch.compile trace
         self._step_op = get_step_op(c, tp_size, noop=self.ablate == "noop_kernel")
+        self._step_ops_by_cap: dict[tuple[int, ...], Any] = {(): self._step_op}
+        if c.capture_layers:
+            self._step_ops_by_cap[tuple(c.capture_layers)] = self._step_op
         self.kv_write_mode = (
             (envs.SGLANG_TPU_GPTOSS_DECODE_MK_KV_WRITE.get() or "layers")
             .strip()
@@ -476,35 +505,60 @@ class GptOssDecodeMK(nn.Module):
             {
                 k: str(getattr(self, "w_" + k).dtype)
                 for k in self.w_names
-                if k in ("w13q", "w2q", "w13", "w2")  # expert matrices (mxfp4 | fp8)
+                if k in ("w13q", "w13s", "w13", "w2")  # expert matrices (mxfp4 | fp8)
             },
         )
+
+    def set_capture_layers(self, layers_to_capture: list[int] | tuple[int, ...]):
+        """Pre-register a step op for ``layers_to_capture`` outside ``torch.compile``."""
+        import dataclasses
+
+        cap = tuple(int(x) for x in (layers_to_capture or ()))
+        if cap not in self._step_ops_by_cap:
+            c_cap = dataclasses.replace(self.c, capture_layers=cap)
+            self._step_ops_by_cap[cap] = get_step_op(
+                c_cap, self.tp_size, noop=self.ablate == "noop_kernel"
+            )
+        return self._step_ops_by_cap[cap]
 
     @staticmethod
     def applies(
         forward_batch, input_ids, input_embeds, pp_proxy_tensors, layers_to_capture
     ) -> bool:
         """Static (per compiled graph) choice between the megakernel and the stock stack."""
-        return (
-            forward_batch.forward_mode.is_decode()
-            and getattr(forward_batch, "spec_info", None) is None
-            and input_embeds is None
-            and pp_proxy_tensors is None
-            and not layers_to_capture
-            and input_ids is not None
-            and input_ids.shape[0] <= MAX_BATCH
-            and input_ids.shape[0] == forward_batch.seq_lens.shape[0]
-        )
+        if (
+            input_embeds is not None
+            or pp_proxy_tensors is not None
+            or input_ids is None
+        ):
+            return False
+        B = forward_batch.seq_lens.shape[0]
+        T = input_ids.shape[0]
+        if B <= 0 or B > MAX_BATCH:
+            return False
+        fm = forward_batch.forward_mode
+        if fm.is_decode():
+            return getattr(forward_batch, "spec_info", None) is None and T == B
+        if fm.is_target_verify():
+            spec = getattr(forward_batch, "spec_info", None)
+            if spec is not None and spec.topk != 1:
+                return False
+            return T >= B and T % B == 0
+        return False
 
-    def _check_backend(self, attn_backend, pool, model) -> None:
+    def _check_backend(self, attn_backend, pool, model, q_per_seq: int = 1) -> None:
         meta = getattr(attn_backend, "forward_metadata", None)
         problems = []
         if meta is None or getattr(meta, "swa_page_indices", None) is None:
             problems.append("attention backend has no hybrid-SWA RPA metadata")
-        elif getattr(meta, "decode_query_size", 1) != 1:
-            problems.append("decode_query_size != 1")
-        if getattr(attn_backend, "_dcp", 1) != 1:
-            problems.append("decode context parallelism")
+        elif getattr(meta, "decode_query_size", 1) not in (1, q_per_seq):
+            problems.append(
+                f"decode_query_size={getattr(meta, 'decode_query_size', 1)} != {q_per_seq}"
+            )
+        if getattr(attn_backend, "_dcp", 1) != self.c.dcp_size:
+            problems.append(
+                f"decode context parallelism {getattr(attn_backend, '_dcp', 1)} != {self.c.dcp_size}"
+            )
         mapping = getattr(pool, "layers_mapping", None)
         want = {l: (l // 2, l % 2 == 0) for l in range(self.c.L)}
         if mapping is None or any(mapping.get(l) != v for l, v in want.items()):
@@ -514,10 +568,17 @@ class GptOssDecodeMK(nn.Module):
         else:
             for l in (0, 1):
                 buf = pool.get_fused_kv_buffer(l)
-                if buf.dim() != 5 or buf.shape[2] != 1 or buf.shape[4] != 128:
+                packing = 4 if buf.dtype == torch.float8_e4m3fn else 2
+                if self.c.dcp_size == 1 or (l == 0 and not self.c.dcp_swa):
+                    want_g = 1
+                elif self.c.dcp_lane_pack and packing == 4:
+                    want_g = max(1, self.c.dcp_size // 4)
+                else:
+                    want_g = max(1, (2 * self.c.dcp_size) // packing)
+                if buf.dim() != 5 or buf.shape[2] != want_g or buf.shape[4] != 128:
                     problems.append(
                         f"layer {l} pool shape {tuple(buf.shape)} is not "
-                        "[pages, page, 1, packing, 128]"
+                        f"[pages, page, {want_g}, packing, 128]"
                     )
                 if buf.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
                     problems.append(f"KV dtype {buf.dtype}")
@@ -536,7 +597,7 @@ class GptOssDecodeMK(nn.Module):
                 f"state: {'; '.join(sorted(set(problems)))}. Unset {ENV_ENABLE}."
             )
 
-    def run(self, model, input_ids: torch.Tensor, forward_batch) -> torch.Tensor:
+    def run(self, model, input_ids: torch.Tensor, forward_batch):
         """Embedding -> megakernel (all layers) -> in-place KV writes -> final norm."""
         # Everything below must stay dynamo-traceable (fullgraph): no context managers,
         # locks, host timers or syncs. Under torch.compile ``diag`` is the constant None
@@ -546,34 +607,72 @@ class GptOssDecodeMK(nn.Module):
             diag.on_run(input_ids.shape[0])
         attn_backend = self._get_attn_backend()  # what RadixAttention uses
         pool = attn_backend.token_to_kv_pool
-        self._check_backend(attn_backend, pool, model)
         meta = attn_backend.forward_metadata
+        kv_lens = (
+            meta.dcp_kv_lens_global
+            if (
+                meta is not None
+                and self.c.dcp_size > 1
+                and getattr(meta, "dcp_kv_lens_global", None) is not None
+            )
+            else getattr(meta, "kv_lens", None)
+        )
+        B_seq = (
+            kv_lens.shape[0]
+            if kv_lens is not None
+            else input_ids.shape[0]
+        )
+        q_per_seq = input_ids.shape[0] // max(B_seq, 1)
+        self._check_backend(attn_backend, pool, model, q_per_seq=q_per_seq)
         pools = [pool.get_fused_kv_buffer(l) for l in self.layer_ids]
         x = model.embed_tokens(input_ids)
+        cap = tuple(int(x_) for x_ in (getattr(model, "layers_to_capture", None) or ()))
         if self.ablate == "no_mk":  # timing only: everything but the two MK ops
             forward_batch.residual_stream = None
-            return model.norm(x)
+            normed = model.norm(x)
+            if cap:
+                return normed, x.repeat(1, len(cap))
+            return normed
         cos_sin = model.layers[0].self_attn.rotary_emb.cos_sin_cache
         weights = [getattr(self, "w_" + k) for k in self.w_names]
-        t0 = diag.tick(x) if diag is not None else None
-        hidden, kvn, newpg, off = self._step_op(
-            x,
-            meta.kv_lens,
-            meta.page_indices,
-            meta.swa_page_indices,
-            cos_sin,
-            self.rank_t,
-            *weights,
-            *pools,
+        step_op = (
+            self._step_ops_by_cap.get(cap)
+            if cap
+            else self._step_op
         )
+        if step_op is None:
+            step_op = self.set_capture_layers(cap)
+        t0 = diag.tick(x) if diag is not None else None
+        if cap:
+            hidden, kvn, newpg, off, aux = step_op(
+                x,
+                kv_lens,
+                meta.page_indices,
+                meta.swa_page_indices,
+                cos_sin,
+                self.rank_t,
+                *weights,
+                *pools,
+            )
+        else:
+            hidden, kvn, newpg, off = step_op(
+                x,
+                kv_lens,
+                meta.page_indices,
+                meta.swa_page_indices,
+                cos_sin,
+                self.rank_t,
+                *weights,
+                *pools,
+            )
         t1 = diag.tick(hidden) if diag is not None else None
-        B = x.shape[0]
+        BQ = x.shape[0]
         if self.ablate == "no_kv_write":  # timing only: the KV pools go stale
             pass
         elif self.kv_write_mode == "layers":
             self._kv_write_op(newpg, off, kvn, *pools)
         else:
-            pg_swa, pg_full = newpg[:B], newpg[B:]
+            pg_swa, pg_full = newpg[:BQ], newpg[BQ:]
             for i, l in enumerate(self.layer_ids):
                 self._kv_write_op(
                     pg_swa if l % 2 == 0 else pg_full, off, kvn[l], pools[i]
@@ -582,7 +681,10 @@ class GptOssDecodeMK(nn.Module):
             diag.on_eager_times(t0, t1, diag.tick(pools[0]))
         # the stock stack's residual stream is not used on this path
         forward_batch.residual_stream = None
-        return model.norm(hidden)
+        normed = model.norm(hidden)
+        if cap:
+            return normed, aux
+        return normed
 
 
 def _to_device(t: torch.Tensor, device) -> torch.Tensor:

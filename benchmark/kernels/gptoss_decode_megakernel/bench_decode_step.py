@@ -271,6 +271,23 @@ def main():
         help="all-reduce full [BR, Hp] rows even for B <= 4",
     )
     ap.add_argument(
+        "--dcp",
+        type=int,
+        default=1,
+        choices=[1, 2, 4],
+        help="decode context parallelism size (1, 2, or 4)",
+    )
+    ap.add_argument(
+        "--dcp-swa",
+        action="store_true",
+        help="also shard sliding-window KV pool across DCP ranks",
+    )
+    ap.add_argument(
+        "--dcp-lane-pack",
+        action="store_true",
+        help="pack pairs of DCP KV heads into low/high 64 lanes (single kv_group for DCP4)",
+    )
+    ap.add_argument(
         "--cpu-smoke",
         action="store_true",
         help="tiny dims + Pallas interpret mode on 8 virtual CPU devices (script check)",
@@ -295,7 +312,7 @@ def main():
     assert len(devs) >= 8, f"need 8 TPU devices, got {devs}"
     mesh = Mesh(np.array(devs[:8]), ("tp",))
     shd, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
-    max_pages = -(-(args.ctx + 1) // 64)
+    max_pages = -(-((args.ctx // args.dcp) + 1) // 64)
     nb = max(args.batch) * max_pages + 1  # full pool: every page of every sequence
     swa_ring = 4  # > NWP pages: sliding layers only ever touch the window's pages
     nb_swa = max(args.batch) * swa_ring + 1
@@ -348,6 +365,9 @@ def main():
             nb_swa=nb_swa,
             max_pages=max_pages,
             kv_bufs=args.kv_bufs,
+            dcp_size=args.dcp,
+            dcp_swa=args.dcp_swa,
+            dcp_lane_pack=args.dcp_lane_pack,
             **extra,
         )
         if W is None:  # weights do not depend on B
@@ -402,6 +422,9 @@ def main():
                 B=B,
                 L=c.L,
                 ctx=args.ctx,
+                dcp=c.dcp_size,
+                dcp_swa=c.dcp_swa,
+                dcp_lane_pack=c.dcp_lane_pack,
                 kv=c.kv_dtype,
                 moe=c.moe_mode,
                 scatter=not args.no_scatter,

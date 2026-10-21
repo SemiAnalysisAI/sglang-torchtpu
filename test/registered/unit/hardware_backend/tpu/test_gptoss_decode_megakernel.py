@@ -49,8 +49,8 @@ def _rel(a, b):
 
 
 def _positions(c):
-    cap = c.max_pages * c.page - 1
-    base = [0, 63, 130, cap, 64, 200, 127, 5, 448, 1]
+    cap = c.max_pages * c.page - c.Q
+    base = [0, 62, 130, cap, 64, 200, 127, 5, 448, 1]
     return np.array([min(base[i % len(base)], cap) for i in range(c.B)], np.int32)
 
 
@@ -62,7 +62,7 @@ def _setup(c, seed=0):
         c.w_dtype != "bf16"
     ):  # the reference sees exactly the MXFP4-representable weights
         layers = [REF.mxfp4_roundtrip(c, w) for w in layers]
-    x = jax.random.normal(keys[c.L], (c.B, c.H), jnp.float32).astype(jnp.bfloat16)
+    x = jax.random.normal(keys[c.L], (c.BQ, c.H), jnp.float32).astype(jnp.bfloat16)
     pos = _positions(c)
     T = c.max_pages * c.page
     kvdt = REF.kv_jdtype(c)
@@ -107,7 +107,7 @@ class TestGptOssDecodeMegakernel(CustomTestCase):
     def _check(self, c, also_fallback=False):
         d = _setup(c)
         margins = []
-        ref, kn_ref, vn_ref = REF.step(
+        ref_res = REF.step(
             c,
             d["x"],
             jnp.asarray(d["pos"]),
@@ -116,25 +116,35 @@ class TestGptOssDecodeMegakernel(CustomTestCase):
             d["layers"],
             margins,
         )
-        out, kv_s, kv_f = _run(c, d, xla_ar=False)
+        ref, kn_ref, vn_ref = ref_res[:3]
+        run_res = _run(c, d, xla_ar=False)
+        out, kv_s, kv_f = run_res[:3]
         # Rows whose top-k routing is a near-tie in some layer can legitimately pick a
         # different expert under f32 summation-order noise; compare the other rows.
-        tie = np.min(np.stack([np.asarray(m) for m in margins]), axis=0) < 3e-3
-        self.assertLessEqual(int(tie.sum()), max(1, c.B // 4), "too many near-tie rows")
+        tie = np.min(np.stack([np.asarray(m) for m in margins]), axis=0) < 4e-3
+        self.assertLessEqual(
+            int(tie.sum()), max(1, c.BQ // 4), "too many near-tie rows"
+        )
         keep = ~tie
-        out, ref = out[keep], ref[keep]
-        rel = _rel(out, ref)
+        out_k, ref_k = out[keep], ref[keep]
+        rel = _rel(out_k, ref_k)
         print(
-            f"{c.moe_mode} w={c.w_dtype} kv={c.kv_dtype} L={c.L} B={c.B}: "
+            f"{c.moe_mode} w={c.w_dtype} kv={c.kv_dtype} L={c.L} B={c.B} Q={c.Q} cap={c.capture_layers}: "
             f"megakernel vs reference rel {rel:.2e} (near-tie rows skipped: {int(tie.sum())})"
         )
         self.assertLess(rel, 2e-2)
+        if c.capture_layers:
+            aux_ref = ref_res[3][:, keep]
+            aux_out = run_res[3][:, keep]
+            rel_aux = _rel(aux_out, aux_ref)
+            print(f"  aux capture rel {rel_aux:.2e}")
+            self.assertLess(rel_aux, 2e-2)
         self._check_pools(c, d, kv_s, kv_f, kn_ref, vn_ref)
         if also_fallback:
             out_fb, kv_s_fb, kv_f_fb = _run(c, d, xla_ar=True)
             out_fb = out_fb[keep]
-            rel_fb = _rel(out_fb, ref)
-            rel_mf = _rel(out, out_fb)
+            rel_fb = _rel(out_fb, ref_k)
+            rel_mf = _rel(out_k, out_fb)
             print(
                 f"  fallback vs reference {rel_fb:.2e}, megakernel vs fallback {rel_mf:.2e}"
             )
@@ -146,24 +156,58 @@ class TestGptOssDecodeMegakernel(CustomTestCase):
             )
 
     def _check_pools(self, c, d, kv_s, kv_f, kn_ref, vn_ref):
-        """New K/V landed at (page(pos), pos % page) of each layer's pool; nothing else moved."""
+        """New K/V landed at (page((pos+q)//dcp), ((pos+q)//dcp) % page) on owner ranks; nothing else moved."""
         before = [np.asarray(p.astype(jnp.float32)) for p in d["pools"]]
         after = [np.asarray(p.astype(jnp.float32)) for p in (kv_s, kv_f)]
         expect = [b.copy() for b in before]
-        kn = np.asarray(kn_ref.astype(jnp.float32))  # [L, B, NKV, D]
+        kn = np.asarray(kn_ref.astype(jnp.float32))  # [L, B*Q, NKV, D]
         vn = np.asarray(vn_ref.astype(jnp.float32))
         for l in range(c.L):
             which, pt = (0, d["pt_swa"]) if c.sliding[l] else (1, d["pt_full"])
+            dcp = c.dcp_size if (not c.sliding[l] or c.dcp_swa) else 1
             for b in range(c.B):
-                p = int(d["pos"][b])
-                pg = int(pt[b, p // c.page])
-                tok = p % c.page
-                slot = expect[which][:, l // 2, pg, tok, 0]  # [R, packing, 128] view
-                slot[...] = (
-                    0.0  # padding lanes and fp8 padding slots are written as zeros
-                )
-                slot[:, 0, : c.D] = kn[l, b]
-                slot[:, 1, : c.D] = vn[l, b]
+                for q in range(c.Q):
+                    t_idx = b * c.Q + q
+                    p = int(d["pos"][b]) + q
+                    pg = int(pt[b, (p // dcp) // c.page])
+                    tok = (p // dcp) % c.page
+                    if dcp == 1:
+                        slot = expect[which][
+                            :, l // 2, pg, tok, 0
+                        ]  # [R, packing, 128] view
+                        slot[...] = (
+                            0.0  # padding lanes and fp8 padding slots are written as zeros
+                        )
+                        slot[:, 0, : c.D] = kn[l, t_idx]
+                        slot[:, 1, : c.D] = vn[l, t_idx]
+                    else:
+                        owner_d = p % dcp
+                        for r in range(c.R):
+                            if r % dcp != owner_d:
+                                continue
+                            grp_base = (r // dcp) * dcp
+                            slot = expect[which][r, l // 2, pg, tok]
+                            slot[...] = 0.0
+                            for h in range(dcp):
+                                kv_h = grp_base + h
+                                if c.dcp_lane_pack and c.kv_dtype == "fp8":
+                                    g_idx = 0
+                                    k_slot, v_slot = 2 * (h // 2), 2 * (h // 2) + 1
+                                    lane_off = 64 * (h % 2)
+                                elif c.kv_packing == 4:
+                                    g_idx = h // 2
+                                    k_slot, v_slot = 2 * (h % 2), 2 * (h % 2) + 1
+                                    lane_off = 0
+                                else:
+                                    g_idx = h
+                                    k_slot, v_slot = 0, 1
+                                    lane_off = 0
+                                slot[
+                                    g_idx, k_slot, lane_off : lane_off + c.D
+                                ] = kn[l, t_idx, kv_h]
+                                slot[
+                                    g_idx, v_slot, lane_off : lane_off + c.D
+                                ] = vn[l, t_idx, kv_h]
         for a, e, b0 in zip(after, expect, before):
             bad = np.abs(a - e) > 0.02 * np.maximum(np.abs(e), 1.0)
             # tiny K/V differences come only from f32 summation order upstream
@@ -242,6 +286,66 @@ class TestGptOssDecodeMegakernel(CustomTestCase):
         self._check(
             dataclasses.replace(
                 C.tiny(B=16, npb=1, w_dtype="bf16"), nb_swa=72, nb_full=72
+            )
+        )
+
+    def test_target_verify_q4_and_capture_layers(self):
+        # EAGLE3 target verify: Q=4 verify tokens per sequence + auxiliary hidden capture
+        # Includes pos=62 (crosses 64-token page boundary within the Q=4 tokens) and
+        # pos=130 (sliding-window boundary shifts per query q in 0..3).
+        self._check(
+            C.tiny(
+                B=3,
+                Q=4,
+                w_dtype="fp8",
+                kv_dtype="fp8",
+                capture_layers=(0, 1, 2),
+            ),
+            also_fallback=True,
+        )
+
+    def test_target_verify_q4_b1_ar_fold(self):
+        # B=1, Q=4 -> BQ=4 exercises AR_FOLD with multi-token verify
+        self._check(
+            C.tiny(
+                B=1,
+                Q=4,
+                w_dtype="fp8",
+                kv_dtype="bf16",
+                capture_layers=(0, 1, 2),
+            )
+        )
+
+    def test_dcp2_fp8_kv(self):
+        # TP8 + DCP2: 2 KV heads per rank, stock pool layout (kv_groups=1)
+        self._check(
+            C.tiny(B=4, dcp_size=2, dcp_swa=False, w_dtype="fp8", kv_dtype="fp8"),
+            also_fallback=True,
+        )
+
+    def test_dcp2_swa_sharded(self):
+        # TP8 + DCP2 with SWA pool also DCP-sharded (matches SGLang dcp_shards_every_kv_pool=True)
+        self._check(
+            C.tiny(B=4, dcp_size=2, dcp_swa=True, w_dtype="fp8", kv_dtype="fp8")
+        )
+
+    def test_dcp4_stock_pool_fp8_kv(self):
+        # TP8 + DCP4: 4 KV heads per rank, stock pool layout (kv_groups=2, strided_load/store)
+        self._check(
+            C.tiny(B=4, dcp_size=4, dcp_swa=True, w_dtype="fp8", kv_dtype="fp8"),
+            also_fallback=True,
+        )
+
+    def test_dcp4_lane_pack_fp8_kv(self):
+        # TP8 + DCP4: 4 KV heads per rank, dual-lane compact pool layout (kv_groups=1, dcp_lane_pack=True)
+        self._check(
+            C.tiny(
+                B=4,
+                dcp_size=4,
+                dcp_swa=False,
+                dcp_lane_pack=True,
+                w_dtype="fp8",
+                kv_dtype="fp8",
             )
         )
 

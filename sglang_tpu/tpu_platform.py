@@ -678,11 +678,11 @@ def _validate_decode_context_parallel(server_args) -> None:
             "pages of that many tokens and the scheduler cuts prefill chunks at "
             "page boundaries, so a smaller chunk is never scheduled."
         )
-    # TODO(yinlin09): lift once DCP4/DCP8 pass the e2e gate on the pinned stack;
+    # TODO(yinlin09): lift once DCP8 passes the e2e gate on the pinned stack;
     # DCP8 served on torch_tpu 0.1.1.dev20260914 with libtpu 0.0.47.
-    if dcp_size > 2:
+    if dcp_size > 4:
         raise ValueError(
-            "--decode-context-parallel-size must be 1 or 2 on TPU, got "
+            "--decode-context-parallel-size must be 1, 2, or 4 on TPU, got "
             f"{dcp_size}: with more ranks the forward stalls in warmup with the "
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."

@@ -67,6 +67,9 @@ def main():
     ap.add_argument(
         "--no-scatter", action="store_true", help="leave out the KV scatter call"
     )
+    ap.add_argument("--dcp", type=int, default=1, choices=[1, 2, 4])
+    ap.add_argument("--dcp-swa", action="store_true")
+    ap.add_argument("--dcp-lane-pack", action="store_true")
     ap.add_argument("--topology", default="tpu7x:2x2x1")
     args = ap.parse_args()
 
@@ -97,11 +100,17 @@ def main():
             ar_mode=args.ar_mode,
             ablate=tuple(args.ablate),
             kv_write=args.kv_write,
+            dcp_size=args.dcp,
+            dcp_swa=args.dcp_swa,
+            dcp_lane_pack=args.dcp_lane_pack,
         )
         rec = dict(
             mode="aot_" + args.topology,
             B=B,
             L=c.L,
+            dcp=c.dcp_size,
+            dcp_swa=c.dcp_swa,
+            dcp_lane_pack=c.dcp_lane_pack,
             kv=c.kv_dtype,
             moe=c.moe_mode,
             w=c.w_dtype,
