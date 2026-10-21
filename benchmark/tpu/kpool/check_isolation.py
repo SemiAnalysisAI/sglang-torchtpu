@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--q1-batch", action="store_true")
+    parser.add_argument("--q1-default", action="store_true")
     parser.add_argument(
         "--baseline-unrolled",
         action="store_true",
@@ -107,9 +108,22 @@ def main():
                     for key, value in options.items()
                     if key != "decode_q1_batch"
                 }
+            if args.q1_default:
+                changed = (
+                    options.get("decode_max_q") == 1
+                    and options.get("decode_pipeline")
+                    and options.get("decode_tile_rows") == 16
+                    and batch == 32
+                    and not options["decode_q1_unroll"]
+                )
+                baseline_options = options
             left = graph(old, specs, tokens, baseline_options)
             right = graph(new, specs, tokens, options)
             passed = (left != right) if changed else (left == right)
+            if args.q1_default and changed:
+                passed = passed and right == graph(
+                    new, specs, tokens, {**options, "decode_q1_batch": True}
+                )
             cases.append(
                 {
                     "batch": batch,

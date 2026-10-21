@@ -3,7 +3,8 @@
 
 Decode/verify uses fixed request/tile slots and double raw buffering. A prior
 store overlaps independent destination reads and compute; aliased destinations
-still serialize their RMW. The general prefill path uses larger raw transfers.
+still serialize their RMW. Q1/B32 batches independent pools in one computation.
+The general prefill path uses larger raw transfers.
 """
 
 from functools import partial
@@ -582,7 +583,7 @@ def compress_and_store(
     decode_max_q=None,
     decode_pipeline=True,
     decode_q1_unroll=False,
-    decode_q1_batch=False,
+    decode_q1_batch=None,
 ):
     """Pool newly closed K4 groups; the returned native cache aliases its input.
 
@@ -595,6 +596,10 @@ def compress_and_store(
     The general path remains preferable for large prefill query lengths.
     decode_q1_unroll opts into an experimental static-slot Q=1 pipeline;
     it has not demonstrated a stable latency gain and is disabled by default.
+    decode_q1_batch=None selects the measured Q1/B32 batch path automatically.
+    False retains the previous implementation. True opts other Q1 shapes into
+    reference-compatible rounding and batches at most 32 requests; larger
+    batches retain bounded serial scratch. Q>1 and prefill are unaffected.
     """
     if kpool != 4 or raw_cache.shape[1:] != (128, 256):
         raise ValueError("fused pooling requires K=4, page_size=128 and D=128")
@@ -610,12 +615,26 @@ def compress_and_store(
         max_q = num_tokens if decode_max_q is None else decode_max_q
         if not isinstance(max_q, int) or max_q < 1:
             raise ValueError("decode_max_q must be a positive static integer")
+        if decode_q1_batch is None:
+            decode_q1_batch = (
+                max_q == 1
+                and kv_lens.shape[0] == 32
+                and decode_tile_rows == 16
+                and decode_pipeline
+                and not decode_q1_unroll
+            )
         desc = _decode_descriptors(
             kv_lens, page_indices, cu_q_lens, distribution, decode_tile_rows, max_q
         )
         pipeline = decode_pipeline and desc.shape[1] > 1
         buffers = 2 if pipeline else 1
-        if decode_q1_batch and max_q == 1 and pipeline and decode_tile_rows == 16:
+        if (
+            decode_q1_batch
+            and max_q == 1
+            and pipeline
+            and decode_tile_rows == 16
+            and desc.shape[1] <= 32
+        ):
             count = desc.shape[1]
             index = jnp.arange(count)
             same_quad = (desc[2, :, None] == desc[2, None, :]) & (
