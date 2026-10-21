@@ -3,6 +3,7 @@
 
 import os
 import unittest
+from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -22,12 +23,12 @@ def reference(raw, old, ape, lens, pages, cu, distribution, tokens):
     req, pos, valid = kp._token_rows(lens, cu, distribution, tokens)
     closing = valid & (pos % 4 == 3)
     member = jnp.maximum(pos[:, None] - 3 + jnp.arange(4)[None, :], 0)
-    loc = dict(
-        page_indices=pages,
-        num_seqs=lens.shape[0],
-        page_size=128,
-        num_pages=raw.shape[0],
-    )
+    loc = {
+        "page_indices": pages,
+        "num_seqs": lens.shape[0],
+        "page_size": 128,
+        "num_pages": raw.shape[0],
+    }
     page, slot = kp._page_slot(
         jnp.broadcast_to(req[:, None], member.shape),
         member,
@@ -45,6 +46,13 @@ class TestKpoolCompress(unittest.TestCase):
     def test_exact_cache_bytes(self):
         ref = jax.jit(reference, static_argnums=(7,))
         fused = jax.jit(compress_and_store, static_argnums=(7,))
+        decode_variants = [
+            jax.jit(
+                partial(compress_and_store, decode=True, decode_tile_rows=rows),
+                static_argnums=(7,),
+            )
+            for rows in (16, 32)
+        ]
         specs = [
             ("full_pages", [0, 0], [128, 128], 256, "random"),
             ("raw_page_boundary", [124, 508], [12, 8], 32, "random"),
@@ -58,6 +66,7 @@ class TestKpoolCompress(unittest.TestCase):
             ("tiny", [0, 0], [16, 16], 32, "tiny"),
             ("nonfinite", [0, 0], [16, 16], 32, "nonfinite"),
             ("shared_quad", [0, 4], [4, 4], 32, "shared"),
+            ("decode_shared_quad", [3, 7], [1, 1], 32, "shared"),
         ]
         for i, (name, start, new, tokens, mode) in enumerate(specs):
             with self.subTest(name=name):
@@ -90,6 +99,11 @@ class TestKpoolCompress(unittest.TestCase):
                 actual = np.asarray(fused(*args))
                 # Includes all inactive records, record padding, FP8 keys and scales.
                 np.testing.assert_array_equal(actual, expected)
+                if max(new) <= 1:
+                    for decode in decode_variants:
+                        np.testing.assert_array_equal(
+                            np.asarray(decode(*args)), expected
+                        )
 
 
 if __name__ == "__main__":
