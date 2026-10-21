@@ -33,9 +33,17 @@ def flash_attention_qk_softmax(
     bq_start: int,
     kv_len_left: list[jax.Array] | None = None,  # [B]
     global_q_k_gap: list[jax.Array] | None = None,  # [B]
+    apply_mask: bool = True,
+    fold_sm_scale: bool = False,
 ):
-    """Flash attention kernel."""
+    """Flash attention kernel.
+
+    ``apply_mask=False`` is for tiles the caller proved fully visible;
+    ``fold_sm_scale`` scales q instead of the scores (exact for a power of two).
+    """
     b, k_heads, tq, h_size = q.shape
+    if fold_sm_scale:
+        q = q * jnp.asarray(cfgs.model.sm_scale, q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -64,7 +72,8 @@ def flash_attention_qk_softmax(
         )
     qk = qk.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
+    if not fold_sm_scale:
+        qk *= cfgs.model.sm_scale
     if cfgs.serve.scale_k is not None:
         qk *= cfgs.serve.scale_k
     if cfgs.serve.scale_q is not None:
@@ -85,6 +94,10 @@ def flash_attention_qk_softmax(
         q_kv_diff_global = q_iota - cfgs.serve.cp_group_size * kv_iota
 
     for b_idx in range(cfgs.block.batch_size):
+        if not apply_mask:
+            # The unused iotas above are dead code once no tile reads them.
+            qk_masked.append(qk[b_idx])
+            continue
         # NOTE: Goal is to compute q_len >= kv_len. But we want to utilize scalar
         # compute as much as possible before involving vector compute. Therefore, we
         # break down a computational steps into following equations to separate out

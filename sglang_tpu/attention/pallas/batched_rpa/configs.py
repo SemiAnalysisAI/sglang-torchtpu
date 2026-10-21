@@ -85,6 +85,10 @@ class ServingConfigs:
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    # Prefill tiles whose every key precedes every query (and lies inside the
+    # sliding window) run without the mask, and a power-of-two sm_scale is folded
+    # into q; both are exact.
+    skip_full_tile_mask: bool = False
 
     @property
     def pages_per_seq(self) -> int:

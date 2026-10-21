@@ -112,6 +112,9 @@ class TpuEnvs:
     # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
     # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
     SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
+    # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
+    # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
+    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

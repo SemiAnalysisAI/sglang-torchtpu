@@ -44,6 +44,7 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     schedule,
     utils,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 
 def prepare_inputs(
@@ -701,6 +702,7 @@ def ragged_paged_attention(
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        skip_full_tile_mask=tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
