@@ -209,6 +209,7 @@ class TestSeededSampling(CustomTestCase):
             info = SimpleNamespace(
                 sampling_seed=torch.tensor([seed, seed]),
                 top_ks=torch.tensor([1, 2]),
+                is_any_greedy=True,
                 top_ps=torch.ones(2),
                 min_ps=torch.zeros(2),
                 need_top_k_sampling=True,
@@ -225,6 +226,18 @@ class TestSeededSampling(CustomTestCase):
             sampled_second.add(tokens[1].item())
         # The sampled row still draws from both tied tokens.
         self.assertEqual(sampled_second, {0, 1})
+
+        # A batch without greedy rows samples the filtered probabilities as they are.
+        info.top_ks, info.is_any_greedy = torch.tensor([2, 2]), False
+        with (
+            patch.object(sampling_mask, "tpu_filter_probs", tie_keeping_filter),
+            patch.object(torch.Tensor, "argmax", side_effect=AssertionError),
+        ):
+            tokens, _ = sampler._sample_from_probs(
+                probs, info, torch.tensor([1, 1]), False
+            )
+        expected = sample_with_seed(probs, info.sampling_seed, torch.tensor([1, 1]))
+        self.assertEqual(tokens.tolist(), expected.tolist())
 
 
 if __name__ == "__main__":

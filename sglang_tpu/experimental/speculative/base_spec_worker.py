@@ -135,6 +135,8 @@ _SAMPLING_WARMUP_VARIANTS = [{"greedy": True}] + [
     {"greedy": False, "top_k": top_k, "top_p": top_p, "min_p": min_p}
     for top_k, top_p, min_p in itertools.product((False, True), repeat=3)
 ]
+# Greedy and sampled rows in one batch: seeded sampling keeps the greedy rows on argmax.
+_MIXED_GREEDY = {"greedy": False, "top_k": True, "mixed_greedy": True}
 
 
 class TpuSpecWorker(BaseSpecWorker):
@@ -835,7 +837,7 @@ class TpuSpecWorker(BaseSpecWorker):
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
                 for variant in _SAMPLING_WARMUP_VARIANTS + [
                     dict(variant, seeded=True)
-                    for variant in _SAMPLING_WARMUP_VARIANTS[1:]
+                    for variant in _SAMPLING_WARMUP_VARIANTS[1:] + [_MIXED_GREEDY]
                 ]:
                     # A target that keeps extend outputs padded samples all cap rows,
                     # materializing the pbs-row params to them.
@@ -1154,20 +1156,22 @@ class TpuSpecWorker(BaseSpecWorker):
         min_p: bool = False,
         seeded: bool = False,
         params_on_cpu: bool = False,
+        mixed_greedy: bool = False,
     ) -> SamplingBatchInfo:
         top_k_value = 1 if greedy else 2 if top_k else TOP_K_ALL
+        top_ks = torch.full((padded_bs,), top_k_value, dtype=torch.int32)
+        if mixed_greedy:
+            top_ks[::2] = 1
         # Pinned like HostPaddedSamplingInfo's rows: a pageable H2D is its own
         # program and would fuse into the sampler's first op.
         pin = is_pin_memory_available(self.device)
         return HostPaddedSamplingInfo(
             temperatures=torch.ones((padded_bs, 1), pin_memory=pin),
             top_ps=torch.full((padded_bs,), 0.9 if top_p else 1.0, pin_memory=pin),
-            top_ks=torch.full(
-                (padded_bs,), top_k_value, dtype=torch.int32, pin_memory=pin
-            ),
+            top_ks=top_ks.pin_memory() if pin else top_ks,
             min_ps=torch.full((padded_bs,), 0.1 if min_p else 0.0, pin_memory=pin),
             is_all_greedy=greedy,
-            is_any_greedy=greedy,
+            is_any_greedy=greedy or mixed_greedy,
             need_top_p_sampling=top_p,
             need_top_k_sampling=top_k_value != TOP_K_ALL,
             need_min_p_sampling=min_p,

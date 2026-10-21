@@ -630,15 +630,18 @@ class TpuSampler(Sampler):
                     need_top_p=sampling_info.need_top_p_sampling,
                     need_min_p=sampling_info.need_min_p_sampling,
                 )
-                # top_k=1 keeps every token tied at the maximum. A greedy row
-                # takes argmax, as it would in an all-greedy batch, so its token
-                # and captured support do not depend on its batch companions.
-                greedy = torch.zeros_like(filtered_probs).scatter_(
-                    -1, probs.argmax(dim=-1, keepdim=True), 1.0
-                )
-                filtered_probs = torch.where(
-                    (sampling_info.top_ks <= 1).unsqueeze(-1), greedy, filtered_probs
-                )
+                if sampling_info.is_any_greedy:
+                    # top_k=1 keeps every token tied at the maximum. A greedy row
+                    # takes argmax, as it would in an all-greedy batch, so its
+                    # token and captured support do not depend on its companions.
+                    greedy = torch.zeros_like(filtered_probs).scatter_(
+                        -1, probs.argmax(dim=-1, keepdim=True), 1.0
+                    )
+                    filtered_probs = torch.where(
+                        (sampling_info.top_ks <= 1).unsqueeze(-1),
+                        greedy,
+                        filtered_probs,
+                    )
             tokens = sample_with_seed(
                 filtered_probs, sampling_info.sampling_seed, positions
             )
