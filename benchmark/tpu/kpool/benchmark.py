@@ -44,31 +44,45 @@ def load_candidate(root, baseline_output=None, revision=PIPELINE_BASELINE_REVISI
     return module.compress_and_store, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def inputs(pages, tokens, decode):
-    """One request, fragmented pages, and an already updated raw cache."""
+def inputs(pages, tokens, decode, batch=1):
+    """Fragmented request pages and an already updated raw cache."""
     if pages < max(17, (tokens + 127) // 128 + 1):
         raise ValueError("Insufficient pages for the requested token bucket")
     raw = jax.jit(lambda key: jax.random.normal(key, (pages, 128, 256), jnp.bfloat16))(
         jax.random.key(42)
     )
-    page_map = np.random.default_rng(42).permutation(np.arange(1, pages))
+    page_count = (pages - 1) // batch * batch
+    page_map = np.random.default_rng(42).permutation(np.arange(1, page_count + 1))
     tail = (
         jnp.zeros((4, 128), jnp.float32),
-        jnp.asarray([132 if decode else tokens], jnp.int32),
+        jnp.full((batch,), 132 if decode else tokens, jnp.int32),
         jnp.asarray(page_map, jnp.int32),
-        jnp.asarray([0, 1 if decode else tokens], jnp.int32),
-        jnp.asarray([1, 1, 1] if decode else [0, 0, 1], jnp.int32),
+        jnp.arange(batch + 1, dtype=jnp.int32)
+        if decode
+        else jnp.asarray([0, tokens], jnp.int32),
+        jnp.asarray([batch, batch, batch] if decode else [0, 0, 1], jnp.int32),
     )
     jax.block_until_ready((raw, tail))
     return raw, tail
 
 
 def benchmark_case(
-    candidate, baseline, double_prefetch, previous, pages, tokens, decode, opts, output
+    candidate,
+    baseline,
+    double_prefetch,
+    previous,
+    pages,
+    tokens,
+    decode,
+    opts,
+    output,
+    batch=1,
 ):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
+    if batch != 1:
+        name += f"_b{batch}"
     print("CASE_START", name, flush=True)
-    raw, tail = inputs(pages, tokens, decode)
+    raw, tail = inputs(pages, tokens, decode, batch)
     variants = {
         "reference": reference.computation,
         "single_prefetch": baseline,
@@ -161,8 +175,9 @@ def benchmark_case(
             "name": name,
             "pages": pages,
             "token_bucket": tokens,
-            "actual_new_tokens": 1 if decode else tokens,
-            "closed_pools": 1 if decode else tokens // 4,
+            "batch": batch,
+            "actual_new_tokens": batch if decode else tokens,
+            "closed_pools": batch if decode else tokens // 4,
             "variants": rows,
             "speedup_pending_accuracy": rows["reference"]["median_ms"]
             / rows["candidate"]["median_ms"],
@@ -210,6 +225,7 @@ def main():
         default=["decode", "prefill"],
     )
     parser.add_argument("--hlo-text", action="store_true")
+    parser.add_argument("--decode-batches", nargs="+", type=int, default=[1, 32])
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -218,6 +234,8 @@ def main():
     opts = parser.parse_args()
     if opts.warmup < 1 or opts.repeats < 2:
         parser.error("Require warmup >= 1 and repeats >= 2")
+    if any(b < 1 or b > 32 for b in opts.decode_batches):
+        parser.error("decode batches must fit the 32-token bucket")
     root = Path(__file__).resolve().parents[3]
     opts.output.mkdir(parents=True, exist_ok=True)
     result = {
@@ -265,20 +283,22 @@ def main():
         ):
             if ("decode" if decode else "prefill") not in opts.cases:
                 continue
-            result["cases"].append(
-                benchmark_case(
-                    candidate,
-                    baseline,
-                    double_prefetch,
-                    previous,
-                    pages,
-                    tokens,
-                    decode,
-                    opts,
-                    opts.output,
+            for batch in opts.decode_batches if decode else [1]:
+                result["cases"].append(
+                    benchmark_case(
+                        candidate,
+                        baseline,
+                        double_prefetch,
+                        previous,
+                        pages,
+                        tokens,
+                        decode,
+                        opts,
+                        opts.output,
+                        batch,
+                    )
                 )
-            )
-            (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
+                (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
         result["status"] = "completed_pending_accuracy"
     except Exception:
         result["status"] = "failed"
