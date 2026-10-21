@@ -37,6 +37,7 @@ from sglang_tpu.k3_megakernel.config import (
     Relax,
     Topology,
 )
+from sglang_tpu.k3_megakernel.kernel import collectives
 from sglang_tpu.k3_megakernel.kernel.collectives import (
     AllGather,
     AllGatherSpec,
@@ -416,6 +417,10 @@ class StackKernel:
         moe_region_m: bool = True,
         moe_up_fill: str = "reduce",
         moe_distinct_balance: bool = False,
+        moe_single_rows: bool = True,
+        moe_down_dequant: bool = True,
+        oproj_full_gather: bool = True,
+        far_first: bool = True,
         moe_fast_topk: bool = True,
         mixture_tree: bool = True,
         mixture_fused_score: bool = True,
@@ -483,7 +488,10 @@ class StackKernel:
         gives the attention o_proj its own ring ("attn_out"), filled from the previous layer's MoE
         together with the input projections instead of at layer start. ``mla_kv_window``: see
         ``MlaStage`` (masks one page instead of the whole KV block; bit-identical).
-        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``fused_head``: the kernel also does the greedy
+        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``moe_single_rows`` / ``moe_down_dequant``: ``MoeStage``
+        ``single_rows`` / ``down_dequant`` (verify rows; f32 reorder). ``oproj_full_gather`` (verify rows,
+        pair o_proj): the row-scattered o_proj reduce gathers both halves in one host round (same bits).
+        ``far_first``: every collective level issues its copies to other hosts first (same bits). ``fused_head``: the kernel also does the greedy
         LM head (``stages.head``; inputs ``embed`` [V, H] and ``lm_head`` [V / world, H] replace
         ``x0``, ``meta[TOKEN_META]`` is the token fed, the next token is the extra SMEM output 3)."""
         self.mix = MixOpts(tree=mixture_tree, fused_score=mixture_fused_score)
@@ -614,6 +622,8 @@ class StackKernel:
             row_gathers=row_gathers or self.rows_mode,
             up_tree=moe_up_tree,
             fast_topk=moe_fast_topk,
+            single_rows=moe_single_rows,
+            down_dequant=moe_down_dequant,
             debug=frozenset(x for x in moe_debug.split(",") if x)
             | frozenset(k for k in debug_skip if k.startswith("moe_")),
         )
@@ -637,6 +647,12 @@ class StackKernel:
             rows=self.R,
         )
         self.kda.skip_core = self.mla.skip_core = "attn_core" in debug_skip
+        # Remote copies to other hosts issued first (issue order only, same bits).
+        collectives.FAR_FIRST[0] = far_first
+        # Verify rows + pair_oproj: one host gather of both o_proj halves.
+        if oproj_full_gather:
+            for st in (self.kda, self.mla):
+                st.out = msgspec.structs.replace(st.out, rows_full_gather=True)
         self.kda.mxu = kda_mxu  # KDA recurrence contractions on the MXU (f32 reorder)
         self.kda.fast_core = kda_fast_core
         # Verify rows: all R checkpoint states staged in VMEM and written by one DMA per family (pool rows

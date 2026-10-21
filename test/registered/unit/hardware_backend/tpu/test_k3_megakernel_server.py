@@ -92,7 +92,7 @@ class _KV:
 
 @unittest.skipIf(srv is None, "fastapi not installed")
 class TestK3MegakernelServer(CustomTestCase):
-    def _server(self, script, k=4):
+    def _server(self, script, k=4, bench_hooks=False):
         engine, tok, jobs, kv = _Engine(script, k), _Tok(), queue.Queue(), _KV()
         app = srv.make_app(
             jobs=jobs,
@@ -101,6 +101,7 @@ class TestK3MegakernelServer(CustomTestCase):
             max_prompt=64,
             vocab=0x110000,
             steps_allowed=(4, 1),
+            bench_hooks=bench_hooks,
         )
         patches = [
             patch.object(srv, "_kv_client", return_value=kv),
@@ -159,6 +160,15 @@ class TestK3MegakernelServer(CustomTestCase):
         # The only published job is number 1: a follower waiting on key 1 runs it.
         self.assertEqual(sorted(kv.data), [srv._KV_PREFIX + "1"])
         self.assertEqual(json.loads(kv.data[srv._KV_PREFIX + "1"])["job"]["n"], 1)
+
+    def test_bench_hooks_need_the_server_flag(self):
+        body = dict(prompt="p", max_tokens=5, k3_force_acc=6, k3_stop_ids=[7])
+        client, _, _ = self._server("hello", k=4)
+        self.assertEqual(client.post("/v1/completions", json=body).status_code, 400)
+        client, _, kv = self._server("hello", k=4, bench_hooks=True)
+        self.assertEqual(client.post("/v1/completions", json=body).status_code, 200)
+        job = json.loads(kv.data[srv._KV_PREFIX + "1"])["job"]
+        self.assertEqual((job["force_acc"], job["stop_ids"]), (6, [7]))
 
     def test_follower_runs_jobs_with_stop_strings_until_shutdown(self):
         kv, engine = _KV(), _Engine("a\nb", k=4)

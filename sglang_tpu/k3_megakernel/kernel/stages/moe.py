@@ -47,6 +47,7 @@ from sglang_tpu.k3_megakernel.kernel.stages.common import (
 )
 from sglang_tpu.k3_megakernel.kernel.stages.expert import (
     down_dot,
+    down_dot_dequant,
     down_dot_pair,
     gate_up_dot,
     situ_and_mul,
@@ -227,6 +228,8 @@ class MoeStage:
         late_latent_up: bool | str = False,
         row_gathers: bool = False,
         up_tree: bool = False,
+        single_rows: bool = True,
+        down_dequant: bool = True,
         debug: frozenset = frozenset(),
     ):
         """``gather_bf16``: the router-score, latent and output gathers travel as bf16 (their
@@ -276,6 +279,10 @@ class MoeStage:
         self.late_latent_up = {True: "latent"}.get(late_latent_up, late_latent_up)
         assert self.late_latent_up in (False, "latent", "reduce"), late_latent_up
         self.up_tree = up_tree
+        # Grouped rows: an expert picked by one row runs its down projection on that row only.
+        self.single_rows = single_rows
+        # Grouped rows, several picking rows: the down dot as one M=R pass on scale-applied bf16 weights.
+        self.down_dequant = down_dequant
         self.debug = debug
         assert ring % 2 == 0 or not pair_down, ring
         self.relax = relax
@@ -727,14 +734,44 @@ class MoeStage:
                 col = jnp.where(row_id == r, wmat[j * rows + r], col)
             return col
 
+        def down_rows(a, slot):
+            dot = down_dot_dequant if self.down_dequant else down_dot
+            return dot(a, ring[2].at[slot], ring[3].at[slot])
+
+        def down_one_row(j, a, slot):
+            """An expert picked by one row only (most at R = 8) runs its down projection on that
+            row: 12 group rows instead of 12 * R. A zero weight marks an unpicked row (a picked
+            row's weight is a normalized sigmoid score, > 0); the other rows' terms are zeros."""
+            picked = [
+                (wmat[j * rows + r] != 0.0).astype(jnp.int32) for r in range(rows)
+            ]
+            one = sum(picked) == 1
+            r1 = sum(picked[r] * r for r in range(1, rows))
+
+            @pl.when(one)
+            def _():
+                a_r = jnp.sum(
+                    jnp.where(row_id == r1, a.astype(jnp.float32), 0.0),
+                    axis=0,
+                    keepdims=True,
+                ).astype(jnp.bfloat16)
+                part = down_dot(a_r, ring[2].at[slot], ring[3].at[slot])
+                acc_vmem[pl.ds(r1, 1), :] += part * wmat[j * rows + r1]
+
+            @pl.when(jnp.logical_not(one))
+            def _():
+                acc_vmem[...] += down_rows(a, slot) * weights(j)
+
         def single(j):
             slot = j % self.ring
             self._wait(w, ring, sems, j, lid, 0)
             a = self._act(ring, slot, x)
             self._refill(w, ring, sems, j, lid, n, 0)
             self._wait(w, ring, sems, j, lid, 1)
-            part = down_dot(a, ring[2].at[slot], ring[3].at[slot])
-            acc_vmem[...] += part * weights(j)
+            if self.single_rows:
+                down_one_row(j, a, slot)
+            else:
+                acc_vmem[...] += down_rows(a, slot) * weights(j)
             self._refill(w, ring, sems, j, lid, n, 1)
 
         # Paired distinct experts are off: at R = 8 they gave a wrong row 0 in --verify-check

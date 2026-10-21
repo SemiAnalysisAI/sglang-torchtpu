@@ -143,6 +143,41 @@ class TestK3MegakernelHooks(CustomTestCase):
             with self.subTest(size=size, mode=mode), self.assertRaises(ValueError):
                 prefill_rows(size, mode)
 
+    def test_kda_rows_follow_the_gdn_pool_layout(self):
+        """Extend / decode use the slot row; a verify reads the committed row and writes the
+        request's window (as TpuGDNAttnBackend)."""
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang_tpu.k3_megakernel.ops import kda_state_rows
+        from sglang_tpu.mamba_pool import TpuMambaPool
+
+        shape = Mamba2StateShape.create(
+            tp_world_size=1, intermediate_size=1024, n_groups=2, num_heads=8,
+            head_dim=128, state_size=128, conv_kernel=4,
+        )  # fmt: skip
+        dtype = Mamba2StateDType(conv=torch.float32, temporal=torch.float32)
+        pool = TpuMambaPool(
+            size=3, spec_state_size=3, mamba_layer_ids=[1], device="cpu",
+            cache_params=Mamba2CacheParams(dtype=dtype, layers=[1], shape=shape),
+            speculative_num_draft_tokens=4, speculative_eagle_topk=1,
+        )  # fmt: skip
+        slot, req = 2, 3
+        window = pool.window_start + req * pool.checkpoint_width
+
+        def rows(mode):
+            read, base = kda_state_rows(
+                pool, mode, torch.tensor(slot, dtype=torch.int32), torch.tensor([req])
+            )
+            return int(read), int(base)
+
+        self.assertEqual(rows(ForwardMode.DECODE), (slot, slot))
+        self.assertEqual(rows(ForwardMode.TARGET_VERIFY), (slot, window))
+        pool.select_checkpoints(torch.tensor([slot]), torch.tensor([2]))
+        self.assertEqual(rows(ForwardMode.TARGET_VERIFY), (window + 2, window))
+
 
 if __name__ == "__main__":
     unittest.main()
