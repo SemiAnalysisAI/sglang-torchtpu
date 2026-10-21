@@ -34,6 +34,7 @@ def manifest(
             "profile-analysis",
             "device-profile",
             "accuracy",
+            "matrix-accuracy",
         )
         or not 0 <= hold_seconds <= 1800
     ):
@@ -96,13 +97,17 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             )
             + f"export KPOOL_ANALYSIS_WORKERS={analysis_workers}\nbash benchmark/tpu/kpool/profile_analysis_task.sh\n"
         )
-    if mode == "accuracy":
+    if mode in ("accuracy", "matrix-accuracy"):
         workload = """python -m pip install jax==0.11.2 jaxlib==0.11.2
 export TPU_LIBRARY_PATH="$(python -c 'import libtpu; print(libtpu.get_library_path())')"
 echo PHASE_CHECKPOINT_ACCURACY
 timeout 1800 python benchmark/tpu/kpool/validate_q1.py \\
   --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/accuracy"
 """
+        if mode == "matrix-accuracy":
+            workload = workload.replace("timeout 1800", "timeout 7200").replace(
+                "validate_q1.py", "validate_matrix.py"
+            )
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -195,7 +200,7 @@ export PATH="$task_root/venv/bin:$PATH"
             {
                 "source_revision": revision,
                 "accuracy": "exact_cache_bytes"
-                if mode == "accuracy"
+                if mode in ("accuracy", "matrix-accuracy")
                 else "deferred_to_checkpoint",
             }
         ),
@@ -218,6 +223,7 @@ def main():
             "profile-analysis",
             "device-profile",
             "accuracy",
+            "matrix-accuracy",
         ),
         default="device-profile",
     )
