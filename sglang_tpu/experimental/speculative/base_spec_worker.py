@@ -33,6 +33,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch import nn
 
 from sglang.srt.compilation.compiled_op import warmup_compiled_op
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -42,6 +43,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -120,6 +122,26 @@ _SAMPLING_WARMUP_VARIANTS = [{"greedy": True}] + [
 ]
 
 
+def _check_draft_lm_head_group(draft_model: nn.Module) -> None:
+    """Reject a draft head sharded over the full TP group under DP attention.
+
+    The draft runs in the attention-TP group, so a shared target head sharded
+    over the full TP group (no --enable-dp-lm-head) would draft from one shard.
+    """
+    lm_head = draft_model.lm_head
+    if (
+        isinstance(lm_head, VocabParallelEmbedding)
+        and lm_head.enable_tp
+        and not lm_head.use_attn_tp_group
+        and lm_head.tp_size > 1
+    ):
+        raise ValueError(
+            "Under DP attention the draft shares a target lm_head sharded over the "
+            "full TP group; pass --enable-dp-lm-head to shard it over the "
+            "attention-TP group the draft runs in."
+        )
+
+
 class TpuSpecWorker(BaseSpecWorker):
     """Speculative decoding as draft -> verify -> commit.
 
@@ -182,6 +204,8 @@ class TpuSpecWorker(BaseSpecWorker):
                 "SGLANG_SPEC_TP_SYNC must enable both or neither spec-accept site "
                 "under DP attention."
             )
+        if self._dp_attention:
+            _check_draft_lm_head_group(draft_worker.model_runner.model)
         self._target_has_linear_attn = (
             mambaish_config(target_worker.model_runner.model_config) is not None
         )

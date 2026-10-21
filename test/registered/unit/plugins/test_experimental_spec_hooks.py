@@ -794,6 +794,32 @@ class TestExperimentalSpecHooks(CustomTestCase):
         # Core's DP unpadding of the relabeled idle rank reads this backup.
         self.assertEqual(tuple(forward_batch.hidden_states_backup.shape), (0, 4))
 
+    def test_dp_attention_rejects_a_draft_head_sharded_over_full_tp(self):
+        """A draft sharing a target head sharded over the full TP group drafts from one
+        shard inside its attention-TP group: acceptance collapses with no error."""
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from sglang_tpu.experimental.speculative.base_spec_worker import (
+            _check_draft_lm_head_group,
+        )
+
+        def head(*, use_attn_tp_group, tp_size):
+            lm_head = object.__new__(VocabParallelEmbedding)
+            lm_head.__dict__.update(
+                enable_tp=True, use_attn_tp_group=use_attn_tp_group, tp_size=tp_size
+            )
+            return lm_head
+
+        with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+            _check_draft_lm_head_group(
+                SimpleNamespace(lm_head=head(use_attn_tp_group=False, tp_size=8))
+            )
+        for lm_head in (
+            head(use_attn_tp_group=True, tp_size=4),
+            head(use_attn_tp_group=False, tp_size=1),
+            None,
+        ):
+            _check_draft_lm_head_group(SimpleNamespace(lm_head=lm_head))
+
     def test_block_dp_attention_drafts_greedy(self):
         """Under DP attention the block draft never samples: peers and idle ranks
         must issue the same draft sync, and sampled requests take target-only accept."""
