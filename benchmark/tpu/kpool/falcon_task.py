@@ -15,6 +15,7 @@ def manifest(
     mode="performance",
     hold_seconds=0,
     aot_cases=None,
+    benchmark_cases=None,
 ):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
@@ -28,12 +29,20 @@ def manifest(
     workload = """echo PHASE_BENCHMARK
 git fetch --depth=1 origin 985b4f8c9f2151cfae7c110156f7433892e1ee60
 git fetch --depth=1 origin 61edd0e421a877158f7bfdfdfd2ae6133173cbfc
+git fetch --depth=1 origin 880e8ace2f2f3f06cc66eb9a1235b6e6d7bf2335
 compiler="${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/compiler"
 mkdir -p "$compiler/llo" "$compiler/mosaic"
 export LIBTPU_INIT_ARGS="--xla_jf_dump_to=$compiler/llo --xla_mosaic_dump_to=$compiler/mosaic --xla_jf_dump_hlo_text=true --xla_jf_dump_llo_text=true --xla_mosaic_enable_llo_source_annotations=true --xla_mosaic_enable_dump_debug_info=true --xla_jf_emit_annotations=true --xla_jf_collect_llo_stack_trace=true"
 timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
   --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/benchmark"
 """
+    if benchmark_cases:
+        workload = (
+            workload.rstrip()
+            + " --cases "
+            + " ".join(shlex.quote(case) for case in benchmark_cases)
+            + "\n"
+        )
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -121,6 +130,7 @@ def main():
     parser.add_argument("--mode", choices=("performance", "aot"), default="performance")
     parser.add_argument("--hold-seconds", type=int, default=0)
     parser.add_argument("--aot-cases", nargs="+")
+    parser.add_argument("--benchmark-cases", nargs="+", choices=("decode", "prefill"))
     args = parser.parse_args()
     print(
         json.dumps(
@@ -132,6 +142,7 @@ def main():
                 args.mode,
                 args.hold_seconds,
                 args.aot_cases,
+                args.benchmark_cases,
             ),
             indent=2,
         )

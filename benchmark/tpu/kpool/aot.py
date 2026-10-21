@@ -29,6 +29,8 @@ CASES = (
     "original_mask_fix",
     "reference_decode",
     "candidate_decode",
+    "candidate_decode32",
+    "candidate_decode_b32",
     "reference_prefill",
     "candidate_prefill",
 )
@@ -101,15 +103,16 @@ def build(case, root, out):
 
     pages = 17 if case.startswith("original_") else 14849
     tokens = 256 if case.startswith("original_") else 32 if "decode" in case else 8192
+    batch = 32 if case.endswith("_b32") else 1
     specs = tuple(
         jax.ShapeDtypeStruct(shape, dtype)
         for shape, dtype in (
             ((pages, 128, 256), jnp.bfloat16),
             ((pages, 32, 4, 256), jnp.uint8),
             ((4, 128), jnp.float32),
-            ((1,), jnp.int32),
-            ((pages - 1,), jnp.int32),
-            ((2,), jnp.int32),
+            ((batch,), jnp.int32),
+            (((pages - 1) // batch * batch,), jnp.int32),
+            ((batch + 1,), jnp.int32),
             ((3,), jnp.int32),
         )
     )
@@ -153,7 +156,13 @@ def build(case, root, out):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         fn = module.compress_and_store
-    return lambda *args: fn(*args, tokens, 4), specs, (1,)
+    extra = {}
+    if case.startswith("candidate_decode"):
+        extra = {
+            "decode": True,
+            "decode_tile_rows": 32 if case.endswith("32") and batch == 1 else 16,
+        }
+    return lambda *args: fn(*args, tokens, 4, **extra), specs, (1,)
 
 
 def worker(opts):
