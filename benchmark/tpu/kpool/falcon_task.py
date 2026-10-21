@@ -16,6 +16,7 @@ def manifest(
     hold_seconds=0,
     aot_cases=None,
     benchmark_cases=None,
+    analysis_input=None,
 ):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
@@ -64,7 +65,7 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
     if mode == "device-profile":
         workload = "bash benchmark/tpu/kpool/profile_capture_task.sh\n"
     if mode == "profile-analysis":
-        workload = "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
+        workload = (f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n" if analysis_input else "") + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -167,6 +168,7 @@ def main():
     parser.add_argument("--hold-seconds", type=int, default=0)
     parser.add_argument("--aot-cases", nargs="+")
     parser.add_argument("--benchmark-cases", nargs="+", choices=("decode", "prefill"))
+    parser.add_argument("--analysis-input")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -179,6 +181,7 @@ def main():
                 args.hold_seconds,
                 args.aot_cases,
                 args.benchmark_cases,
+                args.analysis_input,
             ),
             indent=2,
         )

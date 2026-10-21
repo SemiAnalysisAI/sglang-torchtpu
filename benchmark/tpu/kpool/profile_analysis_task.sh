@@ -8,4 +8,8 @@ python benchmark/tpu/kpool/locate_xprof_skill.py
 printf '%s\n' "$PWD" > /tmp/kpool-analysis-source
 printf '%s\n' "$(command -v python)" > /tmp/kpool-analysis-python
 echo ANALYSIS_READY
+if [ -n "${KPOOL_CAPTURE_ROOT:-}" ]; then
+  python benchmark/tpu/kpool/profile_analyze.py --capture-root "$KPOOL_CAPTURE_ROOT" \
+    --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/analysis/results"
+fi
 sleep 7200
