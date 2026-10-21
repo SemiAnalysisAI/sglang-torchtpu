@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -135,6 +136,13 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return -(-value // divisor)
+
+
+def _spf_aged(req: Req, now: float) -> bool:
+    """Whether shortest-prefill-first should stop reordering behind this request."""
+    max_wait = envs.SGLANG_SCHEDULE_SPF_MAX_WAIT_S.get()
+    entry = req.time_stats.wait_queue_entry_time
+    return max_wait > 0 and entry > 0 and now - entry > max_wait
 
 
 def estimate_prefill_extend_tile_metrics(
@@ -494,13 +502,21 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
-        waiting_queue.sort(
-            key=lambda r: (
+        # Aged requests go first so a long prompt cannot starve behind short ones.
+        now = time.perf_counter()
+
+        def key(r: Req):
+            entry = r.time_stats.wait_queue_entry_time
+            if _spf_aged(r, now):
+                return (False, False, 0, entry)
+            return (
+                True,
                 r.rid in temporary_deprioritized,
                 SchedulePolicy._shortest_prefill_work(r),
-                r.time_stats.wait_queue_entry_time,
+                entry,
             )
-        )
+
+        waiting_queue.sort(key=key)
 
     def shortest_prefill_chunk_limit(
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
@@ -509,6 +525,7 @@ class SchedulePolicy:
         if (
             self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
             or budget < 2 * page_size
+            or _spf_aged(chunked_req, time.perf_counter())
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
