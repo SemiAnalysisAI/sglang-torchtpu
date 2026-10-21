@@ -1049,10 +1049,16 @@ class TpuSRTPlatform(SRTPlatform):
             host_memory_budget_scope,
         )
         from sglang.srt.runtime_context import get_memory
+        from sglang_tpu.envs import envs as tpu_envs
 
         if get_memory().hicache_io_backend != "raiden":
             return super().get_hicache_explicit_size_context()
-        # Full, SWA, and draft pools must fit within one combined RAM budget.
+        # Full, SWA, and draft pools must fit within one combined RAM budget. The
+        # sampled budget is free RAM / local ranks at the moment this rank arrives,
+        # so ranks that arrive after their peers allocated get a shrunken share.
+        budget_gb = tpu_envs.SGLANG_TPU_HICACHE_HOST_BUDGET_GB.get()
+        if budget_gb is not None:
+            return host_memory_budget_scope(int(budget_gb * 1e9))
         return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:

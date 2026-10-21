@@ -109,6 +109,9 @@ class TpuEnvs:
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
     SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS = EnvBool(False)
+    # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
+    # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
+    SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
 
     @classmethod
     def names(cls) -> list[str]:
