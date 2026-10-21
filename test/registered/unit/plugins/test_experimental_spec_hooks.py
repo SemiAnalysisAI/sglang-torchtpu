@@ -204,6 +204,21 @@ class TestExperimentalSpecHooks(CustomTestCase):
             info.device_logit_bias(16), torch.nn.functional.pad(expected, (0, 0, 0, 8))
         )
 
+    def test_static_logit_bias_uploads_once_per_bucket_until_the_batch_changes(self):
+        batch = self.batch([2, 5, 8])
+        batch.reqs[0].sampling_params.logit_bias = {"1": 2.0}
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 32)
+        info = batch.sampling_info
+        first = info.device_logit_bias(4)
+        # Every forward runs on a copy of the scheduler's info.
+        self.assertIs(info.copy_for_forward().device_logit_bias(4), first)
+        self.assertIsNot(info.device_logit_bias(8), first)
+        self.assertIs(info.device_logit_bias(4), first)
+        batch.filter_batch(keep_indices=[1, 2])
+        refreshed = info.device_logit_bias(4)
+        self.assertIsNot(refreshed, first)
+        torch.testing.assert_close(refreshed, torch.zeros((4, 32)))
+
     def test_prefill_preprocessing_adds_bias_at_the_bucket_rows(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 

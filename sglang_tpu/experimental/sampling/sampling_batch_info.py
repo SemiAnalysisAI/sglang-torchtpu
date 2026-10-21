@@ -32,9 +32,23 @@ def _pad_host_rows(
 
 
 @dataclasses.dataclass
+class _DeviceBiasCache:
+    """Device copies of one host logit_bias tensor, by physical row count."""
+
+    source: torch.Tensor | None = None
+    by_rows: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class HostPaddedSamplingInfo(SamplingBatchInfo):
     host_pad_bs: Callable[[int], int] | None = None
     real_batch_size: int = 0
+    # Shared with the per-forward copies (dataclasses.replace), so a static bias
+    # uploads once per bucket. Filtering or merging replaces logit_bias, and
+    # nothing writes a bias tensor after it is built, so identity marks a change.
+    device_bias: _DeviceBiasCache = dataclasses.field(
+        default_factory=_DeviceBiasCache, repr=False
+    )
 
     @classmethod
     def parameter_device(cls, batch):
@@ -99,9 +113,16 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
         """Upload live bias rows at the forward's physical bucket, with neutral padding."""
         if self.logit_bias is None:
             return None
-        return _pad_host_rows(
-            self.logit_bias, rows, 0.0, is_pin_memory_available(self.device)
-        ).to(self.device, non_blocking=True)
+        cache = self.device_bias
+        if cache.source is not self.logit_bias:
+            cache.source, cache.by_rows = self.logit_bias, {}
+        bias = cache.by_rows.get(rows)
+        if bias is None:
+            bias = _pad_host_rows(
+                self.logit_bias, rows, 0.0, is_pin_memory_available(self.device)
+            ).to(self.device, non_blocking=True)
+            cache.by_rows[rows] = bias
+        return bias
 
     def _apply_post_grammar_logits_transforms(self, logits):
         # Prefill only, outside compiled forwards: not warmed. Like the other
@@ -119,5 +140,9 @@ class HostPaddedSamplingInfo(SamplingBatchInfo):
             if (value := getattr(self, name)) is not None
         }
         return dataclasses.replace(
-            self, logit_bias=self.device_logit_bias(self.temperatures.shape[0]), **moved
+            self,
+            logit_bias=self.device_logit_bias(self.temperatures.shape[0]),
+            # The copy's bias is already on the device; keep this info's cache.
+            device_bias=_DeviceBiasCache(),
+            **moved,
         )
