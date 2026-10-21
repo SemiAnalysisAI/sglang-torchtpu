@@ -119,7 +119,11 @@ def benchmark_case(
                 candidate, decode=True, decode_max_q=query_len, decode_pipeline=False
             ),
             "candidate": partial(
-                candidate, decode=True, decode_max_q=query_len, decode_pipeline=True
+                candidate,
+                decode=True,
+                decode_max_q=query_len,
+                decode_pipeline=True,
+                decode_q1_unroll=True,
             ),
         }
     states = {}

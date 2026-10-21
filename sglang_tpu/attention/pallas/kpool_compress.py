@@ -122,6 +122,7 @@ def _decode_kernel(
     tile_rows,
     pipeline,
     single_query,
+    q1_unroll,
 ):
     del old_ref  # Aliased output preserves every inactive record and byte.
     words = out_ref.bitcast(jnp.uint32)
@@ -248,7 +249,7 @@ def _decode_kernel(
 
             refill(i, fixed_slot)
 
-    if single_query and pipeline:
+    if single_query and pipeline and q1_unroll:
         # Only Q=1 uses static ping/pong bindings. Keep the traced Q>1 loop
         # unchanged, including its read/modify/write dependency ordering.
         @pl.loop(0, count // 2)
@@ -419,6 +420,7 @@ def compress_and_store(
     decode_tile_rows=16,
     decode_max_q=None,
     decode_pipeline=True,
+    decode_q1_unroll=False,
 ):
     """Pool newly closed K4 groups; the returned native cache aliases its input.
 
@@ -429,6 +431,8 @@ def compress_and_store(
     the accepted speculative length. Omitting it uses num_tokens as a safe
     bound. The caller must include every verify row when supplying a bound.
     The general path remains preferable for large prefill query lengths.
+    decode_q1_unroll opts into an experimental static-slot Q=1 pipeline;
+    it has not demonstrated a stable latency gain and is disabled by default.
     """
     if kpool != 4 or raw_cache.shape[1:] != (128, 256):
         raise ValueError("fused pooling requires K=4, page_size=128 and D=128")
@@ -455,6 +459,7 @@ def compress_and_store(
                 tile_rows=decode_tile_rows,
                 pipeline=pipeline,
                 single_query=max_q == 1,
+                q1_unroll=decode_q1_unroll,
             ),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(

@@ -173,6 +173,7 @@ def build(case, root, out):
             "decode_tile_rows": 32 if case == "candidate_decode32" else 16,
             "decode_max_q": query_len,
             "decode_pipeline": "_serial" not in case,
+            "decode_q1_unroll": True,
         }
     return lambda *args: fn(*args, tokens, 4, **extra), specs, (1,)
 
