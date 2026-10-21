@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Same-device pooling latency comparison; numerical validation is a later gate."""
+"""Capture same-device XProf events; numerical validation is a later gate."""
 
 import argparse
 import hashlib
@@ -7,7 +7,6 @@ import importlib.metadata
 import importlib.util
 import json
 import subprocess
-import time
 import traceback
 from functools import partial
 from pathlib import Path
@@ -100,30 +99,20 @@ def benchmark_case(
         "reference": reference.computation,
         "single_prefetch": baseline,
         "double_prefetch": double_prefetch,
-        "candidate": candidate,
+        "current_default": candidate,
     }
     if decode:
         variants = {
             "reference": reference.computation,
-            "previous_candidate": previous,
-            "decode_fixed32": partial(candidate, decode=True, decode_tile_rows=32),
-            "candidate": partial(candidate, decode=True, decode_tile_rows=16),
-        }
-    if decode and opts.decode_pipeline:
-        variants = {
-            "reference": reference.computation,
-            "previous_candidate": partial(
-                previous, decode=True, decode_tile_rows=16, decode_max_q=query_len
+            "current_default": partial(
+                candidate, decode=True, decode_max_q=query_len,
             ),
             "decode_serial": partial(
-                candidate, decode=True, decode_max_q=query_len, decode_pipeline=False
+                candidate, decode=True, decode_max_q=query_len, decode_pipeline=False,
             ),
-            "candidate": partial(
-                candidate,
-                decode=True,
-                decode_max_q=query_len,
-                decode_pipeline=True,
-                decode_q1_unroll=True,
+            "q1_unroll": partial(
+                candidate, decode=True, decode_max_q=query_len,
+                decode_pipeline=True, decode_q1_unroll=True,
             ),
         }
     states = {}
@@ -133,16 +122,14 @@ def benchmark_case(
             def entry(*args, _fn=function):
                 return _fn(*args)
 
-            entry.__name__ = f"kpool_{label}"
+            entry.__name__ = f"kpool_{name}_{label}"
             cache = jnp.zeros((pages, 32, 4, 256), jnp.uint8)
             cache.block_until_ready()
-            start = time.perf_counter()
             compiled = (
                 jax.jit(entry, static_argnums=(7, 8), donate_argnums=(1,))
                 .lower(raw, cache, *tail, tokens, 4)
                 .compile()
             )
-            compile_s = time.perf_counter() - start
             hlo_error = None
             if opts.hlo_text:
                 try:
@@ -170,37 +157,20 @@ def benchmark_case(
                 "call": compiled,
                 "cache": cache,
                 "pointer": pointer,
-                "samples": [],
-                "compile_seconds": compile_s,
+                "module_name": f"jit_{entry.__name__}",
                 "memory": stats,
                 "hlo_export_error": hlo_error,
             }
             print("COMPILED", name, label, json.dumps(stats), flush=True)
-        # Alternate order each round to reduce systematic drift on one allocation.
-        for iteration in range(opts.repeats):
-            order = list(states) if iteration % 2 == 0 else list(reversed(states))
-            for label in order:
-                state = states[label]
-                start = time.perf_counter_ns()
-                cache = state["call"](raw, state["cache"], *tail)
-                cache.block_until_ready()
-                state["samples"].append((time.perf_counter_ns() - start) / 1e6)
-                if cache.unsafe_buffer_pointer() != state["pointer"]:
-                    raise RuntimeError(f"{label}: pooled cache allocation changed")
-                state["cache"] = cache
-        rows = {}
-        for label, state in states.items():
-            samples = state["samples"]
-            rows[label] = {
-                "median_ms": float(np.median(samples)),
-                "p10_ms": float(np.percentile(samples, 10)),
-                "p90_ms": float(np.percentile(samples, 90)),
-                "samples_ms": samples,
-                "compile_seconds": state["compile_seconds"],
+        rows = {
+            label: {
+                "module_name": state["module_name"],
                 "memory": state["memory"],
                 "pooled_cache_buffer_reused": True,
                 "hlo_export_error": state["hlo_export_error"],
             }
+            for label, state in states.items()
+        }
         result = {
             "name": name,
             "pages": pages,
@@ -220,38 +190,36 @@ def benchmark_case(
             ),
             "previous_decode_branch": bool(decode and opts.decode_pipeline),
             "variants": rows,
-            "speedup_pending_accuracy": rows["reference"]["median_ms"]
-            / rows["candidate"]["median_ms"],
-            "pipeline_speedup_pending_accuracy": rows[
-                "previous_candidate" if decode else "single_prefetch"
-            ]["median_ms"]
-            / rows["candidate"]["median_ms"],
-            (
-                "serial_to_pipeline_speedup_pending_accuracy"
-                if decode and opts.decode_pipeline
-                else "pooling_tile_speedup_pending_accuracy"
-            ): rows[
-                ("decode_serial" if opts.decode_pipeline else "decode_fixed32")
-                if decode
-                else "double_prefetch"
-            ]["median_ms"]
-            / rows["candidate"]["median_ms"],
-            "device_profile": None,
-            "profile_status": "requested" if opts.profile else "not_requested",
+            "device_profile": str(output / name / "xprof"),
+            "profile_status": "requested",
+            "expected_samples_per_variant": opts.repeats,
+            "timing_source": "XProf device module events; analyze on Falcon CPU",
         }
-        # Persist timings before optional profiler initialization. A native
-        # profiler crash cannot be caught by Python's exception handlers.
-        (output / f"{name}-latency.json").write_text(json.dumps(result, indent=2))
-        print("LATENCY_RESULT", json.dumps(result), flush=True)
-        if opts.profile:
-            # Profile separate invocations; exclude collection from timings.
-            with jax.profiler.trace(str(output / name / "xprof")):
-                for _ in range(5):
-                    for state in states.values():
-                        state["cache"] = state["call"](raw, state["cache"], *tail)
-                        state["cache"].block_until_ready()
-            result["device_profile"] = str(output / name / "xprof")
-            result["profile_status"] = "collected"
+        # Persist identity before profiler startup, which can fail in native code.
+        manifest_path = output / f"{name}-capture.json"
+        manifest_path.write_text(json.dumps(result, indent=2))
+        with jax.profiler.trace(str(output / name / "xprof")):
+            for iteration in range(opts.repeats):
+                order = list(states) if iteration % 2 == 0 else list(reversed(states))
+                for label in order:
+                    state = states[label]
+                    # This host marker identifies a repetition; its duration is
+                    # never used as device time. The device module has a unique
+                    # compiled name and all variants run on the same device.
+                    with jax.profiler.TraceAnnotation(
+                        f"sample/{name}/{label}", repetition=iteration
+                    ):
+                        cache = state["call"](raw, state["cache"], *tail)
+                        cache.block_until_ready()
+                    if cache.unsafe_buffer_pointer() != state["pointer"]:
+                        raise RuntimeError(f"{label}: donated allocation changed")
+                    state["cache"] = cache
+        traces = list((output / name / "xprof").rglob("*.xplane.pb"))
+        if not traces or any(path.stat().st_size == 0 for path in traces):
+            raise RuntimeError(f"{name}: no nonempty XPlane capture")
+        result["profile_status"] = "captured_pending_device_event_verification"
+        result["trace_files"] = [str(path) for path in traces]
+        manifest_path.write_text(json.dumps(result, indent=2))
         print("CASE_RESULT", json.dumps(result), flush=True)
         return result
     finally:
@@ -263,8 +231,8 @@ def benchmark_case(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument(
         "--cases",
         nargs="+",
@@ -278,7 +246,7 @@ def main():
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Collect XProf after saving timings; requires a compatible profiler ABI",
+        help="Compatibility flag; all benchmark runs now capture XProf device events",
     )
     opts = parser.parse_args()
     if opts.warmup < 1 or opts.repeats < 2:
@@ -294,8 +262,8 @@ def main():
     result = {
         "status": "running",
         "accuracy": "not_checked",
-        "scope": "module latency, one device, dispatch plus synchronized execution",
-        "timing": "compile and input creation excluded; warm cache; donated output",
+        "scope": "XProf device module spans and Pallas events, one device",
+        "timing": "compile/input/warmup excluded; warm cache; donated output; no host timing",
         "warmup": opts.warmup,
         "repeats": opts.repeats,
         "cases": [],
@@ -319,6 +287,7 @@ def main():
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
             ).strip(),
             candidate_sha256=digest,
+            reference_sha256=hashlib.sha256(Path(reference.__file__).read_bytes()).hexdigest(),
             pipeline_baseline_revision=PIPELINE_BASELINE_REVISION,
             pipeline_baseline_sha256=baseline_digest,
             double_prefetch_revision=DOUBLE_PREFETCH_REVISION,

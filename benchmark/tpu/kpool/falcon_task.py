@@ -61,6 +61,8 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             + " ".join(shlex.quote(case) for case in benchmark_cases)
             + "\n"
         )
+    if mode == "device-profile":
+        workload = "bash benchmark/tpu/kpool/profile_capture_task.sh\n"
     if mode == "profile-analysis":
         workload = "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
     if mode == "aot":
