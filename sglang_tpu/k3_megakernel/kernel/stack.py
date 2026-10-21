@@ -416,6 +416,7 @@ class StackKernel:
         moe_region_m: bool = True,
         moe_up_fill: str = "reduce",
         moe_distinct_balance: bool = False,
+        moe_single_rows: bool = True,
         moe_fast_topk: bool = True,
         mixture_tree: bool = True,
         mixture_fused_score: bool = True,
@@ -483,7 +484,8 @@ class StackKernel:
         gives the attention o_proj its own ring ("attn_out"), filled from the previous layer's MoE
         together with the input projections instead of at layer start. ``mla_kv_window``: see
         ``MlaStage`` (masks one page instead of the whole KV block; bit-identical).
-        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``fused_head``: the kernel also does the greedy
+        ``moe_up_tree``: ``MoeStage`` ``up_tree``. ``moe_single_rows``: ``MoeStage``
+        ``single_rows`` (verify rows; f32 reorder). ``fused_head``: the kernel also does the greedy
         LM head (``stages.head``; inputs ``embed`` [V, H] and ``lm_head`` [V / world, H] replace
         ``x0``, ``meta[TOKEN_META]`` is the token fed, the next token is the extra SMEM output 3)."""
         self.mix = MixOpts(tree=mixture_tree, fused_score=mixture_fused_score)
@@ -614,6 +616,7 @@ class StackKernel:
             row_gathers=row_gathers or self.rows_mode,
             up_tree=moe_up_tree,
             fast_topk=moe_fast_topk,
+            single_rows=moe_single_rows,
             debug=frozenset(x for x in moe_debug.split(",") if x)
             | frozenset(k for k in debug_skip if k.startswith("moe_")),
         )
