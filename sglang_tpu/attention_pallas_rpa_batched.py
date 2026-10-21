@@ -24,8 +24,10 @@ from sglang_tpu.attention_pallas_rpa_base import (
     BaseTpuPallasRpaMultiStepDraftBackend,
     PallasForwardMetadata,
     RpaKernelSpec,
+    _resolve_decode_query_size,
 )
 from sglang_tpu.cp_forward import get_tpu_cp_layout
+from sglang_tpu.envs import envs as tpu_envs
 
 __all__ = [
     "PallasForwardMetadata",
@@ -96,7 +98,14 @@ def _invoke_batched_kernel(
     # the argument the shared shell passes for kernels that do is
     # discarded here. The base never widens decode for this kernel
     # (``supports_decode_query_size`` is off), so the width is always 1.
-    del cu_kv_lens, decode_query_size
+    del cu_kv_lens
+    block_options = {}
+    if decode_query_size > 1:
+        distribution, block_options["prefill_block_sizes"] = _verify_as_mixed(
+            distribution,
+            decode_query_size=decode_query_size,
+            sliding_window=sliding_window,
+        )
     return jax_rpa(
         queries,
         keys,
@@ -116,7 +125,40 @@ def _invoke_batched_kernel(
         # The kernel owns the KV write; the backend never writes out of band.
         skip_kv_update=False,
         kv_layout=kv_layout(),
+        **block_options,
     )
+
+
+# k block for verify-as-MIXED, measured on v7 at head_dim 64, 2 KV heads, fp8, 16-32 x 8 rows
+# at 150K: 4096 beats 2048 by 10% and 8192 is no better; SWA layers stop at the window.
+_VERIFY_BKV = 4096
+
+
+def _verify_as_mixed(
+    distribution, *, decode_query_size: int, sliding_window: int | None
+):
+    """Rerun a uniform-width DECODE batch as MIXED with a q block of that width.
+
+    The kernel's DECODE range takes one query row per sequence, so verify rows must
+    go through MIXED, whose default block search sizes q blocks for prefill chunks.
+    """
+    import jax.numpy as jnp
+
+    from sglang_tpu.attention.pallas.batched_rpa import configs
+
+    page = _MIN_PAGE_SIZE
+    bkv = _VERIFY_BKV
+    if sliding_window:
+        bkv = min(bkv, max(page, -(-sliding_window // page) * page))
+    # One lane: more lanes help at 16 sequences (-8%) but are 9x slower at 32.
+    blocks = configs.BlockSizes(
+        bq_sz=decode_query_size,
+        bq_c_sz=decode_query_size,
+        bkv_sz=bkv,
+        batch_size=1,
+        n_buffer=3,
+    )
+    return jnp.zeros_like(distribution).at[2].set(distribution[2]), blocks
 
 
 # SEQ_ALONG_LANE tiles the page axis onto lanes, so a page has to be a multiple
@@ -146,6 +188,13 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
+        if tpu_envs.SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS.get():
+            # Verify batches then reach the kernel as uniform-width DECODE, which
+            # _invoke_batched_kernel reruns as MIXED with verify-sized blocks.
+            self.decode_query_size = _resolve_decode_query_size(
+                supports_decode_query_size=True,
+                spec_enabled=not model_runner.spec_algorithm.is_none(),
+            )
         self._pp_schedule_runner = model_runner if parallel.pp_size > 1 else None
         self._cp_schedule_runner = model_runner if parallel.attn_cp_size > 1 else None
 

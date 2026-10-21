@@ -105,6 +105,10 @@ class TpuEnvs:
     # Expert-TP fused-RS: sum the per-device partial rows in the kernel's tiled
     # (rows, hidden // 128, 128) layout instead of relayouting them to 2D first.
     SGLANG_TPU_FUSED_RS_ETP_TILED_REDUCE = EnvBool(False)
+    # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
+    # with a q block of that width; the prefill block search otherwise pads each request's
+    # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
+    SGLANG_TPU_RPA_BATCHED_VERIFY_BLOCKS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
