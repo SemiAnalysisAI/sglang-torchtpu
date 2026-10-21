@@ -22,6 +22,10 @@ class ShortQueryIO:
     def destination(self, i):
         return self.output.at[self.desc[2, i], pl.ds(self.desc[3, i], 1), 0, :]
 
+    def needs_old(self, i):
+        """A fully closed destination quad can overwrite all four records."""
+        return (self.desc[4, i] > 3) | (self.desc[5, i] < 16)
+
     def read(self, i, slot):
         return pltpu.make_async_copy(
             self.raw.at[self.desc[0, i], pl.ds(self.desc[1, i] * 16, 16), :],
