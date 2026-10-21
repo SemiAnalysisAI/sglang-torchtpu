@@ -113,6 +113,11 @@ def main():
     )
     parser.add_argument("--queries", nargs="+", type=int)
     parser.add_argument("--batches", nargs="+", type=int)
+    parser.add_argument(
+        "--conservative-bound",
+        action="store_true",
+        help="Exercise the API fallback that uses total padded tokens as the bound",
+    )
     opts = parser.parse_args()
     opts.output.mkdir(parents=True, exist_ok=True)
     candidate, digest = load_candidate(Path(__file__).resolve().parents[3])
@@ -143,6 +148,7 @@ def main():
             "section": opts.section,
             "queries": opts.queries,
             "batches": opts.batches,
+            "conservative_bound": opts.conservative_bound,
         },
         "rule": "exact entire cache byte equality",
         "cases": [],
@@ -153,7 +159,11 @@ def main():
     for case in cases:
         name, args, old = make_inputs(case)
         print("MATRIX_ACCURACY_START", name, flush=True)
-        fn = partial(candidate, max_query_length=case["query_length"])
+        fn = (
+            candidate
+            if opts.conservative_bound
+            else partial(candidate, max_query_length=case["query_length"])
+        )
         fused = jax.jit(fn, static_argnums=(7, 8), donate_argnums=(1,))
         row = {**case, "name": name}
         try:
