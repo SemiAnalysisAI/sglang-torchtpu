@@ -341,8 +341,9 @@ def _accept_drafts_rejection_sampling(
     p_draft = torch.where(vocab_onehot, p[:, :n], 0).sum(-1)
     q_draft = torch.where(vocab_onehot, q, 0).sum(-1)
     u = torch.rand_like(p_draft) if coins is None else coins[:, :n]
-    # u <= p / q without dividing by q.
-    sample_ok = (u * q_draft <= p_draft) & verify_mask
+    # u < p / q without dividing by q. The coins are half-open, [0, 1), so the
+    # strict test accepts with probability p / q and never at p = 0.
+    sample_ok = (u * q_draft < p_draft) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
 
     p_at = pick(p, sample_num_correct)
@@ -433,8 +434,9 @@ def accept_drafts_target_only(
     vocab = torch.arange(p.shape[-1], device=draft_tokens.device)
     p_draft = torch.where(draft_tokens[..., None] == vocab, p[:, :n], 0).sum(-1)
     u = torch.rand_like(p_draft) if coins is None else coins[:, :n]
+    # Strict on the half-open coins, as in accept_drafts_sampled: never at p = 0.
     sample_ok = (
-        (u * threshold_acc <= p_draft) | (p_draft >= threshold_single)
+        (u * threshold_acc < p_draft) | (p_draft >= threshold_single)
     ) & verify_mask
     sample_num_correct = _leading_true(sample_ok)
 

@@ -398,6 +398,45 @@ class TestSharedFeatures(CustomTestCase):
                 )
                 self.assertEqual(num_correct.tolist(), [1])
 
+    def test_zero_coin_never_accepts_a_zero_probability_draft(self):
+        from sglang_tpu.experimental.speculative import spec_ops
+
+        # The target puts no mass on token 1; the draft put all of it there.
+        target = torch.tensor([[4.0, float("-inf")]]).repeat(2, 1)
+        allowed = torch.tensor([[4.0, 0.0]]).repeat(2, 1)
+        draft_logits = torch.tensor([[[float("-inf"), 4.0]]])
+        coins = dict(
+            coins=torch.zeros(1, 1), final_sampling_coins=torch.full((1,), 0.5)
+        )
+        for logits, accepted in ((target, 0), (allowed, 1)):
+            with self.subTest(target=logits[0].tolist()):
+                num_correct, _ = spec_ops.accept_drafts_sampled(
+                    logits,
+                    torch.tensor([[1]]),
+                    torch.tensor([1]),
+                    draft_logits,
+                    torch.ones(1),
+                    torch.full((1,), 2),
+                    **coins,
+                )
+                self.assertEqual(num_correct.tolist(), [accepted])
+                with patch.object(
+                    spec_ops, "tpu_filter_probs", lambda probs, *_, **__: probs
+                ):
+                    num_correct, _ = spec_ops.accept_drafts_target_only(
+                        logits,
+                        torch.tensor([[1]]),
+                        torch.tensor([1]),
+                        torch.ones(1),
+                        torch.full((1,), 2),
+                        torch.ones(1),
+                        torch.zeros(1),
+                        1.0,
+                        1.0,
+                        **coins,
+                    )
+                self.assertEqual(num_correct.tolist(), [accepted])
+
     def test_seeded_chain_draft_ignores_the_ambient_rng(self):
         from sglang_tpu.experimental.speculative import chain_spec_worker
         from sglang_tpu.sampling.seeded import draft_uniforms
