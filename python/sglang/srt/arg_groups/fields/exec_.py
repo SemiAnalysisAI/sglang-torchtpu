@@ -620,7 +620,6 @@ class ExecGraph(msgspec.Struct):
         Optional[int],
         Arg(
             help="Set the maximum batch size when using torch compile. On TPU, derived from --max-running-requests when unset.",
-            resolvable=True,
             fallback=32,
         ),
     ] = None
