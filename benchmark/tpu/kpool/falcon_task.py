@@ -90,6 +90,8 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
         workload = """python -m pip install jax==0.11.2 jaxlib==0.11.2
 export TPU_LIBRARY_PATH="$(python -c 'import libtpu; print(libtpu.get_library_path())')"
 echo PHASE_CHECKPOINT_ACCURACY
+timeout 600 python benchmark/tpu/kpool/diagnose_q1.py \\
+  --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/accuracy"
 timeout 1800 python benchmark/tpu/kpool/validate_q1.py \\
   --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/accuracy"
 """
