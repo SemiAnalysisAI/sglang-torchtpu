@@ -29,6 +29,6 @@ git fetch --depth=1 origin 985b4f8c9f2151cfae7c110156f7433892e1ee60
 git fetch --depth=1 origin 61edd0e421a877158f7bfdfdfd2ae6133173cbfc
 git fetch --depth=1 origin de72e465f066024c2e678b63de7d4cd73212a404
 echo PHASE_DEVICE_CAPTURE
-timeout 1800 python benchmark/tpu/kpool/benchmark.py --output "$out/benchmark" \
+timeout 7200 python benchmark/tpu/kpool/benchmark.py --output "$out/benchmark" \
   --cases decode prefill --decode-pipeline --decode-query-lengths 1 6 --warmup 10 --repeats 100 --hlo-text "$@"
 echo DEVICE_CAPTURE_COMPLETE

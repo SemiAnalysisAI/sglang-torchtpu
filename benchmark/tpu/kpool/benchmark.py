@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import reference
+import shape_matrix
 
 PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
 DOUBLE_PREFETCH_REVISION = "61edd0e421a877158f7bfdfdfd2ae6133173cbfc"
@@ -63,12 +64,10 @@ def inputs(pages, tokens, decode, batch=1, query_len=1, raw=None):
         jnp.zeros((4, 128), jnp.float32),
         jnp.asarray(starts + query_len, jnp.int32)
         if decode
-        else jnp.full((batch,), tokens, jnp.int32),
+        else jnp.full((batch,), query_len, jnp.int32),
         jnp.asarray(page_map, jnp.int32),
-        jnp.arange(batch + 1, dtype=jnp.int32) * query_len
-        if decode
-        else jnp.asarray([0, tokens], jnp.int32),
-        jnp.asarray([batch, batch, batch] if decode else [0, 0, 1], jnp.int32),
+        jnp.arange(batch + 1, dtype=jnp.int32) * query_len,
+        jnp.asarray([batch, batch, batch] if decode else [0, 0, batch], jnp.int32),
     )
     jax.block_until_ready((raw, tail))
     return raw, tail
@@ -91,7 +90,7 @@ def benchmark_case(
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     if batch != 1:
         name += f"_b{batch}"
-    if query_len != 1:
+    if query_len != 1 or not decode:
         name += f"_q{query_len}"
     print("CASE_START", name, flush=True)
     raw, tail = inputs(pages, tokens, decode, batch, query_len, raw)
@@ -129,6 +128,13 @@ def benchmark_case(
                 decode_max_q=query_len,
                 decode_q1_batch=True,
             ),
+        }
+    if opts.reference_pair:
+        variants = {
+            "reference": reference.computation,
+            "fused": partial(candidate, decode=True, decode_max_q=query_len)
+            if decode
+            else candidate,
         }
     states = {}
     try:
@@ -191,17 +197,12 @@ def benchmark_case(
             "pages": pages,
             "token_bucket": tokens,
             "batch": batch,
-            "query_length": query_len if decode else tokens,
-            "actual_new_tokens": batch * query_len if decode else tokens,
-            "closed_pools": (
-                int(
-                    np.sum(
-                        np.asarray(tail[1]) // 4
-                        - (np.asarray(tail[1]) - query_len) // 4
-                    )
+            "query_length": query_len,
+            "actual_new_tokens": batch * query_len,
+            "closed_pools": int(
+                np.sum(
+                    np.asarray(tail[1]) // 4 - (np.asarray(tail[1]) - query_len) // 4
                 )
-                if decode
-                else tokens // 4
             ),
             "previous_decode_branch": bool(decode and opts.decode_pipeline),
             "variants": rows,
@@ -258,16 +259,29 @@ def main():
     parser.add_argument("--decode-batches", nargs="+", type=int, default=[1, 32])
     parser.add_argument("--decode-query-lengths", nargs="+", type=int, default=[1])
     parser.add_argument("--decode-pipeline", action="store_true")
+    parser.add_argument("--reference-pair", action="store_true")
+    parser.add_argument("--shape-matrix", action="store_true")
+    parser.add_argument(
+        "--matrix-section", choices=("all", "decode", "prefill"), default="all"
+    )
+    parser.add_argument("--matrix-start", type=int, default=0)
+    parser.add_argument("--matrix-stop", type=int)
     parser.add_argument(
         "--profile",
         action="store_true",
         help="Compatibility flag; all benchmark runs now capture XProf device events",
     )
     opts = parser.parse_args()
+    if opts.shape_matrix:
+        opts.reference_pair = True
+    if opts.matrix_start < 0 or (
+        opts.matrix_stop is not None and opts.matrix_stop <= opts.matrix_start
+    ):
+        parser.error("Require 0 <= matrix_start < matrix_stop")
     if opts.warmup < 1 or opts.repeats < 2:
         parser.error("Require warmup >= 1 and repeats >= 2")
-    if any(b < 1 or b > 32 for b in opts.decode_batches):
-        parser.error("decode batches must be between 1 and 32")
+    if any(b < 1 or b > 64 for b in opts.decode_batches):
+        parser.error("decode batches must be between 1 and 64")
     if any(q < 1 or q > 32 for q in opts.decode_query_lengths):
         parser.error("decode query lengths must be between 1 and 32")
     if not opts.decode_pipeline and opts.decode_query_lengths != [1]:
@@ -287,16 +301,21 @@ def main():
         if jax.default_backend() != "tpu":
             raise RuntimeError("This benchmark requires a TPU")
         candidate, digest = load_candidate(root)
-        baseline, baseline_digest = load_candidate(root, opts.output)
-        double_prefetch, double_digest = load_candidate(
-            root, opts.output, DOUBLE_PREFETCH_REVISION
-        )
+        baseline = double_prefetch = previous = None
+        baseline_digest = double_digest = previous_digest = None
         previous_revision = (
             PREVIOUS_DECODE_REVISION
             if opts.decode_pipeline
             else PREVIOUS_CANDIDATE_REVISION
         )
-        previous, previous_digest = load_candidate(root, opts.output, previous_revision)
+        if not opts.reference_pair:
+            baseline, baseline_digest = load_candidate(root, opts.output)
+            double_prefetch, double_digest = load_candidate(
+                root, opts.output, DOUBLE_PREFETCH_REVISION
+            )
+            previous, previous_digest = load_candidate(
+                root, opts.output, previous_revision
+            )
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -318,7 +337,35 @@ def main():
                 for name in ("jax", "jaxlib", "libtpu", "numpy")
             },
         )
-        # Two fixed representative points; AOT covers compilation separately.
+        if opts.shape_matrix:
+            matrix = shape_matrix.cases(opts.matrix_section)[
+                opts.matrix_start : opts.matrix_stop
+            ]
+            if not matrix:
+                raise ValueError("Empty matrix selection")
+            result["matrix"] = matrix
+            shared_raw, _ = inputs(14849, 32, True)
+            for case in matrix:
+                result["cases"].append(
+                    benchmark_case(
+                        candidate,
+                        baseline,
+                        double_prefetch,
+                        previous,
+                        14849,
+                        case["tokens"],
+                        case["mode"] == "decode",
+                        opts,
+                        opts.output,
+                        case["batch"],
+                        case["query_length"],
+                        shared_raw,
+                    )
+                )
+                (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
+            result["status"] = "completed_pending_accuracy"
+            return
+        # The small default matrix is retained for targeted regression checks.
         for pages, tokens, decode in (
             (14849, 32, True),
             (14849, 8192, False),
@@ -330,7 +377,7 @@ def main():
                 print("INPUT_START", pages, flush=True)
                 shared_raw, _ = inputs(pages, 32, True)
                 print("INPUT_READY", pages, flush=True)
-            for query_len in opts.decode_query_lengths if decode else [1]:
+            for query_len in opts.decode_query_lengths if decode else [tokens]:
                 for batch in opts.decode_batches if decode else [1]:
                     bucket = ((batch * query_len + 31) // 32) * 32 if decode else tokens
                     result["cases"].append(
