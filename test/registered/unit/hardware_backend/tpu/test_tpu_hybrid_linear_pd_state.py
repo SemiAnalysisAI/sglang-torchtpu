@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.kv_free_fence import KVFreeFence
 from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
-from sglang_tpu.mamba_pool import TpuMambaPool, TpuMambaSlotAllocator
+from sglang_tpu.mamba_pool import AT_SLOT, TpuMambaPool, TpuMambaSlotAllocator
 
 LAYERS = [1, 2, 4]
 NUM_HEADS, HEAD_DIM, K = 4, 32, 4
@@ -121,30 +121,63 @@ class TestMambaStateDescription(CustomTestCase):
 
 
 class TestRetractionBackup(CustomTestCase):
-    def test_mamba_slots_round_trip(self):
-        for width in (1, 2):
-            with self.subTest(width=width):
-                pool = _mamba_pool(width)
-                _fill(pool.get_state())
-                if width > 1:
-                    pool.checkpoint_read_offsets[3] = 1
-                before = [t.clone() for t in pool.get_state()]
-                saved = pool.get_cpu_copy(torch.tensor(3))
-                for tensor in pool.get_state():
-                    tensor.zero_()
-                if width > 1:
-                    pool.checkpoint_read_offsets.zero_()
-                pool.load_cpu_copy(saved, torch.tensor([5]))
-                rows = torch.arange(width)
-                for got, want in zip(pool.get_state(), before):
-                    torch.testing.assert_close(
-                        got[5 * width + rows], want[3 * width + rows]
-                    )
-                    other = torch.ones(got.shape[0], dtype=torch.bool)
-                    other[5 * width + rows] = False
-                    self.assertEqual(float(got[other].abs().sum()), 0.0)
-                if width > 1:
-                    self.assertEqual(int(pool.checkpoint_read_offsets[5]), 1)
+    def _assert_only_row(self, pool, row, want):
+        for got, expected in zip(pool.get_state(), want):
+            torch.testing.assert_close(got[row], expected)
+            others = torch.ones(got.shape[0], dtype=torch.bool)
+            others[row] = False
+            self.assertEqual(float(got[others].abs().sum()), 0.0)
+
+    def test_mamba_slot_round_trip(self):
+        pool = _mamba_pool()
+        _fill(pool.get_state())
+        before = [t.clone() for t in pool.get_state()]
+        saved = pool.get_cpu_copy(torch.tensor(3))
+        for tensor in pool.get_state():
+            tensor.zero_()
+        pool.load_cpu_copy(saved, torch.tensor([5]))
+        self._assert_only_row(pool, 5, [t[3] for t in before])
+
+    def test_backup_reads_the_committed_window_row(self):
+        """After a verify the committed state is a row of the request's window.
+        The hybrid pool hands the request's pool row down to find it, and the
+        restore leaves it in the resumed request's slot row."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        mamba = _mamba_pool(width=2)
+        _fill(mamba.get_state())
+        before = [t.clone() for t in mamba.get_state()]
+        # Slot 3's request holds pool row 2; its last verify kept window row 1.
+        mamba.select_checkpoints(torch.tensor([3]), torch.tensor([1]))
+        committed = mamba.window_start + 2 * 2 + 1
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = _mla_pool()
+        pool.mamba_pool = mamba
+        pool._mamba_translate = lambda ids: ids
+        saved = pool.get_cpu_copy(
+            torch.arange(16, 21), mamba_indices=torch.tensor(3), req_pool_index=2
+        )
+        for tensor in mamba.get_state():
+            tensor.zero_()
+        # The resumed request holds slot 5 and pool row 6; a stale verify
+        # offset on slot 5 must not survive the restore.
+        mamba.checkpoint_read_offsets[5] = 0
+        pool.load_cpu_copy(
+            saved,
+            torch.arange(32, 37),
+            mamba_indices=torch.tensor(5),
+            req_pool_index=6,
+        )
+        self._assert_only_row(mamba, 5, [t[committed] for t in before])
+        self.assertEqual(int(mamba.checkpoint_read_offsets[5]), AT_SLOT)
+
+    def test_backup_without_the_request_row_refuses_a_window_state(self):
+        pool = _mamba_pool(width=2)
+        # At its slot row (after extend), the state needs no request row.
+        self.assertEqual(len(pool.get_cpu_copy(torch.tensor(3))), len(pool.get_state()))
+        pool.select_checkpoints(torch.tensor([3]), torch.tensor([0]))
+        with self.assertRaisesRegex(ValueError, "req_pool_indices"):
+            pool.get_cpu_copy(torch.tensor(3))
 
     def test_mla_tokens_round_trip_full_and_partial_pages(self):
         pool = _mla_pool(page_size=16)

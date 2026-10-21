@@ -551,34 +551,37 @@ class TpuMambaPool(MambaPool):
     # [num_layers, slots, ...] tensor (`state[:, slots]`); this pool keeps one
     # tensor per layer, so they are reimplemented over `_copy_states()`.
 
-    def _slot_rows(self, indices: torch.Tensor) -> torch.Tensor:
-        """Host rows holding the slots ``indices``: every checkpoint row of each."""
-        slots = indices.reshape(-1).to(device="cpu", dtype=torch.long)
-        if self.checkpoint_width == 1:
-            return slots
-        steps = torch.arange(self.checkpoint_width, dtype=torch.long)
-        return (slots[:, None] * self.checkpoint_width + steps).reshape(-1)
-
     @torch.no_grad()
-    def get_cpu_copy(self, indices):
-        """Host copy of the slots ``indices`` (retraction backup).
+    def get_cpu_copy(self, indices, req_pool_indices=None):
+        """Host copy of the slots' committed states (retraction backup).
 
-        Returns one ``[rows, ...]`` tensor per state tensor, in transfer-entry
-        order, and the slots' checkpoint offsets under speculation.
+        Returns one ``[slots, ...]`` tensor per state tensor, in transfer-entry
+        order. After a verify a slot's committed state is a row of its
+        request's verify window, which ``req_pool_indices`` (the requests'
+        pool rows) locate. `load_cpu_copy` writes the copies into slot rows:
+        the resumed request may hold another pool row.
         """
-        rows = self._slot_rows(indices)
-        states = self._copy_states()
-        device_rows = rows.to(states[0].device)
-        copies = [state.index_select(0, device_rows).to("cpu") for state in states]
-        offsets = None
+        slots = indices.reshape(-1).to(self.device, dtype=torch.long)
+        rows = slots
         if self.checkpoint_read_offsets is not None:
-            slots = indices.reshape(-1).to(self.device, dtype=torch.long)
-            offsets = self.checkpoint_read_offsets.index_select(0, slots).to("cpu")
-        return copies, offsets
+            if req_pool_indices is not None:
+                req_rows = torch.as_tensor(req_pool_indices, dtype=torch.long)
+                rows = self.committed_state_rows(
+                    slots, req_rows.reshape(-1).to(self.device)
+                )
+            elif bool(
+                (self.checkpoint_read_offsets.index_select(0, slots) != AT_SLOT).any()
+            ):
+                raise ValueError(
+                    "A slot's committed state is in its request's verify window; "
+                    "back it up with the request's req_pool_indices"
+                )
+        return [state.index_select(0, rows).to("cpu") for state in self._copy_states()]
 
     @torch.no_grad()
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        """Write a `get_cpu_copy` payload back into the slots ``indices``.
+        """Write a `get_cpu_copy` payload into the slots ``indices``' own rows,
+        which then hold their committed states (read offset ``AT_SLOT``).
 
         On TPU each state tensor is written through the in-place page-write
         kernel: an eager scatter would reallocate the tensor's buffer and
@@ -587,19 +590,16 @@ class TpuMambaPool(MambaPool):
         """
         from sglang_tpu.kv_page_write import write_pages_torch
 
-        copies, offsets = mamba_cache_cpu
         states = self._copy_states()
-        if len(copies) != len(states):
+        if len(mamba_cache_cpu) != len(states):
             raise ValueError(
-                f"Mamba state backup holds {len(copies)} tensors; the pool has "
-                f"{len(states)}"
+                f"Mamba state backup holds {len(mamba_cache_cpu)} tensors; the "
+                f"pool has {len(states)}"
             )
-        device_rows = self._slot_rows(indices).to(states[0].device)
-        for state, rows in zip(states, copies):
-            write_pages_torch(device_rows, rows.to(state.device), state)
-        if offsets is not None:
-            slots = indices.reshape(-1).to(self.device, dtype=torch.long)
-            self.checkpoint_read_offsets.index_copy_(0, slots, offsets.to(self.device))
+        slots = indices.reshape(-1).to(self.device, dtype=torch.long)
+        for state, rows in zip(states, mamba_cache_cpu):
+            write_pages_torch(slots, rows.to(state.device), state)
+        self.clear_slots(slots)
 
     def _iter_transfer_state_entries(self):
         """One [state_slots, ...] tensor per layer, laid out as get_state.

@@ -1226,7 +1226,10 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, req_pool_indices=None):
+        # req_pool_indices (the requests' pool rows) are for pools that keep a
+        # slot's committed state in a per-request verify window; here it is
+        # always the slot row.
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -4633,7 +4636,9 @@ class HybridLinearKVPool(KVCache):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices, req_pool_index=req_pool_index)
         # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
         mamba_cpu = (
-            self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
+            self.mamba_pool.get_cpu_copy(
+                self._mamba_translate(mamba_indices), req_pool_indices=req_pool_index
+            )
             if mamba_indices is not None
             else None
         )
