@@ -32,9 +32,6 @@ from sglang_tpu.muse_megakernel import kernel as K
 logger = logging.getLogger(__name__)
 
 _OP_NS = "sglang_tpu_pallas"
-# Larger steps run the native decoder: 32 rows (cc=8 with 4 DFlash drafts) is the
-# largest batch measured faster on the megakernel.
-_MAX_ROWS = 32
 # KV pages per attention chunk: 4 beats 2 on long-context verify steps and is neutral
 # at short context; 8+ costs VMEM the expert ring needs.
 _CHUNK_PAGES = 4
@@ -158,7 +155,7 @@ class MuseMegakernel(torch.nn.Module):
 
     # ------------------------------------------------------------------ preparation
     @classmethod
-    def from_model(cls, model, *, max_rows: int = _MAX_ROWS) -> "MuseMegakernel":
+    def from_model(cls, model) -> "MuseMegakernel":
         from sglang.srt.runtime_context import get_parallel
 
         parallel = get_parallel()
@@ -286,7 +283,7 @@ class MuseMegakernel(torch.nn.Module):
             kinds=tuple(kinds),
             tp_size=parallel.tp_size,
             tp_rank=parallel.tp_rank,
-            max_rows=max_rows,
+            max_rows=tpu_envs.SGLANG_TPU_MUSE_MK_MAX_ROWS.get(),
             max_position=rope_tab.shape[0],
             scale_fp8=scale_fp8,
         )

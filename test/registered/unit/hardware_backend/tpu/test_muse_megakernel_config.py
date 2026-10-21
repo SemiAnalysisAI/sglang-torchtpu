@@ -75,6 +75,29 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     )
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
 
+    def test_48_row_shapes_fit_the_scratch_budget(self):
+        # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
+        # packed bf16 pool and on fp8 SEQ_ALONG_LANE pages (which keep extra headroom).
+        for q, n_req in ((4, 12), (8, 6)):
+            for kv_sal in (False, True):
+                with self.subTest(q=q, n_req=n_req, kv_sal=kv_sal):
+                    cfg = ops.MuseMegakernel.config(
+                        _megakernel(),
+                        rows=48,
+                        q=q,
+                        n_req=n_req,
+                        n_page_entries=n_req * 4096,
+                        page_size=256 if kv_sal else 128,
+                        capture=(1, 16, 30, 44, 59),
+                        kv_sal=kv_sal,
+                        kv_sal_fp8=kv_sal,
+                    ).validate()
+                    budget = ops._SCRATCH_VMEM_BUDGET - (
+                        ops._SAL_VMEM_HEADROOM if kv_sal else 0
+                    )
+                    self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
+                    self.assertEqual(cfg.compact_rows, 8)
+
     def test_tp16_shapes_keep_a_deep_weight_ring(self):
         # tp16's dense weights split into 26 tiles, whose only ring divisor is 2; the
         # tiling must split tiles until a ring of at least MIN_RING_SLOTS divides them.
