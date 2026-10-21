@@ -30,6 +30,7 @@ def manifest(
             "aot",
             "profile-analysis",
             "device-profile",
+            "accuracy",
         )
         or not 0 <= hold_seconds <= 1800
     ):
@@ -85,6 +86,13 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             if analysis_input
             else ""
         ) + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
+    if mode == "accuracy":
+        workload = """python -m pip install jax==0.11.2 jaxlib==0.11.2
+export TPU_LIBRARY_PATH="$(python -c 'import libtpu; print(libtpu.get_library_path())')"
+echo PHASE_CHECKPOINT_ACCURACY
+timeout 1800 python benchmark/tpu/kpool/validate_q1.py \\
+  --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/accuracy"
+"""
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -172,7 +180,12 @@ export PATH="$task_root/venv/bin:$PATH"
         "exp_type": "BENCHMARK",
         "artifact_type": "GCS",
         "config": json.dumps(
-            {"source_revision": revision, "accuracy": "deferred_to_checkpoint"}
+            {
+                "source_revision": revision,
+                "accuracy": "exact_cache_bytes"
+                if mode == "accuracy"
+                else "deferred_to_checkpoint",
+            }
         ),
         "role_to_task_spec": {"worker": task},
     }
@@ -192,6 +205,7 @@ def main():
             "aot",
             "profile-analysis",
             "device-profile",
+            "accuracy",
         ),
         default="device-profile",
     )
