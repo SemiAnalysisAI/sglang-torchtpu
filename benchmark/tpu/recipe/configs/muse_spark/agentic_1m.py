@@ -1,17 +1,18 @@
 """Muse Spark for many agentic sessions per host at up to 1M tokens of context.
 
-The AgentX 1M-context configuration for concurrency 24-32 on one host: fp8 KV in
+The AgentX 1M-context configuration for concurrency 16-32 on one host: fp8 KV in
 the SEQ_ALONG_LANE layout (batched RPA prefill, megakernel decode), host KV
 offload with write-back, and a sliding-window pool sized for long cold prefills.
-This file is the concurrency-32 profile: 8 running requests with 4 DFlash draft
+This file is the concurrency-28 profile: 8 running requests with 4 DFlash draft
 tokens. The other profiles change only these settings:
 
+    concurrency 16: max_running_requests 2, 8 draft tokens, tpu_compile_bs [1, 2]
     concurrency 24: max_running_requests 6, 8 draft tokens,
                     tpu_compile_bs [1, 2, 3, 4, 5, 6], SGLANG_TPU_MUSE_MK_MAX_ROWS=48
-    concurrency 32, throughput: max_running_requests 10, prefill_decode_interval 16,
+    concurrency 32: max_running_requests 10, prefill_decode_interval 16,
                     tpu_compile_bs [1, 2, 4, 6, 8, 10], SGLANG_TPU_MUSE_MK_MAX_ROWS=48
-    concurrency 4-16: agentic.py with bf16 KV, max_running_requests = concurrency / 4,
-                    8 draft tokens
+    concurrency 4-8: agentic.py with bf16 KV, max_running_requests concurrency / 4,
+                    tpu_compile_bs [1, ..., max_running_requests]
 
 The pool settings assume a windowed draft: the DFlash2 draft's layers are all
 2048-token sliding-window, and a draft config that declares it (is_hybrid_swa and
