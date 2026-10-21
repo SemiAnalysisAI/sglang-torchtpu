@@ -129,22 +129,24 @@ def _decode_kernel(
     count = desc_ref.shape[1]
     buffers = 2 if pipeline else 1
 
-    def raw_read(i):
+    def raw_read(i, slot=None):
         return pltpu.make_async_copy(
             raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[1, i] * tile_rows, tile_rows), :],
-            raw_buf.at[i % buffers],
-            read_sem.at[i % buffers],
+            raw_buf.at[i % buffers if slot is None else slot],
+            read_sem.at[i % buffers if slot is None else slot],
         )
 
     def destination(i):
         return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], word_rows), 0, :]
 
-    def write(i):
+    def write(i, slot=None):
         return pltpu.make_async_copy(
-            out_buf.at[i % buffers], destination(i), write_sem.at[i % buffers]
+            out_buf.at[i % buffers if slot is None else slot],
+            destination(i),
+            write_sem.at[i % buffers if slot is None else slot],
         )
 
-    def refill(i):
+    def refill(i, slot=None):
         # Clip the speculative descriptor index before checking its live bit.
         # This also covers trailing inactive slots without waiting on a DMA
         # that was never started.
@@ -152,7 +154,7 @@ def _decode_kernel(
 
         @pl.when((i + buffers < count) & (desc_ref[6, following] != 0))
         def _start():
-            raw_read(following).start()
+            raw_read(following, slot).start()
 
     for initial in range(min(buffers, count)):
 
@@ -160,9 +162,9 @@ def _decode_kernel(
         def _prime(initial=initial):
             raw_read(initial).start()
 
-    @pl.loop(0, count)
-    def _tile(i):
-        slot = i % buffers
+    def _tile(i, fixed_slot=None):
+        slot = i % buffers if fixed_slot is None else fixed_slot
+        previous_slot = None if fixed_slot is None else 1 - fixed_slot
         previous = jnp.maximum(i - 1, 0)
         previous_live = (i > 0) & (desc_ref[6, previous] != 0)
         # Tiles have equal aligned extents. Equal page and quad start means
@@ -177,17 +179,17 @@ def _decode_kernel(
 
                 @pl.when(previous_live & conflict)
                 def _conflict_wait():
-                    write(previous).wait()
+                    write(previous, previous_slot).wait()
 
             old = pltpu.make_async_copy(
                 destination(i), out_buf.at[slot], old_sem.at[slot]
             )
             old.start()
-            raw_read(i).wait()
+            raw_read(i, fixed_slot).wait()
             pooled = _pool_rows(raw_buf[slot], ape_ref[...])
             if pipeline:
                 # Ref loads finished; later compute uses SSA values only.
-                refill(i)
+                refill(i, fixed_slot)
             rotated = _hadamard128(pooled.astype(jnp.float32))
             rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
             amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
@@ -227,11 +229,11 @@ def _decode_kernel(
                     # The prior store overlaps this tile's reads and compute.
                     # Drain it before starting another store, keeping at most
                     # one pending write and making buffer reuse unambiguous.
-                    write(previous).wait()
+                    write(previous, previous_slot).wait()
 
             old.wait()
             out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
-            write(i).start()
+            write(i, fixed_slot).start()
             if not pipeline:
                 write(i).wait()
                 refill(i)
@@ -242,9 +244,25 @@ def _decode_kernel(
 
                 @pl.when(previous_live)
                 def _drain_previous():
-                    write(previous).wait()
+                    write(previous, previous_slot).wait()
 
-            refill(i)
+            refill(i, fixed_slot)
+
+    if single_query and pipeline:
+        # Only Q=1 uses static ping/pong bindings. Keep the traced Q>1 loop
+        # unchanged, including its read/modify/write dependency ordering.
+        @pl.loop(0, count // 2)
+        def _pair(pair):
+            _tile(pair * 2, 0)
+            _tile(pair * 2 + 1, 1)
+
+        if count % 2:
+            _tile(count - 1, 0)
+    else:
+
+        @pl.loop(0, count)
+        def _loop(i):
+            _tile(i)
 
     if pipeline:
 
