@@ -101,12 +101,7 @@ def main():
                 if key != "decode_q1_unroll"
             }
             if args.q1_batch:
-                changed = (
-                    options.get("decode_max_q") == 1
-                    and options.get("decode_pipeline")
-                    and options.get("decode_tile_rows") == 16
-                    and batch > 1
-                )
+                changed = options.get("decode_max_q") == 1
                 baseline_options = {
                     key: value
                     for key, value in options.items()
