@@ -28,6 +28,11 @@ def main():
         donate_argnums=(1,),
     )
     previous = jax.jit(
+        partial(candidate, decode=True, decode_max_q=1, decode_q1_batch=False),
+        static_argnums=(7, 8),
+        donate_argnums=(1,),
+    )
+    automatic = jax.jit(
         partial(candidate, decode=True, decode_max_q=1),
         static_argnums=(7, 8),
         donate_argnums=(1,),
@@ -101,7 +106,10 @@ def main():
         print("ACCURACY_CASE_START", batch, mode, flush=True)
         expected = call(baseline)
         row = {"batch": batch, "mode": mode, "rule": "exact cache byte equality"}
-        for label, fn in [("previous", previous), ("batched", batched)]:
+        functions = [("previous", previous), ("batched", batched)]
+        if batch == 32:
+            functions.append(("automatic", automatic))
+        for label, fn in functions:
             try:
                 actual = call(fn)
                 mismatch = np.argwhere(actual != expected)
@@ -120,14 +128,21 @@ def main():
                     "candidate_sha256": digest,
                     "jax": jax.__version__,
                     "cases": results,
-                    "passed": all(r["batched"]["passed"] for r in results),
+                    "passed": all(
+                        r["batched"]["passed"]
+                        and r.get("automatic", {"passed": True})["passed"]
+                        for r in results
+                    ),
                     "complete": len(results) == len(cases),
                 },
                 indent=2,
             )
             + "\n"
         )
-    if not all(r["batched"]["passed"] for r in results):
+    if not all(
+        r["batched"]["passed"] and r.get("automatic", {"passed": True})["passed"]
+        for r in results
+    ):
         raise SystemExit(1)
 
 

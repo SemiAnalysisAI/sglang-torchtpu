@@ -104,10 +104,11 @@ def benchmark_case(
     if decode:
         variants = {
             "reference": reference.computation,
-            "current_default": partial(
+            "previous_pipeline": partial(
                 candidate,
                 decode=True,
                 decode_max_q=query_len,
+                decode_q1_batch=False,
             ),
             "decode_serial": partial(
                 candidate,
