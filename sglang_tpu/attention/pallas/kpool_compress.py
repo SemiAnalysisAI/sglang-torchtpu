@@ -98,6 +98,7 @@ def _short_kernel(
     write_sem,
     *,
     group_size,
+    pools_per_tile,
 ):
     del old_ref  # out_ref aliases the pooled input, including untouched bytes.
     io = ShortQueryIO(
@@ -110,7 +111,7 @@ def _short_kernel(
         old_sem,
         write_sem,
     )
-    ShortQueryPipeline(group_size).emit(io, ape_ref, mask_ref)
+    ShortQueryPipeline(group_size, pools_per_tile).emit(io, ape_ref, mask_ref)
 
 
 def _long_kernel(
@@ -206,7 +207,11 @@ def compress_and_store(
             axis=1,
         )[:, None]
         return pl.pallas_call(
-            partial(_short_kernel, group_size=group_size),
+            partial(
+                _short_kernel,
+                group_size=group_size,
+                pools_per_tile=min(4, (max_q + 3) // 4),
+            ),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,

@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .compute import pack_pools, pool_rows
+from .compute import pack_pools, pack_selected_pools, pool_rows
 from .io import LongQueryIO, ShortQueryIO
 
 
@@ -21,6 +21,7 @@ class ShortQueryPipeline:
     """Batch independent tiles; serialize a group with shared destinations."""
 
     group_size: int
+    pools_per_tile: int = 4
 
     def emit(self, io: ShortQueryIO, ape_ref, mask_ref):
         group_size = self.group_size
@@ -41,8 +42,16 @@ class ShortQueryPipeline:
                         io.read(i, slot).start()
                         io.read_old(i, slot).start()
                         io.read(i, slot).wait()
-                        packed = pack_pools(pool_rows(raw_buf[slot], ape_ref[...]))
                         mask = mask_ref[pl.ds(i, 1), :]
+                        if self.pools_per_tile == 4:
+                            packed = pack_pools(pool_rows(raw_buf[slot], ape_ref[...]))
+                        else:
+                            packed = pack_selected_pools(
+                                raw_buf[pl.ds(slot, 1), :, :],
+                                ape_ref[...],
+                                mask,
+                                self.pools_per_tile,
+                            )
                         io.read_old(i, slot).wait()
                         out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
                         io.write(i, slot).start()
@@ -67,11 +76,17 @@ class ShortQueryPipeline:
                     def _live():
                         io.read(i, slot).wait()
 
-                # All four pools of each aligned tile stay adjacent through packing;
-                # no Q=1 extraction or packing across unrelated requests is needed.
-                raw = raw_buf[...].reshape((group_size * 16, 256))
-                packed = pack_pools(pool_rows(raw, ape_ref[...]))
                 mask = mask_ref[pl.ds(begin, group_size), :]
+                if self.pools_per_tile == 4:
+                    raw = raw_buf[...].reshape((group_size * 16, 256))
+                    packed = pack_pools(pool_rows(raw, ape_ref[...]))
+                else:
+                    packed = pack_selected_pools(
+                        raw_buf[...],
+                        ape_ref[...],
+                        mask,
+                        self.pools_per_tile,
+                    )
 
                 @pl.loop(0, group_size)
                 def _wait_old(slot):
