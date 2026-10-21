@@ -9,6 +9,7 @@ import json
 import subprocess
 import time
 import traceback
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -18,6 +19,7 @@ import reference
 
 PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
 DOUBLE_PREFETCH_REVISION = "61edd0e421a877158f7bfdfdfd2ae6133173cbfc"
+PREVIOUS_CANDIDATE_REVISION = "880e8ace2f2f3f06cc66eb9a1235b6e6d7bf2335"
 
 
 def load_candidate(root, baseline_output=None, revision=PIPELINE_BASELINE_REVISION):
@@ -62,7 +64,7 @@ def inputs(pages, tokens, decode):
 
 
 def benchmark_case(
-    candidate, baseline, double_prefetch, pages, tokens, decode, opts, output
+    candidate, baseline, double_prefetch, previous, pages, tokens, decode, opts, output
 ):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     print("CASE_START", name, flush=True)
@@ -73,6 +75,13 @@ def benchmark_case(
         "double_prefetch": double_prefetch,
         "candidate": candidate,
     }
+    if decode:
+        variants = {
+            "reference": reference.computation,
+            "previous_candidate": previous,
+            "decode_fixed32": partial(candidate, decode=True, decode_tile_rows=32),
+            "candidate": partial(candidate, decode=True, decode_tile_rows=16),
+        }
     states = {}
     try:
         for label, function in variants.items():
@@ -91,10 +100,11 @@ def benchmark_case(
             )
             compile_s = time.perf_counter() - start
             hlo_error = None
-            try:
-                (output / f"{name}-{label}.hlo.txt").write_text(compiled.as_text())
-            except jax.errors.JaxRuntimeError:
-                hlo_error = traceback.format_exc()
+            if opts.hlo_text:
+                try:
+                    (output / f"{name}-{label}.hlo.txt").write_text(compiled.as_text())
+                except jax.errors.JaxRuntimeError:
+                    hlo_error = traceback.format_exc()
             memory = compiled.memory_analysis()
             stats = {
                 field: getattr(memory, field, None)
@@ -156,11 +166,13 @@ def benchmark_case(
             "variants": rows,
             "speedup_pending_accuracy": rows["reference"]["median_ms"]
             / rows["candidate"]["median_ms"],
-            "pipeline_speedup_pending_accuracy": rows["single_prefetch"]["median_ms"]
+            "pipeline_speedup_pending_accuracy": rows[
+                "previous_candidate" if decode else "single_prefetch"
+            ]["median_ms"]
             / rows["candidate"]["median_ms"],
-            "pooling_tile_speedup_pending_accuracy": rows["double_prefetch"][
-                "median_ms"
-            ]
+            "pooling_tile_speedup_pending_accuracy": rows[
+                "decode_fixed32" if decode else "double_prefetch"
+            ]["median_ms"]
             / rows["candidate"]["median_ms"],
             "device_profile": None,
             "profile_status": "requested" if opts.profile else "not_requested",
@@ -192,6 +204,13 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument(
+        "--cases",
+        nargs="+",
+        choices=("decode", "prefill"),
+        default=["decode", "prefill"],
+    )
+    parser.add_argument("--hlo-text", action="store_true")
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Collect XProf after saving timings; requires a compatible profiler ABI",
@@ -218,6 +237,9 @@ def main():
         double_prefetch, double_digest = load_candidate(
             root, opts.output, DOUBLE_PREFETCH_REVISION
         )
+        previous, previous_digest = load_candidate(
+            root, opts.output, PREVIOUS_CANDIDATE_REVISION
+        )
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -227,6 +249,8 @@ def main():
             pipeline_baseline_sha256=baseline_digest,
             double_prefetch_revision=DOUBLE_PREFETCH_REVISION,
             double_prefetch_sha256=double_digest,
+            previous_candidate_revision=PREVIOUS_CANDIDATE_REVISION,
+            previous_candidate_sha256=previous_digest,
             devices=[str(d) for d in jax.devices()],
             device_kind=jax.devices()[0].device_kind,
             runtime={
@@ -239,11 +263,14 @@ def main():
             (14849, 32, True),
             (14849, 8192, False),
         ):
+            if ("decode" if decode else "prefill") not in opts.cases:
+                continue
             result["cases"].append(
                 benchmark_case(
                     candidate,
                     baseline,
                     double_prefetch,
+                    previous,
                     pages,
                     tokens,
                     decode,
