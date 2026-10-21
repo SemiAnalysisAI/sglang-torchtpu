@@ -954,12 +954,21 @@ def _can_dma_rows(size, dtype):
 
 @jax.named_scope("dma_gather_gm_start")
 def dma_gather_gm_start(
-    src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata_ref, divisor: int = 1
+    src_ref,
+    dst_ref,
+    indices_ref,
+    sem_ref,
+    gm_id,
+    metadata_ref,
+    divisor: int = 1,
+    unroll: int = 1,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
     src_ref and dst_ref must be 3D: (rows, k // num_lanes, num_lanes).
     No reshape — reshape on refs breaks dynamic pl.ds offsets.
+
+    `unroll`: rows issued per loop iteration (the remainder runs one by one).
 
     `divisor`: optional integer divisor applied to indices_ref values before
     use. Set > 1 when indices_ref contains packed values (e.g.,
@@ -983,7 +992,20 @@ def dma_gather_gm_start(
         ).start()
         return _
 
-    lax.fori_loop(0, m_end - m_start, _gather_body, 0)
+    num_rows = m_end - m_start
+    if unroll == 1:
+        lax.fori_loop(0, num_rows, _gather_body, 0)
+        return
+
+    # `unroll` rows per iteration (fewer loop branches per row), then the tail.
+    def _block(b, _):
+        for u in range(unroll):
+            _gather_body(b * unroll + u, None)
+        return _
+
+    num_blocks = num_rows // unroll
+    lax.fori_loop(0, num_blocks, _block, 0)
+    lax.fori_loop(num_blocks * unroll, num_rows, _gather_body, 0)
 
 
 @jax.named_scope("dma_gather_gm_wait")

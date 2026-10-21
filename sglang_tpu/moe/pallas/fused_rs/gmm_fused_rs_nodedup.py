@@ -490,8 +490,11 @@ def kernel_main_fused_rs(
     fp8_direct_write: bool = False,
     defer_writes: bool = False,
     skip_out_zero: bool = False,
+    row_loop_unroll: int = 1,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
+
+    `row_loop_unroll`: rows per iteration of the per-row gather and write loops.
 
     `pack_indices`: when True (default), `lhs_indices_ref` holds packed values
     `combined = lhs_idx * top_k + topk_slot`; `topk_indices_ref` is a dummy.
@@ -1030,6 +1033,7 @@ def kernel_main_fused_rs(
                     0,
                     metadata_ref,
                     divisor=_gather_divisor,
+                    unroll=row_loop_unroll,
                 )
 
             @jax.named_scope("dma_gather_prefetch")
@@ -1043,6 +1047,7 @@ def kernel_main_fused_rs(
                     gm_id + 1,
                     metadata_ref,
                     divisor=_gather_divisor,
+                    unroll=row_loop_unroll,
                 )
 
             # --- Weight DMA (overlapped with gather) ---
@@ -1373,9 +1378,29 @@ def kernel_main_fused_rs(
                         local_sz + lax.select(is_local, jnp.int32(1), jnp.int32(0)),
                     )
 
-                send_sz, local_sz = lax.fori_loop(
-                    0, num_valid, _write_row, (jnp.int32(0), jnp.int32(0))
-                )
+                if row_loop_unroll == 1:
+                    send_sz, local_sz = lax.fori_loop(
+                        0, num_valid, _write_row, (jnp.int32(0), jnp.int32(0))
+                    )
+                else:
+
+                    def _write_block(b, carry):
+                        for u in range(row_loop_unroll):
+                            carry = _write_row(b * row_loop_unroll + u, carry)
+                        return carry
+
+                    num_blocks = num_valid // row_loop_unroll
+                    send_sz, local_sz = lax.fori_loop(
+                        num_blocks * row_loop_unroll,
+                        num_valid,
+                        _write_row,
+                        lax.fori_loop(
+                            0,
+                            num_blocks,
+                            _write_block,
+                            (jnp.int32(0), jnp.int32(0)),
+                        ),
+                    )
                 gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + send_sz
                 gm_id_ref[4 + stg_id] = gm_id_ref[4 + stg_id] + local_sz
 
@@ -1487,6 +1512,7 @@ def kernel_main_fused_rs_fp8(
     pack_indices: bool = True,
     defer_writes: bool = False,
     skip_out_zero: bool = False,
+    row_loop_unroll: int = 1,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -1580,6 +1606,7 @@ def kernel_main_fused_rs_fp8(
         "local_rows",
         "tiled_output",
         "skip_out_zero",
+        "row_loop_unroll",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1612,6 +1639,7 @@ def gmm_v2_fused_rs(
     local_rows: bool = False,
     tiled_output: bool = False,
     skip_out_zero: bool = False,
+    row_loop_unroll: int = 1,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -2164,6 +2192,7 @@ def gmm_v2_fused_rs(
         pack_indices=pack_indices,
         defer_writes=expert_tp,
         skip_out_zero=skip_out_zero and expert_tp and not fp8_direct_write,
+        row_loop_unroll=row_loop_unroll,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d

@@ -108,6 +108,8 @@ class TpuEnvs:
     # Expert-TP fused-RS: skip zeroing the output buffer, which the per-row writes
     # cover exactly once.
     SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
+    # Fused-RS: rows issued per iteration of the per-row gather / write DMA loops.
+    SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
