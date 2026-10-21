@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """K4/D128 pooling directly from raw pages into the native pooled cache.
 
-Decode/verify uses fixed request/tile slots and double raw buffering. A prior
-store overlaps independent destination reads and compute; aliased destinations
-still serialize their RMW. Q1/B32 batches independent pools in one computation.
-The general prefill path uses larger raw transfers.
+Short queries batch independent aligned raw tiles across requests. Long queries
+stream larger contiguous tiles through two buffers. Dispatch uses a static
+per-request query bound, regardless of whether the caller is decoding or prefilling.
 """
 
 from functools import partial
@@ -70,7 +69,7 @@ def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, til
     return jnp.sum(first, dtype=jnp.int32)[None], desc
 
 
-def _decode_descriptors(
+def _request_descriptors(
     kv_lens, page_indices, cu_q_lens, distribution, tile_rows, max_q
 ):
     """Fixed tile slots cover every newly completed pool, including verify Q>1."""
@@ -108,11 +107,30 @@ def _decode_descriptors(
     )
 
 
-def _decode_kernel(
+def _pack_pools(pooled):
+    """BF16 pooled keys -> F32 Hadamard -> FP8 keys and scale bytes."""
+    rotated = _hadamard128(pooled.astype(jnp.float32)) * (128**-0.5)
+    amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
+    exponent = jnp.ceil(jnp.log2(amax / 448.0))
+    q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(jnp.float8_e4m3fn)
+    scale_bytes = jnp.where(
+        jnp.arange(128)[None, :] == 0,
+        (exponent + 127).astype(jnp.uint8),
+        jnp.uint8(0),
+    )
+    # Each four adjacent pool rows belong to one physical destination quad.
+    return jnp.concatenate(
+        (pltpu.bitcast(q, jnp.uint32), pltpu.bitcast(scale_bytes, jnp.uint32)),
+        axis=1,
+    )
+
+
+def _short_kernel(
     desc_ref,
     raw_ref,
     old_ref,
     ape_ref,
+    mask_ref,
     out_ref,
     raw_buf,
     out_buf,
@@ -120,321 +138,112 @@ def _decode_kernel(
     old_sem,
     write_sem,
     *,
-    tile_rows,
-    pipeline,
-    single_query,
-    q1_unroll,
-    q1_reference_precision=False,
+    group_size,
 ):
-    del old_ref  # Aliased output preserves every inactive record and byte.
-    words = out_ref.bitcast(jnp.uint32)
-    word_rows = tile_rows // 16
-    count = desc_ref.shape[1]
-    buffers = 2 if pipeline else 1
+    """Bounded groups of independent tiles share one vector computation.
 
-    def raw_read(i, slot=None):
-        return pltpu.make_async_copy(
-            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[1, i] * tile_rows, tile_rows), :],
-            raw_buf.at[i % buffers if slot is None else slot],
-            read_sem.at[i % buffers if slot is None else slot],
-        )
+    All stores drain before the next group reads the aliased pooled cache.
+    Within a group, shared destination quads use ordered read/modify/write.
+    """
+    del old_ref
+    words = out_ref.bitcast(jnp.uint32)
 
     def destination(i):
-        return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], word_rows), 0, :]
+        return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], 1), 0, :]
 
-    def write(i, slot=None):
+    def raw_read(i, slot):
         return pltpu.make_async_copy(
-            out_buf.at[i % buffers if slot is None else slot],
-            destination(i),
-            write_sem.at[i % buffers if slot is None else slot],
+            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[1, i] * 16, 16), :],
+            raw_buf.at[slot],
+            read_sem.at[slot],
         )
 
-    def refill(i, slot=None):
-        # Clip the speculative descriptor index before checking its live bit.
-        # This also covers trailing inactive slots without waiting on a DMA
-        # that was never started.
-        following = jnp.minimum(i + buffers, count - 1)
+    def old_read(i, slot):
+        return pltpu.make_async_copy(destination(i), out_buf.at[slot], old_sem.at[slot])
 
-        @pl.when((i + buffers < count) & (desc_ref[6, following] != 0))
-        def _start():
-            raw_read(following, slot).start()
-
-    for initial in range(min(buffers, count)):
-
-        @pl.when(desc_ref[6, initial] != 0)
-        def _prime(initial=initial):
-            raw_read(initial).start()
-
-    def _tile(i, fixed_slot=None):
-        slot = i % buffers if fixed_slot is None else fixed_slot
-        previous_slot = None if fixed_slot is None else 1 - fixed_slot
-        previous = jnp.maximum(i - 1, 0)
-        previous_live = (i > 0) & (desc_ref[6, previous] != 0)
-        # Tiles have equal aligned extents. Equal page and quad start means
-        # their entire RMW regions alias, even if different pool bytes change.
-        conflict = (desc_ref[2, previous] == desc_ref[2, i]) & (
-            desc_ref[3, previous] == desc_ref[3, i]
+    def write(i, slot):
+        return pltpu.make_async_copy(
+            out_buf.at[slot], destination(i), write_sem.at[slot]
         )
 
-        @pl.when(desc_ref[6, i] != 0)
-        def _closed():
-            if pipeline:
+    @pl.loop(0, desc_ref.shape[1] // group_size)
+    def _group(group):
+        begin = group * group_size
 
-                @pl.when(previous_live & conflict)
-                def _conflict_wait():
-                    write(previous, previous_slot).wait()
+        @pl.when(desc_ref[7, begin] != 0)
+        def _shared_quad():
+            @pl.loop(0, group_size)
+            def _ordered(slot):
+                i = begin + slot
 
-            old = pltpu.make_async_copy(
-                destination(i), out_buf.at[slot], old_sem.at[slot]
-            )
-            old.start()
-            raw_read(i, fixed_slot).wait()
-            pooled = _pool_rows(raw_buf[slot], ape_ref[...])
-            if pipeline:
-                # Ref loads finished; later compute uses SSA values only.
-                refill(i, fixed_slot)
-            rotated = _hadamard128(pooled.astype(jnp.float32))
-            if q1_reference_precision:
-                # Match the complete reference executable: its final BF16->F32
-                # round trip is eliminated before quantization (JAX 0.11.2).
-                rotated = rotated * (128**-0.5)
-            else:
-                rotated = (
-                    (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
-                )
-            amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
-            exponent = jnp.ceil(jnp.log2(amax / 448.0))
-            q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(
-                jnp.float8_e4m3fn
-            )
-            scale_bytes = jnp.where(
-                jnp.arange(128)[None, :] == 0,
-                (exponent + 127).astype(jnp.uint8),
-                jnp.uint8(0),
-            )
-            packed = jnp.concatenate(
-                (pltpu.bitcast(q, jnp.uint32), pltpu.bitcast(scale_bytes, jnp.uint32)),
-                axis=1,
-            )
-            row = jax.lax.broadcasted_iota(jnp.int32, (word_rows, 256), 0)
-            if single_query:
-                selected = (desc_ref[5, i] - 1) // 4
-                mask = jnp.where(
-                    row == selected // 4,
-                    jnp.uint32(255) << ((selected % 4) * 8),
-                    jnp.uint32(0),
-                )
-            else:
-                mask = jnp.zeros((word_rows, 256), jnp.uint32)
-                for lane in range(4):
-                    ends = row * 16 + lane * 4 + 3
-                    live = (ends >= desc_ref[4, i]) & (ends < desc_ref[5, i])
-                    mask |= jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (
-                        lane * 8
-                    )
-            if pipeline:
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    raw_read(i, slot).start()
+                    old_read(i, slot).start()
+                    raw_read(i, slot).wait()
+                    packed = _pack_pools(_pool_rows(raw_buf[slot], ape_ref[...]))
+                    mask = mask_ref[pl.ds(i, 1), :]
+                    old_read(i, slot).wait()
+                    out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
+                    write(i, slot).start()
+                    write(i, slot).wait()
 
-                @pl.when(previous_live & ~conflict)
-                def _nonconflict_wait():
-                    # The prior store overlaps this tile's reads and compute.
-                    # Drain it before starting another store, keeping at most
-                    # one pending write and making buffer reuse unambiguous.
-                    write(previous, previous_slot).wait()
+        @pl.when(desc_ref[7, begin] == 0)
+        def _independent():
+            @pl.loop(0, group_size)
+            def _start(slot):
+                i = begin + slot
 
-            old.wait()
-            out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
-            write(i, fixed_slot).start()
-            if not pipeline:
-                write(i).wait()
-                refill(i)
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    raw_read(i, slot).start()
+                    old_read(i, slot).start()
 
-        @pl.when(desc_ref[6, i] == 0)
-        def _inactive():
-            if pipeline:
+            @pl.loop(0, group_size)
+            def _wait_raw(slot):
+                i = begin + slot
 
-                @pl.when(previous_live)
-                def _drain_previous():
-                    write(previous, previous_slot).wait()
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    raw_read(i, slot).wait()
 
-            refill(i, fixed_slot)
+            # All four pools of each aligned tile stay adjacent through packing;
+            # no Q=1 extraction or packing across unrelated requests is needed.
+            raw = raw_buf[...].reshape((group_size * 16, 256))
+            packed = _pack_pools(_pool_rows(raw, ape_ref[...]))
+            mask = mask_ref[pl.ds(begin, group_size), :]
 
-    if single_query and pipeline and q1_unroll:
-        # Only Q=1 uses static ping/pong bindings. Keep the traced Q>1 loop
-        # unchanged, including its read/modify/write dependency ordering.
-        @pl.loop(0, count // 2)
-        def _pair(pair):
-            _tile(pair * 2, 0)
-            _tile(pair * 2 + 1, 1)
+            @pl.loop(0, group_size)
+            def _wait_old(slot):
+                i = begin + slot
 
-        if count % 2:
-            _tile(count - 1, 0)
-    else:
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    old_read(i, slot).wait()
 
-        @pl.loop(0, count)
-        def _loop(i):
-            _tile(i)
-
-    if pipeline:
-
-        @pl.when(desc_ref[6, count - 1] != 0)
-        def _drain():
-            write(count - 1).wait()
-
-
-def _q1_batch_kernel(
-    desc_ref,
-    raw_ref,
-    old_ref,
-    ape_ref,
-    mask_ref,
-    out_ref,
-    raw_batch,
-    old_batch,
-    batch_read_sem,
-    batch_old_sem,
-    batch_write_sem,
-    raw_serial,
-    out_serial,
-    read_sem,
-    old_sem,
-    write_sem,
-):
-    """Gather independent Q1 pools together, then compute all requests at once.
-
-    A shared physical quad uses the existing ordered RMW implementation. This
-    decision stays inside the aliased Pallas call, without a whole-cache select.
-    """
-    count = desc_ref.shape[1]
-
-    @pl.when(desc_ref[7, 0] != 0)
-    def _shared_quad():
-        _decode_kernel(
-            desc_ref,
-            raw_ref,
-            old_ref,
-            ape_ref,
-            out_ref,
-            raw_serial,
-            out_serial,
-            read_sem,
-            old_sem,
-            write_sem,
-            tile_rows=16,
-            pipeline=True,
-            single_query=True,
-            q1_unroll=False,
-            q1_reference_precision=True,
-        )
-
-    @pl.when(desc_ref[7, 0] == 0)
-    def _independent():
-        words = out_ref.bitcast(jnp.uint32)
-
-        def destination(i):
-            return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], 1), 0, :]
-
-        def raw_read(i):
-            # HBM BF16 rows use the native tile layout. A four-row DMA with
-            # a nonzero sub-tile offset fails its runtime alignment check.
-            # Read the aligned tile, then select only the useful pool in VMEM.
-            row = desc_ref[1, i] * 16
-            return pltpu.make_async_copy(
-                raw_ref.at[desc_ref[0, i], pl.ds(row, 16), :],
-                raw_batch.at[i],
-                batch_read_sem.at[i],
+            old = out_buf[...].reshape((group_size, 256))
+            out_buf[...] = ((old & ~mask) | (packed & mask)).reshape(
+                (group_size, 1, 256)
             )
 
-        def old_read(i):
-            return pltpu.make_async_copy(
-                destination(i),
-                old_batch.at[i],
-                batch_old_sem.at[i],
-            )
+            @pl.loop(0, group_size)
+            def _start_write(slot):
+                i = begin + slot
 
-        def write(i):
-            return pltpu.make_async_copy(
-                old_batch.at[i],
-                destination(i),
-                batch_write_sem.at[i],
-            )
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    write(i, slot).start()
 
-        @pl.loop(0, count)
-        def _start(i):
-            @pl.when(desc_ref[6, i] != 0)
-            def _live():
-                raw_read(i).start()
-                old_read(i).start()
+            @pl.loop(0, group_size)
+            def _wait_write(slot):
+                i = begin + slot
 
-        @pl.loop(0, count)
-        def _wait_raw(i):
-            @pl.when(desc_ref[6, i] != 0)
-            def _live():
-                raw_read(i).wait()
-
-        # The batch dimension contains independent requests. Reduce only their
-        # four member rows, never across requests or inactive padding rows.
-        shift = mask_ref[...]
-        raw_tiles = raw_batch[...].astype(jnp.float32).reshape((count, 4, 4, 256))
-        selected_pool = (shift // 8).reshape((count, 1, 1, 1))
-        raw = jnp.sum(
-            jnp.where(
-                jnp.arange(4)[None, :, None, None] == selected_pool,
-                raw_tiles,
-                jnp.float32(0),
-            ),
-            axis=1,
-        )
-        keys = raw[:, :, :128]
-        scores = raw[:, :, 128:] + ape_ref[...][None, :, :]
-        scores -= jnp.max(scores, axis=1, keepdims=True)
-        weight = jnp.exp(scores)
-        weight /= jnp.sum(weight, axis=1, keepdims=True)
-        pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
-        rotated = _hadamard128(pooled.astype(jnp.float32))
-        # The compiled reference retains BF16 pooling, but quantizes the F32
-        # rotation directly. An extra BF16 rounding changes FP8 tie outcomes.
-        rotated = rotated * (128**-0.5)
-        amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
-        exponent = jnp.ceil(jnp.log2(amax / 448.0))
-        q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(
-            jnp.float8_e4m3fn
-        )
-        # Expand individual bytes to words; packing adjacent batch rows here
-        # would mix different requests instead of preserving each cache quad.
-        key_bytes = jax.lax.bitcast_convert_type(q, jnp.uint8).astype(jnp.uint32)
-        scale_bytes = jnp.where(
-            jnp.arange(128)[None, :] == 0,
-            (exponent + 127).astype(jnp.uint32),
-            jnp.uint32(0),
-        )
-        packed = jnp.concatenate((key_bytes, scale_bytes), axis=1)
-        mask = jnp.uint32(255) << shift
-        packed = (packed << shift) & mask
-
-        @pl.loop(0, count)
-        def _wait_old(i):
-            @pl.when(desc_ref[6, i] != 0)
-            def _live():
-                old_read(i).wait()
-
-        old_batch[...] = (
-            old_batch[...].reshape((count, 256)) & ~mask | packed
-        ).reshape((count, 1, 256))
-
-        @pl.loop(0, count)
-        def _start_write(i):
-            @pl.when(desc_ref[6, i] != 0)
-            def _live():
-                write(i).start()
-
-        @pl.loop(0, count)
-        def _wait_write(i):
-            @pl.when(desc_ref[6, i] != 0)
-            def _live():
-                write(i).wait()
+                @pl.when(desc_ref[6, i] != 0)
+                def _live():
+                    write(i, slot).wait()
 
 
-def _kernel(
+def _long_kernel(
     count_ref,
     desc_ref,
     raw_ref,
@@ -502,22 +311,7 @@ def _kernel(
         def _refill():
             read(i + 2).start()
 
-        rotated = _hadamard128(pooled.astype(jnp.float32))
-        rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
-        amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
-        exponent = jnp.ceil(jnp.log2(amax / 448.0))
-        scale = jnp.exp2(exponent)
-        q = jnp.clip(rotated / scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-        # Pallas bitcast packs consecutive rows in the second-last dimension,
-        # matching the cache's [quad, 4, byte] -> [quad, 1, word] Ref view.
-        key_words = pltpu.bitcast(q, jnp.uint32)
-        scale_bytes = jnp.where(
-            jnp.arange(128)[None, :] == 0,
-            (exponent + 127).astype(jnp.uint8),
-            jnp.uint8(0),
-        )
-        scale_words = pltpu.bitcast(scale_bytes, jnp.uint32)
-        packed = jnp.concatenate((key_words, scale_words), axis=1)
+        packed = _pack_pools(pooled)
         mask = jnp.zeros((word_rows, 256), jnp.uint32)
         for lane in range(4):
             ends = (
@@ -578,28 +372,16 @@ def compress_and_store(
     num_tokens,
     kpool=4,
     *,
-    decode=False,
-    decode_tile_rows=16,
-    decode_max_q=None,
-    decode_pipeline=True,
-    decode_q1_unroll=False,
-    decode_q1_batch=None,
+    max_query_length=None,
 ):
-    """Pool newly closed K4 groups; the returned native cache aliases its input.
+    """Compress newly closed K4 groups into the aliased native pooled cache.
 
     Raw writes must already be complete. Destination records must be unique;
     distinct records in a shared physical block are supported.
-    Set static decode=True for decode/verify, including multiple query tokens.
-    decode_max_q is a static upper bound on each request's query length, NOT
-    the accepted speculative length. Omitting it uses num_tokens as a safe
-    bound. The caller must include every verify row when supplying a bound.
-    The general path remains preferable for large prefill query lengths.
-    decode_q1_unroll opts into an experimental static-slot Q=1 pipeline;
-    it has not demonstrated a stable latency gain and is disabled by default.
-    decode_q1_batch=None selects the measured Q1/B32 batch path automatically.
-    False retains the previous implementation. True opts other Q1 shapes into
-    reference-compatible rounding and batches at most 32 requests; larger
-    batches retain bounded serial scratch. Q>1 and prefill are unaffected.
+    max_query_length is a static upper bound on each request's newly supplied
+    query tokens, including every verification row, not historical KV length.
+    Omit it to use num_tokens as a conservative bound for ragged requests.
+    Short prefill, decode and verification use the same batched implementation.
     """
     if kpool != 4 or raw_cache.shape[1:] != (128, 256):
         raise ValueError("fused pooling requires K=4, page_size=128 and D=128")
@@ -609,83 +391,39 @@ def compress_and_store(
         raise ValueError("expected BF16 raw cache and uint8 pooled cache")
     if not num_tokens:
         return pooled_cache
-    if decode:
-        if decode_tile_rows not in (16, 32):
-            raise ValueError("decode_tile_rows must be 16 or 32")
-        max_q = num_tokens if decode_max_q is None else decode_max_q
-        if not isinstance(max_q, int) or max_q < 1:
-            raise ValueError("decode_max_q must be a positive static integer")
-        if decode_q1_batch is None:
-            decode_q1_batch = (
-                max_q == 1
-                and kv_lens.shape[0] == 32
-                and decode_tile_rows == 16
-                and decode_pipeline
-                and not decode_q1_unroll
-            )
-        desc = _decode_descriptors(
-            kv_lens, page_indices, cu_q_lens, distribution, decode_tile_rows, max_q
+    max_q = num_tokens if max_query_length is None else max_query_length
+    if not isinstance(max_q, int) or max_q < 1:
+        raise ValueError("max_query_length must be a positive static integer")
+    if max_q <= 32:
+        desc = _request_descriptors(
+            kv_lens, page_indices, cu_q_lens, distribution, 16, max_q
         )
-        pipeline = decode_pipeline and desc.shape[1] > 1
-        buffers = 2 if pipeline else 1
-        if (
-            decode_q1_batch
-            and max_q == 1
-            and pipeline
-            and decode_tile_rows == 16
-            and desc.shape[1] <= 32
-        ):
-            count = desc.shape[1]
-            index = jnp.arange(count)
-            same_quad = (desc[2, :, None] == desc[2, None, :]) & (
-                desc[3, :, None] == desc[3, None, :]
-            )
-            live_pair = (desc[6, :, None] != 0) & (desc[6, None, :] != 0)
-            conflict = jnp.any(
-                same_quad & live_pair & (index[:, None] < index[None, :])
-            )
-            batch_desc = jnp.concatenate(
-                (desc, jnp.broadcast_to(conflict.astype(jnp.int32), (1, count))), axis=0
-            )
-            shifts = (((desc[5] - 1) // 4 % 4) * 8).astype(jnp.uint32)[:, None]
-            return pl.pallas_call(
-                _q1_batch_kernel,
-                out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
-                grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=1,
-                    grid=(1,),
-                    in_specs=(
-                        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                        pl.BlockSpec(),
-                        pl.BlockSpec(),
-                    ),
-                    out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                    scratch_shapes=(
-                        pltpu.VMEM((count, 16, 256), jnp.bfloat16),
-                        pltpu.VMEM((count, 1, 256), jnp.uint32),
-                        pltpu.SemaphoreType.DMA((count,)),
-                        pltpu.SemaphoreType.DMA((count,)),
-                        pltpu.SemaphoreType.DMA((count,)),
-                        pltpu.VMEM((2, 16, 256), jnp.bfloat16),
-                        pltpu.VMEM((2, 1, 256), jnp.uint32),
-                        pltpu.SemaphoreType.DMA((2,)),
-                        pltpu.SemaphoreType.DMA((2,)),
-                        pltpu.SemaphoreType.DMA((2,)),
-                    ),
-                ),
-                input_output_aliases={2: 0},
-                name="kpool_decode_store_q1_batch",
-            )(batch_desc, raw_cache, pooled_cache, ape.astype(jnp.float32), shifts)
+        group_size = min(16, desc.shape[1])
+        padding = (-desc.shape[1]) % group_size
+        desc = jnp.pad(desc, ((0, 0), (0, padding)))
+        count = desc.shape[1]
+        groups = desc.reshape((7, count // group_size, group_size))
+        same_quad = (groups[2, :, :, None] == groups[2, :, None, :]) & (
+            groups[3, :, :, None] == groups[3, :, None, :]
+        )
+        live_pair = (groups[6, :, :, None] != 0) & (groups[6, :, None, :] != 0)
+        index = jnp.arange(group_size)
+        conflict = jnp.any(
+            same_quad & live_pair & (index[:, None] < index[None, :]), axis=(1, 2)
+        )
+        desc = jnp.concatenate(
+            (desc, jnp.repeat(conflict, group_size)[None, :].astype(jnp.int32)),
+            axis=0,
+        )
+        ends = jnp.arange(4) * 4 + 3
+        live = (ends[None, :] >= desc[4, :, None]) & (ends[None, :] < desc[5, :, None])
+        mask = jnp.sum(
+            jnp.where(live, jnp.uint32(255), jnp.uint32(0))
+            << (jnp.arange(4, dtype=jnp.uint32) * 8)[None, :],
+            axis=1,
+        )[:, None]
         return pl.pallas_call(
-            partial(
-                _decode_kernel,
-                tile_rows=decode_tile_rows,
-                pipeline=pipeline,
-                single_query=max_q == 1,
-                q1_unroll=decode_q1_unroll,
-                q1_reference_precision=decode_q1_batch and max_q == 1,
-            ),
+            partial(_short_kernel, group_size=group_size),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
@@ -694,25 +432,26 @@ def compress_and_store(
                     pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                     pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                     pl.BlockSpec(),
+                    pl.BlockSpec(),
                 ),
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=(
-                    pltpu.VMEM((buffers, decode_tile_rows, 256), jnp.bfloat16),
-                    pltpu.VMEM((buffers, decode_tile_rows // 16, 256), jnp.uint32),
-                    pltpu.SemaphoreType.DMA((buffers,)),
-                    pltpu.SemaphoreType.DMA((buffers,)),
-                    pltpu.SemaphoreType.DMA((buffers,)),
+                    pltpu.VMEM((group_size, 16, 256), jnp.bfloat16),
+                    pltpu.VMEM((group_size, 1, 256), jnp.uint32),
+                    pltpu.SemaphoreType.DMA((group_size,)),
+                    pltpu.SemaphoreType.DMA((group_size,)),
+                    pltpu.SemaphoreType.DMA((group_size,)),
                 ),
             ),
             input_output_aliases={2: 0},
-            name=f"kpool_decode_store_k4_d128_r{decode_tile_rows}_p{buffers}",
-        )(desc, raw_cache, pooled_cache, ape.astype(jnp.float32))
-    tile_rows = 32 if num_tokens < 128 else 128
+            name="kpool_short_query_store",
+        )(desc, raw_cache, pooled_cache, ape.astype(jnp.float32), mask)
+    tile_rows = 32 if max_q < 128 else 128
     count, desc = _descriptors(
         kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows
     )
     return pl.pallas_call(
-        partial(_kernel, tile_rows=tile_rows),
+        partial(_long_kernel, tile_rows=tile_rows),
         out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -733,11 +472,5 @@ def compress_and_store(
             ),
         ),
         input_output_aliases={3: 0},
-        name="kpool_compress_store_k4_d128",
-    )(
-        count,
-        desc,
-        raw_cache,
-        pooled_cache,
-        ape.astype(jnp.float32),
-    )
+        name="kpool_long_query_store",
+    )(count, desc, raw_cache, pooled_cache, ape.astype(jnp.float32))
