@@ -18,9 +18,9 @@ import reference
 import shape_matrix
 
 
-def load_candidate(root):
+def load_candidate(root, source=None):
     """Load the standalone kernel without importing the serving plugin."""
-    path = root / "sglang_tpu/attention/pallas/kpool_compress.py"
+    path = source or root / "sglang_tpu/attention/pallas/kpool_compress.py"
     spec = importlib.util.spec_from_file_location("kpool_candidate", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -65,6 +65,7 @@ def benchmark_case(
     batch=1,
     query_len=1,
     raw=None,
+    baseline=None,
 ):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     if batch != 1:
@@ -75,10 +76,16 @@ def benchmark_case(
     raw, tail = inputs(pages, tokens, decode, batch, query_len, raw)
     variants = {
         "reference": reference.computation,
-        "fused": partial(candidate, decode=True, decode_max_q=query_len)
-        if decode
-        else candidate,
+        "fused": partial(candidate, max_query_length=query_len),
     }
+    if baseline is not None:
+        variants = {
+            "reference": reference.computation,
+            "baseline": partial(baseline, decode=True, decode_max_q=query_len)
+            if decode
+            else baseline,
+            "fused": variants["fused"],
+        }
     states = {}
     try:
         for label, function in variants.items():
@@ -197,6 +204,16 @@ def main():
     )
     parser.add_argument("--matrix-start", type=int, default=0)
     parser.add_argument("--matrix-stop", type=int)
+    parser.add_argument(
+        "--baseline-revision",
+        help="Compare the previous kernel API from a Git revision",
+    )
+    parser.add_argument(
+        "--queries", nargs="+", type=int, help="Filter the declared matrix by Q"
+    )
+    parser.add_argument(
+        "--batches", nargs="+", type=int, help="Filter the declared matrix by batch"
+    )
     opts = parser.parse_args()
     if opts.matrix_start < 0 or (
         opts.matrix_stop is not None and opts.matrix_stop <= opts.matrix_start
@@ -219,11 +236,29 @@ def main():
         if jax.default_backend() != "tpu":
             raise RuntimeError("This benchmark requires a TPU")
         candidate, digest = load_candidate(root)
+        baseline = None
+        baseline_digest = None
+        if opts.baseline_revision:
+            path = opts.output / "baseline.py"
+            path.write_bytes(
+                subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "show",
+                        f"{opts.baseline_revision}:sglang_tpu/attention/pallas/kpool_compress.py",
+                    ]
+                )
+            )
+            baseline, baseline_digest = load_candidate(root, source=path)
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
             ).strip(),
             candidate_sha256=digest,
+            baseline_revision=opts.baseline_revision,
+            baseline_sha256=baseline_digest,
             reference_sha256=hashlib.sha256(
                 Path(reference.__file__).read_bytes()
             ).hexdigest(),
@@ -236,6 +271,12 @@ def main():
         )
         matrix = shape_matrix.cases(opts.matrix_section)[
             opts.matrix_start : opts.matrix_stop
+        ]
+        matrix = [
+            case
+            for case in matrix
+            if (opts.queries is None or case["query_length"] in opts.queries)
+            and (opts.batches is None or case["batch"] in opts.batches)
         ]
         if not matrix:
             raise ValueError("Empty matrix selection")
@@ -254,6 +295,7 @@ def main():
                         case["batch"],
                         case["query_length"],
                         shared_raw,
+                        baseline=baseline,
                     )
                 )
                 (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))

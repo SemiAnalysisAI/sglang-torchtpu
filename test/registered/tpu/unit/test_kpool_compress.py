@@ -97,22 +97,11 @@ class TestKpoolCompress(unittest.TestCase):
                 actual = np.asarray(fused(*args))
                 # Includes all inactive records, record padding, FP8 keys and scales.
                 np.testing.assert_array_equal(actual, expected)
-                if max(new) <= 32:
-                    for rows in (16, 32):
-                        for pipeline in (False, True):
-                            decode = jax.jit(
-                                partial(
-                                    compress_and_store,
-                                    decode=True,
-                                    decode_tile_rows=rows,
-                                    decode_max_q=max(1, max(new)),
-                                    decode_pipeline=pipeline,
-                                ),
-                                static_argnums=(7,),
-                            )
-                            np.testing.assert_array_equal(
-                                np.asarray(decode(*args)), expected
-                            )
+                bounded = jax.jit(
+                    partial(compress_and_store, max_query_length=max(1, max(new))),
+                    static_argnums=(7,),
+                )
+                np.testing.assert_array_equal(np.asarray(bounded(*args)), expected)
 
 
 if __name__ == "__main__":
