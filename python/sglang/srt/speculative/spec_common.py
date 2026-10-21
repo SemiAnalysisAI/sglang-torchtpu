@@ -43,38 +43,33 @@ def adjust_verify_logits(
 ) -> None:
     """Apply accumulated penalties and logit_bias to verify logits in place.
 
-    Traceable. Each request's per-request row is repeated over its
+    Traceable. Each request's per-request row is broadcast over its
     ``draft_token_num`` verify rows, a relaxed form of penalties for
-    speculative decoding. Rows past ``len(sampling_info) * draft_token_num``
-    (bucket padding) are left untouched.
+    speculative decoding, without materializing a repeated vocabulary-sized
+    tensor. Rows past ``len(sampling_info) * draft_token_num`` (bucket padding)
+    are left untouched.
     """
     # Looked up at call time: a platform may rebind this module attribute at startup.
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
 
+    def per_request_rows(modifier: torch.Tensor) -> torch.Tensor:
+        # [requests, draft_token_num, vocab] view of the live verify rows.
+        rows = modifier.shape[0] * draft_token_num
+        return next_token_logits[:rows].view(modifier.shape[0], draft_token_num, -1)
+
     if sampling_info.acc_additive_penalties is not None:
-        additive_penalties = torch.repeat_interleave(
-            sampling_info.acc_additive_penalties,
-            draft_token_num,
-            dim=0,
-        )
-        next_token_logits[: additive_penalties.shape[0]].add_(additive_penalties)
+        additive_penalties = sampling_info.acc_additive_penalties
+        per_request_rows(additive_penalties).add_(additive_penalties.unsqueeze(1))
     if sampling_info.acc_scaling_penalties is not None:
-        scaling_penalties = torch.repeat_interleave(
-            sampling_info.acc_scaling_penalties,
-            draft_token_num,
-            dim=0,
-        )
+        scaling_penalties = sampling_info.acc_scaling_penalties
         apply_scaling_penalties(
-            next_token_logits[: scaling_penalties.shape[0]],
-            scaling_penalties,
+            per_request_rows(scaling_penalties), scaling_penalties.unsqueeze(1)
         )
     if sampling_info.logit_bias is not None:
-        logit_bias = torch.repeat_interleave(
-            sampling_info.logit_bias, draft_token_num, dim=0
-        )
-        next_token_logits[: logit_bias.shape[0]].add_(logit_bias)
+        logit_bias = sampling_info.logit_bias
+        per_request_rows(logit_bias).add_(logit_bias.unsqueeze(1))
 
 
 def seeded_verify_coins(
