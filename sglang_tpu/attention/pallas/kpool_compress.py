@@ -17,33 +17,24 @@ from .kpool.io import LongQueryIO, ShortQueryIO
 from .kpool.pipeline import LongQueryPipeline, ShortQueryPipeline
 
 
-def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows):
-    """One descriptor per aligned raw tile containing a newly closed pool."""
+def _descriptors(
+    kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows, max_q
+):
+    """Compact request tile slots in request order for the streaming schedule."""
     batch = kv_lens.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    req = jnp.minimum(jnp.searchsorted(cu_q_lens[1:], tok, side="right"), batch - 1)
-    start = kv_lens[req] - (cu_q_lens[req + 1] - cu_q_lens[req])
-    pos = start + tok - cu_q_lens[req]
-    closing = (tok < cu_q_lens[distribution[2]]) & (pos % 4 == 3)
-    first = closing & ((pos % tile_rows == 3) | (tok - cu_q_lens[req] < 4))
-    # Each request contributes at most two boundary tiles plus q_len // tile_rows.
+    tiles = _request_descriptors(
+        kv_lens, page_indices, cu_q_lens, distribution, tile_rows, max_q
+    )
+    # Preserve request-major order. The short schedule instead groups the
+    # first tiles of independent requests to expose concurrent transfers.
+    tiles = tiles.reshape(7, -1, batch).transpose(0, 2, 1).reshape(7, -1)
+    live = tiles[6] != 0
     capacity = min(num_tokens, num_tokens // tile_rows + 2 * batch)
-    chosen = jnp.nonzero(first, size=capacity, fill_value=0)[0]
-    r, page = req[chosen], pos[chosen] // 128
-    tile_start = pos[chosen] // tile_rows * tile_rows
-    raw_offset = tile_start % 128
-    pages_per_seq = page_indices.shape[0] // batch
-    desc = jnp.stack(
-        (
-            page_indices[r * pages_per_seq + page],
-            page_indices[r * pages_per_seq + page // 4],
-            (page % 4) * 8 + raw_offset // 16,
-            start[chosen] - tile_start,
-            kv_lens[r] - tile_start,
-            raw_offset // tile_rows,
-        )
-    ).astype(jnp.int32)
-    return jnp.sum(first, dtype=jnp.int32)[None], desc
+    chosen = jnp.nonzero(live, size=capacity, fill_value=0)[0]
+    # Streaming IO uses: raw page, pooled page, pooled quad, first/last row,
+    # and raw tile offset. Only the compacted live prefix is consumed.
+    desc = tiles[jnp.array([0, 2, 3, 4, 5, 1]), :][:, chosen]
+    return jnp.sum(live, dtype=jnp.int32)[None], desc
 
 
 def _request_descriptors(
@@ -177,9 +168,7 @@ def compress_and_store(
     max_q = num_tokens if max_query_length is None else max_query_length
     if not isinstance(max_q, int) or max_q < 1:
         raise ValueError("max_query_length must be a positive static integer")
-    # Request descriptors avoid token-wide metadata expansion for small
-    # query spans. Grouped transfers amortize per-tile launch and waits.
-    if max_q <= 256:
+    if max_q <= 32:
         desc = _request_descriptors(
             kv_lens, page_indices, cu_q_lens, distribution, 16, max_q
         )
@@ -233,7 +222,7 @@ def compress_and_store(
         )(desc, raw_cache, pooled_cache, ape.astype(jnp.float32), mask)
     tile_rows = 32 if max_q < 128 else 128
     count, desc = _descriptors(
-        kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows
+        kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows, max_q
     )
     return pl.pallas_call(
         partial(_long_kernel, tile_rows=tile_rows),
