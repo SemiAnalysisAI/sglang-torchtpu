@@ -56,6 +56,19 @@ def union_ns(rows):
     return total
 
 
+def module_ops(events, module):
+    # Events DB rounds picosecond starts/durations to integer nanoseconds.
+    # An op sharing the module end can therefore end 1 ns after its parent.
+    # This tolerance joins records; it does not alter either measured duration.
+    return [
+        event for event in events
+        if event["device"] == module["device"]
+        and event["category"] == "XLA Ops"
+        and event["start_ns"] >= module["start_ns"] - 1
+        and event["end_ns"] <= module["end_ns"] + 1
+    ]
+
+
 def fusion_context(graph, instruction):
     if not isinstance(graph, str):
         return None, [], "Fusion was not determined: graph text unavailable."
@@ -63,10 +76,10 @@ def fusion_context(graph, instruction):
     computations = defaultdict(list)
     computation = None
     for line in graph.splitlines():
-        header = re.match(r"^(?:ENTRY )?%([^\s(]+)\s*\(", line)
+        header = re.match(r"^(?:ENTRY )?%?([\w.-]+)(?:\s*\(.*)?\s+\{$", line)
         if header:
             computation = header.group(1)
-        item = re.match(r"\s*(?:ROOT )?%([\w.-]+)\s*=\s*(.*)", line)
+        item = re.match(r"\s+(?:ROOT )?%?([\w.-]+)\s*=\s*(.*)", line)
         if item:
             name, body = item.groups()
             instructions[name] = body
@@ -78,7 +91,7 @@ def fusion_context(graph, instruction):
         return None, [], "Fusion was not determined: instruction absent from selected graph text."
     if not re.search(r"\bfusion\(", body):
         return None, [], "Selected HLO instruction is not fused."
-    called = re.search(r"calls=%([\w.-]+)", body)
+    called = re.search(r"calls=%?([\w.-]+)", body)
     if not called or called.group(1) not in computations:
         return instruction, [], "Fusion owner is known; fused computation members were unavailable."
     return instruction, computations[called.group(1)], "Members are from the compiled fused computation."
@@ -97,6 +110,7 @@ def main():
         "capture_root": str(args.capture_root),
         "capture_metrics": metrics,
         "cases": [],
+        "device_boundary_rounding_tolerance_ns": 1,
         "attribution": "Pair host sample marker order with serialized device module order, after validating counts and the alternating variant schedule; host timestamps and durations are not used. Identical executable fingerprints can alias module names.",
         "formula": "module_us=(end_ns-start_ns)/1000 on XLA Modules; Pallas_us=union of outermost kpool XLA Ops within that module /1000, separately for each device; percentiles use numpy linear interpolation",
     }
@@ -176,7 +190,7 @@ def main():
                 samples = []
                 op_totals = defaultdict(lambda: {"count": 0, "self_us": 0.0, "inclusive_us": 0.0})
                 for index, row in enumerate(module_rows):
-                    child = [r for r in events if r["device"] == device and r["category"] == "XLA Ops" and r["start_ns"] >= row["start_ns"] and r["end_ns"] <= row["end_ns"]]
+                    child = module_ops(events, row)
                     for op in child:
                         key = op["hlo_op"] or op["kernel_name"]
                         totals = op_totals[key]
@@ -196,6 +210,8 @@ def main():
                     }
                     samples.append(sample)
                     sample_evidence.append(sample)
+                if label != "reference" and any(s["pallas_event_count"] != 1 for s in samples):
+                    raise RuntimeError(f"{name}/{label}/{device}: expected one outer Pallas event in every module")
                 records[label][device] = {
                     "module_us": distribution([s["module_us"] for s in samples]),
                     "pallas_us": distribution([s["pallas_us"] for s in samples if s["pallas_us"] is not None]),
@@ -247,7 +263,7 @@ def main():
         }
         summary["cases"].append(case_summary)
         (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
-        print("CASE_ANALYZED", name, json.dumps(records), flush=True)
+        print("CASE_ANALYZED", name, flush=True)
     print("ANALYSIS_COMPLETE", flush=True)
 
 
