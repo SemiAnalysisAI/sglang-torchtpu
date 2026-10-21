@@ -31,6 +31,8 @@ CASES = (
     "candidate_decode",
     "candidate_decode32",
     "candidate_decode_b32",
+    "candidate_decode_q6_b32",
+    "candidate_decode_q6_serial_b32",
     "reference_prefill",
     "candidate_prefill",
 )
@@ -102,8 +104,15 @@ def build(case, root, out):
         return call, (jax.ShapeDtypeStruct(shape, dtype),), ()
 
     pages = 17 if case.startswith("original_") else 14849
-    tokens = 256 if case.startswith("original_") else 32 if "decode" in case else 8192
     batch = 32 if case.endswith("_b32") else 1
+    query_len = 6 if "_q6" in case else 1
+    tokens = (
+        256
+        if case.startswith("original_")
+        else max(32, batch * query_len)
+        if "decode" in case
+        else 8192
+    )
     specs = tuple(
         jax.ShapeDtypeStruct(shape, dtype)
         for shape, dtype in (
@@ -160,7 +169,9 @@ def build(case, root, out):
     if case.startswith("candidate_decode"):
         extra = {
             "decode": True,
-            "decode_tile_rows": 32 if case.endswith("32") and batch == 1 else 16,
+            "decode_tile_rows": 32 if case == "candidate_decode32" else 16,
+            "decode_max_q": query_len,
+            "decode_pipeline": "_serial" not in case,
         }
     return lambda *args: fn(*args, tokens, 4, **extra), specs, (1,)
 
