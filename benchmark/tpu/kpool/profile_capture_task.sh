@@ -2,6 +2,8 @@
 set -euo pipefail
 out="${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/device-profile"
 mkdir -p "$out"
+# All variants use the already verified profiler-compatible runtime.
+python -m pip install jax==0.11.2 jaxlib==0.11.2
 # Resolve the intended wheel explicitly; do not inherit the image's libtpu.
 export TPU_LIBRARY_PATH="$(python -c 'import libtpu; print(libtpu.get_library_path())')"
 export LIBTPU_INIT_ARGS="--xla_xprof_register_llo_debug_info=true"
