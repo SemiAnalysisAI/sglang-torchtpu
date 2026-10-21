@@ -324,9 +324,12 @@ def _q1_batch_kernel(
             return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], 1), 0, :]
 
         def raw_read(i):
-            row = desc_ref[1, i] * 16 + ((desc_ref[5, i] - 1) // 4) * 4
+            # HBM BF16 rows use the native tile layout. A four-row DMA with
+            # a nonzero sub-tile offset fails its runtime alignment check.
+            # Read the aligned tile, then select only the useful pool in VMEM.
+            row = desc_ref[1, i] * 16
             return pltpu.make_async_copy(
-                raw_ref.at[desc_ref[0, i], pl.ds(row, 4), :],
+                raw_ref.at[desc_ref[0, i], pl.ds(row, 16), :],
                 raw_batch.at[i],
                 batch_read_sem.at[i],
             )
@@ -360,7 +363,17 @@ def _q1_batch_kernel(
 
         # The batch dimension contains independent requests. Reduce only their
         # four member rows, never across requests or inactive padding rows.
-        raw = raw_batch[...].astype(jnp.float32)
+        shift = mask_ref[...]
+        raw_tiles = raw_batch[...].astype(jnp.float32).reshape((count, 4, 4, 256))
+        selected_pool = (shift // 8).reshape((count, 1, 1, 1))
+        raw = jnp.sum(
+            jnp.where(
+                jnp.arange(4)[None, :, None, None] == selected_pool,
+                raw_tiles,
+                jnp.float32(0),
+            ),
+            axis=1,
+        )
         keys = raw[:, :, :128]
         scores = raw[:, :, 128:] + ape_ref[...][None, :, :]
         scores -= jnp.max(scores, axis=1, keepdims=True)
@@ -383,7 +396,6 @@ def _q1_batch_kernel(
             jnp.uint32(0),
         )
         packed = jnp.concatenate((key_bytes, scale_bytes), axis=1)
-        shift = mask_ref[...]
         mask = jnp.uint32(255) << shift
         packed = (packed << shift) & mask
 
@@ -620,7 +632,7 @@ def compress_and_store(
                     ),
                     out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                     scratch_shapes=(
-                        pltpu.VMEM((count, 4, 256), jnp.bfloat16),
+                        pltpu.VMEM((count, 16, 256), jnp.bfloat16),
                         pltpu.VMEM((count, 1, 256), jnp.uint32),
                         pltpu.SemaphoreType.DMA((count,)),
                         pltpu.SemaphoreType.DMA((count,)),
