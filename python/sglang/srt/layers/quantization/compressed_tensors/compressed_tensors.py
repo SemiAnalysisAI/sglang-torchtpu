@@ -803,6 +803,53 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
+    def _get_wna16_moe_scheme(self, weight_quant, input_quant):
+        if not _is_npu:
+            if (
+                self._is_mxint4a16(weight_quant, input_quant)
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+            ):
+                return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
+            elif _is_hip:
+                logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                return CompressedTensorsWNA16TritonMoE(self, weight_quant=weight_quant)
+            else:
+                moe_backend = get_moe_runner_backend()
+                triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
+                use_blackwell_triton = (
+                    moe_backend.is_auto()
+                    and get_platform().is_sm100
+                    and triton_supported
+                )
+                if moe_backend.is_triton() and not triton_supported:
+                    raise ValueError(
+                        "The Triton WNA16 MoE backend only supports symmetric "
+                        "INT4 group quantization with group_size=32 or 128 and no "
+                        "actorder."
+                    )
+                if moe_backend.is_triton() or use_blackwell_triton:
+                    reason = (
+                        "SM100/SM103 auto default"
+                        if use_blackwell_triton
+                        else "moe_runner_backend=triton"
+                    )
+                    logger.info_once(
+                        f"Using CompressedTensorsWNA16TritonMoE ({reason})"
+                    )
+                    return CompressedTensorsWNA16TritonMoE(
+                        self, weight_quant=weight_quant
+                    )
+                logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
+                return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
+        else:
+            if (
+                self._is_dynamic_token_w4(weight_quant, input_quant)
+                and input_quant is None
+            ):
+                logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
+                return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        return None
+
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsMoEScheme]:
@@ -866,52 +913,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Using TpuCompressedTensorsWNA16MoE (Pallas gmm_v2 W4A16)"
                 )
                 return TpuCompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
-            if not _is_npu:
-                if (
-                    self._is_mxint4a16(weight_quant, input_quant)
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
-                    return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
-                elif _is_hip:
-                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
-                    return CompressedTensorsWNA16TritonMoE(
-                        self, weight_quant=weight_quant
-                    )
-                else:
-                    moe_backend = get_moe_runner_backend()
-                    triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
-                    use_blackwell_triton = (
-                        moe_backend.is_auto()
-                        and get_platform().is_sm100
-                        and triton_supported
-                    )
-                    if moe_backend.is_triton() and not triton_supported:
-                        raise ValueError(
-                            "The Triton WNA16 MoE backend only supports symmetric "
-                            "INT4 group quantization with group_size=32 or 128 and no "
-                            "actorder."
-                        )
-                    if moe_backend.is_triton() or use_blackwell_triton:
-                        reason = (
-                            "SM100/SM103 auto default"
-                            if use_blackwell_triton
-                            else "moe_runner_backend=triton"
-                        )
-                        logger.info_once(
-                            f"Using CompressedTensorsWNA16TritonMoE ({reason})"
-                        )
-                        return CompressedTensorsWNA16TritonMoE(
-                            self, weight_quant=weight_quant
-                        )
-                    logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                    return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
-            else:
-                if (
-                    self._is_dynamic_token_w4(weight_quant, input_quant)
-                    and input_quant is None
-                ):
-                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
-                    return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+            scheme = self._get_wna16_moe_scheme(weight_quant, input_quant)
+            if scheme is not None:
+                return scheme
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

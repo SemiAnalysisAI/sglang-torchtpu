@@ -73,6 +73,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.plugins.oot_classes import oot_base_class
 from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
@@ -1219,7 +1220,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                method.__class__.__name__
+                oot_base_class(type(method)).__name__
                 in [
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
@@ -1471,7 +1472,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
-                method.__class__.__name__
+                oot_base_class(type(method)).__name__
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",

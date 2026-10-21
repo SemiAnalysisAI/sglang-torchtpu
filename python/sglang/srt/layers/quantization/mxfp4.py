@@ -442,6 +442,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def _get_intermediate_size_after_pad(self, size: int) -> int:
+        return size
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -553,6 +556,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif is_tpu():
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, mxfp4_block
+            )
+        else:
+            intermediate_size_per_partition_after_pad = (
+                self._get_intermediate_size_after_pad(intermediate_size_per_partition)
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
