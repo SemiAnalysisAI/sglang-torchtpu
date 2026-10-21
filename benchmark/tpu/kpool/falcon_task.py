@@ -21,7 +21,10 @@ def manifest(
         raise ValueError("revision must be a full Git commit SHA")
     if bool(wheelhouse_bucket) != bool(wheelhouse_prefix):
         raise ValueError("Set both wheelhouse bucket and prefix, or neither")
-    if mode not in ("performance", "aot") or not 0 <= hold_seconds <= 1800:
+    if (
+        mode not in ("performance", "decode-performance", "aot")
+        or not 0 <= hold_seconds <= 1800
+    ):
         raise ValueError("Invalid task mode or artifact retrieval window")
     install = "python -m pip install -r benchmark/tpu/kpool/requirements.txt"
     if wheelhouse_bucket:
@@ -36,7 +39,22 @@ export LIBTPU_INIT_ARGS="--xla_jf_dump_to=$compiler/llo --xla_mosaic_dump_to=$co
 timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
   --output "${ARTIFACT_LOCAL_DIR:?}/rank-${FALCON_RANK:-0}/benchmark"
 """
-    if benchmark_cases:
+    if mode == "decode-performance":
+        # Full LLO is collected by the separate AOT task. Keep compiler-dump
+        # I/O out of this bounded same-device latency comparison.
+        lines = workload.splitlines()
+        lines = [
+            line for line in lines if not line.startswith("export LIBTPU_INIT_ARGS=")
+        ]
+        workload = (
+            "\n".join(lines)
+            + " --cases decode --decode-pipeline --decode-query-lengths 1 6\n"
+        )
+        workload = workload.replace(
+            "echo PHASE_BENCHMARK",
+            "echo PHASE_BENCHMARK\ngit fetch --depth=1 origin 08ab4f9395b2753a8c7a4f86fa269a559f4a0b4f",
+        )
+    if benchmark_cases and mode != "decode-performance":
         workload = (
             workload.rstrip()
             + " --cases "
@@ -127,7 +145,11 @@ def main():
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--wheelhouse-bucket")
     parser.add_argument("--wheelhouse-prefix")
-    parser.add_argument("--mode", choices=("performance", "aot"), default="performance")
+    parser.add_argument(
+        "--mode",
+        choices=("performance", "decode-performance", "aot"),
+        default="performance",
+    )
     parser.add_argument("--hold-seconds", type=int, default=0)
     parser.add_argument("--aot-cases", nargs="+")
     parser.add_argument("--benchmark-cases", nargs="+", choices=("decode", "prefill"))

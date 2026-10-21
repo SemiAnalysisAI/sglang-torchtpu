@@ -46,13 +46,6 @@ class TestKpoolCompress(unittest.TestCase):
     def test_exact_cache_bytes(self):
         ref = jax.jit(reference, static_argnums=(7,))
         fused = jax.jit(compress_and_store, static_argnums=(7,))
-        decode_variants = [
-            jax.jit(
-                partial(compress_and_store, decode=True, decode_tile_rows=rows),
-                static_argnums=(7,),
-            )
-            for rows in (16, 32)
-        ]
         specs = [
             ("full_pages", [0, 0], [128, 128], 256, "random"),
             ("raw_page_boundary", [124, 508], [12, 8], 32, "random"),
@@ -67,6 +60,11 @@ class TestKpoolCompress(unittest.TestCase):
             ("nonfinite", [0, 0], [16, 16], 32, "nonfinite"),
             ("shared_quad", [0, 4], [4, 4], 32, "shared"),
             ("decode_shared_quad", [3, 7], [1, 1], 32, "shared"),
+            ("verify_q6", [131, 130], [6, 6], 32, "random"),
+            ("verify_tile_boundary", [15, 31], [6, 6], 32, "random"),
+            ("verify_page_boundary", [127, 511], [6, 6], 32, "random"),
+            ("verify_mixed_q", [125, 511], [3, 9], 32, "random"),
+            ("verify_shared_quad", [1, 8], [6, 8], 32, "shared"),
         ]
         for i, (name, start, new, tokens, mode) in enumerate(specs):
             with self.subTest(name=name):
@@ -99,11 +97,22 @@ class TestKpoolCompress(unittest.TestCase):
                 actual = np.asarray(fused(*args))
                 # Includes all inactive records, record padding, FP8 keys and scales.
                 np.testing.assert_array_equal(actual, expected)
-                if max(new) <= 1:
-                    for decode in decode_variants:
-                        np.testing.assert_array_equal(
-                            np.asarray(decode(*args)), expected
-                        )
+                if max(new) <= 32:
+                    for rows in (16, 32):
+                        for pipeline in (False, True):
+                            decode = jax.jit(
+                                partial(
+                                    compress_and_store,
+                                    decode=True,
+                                    decode_tile_rows=rows,
+                                    decode_max_q=max(1, max(new)),
+                                    decode_pipeline=pipeline,
+                                ),
+                                static_argnums=(7,),
+                            )
+                            np.testing.assert_array_equal(
+                                np.asarray(decode(*args)), expected
+                            )
 
 
 if __name__ == "__main__":

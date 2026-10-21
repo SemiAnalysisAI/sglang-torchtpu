@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """K4/D128 pooling directly from raw pages into the native pooled cache.
 
-One tile computes 8 or 32 pools. Both raw buffers are primed; a consumed
-slot is refilled while later stages use its SSA values. Output read-modify-write
-starts only after the preceding store finishes, including shared destination blocks.
+Decode/verify uses fixed request/tile slots and double raw buffering. A prior
+store overlaps independent destination reads and compute; aliased destinations
+still serialize their RMW. The general prefill path uses larger raw transfers.
 """
 
 from functools import partial
@@ -69,26 +69,42 @@ def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, til
     return jnp.sum(first, dtype=jnp.int32)[None], desc
 
 
-def _decode_descriptors(kv_lens, page_indices, cu_q_lens, distribution, tile_rows):
-    """Fixed request slots; decode admits zero or one new token per request."""
+def _decode_descriptors(
+    kv_lens, page_indices, cu_q_lens, distribution, tile_rows, max_q
+):
+    """Fixed tile slots cover every newly completed pool, including verify Q>1."""
     batch = kv_lens.shape[0]
-    req = jnp.arange(batch, dtype=jnp.int32)
+    # Closed groups end at 3 mod 4. A request's first end can be at the last
+    # group in a tile; account for that alignment when bounding tile slots.
+    slots = (max_q + tile_rows - 5) // tile_rows + 1
+    req = jnp.arange(batch, dtype=jnp.int32)[None, :]
     q_len = cu_q_lens[1:] - cu_q_lens[:-1]
-    live = (req < distribution[2]) & (q_len == 1) & (kv_lens % 4 == 0)
-    pos = jnp.maximum(kv_lens - 1, 0)
+    start = kv_lens - q_len
+    first_end = (start // 4) * 4 + 3
+    tile_start = (first_end // tile_rows) * tile_rows
+    tile_start = tile_start[None, :] + jnp.arange(slots)[:, None] * tile_rows
+    first_in_tile = jnp.maximum(first_end[None, :], tile_start + 3)
+    live = (req < distribution[2]) & (q_len > 0) & (first_in_tile < kv_lens)
+    # Inactive slots still need safe metadata gathers, but issue no DMA.
+    safe_start = jnp.where(live, tile_start, 0)
     pages_per_seq = page_indices.shape[0] // batch
-    # Inactive slots must still have safe metadata gathers. They issue no DMA.
-    pos = jnp.where(live, pos, 0)
-    return jnp.stack(
-        (
-            page_indices[req * pages_per_seq + pos // 128],
-            (pos % 128) // tile_rows,
-            page_indices[req * pages_per_seq + pos // 512],
-            ((pos % 512) // tile_rows) * (tile_rows // 16),
-            (pos % tile_rows) // 4,
-            live.astype(jnp.int32),
+    # Tile-major order keeps the first tiles of different requests adjacent.
+    # Request-major order would insert unused slots between Q=1 requests.
+    return (
+        jnp.stack(
+            (
+                page_indices[req * pages_per_seq + safe_start // 128],
+                (safe_start % 128) // tile_rows,
+                page_indices[req * pages_per_seq + safe_start // 512],
+                (safe_start % 512) // 16,
+                start[None, :] - tile_start,
+                kv_lens[None, :] - tile_start,
+                live.astype(jnp.int32),
+            )
         )
-    ).astype(jnp.int32)
+        .reshape(7, slots * batch)
+        .astype(jnp.int32)
+    )
 
 
 def _decode_kernel(
@@ -104,30 +120,74 @@ def _decode_kernel(
     write_sem,
     *,
     tile_rows,
+    pipeline,
+    single_query,
 ):
     del old_ref  # Aliased output preserves every inactive record and byte.
     words = out_ref.bitcast(jnp.uint32)
     word_rows = tile_rows // 16
+    count = desc_ref.shape[1]
+    buffers = 2 if pipeline else 1
 
-    @pl.loop(0, desc_ref.shape[1])
-    def _request(req):
-        @pl.when(desc_ref[5, req] != 0)
+    def raw_read(i):
+        return pltpu.make_async_copy(
+            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[1, i] * tile_rows, tile_rows), :],
+            raw_buf.at[i % buffers],
+            read_sem.at[i % buffers],
+        )
+
+    def destination(i):
+        return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], word_rows), 0, :]
+
+    def write(i):
+        return pltpu.make_async_copy(
+            out_buf.at[i % buffers], destination(i), write_sem.at[i % buffers]
+        )
+
+    def refill(i):
+        # Clip the speculative descriptor index before checking its live bit.
+        # This also covers trailing inactive slots without waiting on a DMA
+        # that was never started.
+        following = jnp.minimum(i + buffers, count - 1)
+
+        @pl.when((i + buffers < count) & (desc_ref[6, following] != 0))
+        def _start():
+            raw_read(following).start()
+
+    for initial in range(min(buffers, count)):
+
+        @pl.when(desc_ref[6, initial] != 0)
+        def _prime(initial=initial):
+            raw_read(initial).start()
+
+    @pl.loop(0, count)
+    def _tile(i):
+        slot = i % buffers
+        previous = jnp.maximum(i - 1, 0)
+        previous_live = (i > 0) & (desc_ref[6, previous] != 0)
+        # Tiles have equal aligned extents. Equal page and quad start means
+        # their entire RMW regions alias, even if different pool bytes change.
+        conflict = (desc_ref[2, previous] == desc_ref[2, i]) & (
+            desc_ref[3, previous] == desc_ref[3, i]
+        )
+
+        @pl.when(desc_ref[6, i] != 0)
         def _closed():
-            raw = pltpu.make_async_copy(
-                raw_ref.at[
-                    desc_ref[0, req], pl.ds(desc_ref[1, req] * tile_rows, tile_rows), :
-                ],
-                raw_buf,
-                read_sem,
+            if pipeline:
+
+                @pl.when(previous_live & conflict)
+                def _conflict_wait():
+                    write(previous).wait()
+
+            old = pltpu.make_async_copy(
+                destination(i), out_buf.at[slot], old_sem.at[slot]
             )
-            dst = words.at[desc_ref[2, req], pl.ds(desc_ref[3, req], word_rows), 0, :]
-            old = pltpu.make_async_copy(dst, out_buf, old_sem)
-            # The preceding request's store has drained. Read the old block
-            # alongside raw data, before the compute chain, even for count=1.
-            raw.start()
             old.start()
-            raw.wait()
-            pooled = _pool_rows(raw_buf[...], ape_ref[...])
+            raw_read(i).wait()
+            pooled = _pool_rows(raw_buf[slot], ape_ref[...])
+            if pipeline:
+                # Ref loads finished; later compute uses SSA values only.
+                refill(i)
             rotated = _hadamard128(pooled.astype(jnp.float32))
             rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
             amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
@@ -144,20 +204,53 @@ def _decode_kernel(
                 (pltpu.bitcast(q, jnp.uint32), pltpu.bitcast(scale_bytes, jnp.uint32)),
                 axis=1,
             )
-            selected = desc_ref[4, req]
             row = jax.lax.broadcasted_iota(jnp.int32, (word_rows, 256), 0)
-            mask = jnp.where(
-                row == selected // 4,
-                jnp.uint32(255) << ((selected % 4) * 8),
-                jnp.uint32(0),
-            )
+            if single_query:
+                selected = (desc_ref[5, i] - 1) // 4
+                mask = jnp.where(
+                    row == selected // 4,
+                    jnp.uint32(255) << ((selected % 4) * 8),
+                    jnp.uint32(0),
+                )
+            else:
+                mask = jnp.zeros((word_rows, 256), jnp.uint32)
+                for lane in range(4):
+                    ends = row * 16 + lane * 4 + 3
+                    live = (ends >= desc_ref[4, i]) & (ends < desc_ref[5, i])
+                    mask |= jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (
+                        lane * 8
+                    )
+            if pipeline:
+
+                @pl.when(previous_live & ~conflict)
+                def _nonconflict_wait():
+                    # The prior store overlaps this tile's reads and compute.
+                    # Drain it before starting another store, keeping at most
+                    # one pending write and making buffer reuse unambiguous.
+                    write(previous).wait()
+
             old.wait()
-            out_buf[...] = (out_buf[...] & ~mask) | (packed & mask)
-            store = pltpu.make_async_copy(out_buf, dst, write_sem)
-            store.start()
-            # Requests can share a physical quad. Complete its RMW before
-            # the next request reads the old bytes or reuses either buffer.
-            store.wait()
+            out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
+            write(i).start()
+            if not pipeline:
+                write(i).wait()
+                refill(i)
+
+        @pl.when(desc_ref[6, i] == 0)
+        def _inactive():
+            if pipeline:
+
+                @pl.when(previous_live)
+                def _drain_previous():
+                    write(previous).wait()
+
+            refill(i)
+
+    if pipeline:
+
+        @pl.when(desc_ref[6, count - 1] != 0)
+        def _drain():
+            write(count - 1).wait()
 
 
 def _kernel(
@@ -306,13 +399,18 @@ def compress_and_store(
     *,
     decode=False,
     decode_tile_rows=16,
+    decode_max_q=None,
+    decode_pipeline=True,
 ):
     """Pool newly closed K4 groups; the returned native cache aliases its input.
 
     Raw writes must already be complete. Destination records must be unique;
     distinct records in a shared physical block are supported.
-    Set static decode=True only when every request has zero or one new token.
-    Small chunked-prefill buckets must use the default general path.
+    Set static decode=True for decode/verify, including multiple query tokens.
+    decode_max_q is a static upper bound on each request's query length, NOT
+    the accepted speculative length. Omitting it uses num_tokens as a safe
+    bound. The caller must include every verify row when supplying a bound.
+    The general path remains preferable for large prefill query lengths.
     """
     if kpool != 4 or raw_cache.shape[1:] != (128, 256):
         raise ValueError("fused pooling requires K=4, page_size=128 and D=128")
@@ -325,11 +423,21 @@ def compress_and_store(
     if decode:
         if decode_tile_rows not in (16, 32):
             raise ValueError("decode_tile_rows must be 16 or 32")
+        max_q = num_tokens if decode_max_q is None else decode_max_q
+        if not isinstance(max_q, int) or max_q < 1:
+            raise ValueError("decode_max_q must be a positive static integer")
         desc = _decode_descriptors(
-            kv_lens, page_indices, cu_q_lens, distribution, decode_tile_rows
+            kv_lens, page_indices, cu_q_lens, distribution, decode_tile_rows, max_q
         )
+        pipeline = decode_pipeline and desc.shape[1] > 1
+        buffers = 2 if pipeline else 1
         return pl.pallas_call(
-            partial(_decode_kernel, tile_rows=decode_tile_rows),
+            partial(
+                _decode_kernel,
+                tile_rows=decode_tile_rows,
+                pipeline=pipeline,
+                single_query=max_q == 1,
+            ),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
@@ -341,15 +449,15 @@ def compress_and_store(
                 ),
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=(
-                    pltpu.VMEM((decode_tile_rows, 256), jnp.bfloat16),
-                    pltpu.VMEM((decode_tile_rows // 16, 256), jnp.uint32),
-                    pltpu.SemaphoreType.DMA,
-                    pltpu.SemaphoreType.DMA,
-                    pltpu.SemaphoreType.DMA,
+                    pltpu.VMEM((buffers, decode_tile_rows, 256), jnp.bfloat16),
+                    pltpu.VMEM((buffers, decode_tile_rows // 16, 256), jnp.uint32),
+                    pltpu.SemaphoreType.DMA((buffers,)),
+                    pltpu.SemaphoreType.DMA((buffers,)),
+                    pltpu.SemaphoreType.DMA((buffers,)),
                 ),
             ),
             input_output_aliases={2: 0},
-            name=f"kpool_decode_store_k4_d128_r{decode_tile_rows}",
+            name=f"kpool_decode_store_k4_d128_r{decode_tile_rows}_p{buffers}",
         )(desc, raw_cache, pooled_cache, ape.astype(jnp.float32))
     tile_rows = 32 if num_tokens < 128 else 128
     count, desc = _descriptors(
