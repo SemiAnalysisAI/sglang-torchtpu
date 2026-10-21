@@ -386,18 +386,21 @@ class TpuBlockSpecWorker(TpuSpecWorker):
                     torch.ones((padded_bs,), dtype=torch.float32).to(self.device),
                     torch.ones((padded_bs,), dtype=torch.int32).to(self.device),
                 )
-                self._sample_draft_block(
-                    block_hidden,
-                    bonus_tokens,
-                    torch.ones(padded_bs, device=self.device),
-                    torch.full((padded_bs,), 2, dtype=torch.int32, device=self.device),
-                    sampling_seed=torch.zeros(
-                        padded_bs, dtype=torch.int64, device=self.device
-                    ),
-                    seq_lens=torch.zeros(
-                        padded_bs, dtype=torch.int64, device=self.device
-                    ),
-                )[0].cpu()
+                if self._seeds_requests():
+                    self._sample_draft_block(
+                        block_hidden,
+                        bonus_tokens,
+                        torch.ones(padded_bs, device=self.device),
+                        torch.full(
+                            (padded_bs,), 2, dtype=torch.int32, device=self.device
+                        ),
+                        sampling_seed=torch.zeros(
+                            padded_bs, dtype=torch.int64, device=self.device
+                        ),
+                        seq_lens=torch.zeros(
+                            padded_bs, dtype=torch.int64, device=self.device
+                        ),
+                    )[0].cpu()
                 draft_logits.float().cpu()
                 torch.cat([bonus_tokens[:, None], draft_tokens], dim=1).cpu()
                 self._warmup_sampled_accept(padded_bs, draft_tokens, draft_logits)

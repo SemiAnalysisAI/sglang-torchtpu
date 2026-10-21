@@ -556,7 +556,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         with torch.no_grad():
             for pbs in self._b_bucketer().buckets:
                 self._warmup_draft_chain(pbs)
-                if self._sampled_drafts:
+                if self._sampled_drafts and self._seeds_requests():
                     zeros = torch.zeros((pbs,), dtype=torch.int64, device=self.device)
                     warmup_compiled_op(draft_uniforms, zeros, zeros, self.num_drafts)
                 rows = _dummy_verify_rows(pbs, width, self.device)

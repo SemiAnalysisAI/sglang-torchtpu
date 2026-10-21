@@ -227,7 +227,7 @@ class TestSharedFeatures(CustomTestCase):
         worker.num_verify_rows = 3
         worker.device = "cpu"
         worker._b_bucketer = lambda: SimpleNamespace(buckets=[2, 4])
-        worker._warmup_seeded_accept = lambda pbs, vocab_size: None
+        worker._seeds_requests = lambda: False
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(vocab_size=40))
         )
@@ -247,6 +247,65 @@ class TestSharedFeatures(CustomTestCase):
             shapes,
             [((6, 40), (6, 2), torch.int32), ((12, 40), (12, 2), torch.int32)],
         )
+
+    def test_seed_only_verify_warmups_follow_deterministic_inference(self):
+        """Request seeds reach sampling only under deterministic inference, so
+        seeded acceptance and its coins are warmed only then."""
+        for seeds in (False, True):
+            worker = object.__new__(TpuBlockSpecWorker)
+            worker.num_verify_rows = 3
+            worker.device = "cpu"
+            worker._b_bucketer = lambda: SimpleNamespace(buckets=[2, 4])
+            worker._seeds_requests = lambda seeds=seeds: seeds
+            seeded_accepts = []
+            worker._warmup_seeded_accept = lambda pbs, vocab_size: (
+                seeded_accepts.append(pbs)
+            )
+            worker._target_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model_config=SimpleNamespace(vocab_size=40)
+                )
+            )
+            warmed = []
+            with (
+                self.subTest(seeds=seeds),
+                patch.object(
+                    base_spec_worker,
+                    "warmup_compiled_op",
+                    side_effect=lambda op, *args, **kwargs: warmed.append(op),
+                ),
+            ):
+                worker._warmup_verify_logit_modifiers()
+                self.assertEqual(seeded_accepts, [2, 4] if seeds else [])
+                self.assertEqual(
+                    warmed.count(base_spec_worker.verify_coins), 2 if seeds else 0
+                )
+
+    def test_partial_acceptance_logprobs_keep_the_scheduler_sentinels(self):
+        """Rejected draft slots hold -1; their logprobs are gathered in
+        vocabulary and dropped, and the token ids keep the -1 sentinels."""
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 3
+        logits = torch.randn(6, 5, generator=torch.Generator().manual_seed(3))
+        output = LogitsProcessorOutput(next_token_logits=logits)
+        # Row 0 accepted no draft (bonus 1); row 1 accepted both (bonus 1).
+        tokens = torch.tensor([1, -1, -1, 4, 0, 1])
+        temperatures = torch.tensor([[0.5], [2.0]])
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(
+                temperatures=temperatures, is_all_greedy=False
+            ),
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+        )
+        worker._attach_logprobs(batch, output, tokens, 2)
+        expected = (logits / temperatures.repeat_interleave(3, dim=0)).log_softmax(-1)
+        live = tokens >= 0
+        torch.testing.assert_close(
+            output.next_token_logprobs.reshape(-1)[live],
+            expected[live].gather(1, tokens[live][:, None]).view(-1),
+        )
+        self.assertEqual(tokens.tolist(), [1, -1, -1, 4, 0, 1])
 
     def test_logprobs_use_live_temperatures_and_include_bonus(self):
         logits = torch.arange(30, dtype=torch.float32).reshape(6, 5).flip(0)

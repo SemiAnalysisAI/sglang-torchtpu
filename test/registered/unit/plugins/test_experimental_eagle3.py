@@ -437,6 +437,7 @@ class TestExperimentalEagle3(CustomTestCase):
         with (
             patch.object(TpuChainSpecWorker, "_compile_policy", return_value=policy),
             patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
+            patch.object(TpuChainSpecWorker, "_seeds_requests", return_value=True),
         ):
             worker._warmup_extend_sampling()
         self.assertEqual({shape for shape, _ in sampled}, {(1,), (2,), (4,)})
@@ -444,6 +445,41 @@ class TestExperimentalEagle3(CustomTestCase):
             broadcast,
             {(SpecTpSyncSite.SPEC_TARGET, *shape_dtype) for shape_dtype in sampled},
         )
+
+    def test_seed_only_extend_warmups_follow_deterministic_inference(self):
+        """Request seeds reach sampling only under deterministic inference, so
+        the seeded sampler variants are warmed only then."""
+        policy = SimpleNamespace(
+            _extend_compile_cap=lambda: 4, _compiles_logits_processor=lambda: True
+        )
+        buckets = SimpleNamespace(next_bucket=lambda bs: 1 << (bs - 1).bit_length())
+        calls = {}
+        for seeds in (False, True):
+            worker = _chain_worker()
+            seeded = calls[seeds] = []
+
+            def sampler(logits_output, sampling_info, *_args, seeded=seeded):
+                seeded.append(sampling_info.sampling_seed is not None)
+                rows = logits_output.next_token_logits.shape[0]
+                return torch.zeros((rows,), dtype=torch.int32)
+
+            worker._tp_sync = SimpleNamespace(sync=lambda site, values: values)
+            worker._target_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    sampler=sampler, model_config=SimpleNamespace(vocab_size=8)
+                )
+            )
+            with (
+                patch.object(
+                    TpuChainSpecWorker, "_compile_policy", return_value=policy
+                ),
+                patch.object(TpuChainSpecWorker, "_b_bucketer", return_value=buckets),
+                patch.object(TpuChainSpecWorker, "_seeds_requests", return_value=seeds),
+            ):
+                worker._warmup_extend_sampling()
+        self.assertNotIn(True, calls[False])
+        self.assertGreater(calls[True].count(True), 0)
+        self.assertEqual(calls[True].count(False), len(calls[False]))
 
     def test_draft_prompt_shift_keeps_chunks_consistent(self):
         """Each request's last row takes its own sampled token, except a non-final

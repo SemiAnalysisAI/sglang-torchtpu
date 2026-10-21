@@ -636,19 +636,30 @@ class TpuSpecWorker(BaseSpecWorker):
         assert isinstance(next_draft_input, HostPaddedDraftInput)
         next_draft_input.kv_fence_tail = committed.kv_fence_tail
         if batch.return_logprob:
-            compute_spec_logprobs_from_tensors(
-                logits_output,
-                result.next_token_ids,
-                batch_size=bs,
-                temperatures=batch.sampling_info.temperatures[:bs].to(
-                    logits_output.next_token_logits.device
-                ),
-                is_all_greedy=batch.sampling_info.is_all_greedy,
-                top_logprobs_nums=batch.top_logprobs_nums,
-                token_ids_logprobs=batch.token_ids_logprobs,
-                chain_stride=self.num_verify_rows,
-            )
+            self._attach_logprobs(batch, logits_output, result.next_token_ids, bs)
         return result
+
+    def _attach_logprobs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: torch.Tensor,
+        bs: int,
+    ) -> None:
+        # Rejected draft slots hold -1 for the scheduler, which drops their
+        # logprobs; gather them at token 0 so every index is in the vocabulary.
+        compute_spec_logprobs_from_tensors(
+            logits_output,
+            next_token_ids.clamp(min=0),
+            batch_size=bs,
+            temperatures=batch.sampling_info.temperatures[:bs].to(
+                logits_output.next_token_logits.device
+            ),
+            is_all_greedy=batch.sampling_info.is_all_greedy,
+            top_logprobs_nums=batch.top_logprobs_nums,
+            token_ids_logprobs=batch.token_ids_logprobs,
+            chain_stride=self.num_verify_rows,
+        )
 
     def _decode_buckets_for(self, bs: int) -> list[int]:
         """Decode buckets a rank with bs live requests can run (_decode_bucket)."""
@@ -833,12 +844,17 @@ class TpuSpecWorker(BaseSpecWorker):
         # A multimodal wrapper's eager outer logits processor emits live rows,
         # which TpuSampler pads to the batch bucket (whatever the input modality).
         eager_logits = not self._compile_policy()._compiles_logits_processor()
+        seeded_variants = (
+            [
+                dict(variant, seeded=True)
+                for variant in _SAMPLING_WARMUP_VARIANTS[1:] + [_MIXED_GREEDY]
+            ]
+            if self._seeds_requests()
+            else []
+        )
         with torch.no_grad():
             for pbs in sorted({self._pad_bs(bs) for bs in extend_sizes}):
-                for variant in _SAMPLING_WARMUP_VARIANTS + [
-                    dict(variant, seeded=True)
-                    for variant in _SAMPLING_WARMUP_VARIANTS[1:] + [_MIXED_GREEDY]
-                ]:
+                for variant in _SAMPLING_WARMUP_VARIANTS + seeded_variants:
                     # A target that keeps extend outputs padded samples all cap rows,
                     # materializing the pbs-row params to them.
                     variants = {(pbs, False), (cap, True)}
@@ -933,13 +949,14 @@ class TpuSpecWorker(BaseSpecWorker):
                 torch.zeros((rows, vocab_size), device=self.device),
                 bitmask.to(self.device, non_blocking=True),
             )
-            self._warmup_seeded_accept(pbs, vocab_size)
-            warmup_compiled_op(
-                verify_coins,
-                torch.zeros(pbs, dtype=torch.int64, device=self.device),
-                torch.zeros(pbs, dtype=torch.int64, device=self.device),
-                self.num_verify_rows,
-            )
+            if self._seeds_requests():
+                self._warmup_seeded_accept(pbs, vocab_size)
+                warmup_compiled_op(
+                    verify_coins,
+                    torch.zeros(pbs, dtype=torch.int64, device=self.device),
+                    torch.zeros(pbs, dtype=torch.int64, device=self.device),
+                    self.num_verify_rows,
+                )
 
     def _warmup_seeded_accept(self, pbs, vocab_size):
         logits = torch.zeros(
@@ -1183,6 +1200,12 @@ class TpuSpecWorker(BaseSpecWorker):
             # Serving's flag survives on_device(), so the sampler pads the params to the logits rows.
             sampling_params_on_cpu=params_on_cpu,
         )
+
+    def _seeds_requests(self) -> bool:
+        """Requests carry their seeds into sampling only under deterministic
+        inference (SamplingBatchInfo.from_schedule_batch); the seed-only programs
+        are warmed only then."""
+        return get_exec().deterministic.enable_deterministic_inference
 
     def _compile_policy(self) -> DecoderTpuCompilePolicy:
         compile_policy = self.target_worker.model_runner.compile_policy
