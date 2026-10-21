@@ -119,10 +119,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--case", nargs="+", dest="selected_cases")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     xprof = str(Path(sys.executable).with_name("xprof"))
     metrics = json.loads((args.capture_root / "benchmark/metrics.json").read_text())
+    selected = metrics["cases"]
+    if args.selected_cases:
+        names = {case["name"] for case in selected}
+        if set(args.selected_cases) - names:
+            raise ValueError("Requested case absent from capture")
+        selected = [case for case in selected if case["name"] in args.selected_cases]
     summary = {
         "xprof_version": importlib.metadata.version("xprof-nightly"),
         "capture_root": str(args.capture_root),
@@ -132,7 +139,7 @@ def main():
         "attribution": "Pair host sample marker order with serialized device module order, after validating counts and the alternating variant schedule; host timestamps and durations are not used. Identical executable fingerprints can alias module names.",
         "formula": "module_us=(end_ns-start_ns)/1000 on XLA Modules; Pallas_us=union of outermost kpool XLA Ops within that module /1000, separately for each device; percentiles use numpy linear interpolation",
     }
-    for case in metrics["cases"]:
+    for case in selected:
         start_time = time.monotonic()
         name = case["name"]
         dest = args.output / name

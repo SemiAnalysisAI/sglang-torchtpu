@@ -18,6 +18,8 @@ def manifest(
     benchmark_cases=None,
     analysis_input=None,
     profile_bucket=None,
+    benchmark_args=None,
+    analysis_workers=1,
 ):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
@@ -78,15 +80,22 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             if capture_cases
             else ""
         )
+        if benchmark_args:
+            capture_args += " " + " ".join(shlex.quote(arg) for arg in benchmark_args)
         workload = (
             "bash benchmark/tpu/kpool/profile_capture_task.sh" + capture_args + "\n"
         )
     if mode == "profile-analysis":
+        if not 1 <= analysis_workers <= 4:
+            raise ValueError("analysis_workers must be between 1 and 4")
         workload = (
-            f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n"
-            if analysis_input
-            else ""
-        ) + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
+            (
+                f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n"
+                if analysis_input
+                else ""
+            )
+            + f"export KPOOL_ANALYSIS_WORKERS={analysis_workers}\nbash benchmark/tpu/kpool/profile_analysis_task.sh\n"
+        )
     if mode == "accuracy":
         workload = """python -m pip install jax==0.11.2 jaxlib==0.11.2
 export TPU_LIBRARY_PATH="$(python -c 'import libtpu; print(libtpu.get_library_path())')"
@@ -217,6 +226,8 @@ def main():
     parser.add_argument("--benchmark-cases", nargs="+", choices=("decode", "prefill"))
     parser.add_argument("--analysis-input")
     parser.add_argument("--profile-bucket")
+    parser.add_argument("--analysis-workers", type=int, default=1)
+    parser.add_argument("--benchmark-args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -231,6 +242,8 @@ def main():
                 args.benchmark_cases,
                 args.analysis_input,
                 args.profile_bucket,
+                args.benchmark_args,
+                args.analysis_workers,
             ),
             indent=2,
         )
