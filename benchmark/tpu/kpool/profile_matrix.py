@@ -55,7 +55,11 @@ def main():
             rows.append(future.result())
             (opts.output / "matrix-progress.json").write_text(
                 json.dumps(
-                    {"completed": len(rows), "expected": len(futures), "cases": rows},
+                    {
+                        "completed": len(rows),
+                        "expected": len(futures),
+                        "cases": [row["case"] for row in rows],
+                    },
                     indent=2,
                 )
             )

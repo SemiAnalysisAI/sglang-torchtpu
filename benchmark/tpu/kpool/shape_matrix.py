@@ -21,9 +21,9 @@ def cases(section="all"):
                         "mode": mode,
                         "batch": b,
                         "query_length": q,
-                        "tokens": max(
-                            32 if mode == "decode" else 64, (b * q + 31) // 32 * 32
-                        ),
+                        # Fixed-width decode/verify buckets whole requests:
+                        # compiled_forward_shim uses T = padded B * Q.
+                        "tokens": b * q if mode == "decode" else max(64, b * q),
                     }
                 )
     return result
