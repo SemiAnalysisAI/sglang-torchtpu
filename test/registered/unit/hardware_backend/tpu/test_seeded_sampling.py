@@ -11,10 +11,12 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import sampling_mask
 from sglang_tpu.experimental.speculative.spec_ops import (
     accept_drafts_sampled,
     sample_tokens,
 )
+from sglang_tpu.sampler import TpuSampler
 from sglang_tpu.sampling import seeded
 from sglang_tpu.sampling.seeded import (
     DRAFT_COLUMN,
@@ -189,6 +191,40 @@ class TestSeededSampling(CustomTestCase):
                 self.assertTrue(torch.equal(before, torch.random.get_rng_state()))
         for left, right in zip(*outputs):
             self.assertTrue(torch.equal(left, right))
+
+    def test_greedy_row_takes_argmax_beside_a_sampled_row(self):
+        """top_k=1 keeps every token tied at the maximum, so without a greedy
+        override a greedy row's token would depend on its companion's mode."""
+
+        def tie_keeping_filter(probs, top_ks, top_ps, min_ps, **need):
+            del top_ps, min_ps, need
+            k = top_ks.clamp(1, probs.shape[1]).long() - 1
+            descending = probs.sort(dim=-1, descending=True).values
+            return torch.where(probs >= descending.gather(1, k[:, None]), probs, 0.0)
+
+        sampler = object.__new__(TpuSampler)
+        probs = torch.softmax(torch.tensor([[1.0, 1.0, -1.0]]).repeat(2, 1), dim=-1)
+        sampled_second = set()
+        for seed in range(16):
+            info = SimpleNamespace(
+                sampling_seed=torch.tensor([seed, seed]),
+                top_ks=torch.tensor([1, 2]),
+                top_ps=torch.ones(2),
+                min_ps=torch.zeros(2),
+                need_top_k_sampling=True,
+                need_top_p_sampling=False,
+                need_min_p_sampling=False,
+                sampling_mask_batch_indices=torch.tensor([0, 1]),
+            )
+            with patch.object(sampling_mask, "tpu_filter_probs", tie_keeping_filter):
+                tokens, capture = sampler._sample_from_probs(
+                    probs, info, torch.tensor([1, 1]), False
+                )
+            self.assertEqual(tokens[0].item(), 0)
+            self.assertEqual(capture.weights[0].nonzero().flatten().tolist(), [0])
+            sampled_second.add(tokens[1].item())
+        # The sampled row still draws from both tied tokens.
+        self.assertEqual(sampled_second, {0, 1})
 
 
 if __name__ == "__main__":
