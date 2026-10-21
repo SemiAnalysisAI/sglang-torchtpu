@@ -12,7 +12,7 @@ def manifest(
     cluster,
     wheelhouse_bucket=None,
     wheelhouse_prefix=None,
-    mode="performance",
+    mode="device-profile",
     hold_seconds=0,
     aot_cases=None,
     benchmark_cases=None,
@@ -62,8 +62,13 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             + " ".join(shlex.quote(case) for case in benchmark_cases)
             + "\n"
         )
-    if mode == "device-profile":
-        workload = "bash benchmark/tpu/kpool/profile_capture_task.sh\n"
+    if mode in ("performance", "decode-performance", "device-profile"):
+        capture_cases = ["decode"] if mode == "decode-performance" else benchmark_cases
+        capture_args = (
+            " --cases " + " ".join(shlex.quote(case) for case in capture_cases)
+            if capture_cases else ""
+        )
+        workload = "bash benchmark/tpu/kpool/profile_capture_task.sh" + capture_args + "\n"
     if mode == "profile-analysis":
         workload = (f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n" if analysis_input else "") + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
     if mode == "aot":
@@ -163,7 +168,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=("performance", "decode-performance", "aot", "profile-analysis", "device-profile"),
-        default="performance",
+        default="device-profile",
     )
     parser.add_argument("--hold-seconds", type=int, default=0)
     parser.add_argument("--aot-cases", nargs="+")
