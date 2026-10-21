@@ -104,3 +104,19 @@ def sample_with_seed(weights, seed, positions):
 def sample_draft_with_seed(weights, seed, positions):
     """Seeded draft draws, keyed apart from every verify and target coin."""
     return _sample_at_column(weights, seed, positions, DRAFT_COLUMN)
+
+
+@compiled_op()
+def draft_uniforms(seed, seq_lens, num_drafts):
+    """[bs, num_drafts] seeded chain-draft uniforms, keyed as sample_draft_with_seed.
+
+    Draft j (0-based) sits at absolute position seq_lens + j + 1.
+    """
+    columns = torch.full((1,), DRAFT_COLUMN, dtype=torch.int64, device=seq_lens.device)
+    return torch.stack(
+        [
+            _uniforms(seed, seq_lens + step + 1, columns)[:, 0]
+            for step in range(num_drafts)
+        ],
+        dim=1,
+    )

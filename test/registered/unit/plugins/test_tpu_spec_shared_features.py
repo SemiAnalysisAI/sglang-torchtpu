@@ -344,6 +344,74 @@ class TestSharedFeatures(CustomTestCase):
             for result in results:
                 torch.testing.assert_close(result, expected.to(torch.int64))
 
+    def test_seeded_chain_draft_uniforms_key_like_block_drafts(self):
+        from sglang_tpu.sampling.seeded import (
+            draft_uniforms,
+            sample_categorical,
+            sample_draft_with_seed,
+            verify_coins,
+        )
+
+        seed = torch.tensor([123, 456])
+        seq_lens = torch.tensor([7, 31])
+        weights = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]])
+        uniforms = draft_uniforms(seed, seq_lens, 3)
+        self.assertEqual(uniforms.shape, (2, 3))
+        for step in range(3):
+            # The chain's draft at step j is the block drafter's draw at its position.
+            torch.testing.assert_close(
+                sample_categorical(weights, uniforms[:, step]),
+                sample_draft_with_seed(weights, seed, seq_lens + step + 1),
+            )
+        coins, _ = verify_coins(seed, seq_lens, 4)
+        self.assertFalse(torch.isin(uniforms, coins).any())
+
+    def test_seeded_chain_draft_ignores_the_ambient_rng(self):
+        from sglang_tpu.experimental.speculative import chain_spec_worker
+        from sglang_tpu.sampling.seeded import draft_uniforms
+
+        captured = []
+        worker = chain_spec_worker.TpuChainSpecWorker.__new__(
+            chain_spec_worker.TpuChainSpecWorker
+        )
+        worker._chain_draft_worker = SimpleNamespace(
+            fused_draft_batch=lambda **kwargs: SimpleNamespace(),
+            run_fused_draft=lambda forward_batch, **kwargs: (
+                captured.append(kwargs["uniforms"]) or (torch.zeros(2, 3), None)
+            ),
+        )
+        worker._spec_algorithm = None
+        worker._tp_sync = SimpleNamespace(sync=lambda site, value: value)
+        worker.num_drafts = 3
+        worker.device = "cpu"
+        state = SimpleNamespace(
+            bonus_tokens=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.tensor([7, 31]),
+            req_pool_indices=torch.ones(2, dtype=torch.int64),
+        )
+        rows = SimpleNamespace(
+            cache_locs=torch.ones((2, 4), dtype=torch.int64),
+            positions=torch.zeros((2, 4), dtype=torch.int64),
+        )
+        seed = torch.tensor([123, 456])
+        with patch.object(
+            chain_spec_worker.torch, "rand", side_effect=AssertionError("ambient RNG")
+        ):
+            for ambient in (1, 789):
+                torch.manual_seed(ambient)
+                worker._run_fused_draft(
+                    state=state,
+                    rows=rows,
+                    req_pool_indices_cpu=torch.ones(2, dtype=torch.int64),
+                    seq_lens_cpu=torch.full((2,), 4, dtype=torch.int64),
+                    temperatures=torch.ones(2),
+                    top_ks=torch.full((2,), 1 << 30, dtype=torch.int32),
+                    sampling_seed=seed,
+                )
+        expected = draft_uniforms(seed, state.seq_lens, 3)
+        for uniforms in captured:
+            torch.testing.assert_close(uniforms, expected)
+
     def test_seeded_bucket_one_params_sample_padded_extend_rows(self):
         from sglang.srt.runtime_context import get_context
         from sglang_tpu.sampler import TpuSampler
