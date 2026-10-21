@@ -79,7 +79,7 @@ class TestMXINT8Configurator(CustomTestCase):
         self.addCleanup(override.restore)
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
-            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            get_kv_pool_cls=Mock(return_value=self.platform_pool),
             is_cpu=lambda: False,
         )
         self.swa_pool = Mock(name="swa_pool")
@@ -205,14 +205,14 @@ class TestMXINT8Configurator(CustomTestCase):
                 self.assertIsNone(kvc.kv_group_size)
                 self.assertEqual(kvc._mxint8_pool_kwargs(), {})
                 self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.assertEqual(self.platform.get_mha_kv_pool_cls.call_count, 4)
+        self.assertEqual(self.platform.get_kv_pool_cls.call_count, 4)
 
     def test_validation_override_retains_default_group_and_platform_factory(self):
         with patch.object(self.configurator, "_validate_mxint8", return_value=None):
             kvc = self._make(kv_group_size=None)
         self.assertEqual(kvc.kv_group_size, 32)
         self.assertIs(kvc._tpu_mha_pool_class(), self.platform_pool)
-        self.platform.get_mha_kv_pool_cls.assert_called_once_with()
+        self.platform.get_kv_pool_cls.assert_called_once_with(kind="mha")
 
     def test_bare_int8_rejected_before_profiling(self):
         for name in (None, "auto", "bf16"):
@@ -274,7 +274,7 @@ class TestMXINT8Configurator(CustomTestCase):
                 backend_pool.return_value,
             )
             self.assertEqual(backend_pool.call_args.kwargs["layer_num"], 1)
-            self.platform.get_mha_kv_pool_cls.assert_not_called()
+            self.platform.get_kv_pool_cls.assert_not_called()
         self._assert_preflight_error()
 
 

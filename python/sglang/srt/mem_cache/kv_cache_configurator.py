@@ -384,7 +384,13 @@ class KVCacheConfigurator:
         )
 
     def _tpu_mha_pool_class(self):
-        return current_platform.get_mha_kv_pool_cls()
+        # None selects the in-tree pool; a platform that still overrides the
+        # per-kind hook is served from it by get_kv_pool_cls.
+        return current_platform.get_kv_pool_cls(kind="mha") or (
+            PageMajorMHATokenToKVPool
+            if self._page_major_enabled()
+            else MHATokenToKVPool
+        )
 
     @property
     def kv_swa_layout(self) -> str | None:
@@ -1761,6 +1767,8 @@ class KVCacheConfigurator:
             if self.use_mla_backend and is_dsa_model:
                 token_to_kv_pool = self._build_oot_dsa_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_running_requests=req_to_token_pool.req_to_token.shape[0],
+                    dsa_pool_class=dsa_pool_class,
                 )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_oot_mla_kv_pool(
@@ -1806,7 +1814,7 @@ class KVCacheConfigurator:
             # TPU MHA and DSA pools (mirrors the ascend branch above). TPU is
             # in-tree (PlatformEnum.TPU), so the is_out_of_tree() branch never
             # fires; build via the same platform hooks the OOT path uses.
-            # get_mha_kv_pool_cls() returns the fused (RPA v3) or flat
+            # get_kv_pool_cls(kind="mha") returns the fused (RPA v3) or flat
             # (torch_native / pallas_tpu_flash) pool per the resolved backend.
             # TPU MLA models without DSA fall through to the shared MLA branch
             # below.
@@ -1999,17 +2007,57 @@ class KVCacheConfigurator:
             enable_page_major = False
         return enable_page_major
 
-    def _build_oot_mla_kv_pool(
-        self, *, max_total_num_tokens: int, is_dsa_model: bool
+    def _build_oot_dsa_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        max_running_requests: int,
+        dsa_pool_class: type,
     ) -> KVCache:
-        PoolCls = current_platform.get_mla_kv_pool_cls()
-        token_to_kv_pool = PoolCls(
+        # A platform that keeps the per-kind DSA hook builds, or refuses, its pool
+        # there: TPU's out-of-tree identity refuses DSA. One that implements only
+        # get_kv_pool_cls gets the in-tree DSA build with its resolved class.
+        hook = getattr(current_platform, "get_dsa_kv_pool_cls", None)
+        if hook is None:
+            return self._build_dsa_kv_pool(
+                max_total_num_tokens=max_total_num_tokens,
+                max_running_requests=max_running_requests,
+                dsa_pool_class=dsa_pool_class,
+            )
+        PoolCls = hook()
+        return PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            kv_cache_dim=calculate_mla_kv_cache_dim(
+                model_config=self.model_config,
+                kv_cache_dtype=self.kv_cache_dtype,
+            ),
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+        )
+
+    def _build_oot_mla_kv_pool(
+        self, *, max_total_num_tokens: int, is_dsa_model: bool
+    ) -> KVCache:
+        pool_cls = current_platform.get_kv_pool_cls(kind="mla") or MLATokenToKVPool
+        # The in-tree MLA pool takes no index_head_dim; pass it only when set.
+        index_kwargs = (
+            {"index_head_dim": self.model_config.index_head_dim} if is_dsa_model else {}
+        )
+        token_to_kv_pool = pool_cls(
+            max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            **index_kwargs,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -2817,7 +2865,10 @@ class KVCacheConfigurator:
             if current_platform.is_out_of_tree() and not self.is_hybrid_swa:
                 # Hybrid SWA uses the generic SWA allocator arms, as the TPU arm does.
                 # DCP widens the location space as in the TPU arm below.
-                AllocatorCls = current_platform.get_paged_allocator_cls()
+                AllocatorCls = (
+                    current_platform.get_paged_allocator_cls()
+                    or PagedTokenToKVPoolAllocator
+                )
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                     page_size=get_schedule().page_size * get_parallel().attn_dcp_size,

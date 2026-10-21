@@ -2251,6 +2251,161 @@ class TestTpuDsaRouting(CustomTestCase):
         fake._build_dsa_kv_pool.assert_not_called()
 
 
+class TestOutOfTreePlatformKvApi(CustomTestCase):
+    """An out-of-tree platform that implements only get_kv_pool_cls and
+    get_paged_allocator_cls, with None meaning the in-tree class."""
+
+    _sizes = TestOutOfTreeHybridSwaRouting._sizes
+
+    class _Platform:
+        def __init__(self, mha_pool_cls):
+            self.mha_pool_cls = mha_pool_cls
+
+        def is_out_of_tree(self):
+            return True
+
+        def is_tpu(self):
+            return False
+
+        def get_kv_pool_cls(self, *, kind):
+            return self.mha_pool_cls if kind == "mha" else None
+
+        def get_paged_allocator_cls(self):
+            return None
+
+    def _fake_configurator(self):
+        from functools import partial
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, page_size=64, disaggregation_mode="null")
+        fake = SimpleNamespace(
+            device="cpu",
+            pool_page_size=64,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=False,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(),
+                head_dim=64,
+                get_num_kv_heads=lambda *_: 2,
+            ),
+            layer_info=SimpleNamespace(
+                num_effective_layers=2, start_layer=0, end_layer=2
+            ),
+            _page_major_enabled=lambda: False,
+            _mxint8_pool_kwargs=lambda: {},
+        )
+        for name in (
+            "_resolve_kv_pool_class",
+            "_tpu_mha_pool_class",
+            "_build_oot_mha_kv_pool",
+        ):
+            setattr(fake, name, partial(getattr(KVCacheConfigurator, name), fake))
+        return fake
+
+    def test_pool_comes_from_get_kv_pool_cls_or_the_in_tree_default(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        class _CustomPool(MHATokenToKVPool):
+            pass
+
+        for supplied, expected in (
+            (_CustomPool, _CustomPool),
+            (None, MHATokenToKVPool),
+        ):
+            fake = self._fake_configurator()
+            with (
+                self.subTest(supplied=supplied),
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                    self._Platform(supplied),
+                ),
+                # autospec raises TypeError on a keyword the real __init__ lacks.
+                patch.object(expected, "__init__", autospec=True, return_value=None),
+            ):
+                pool = KVCacheConfigurator._build_token_to_kv_pool(
+                    fake,
+                    sizes=self._sizes(),
+                    is_dsa_model=False,
+                    is_dsv4_model=False,
+                    req_to_token_pool=MagicMock(),
+                )
+                self.assertIs(type(pool), expected)
+
+    def test_dsa_uses_the_platform_hook_or_the_in_tree_build(self):
+        from functools import partial
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang_tpu.platform import TpuOOTPlatform
+
+        fake = self._fake_configurator()
+        fake.use_mla_backend = True
+        fake._build_dsa_kv_pool = MagicMock(name="in_tree_dsa_builder")
+        fake._build_oot_dsa_kv_pool = partial(
+            KVCacheConfigurator._build_oot_dsa_kv_pool, fake
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+            self._Platform(None),
+        ):
+            pool = KVCacheConfigurator._build_token_to_kv_pool(
+                fake,
+                sizes=self._sizes(),
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(4, 8)),
+            )
+        self.assertIs(pool, fake._build_dsa_kv_pool.return_value)
+        fake._build_dsa_kv_pool.assert_called_once_with(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            dsa_pool_class=DSATokenToKVPool,
+        )
+        # The TPU out-of-tree identity keeps its hook, which refuses DSA.
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                TpuOOTPlatform(),
+            ),
+            self.assertRaisesRegex(NotImplementedError, "SGLANG_PLATFORM=tpu"),
+        ):
+            fake._build_oot_dsa_kv_pool(
+                max_total_num_tokens=256,
+                max_running_requests=4,
+                dsa_pool_class=DSATokenToKVPool,
+            )
+
+    def test_allocator_defaults_to_the_in_tree_paged_allocator(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+                self._Platform(None),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.PagedTokenToKVPoolAllocator"
+            ) as paged_allocator,
+        ):
+            allocator = KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                fake,
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        paged_allocator.assert_called_once()
+        self.assertIs(allocator, paged_allocator.return_value)
+
+
 class TestOutOfTreeMlaPoolConstruction(CustomTestCase):
     """The core OOT MLA builder passes index_head_dim, which no TPU MLA pool took,
     so every MLA model failed to build its KV pool under SGLANG_PLATFORM=tpu_oot."""
