@@ -69,22 +69,35 @@ class ShortQueryPipeline:
 
                 # All four pools of each aligned tile stay adjacent through packing;
                 # no Q=1 extraction or packing across unrelated requests is needed.
-                raw = raw_buf[...].reshape((group_size * 16, 256))
-                packed = pack_pools(pool_rows(raw, ape_ref[...]))
-                mask = mask_ref[pl.ds(begin, group_size), :]
+                # Keep the DMA group wide, but bound the compute live set.
+                # Each chunk materializes its packed result before the next
+                # chunk's pooling temporaries become live.
+                compute_tiles = 4 if group_size % 4 == 0 else group_size
 
-                @pl.loop(0, group_size)
-                def _wait_old(slot):
-                    i = begin + slot
+                @pl.loop(0, group_size // compute_tiles)
+                def _compute_chunk(chunk):
+                    offset = chunk * compute_tiles
+                    raw = raw_buf[pl.ds(offset, compute_tiles), :, :].reshape(
+                        (compute_tiles * 16, 256)
+                    )
+                    packed = pack_pools(pool_rows(raw, ape_ref[...]))
+                    mask = mask_ref[pl.ds(begin + offset, compute_tiles), :]
 
-                    @pl.when(desc_ref[6, i] != 0)
-                    def _live():
-                        io.read_old(i, slot).wait()
+                    @pl.loop(0, compute_tiles)
+                    def _wait_old(local_slot):
+                        slot = offset + local_slot
+                        i = begin + slot
 
-                old = out_buf[...].reshape((group_size, 256))
-                out_buf[...] = ((old & ~mask) | (packed & mask)).reshape(
-                    (group_size, 1, 256)
-                )
+                        @pl.when(desc_ref[6, i] != 0)
+                        def _live():
+                            io.read_old(i, slot).wait()
+
+                    old = out_buf[pl.ds(offset, compute_tiles), :, :].reshape(
+                        (compute_tiles, 256)
+                    )
+                    out_buf[pl.ds(offset, compute_tiles), :, :] = (
+                        (old & ~mask) | (packed & mask)
+                    ).reshape((compute_tiles, 1, 256))
 
                 @pl.loop(0, group_size)
                 def _start_write(slot):
