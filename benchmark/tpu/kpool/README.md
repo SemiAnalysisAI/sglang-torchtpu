@@ -1,8 +1,9 @@
 # Indexer pool benchmark
 
 Compare the standalone fused K4/D128 kernel with the frozen JAX reference.
-Serving integration and end-to-end validation remain pending. The exact-byte
-gate below checks both updated records and untouched cache bytes.
+The GLM-5.3-Flash pooled indexer uses this kernel by default for K=4, D=128,
+128-token pages, and BF16 raw data. Other shapes keep the generic JAX path.
+The exact-byte gate below checks both updated records and untouched cache bytes.
 The final kernel at `3f37bebe2f` passed all 414 cases on TPU, plus 31 selected
 cases using the default conservative query bound, with the versions below.
 
@@ -23,6 +24,11 @@ Both schedules preserve partial destination blocks. Requests that update
 different records in a shared physical quad use ordered read/modify/write.
 Pooling retains BF16 rounding before rotation. Rotation and FP8 quantization
 use the frozen compiled reference's FP32 path, without an extra BF16 round trip.
+
+The serving custom op passes a static query bound from the attention metadata:
+uniform DECODE uses `decode_query_size`; mixed prefill and verification use the
+token bucket. This avoids a device-to-host metadata read and keeps the bound
+valid when ragged requests share a compiled graph.
 
 ## Device timing
 
