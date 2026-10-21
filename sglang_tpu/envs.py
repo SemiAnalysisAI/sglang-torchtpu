@@ -108,6 +108,9 @@ class TpuEnvs:
     # Expert-TP fused-RS: skip zeroing the output buffer, which the per-row writes
     # cover exactly once.
     SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO = EnvBool(False)
+    # Expert-TP fused-RS with a post-expert norm: ep sum, norm and top-k combine in one Pallas
+    # pass instead of three XLA fusions. Equal up to f32 summation order (bf16 casts kept).
+    SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)
     # Fused-RS: rows issued per iteration of the per-row gather / write DMA loops.
     SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED

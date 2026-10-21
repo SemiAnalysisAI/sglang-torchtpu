@@ -34,6 +34,10 @@ from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
 )
+from sglang_tpu.moe.pallas.fused_rs.post_combine import (
+    fused_post_combine,
+    supports_fused_post_combine,
+)
 from sglang_tpu.moe.pallas.fused_rs.utils import (
     combine_partition_axes,
     get_mesh_shape_product,
@@ -338,6 +342,24 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
+    post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
+    if (
+        expert_tp
+        and post_expert_norm_weight is not None
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE.get()
+        and supports_fused_post_combine(
+            out_buf, chunk_size, post_expert_norm_weight.shape[0]
+        )
+    ):
+        return fused_post_combine(
+            out_buf,
+            post_expert_norm_weight,
+            local_topk_weights,
+            chunk_size=chunk_size,
+            topk=topk,
+            ep_size=ep_size,
+            eps=1e-8,
+        )
     if expert_tp and out_buf.ndim == 3:
         # Split rows only: the ep sum reads the kernel's tiled layout in place.
         out_3d = (
