@@ -13,31 +13,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-
-def _hadamard128(value):
-    """Sylvester-order butterfly in f32; rounding is checked at the accuracy gate."""
-    lane = jnp.arange(128, dtype=jnp.int32)[None, :]
-    for step in (1, 2, 4, 8, 16, 32, 64):
-        low = (lane & step) == 0
-        partner = jnp.where(
-            low,
-            pltpu.roll(value, 128 - step, axis=1),
-            pltpu.roll(value, step, axis=1),
-        )
-        value = partner + jnp.where(low, value, -value)
-    return value
-
-
-def _pool_rows(raw, ape):
-    """Pool a small aligned raw tile without expanding the live set."""
-    pools = raw.shape[0] // 4
-    raw = raw.astype(jnp.float32)
-    keys = raw[:, :128].reshape((pools, 4, 128))
-    scores = raw[:, 128:].reshape((pools, 4, 128)) + ape[None, :, :]
-    scores -= jnp.max(scores, axis=1, keepdims=True)
-    weight = jnp.exp(scores)
-    weight /= jnp.sum(weight, axis=1, keepdims=True)
-    return jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+from .kpool.io import LongQueryIO, ShortQueryIO
+from .kpool.pipeline import LongQueryPipeline, ShortQueryPipeline
 
 
 def _descriptors(kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows):
@@ -107,24 +84,6 @@ def _request_descriptors(
     )
 
 
-def _pack_pools(pooled):
-    """BF16 pooled keys -> F32 Hadamard -> FP8 keys and scale bytes."""
-    rotated = _hadamard128(pooled.astype(jnp.float32)) * (128**-0.5)
-    amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
-    exponent = jnp.ceil(jnp.log2(amax / 448.0))
-    q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(jnp.float8_e4m3fn)
-    scale_bytes = jnp.where(
-        jnp.arange(128)[None, :] == 0,
-        (exponent + 127).astype(jnp.uint8),
-        jnp.uint8(0),
-    )
-    # Each four adjacent pool rows belong to one physical destination quad.
-    return jnp.concatenate(
-        (pltpu.bitcast(q, jnp.uint32), pltpu.bitcast(scale_bytes, jnp.uint32)),
-        axis=1,
-    )
-
-
 def _short_kernel(
     desc_ref,
     raw_ref,
@@ -140,107 +99,18 @@ def _short_kernel(
     *,
     group_size,
 ):
-    """Bounded groups of independent tiles share one vector computation.
-
-    All stores drain before the next group reads the aliased pooled cache.
-    Within a group, shared destination quads use ordered read/modify/write.
-    """
-    del old_ref
-    words = out_ref.bitcast(jnp.uint32)
-
-    def destination(i):
-        return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], 1), 0, :]
-
-    def raw_read(i, slot):
-        return pltpu.make_async_copy(
-            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[1, i] * 16, 16), :],
-            raw_buf.at[slot],
-            read_sem.at[slot],
-        )
-
-    def old_read(i, slot):
-        return pltpu.make_async_copy(destination(i), out_buf.at[slot], old_sem.at[slot])
-
-    def write(i, slot):
-        return pltpu.make_async_copy(
-            out_buf.at[slot], destination(i), write_sem.at[slot]
-        )
-
-    @pl.loop(0, desc_ref.shape[1] // group_size)
-    def _group(group):
-        begin = group * group_size
-
-        @pl.when(desc_ref[7, begin] != 0)
-        def _shared_quad():
-            @pl.loop(0, group_size)
-            def _ordered(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    raw_read(i, slot).start()
-                    old_read(i, slot).start()
-                    raw_read(i, slot).wait()
-                    packed = _pack_pools(_pool_rows(raw_buf[slot], ape_ref[...]))
-                    mask = mask_ref[pl.ds(i, 1), :]
-                    old_read(i, slot).wait()
-                    out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
-                    write(i, slot).start()
-                    write(i, slot).wait()
-
-        @pl.when(desc_ref[7, begin] == 0)
-        def _independent():
-            @pl.loop(0, group_size)
-            def _start(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    raw_read(i, slot).start()
-                    old_read(i, slot).start()
-
-            @pl.loop(0, group_size)
-            def _wait_raw(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    raw_read(i, slot).wait()
-
-            # All four pools of each aligned tile stay adjacent through packing;
-            # no Q=1 extraction or packing across unrelated requests is needed.
-            raw = raw_buf[...].reshape((group_size * 16, 256))
-            packed = _pack_pools(_pool_rows(raw, ape_ref[...]))
-            mask = mask_ref[pl.ds(begin, group_size), :]
-
-            @pl.loop(0, group_size)
-            def _wait_old(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    old_read(i, slot).wait()
-
-            old = out_buf[...].reshape((group_size, 256))
-            out_buf[...] = ((old & ~mask) | (packed & mask)).reshape(
-                (group_size, 1, 256)
-            )
-
-            @pl.loop(0, group_size)
-            def _start_write(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    write(i, slot).start()
-
-            @pl.loop(0, group_size)
-            def _wait_write(slot):
-                i = begin + slot
-
-                @pl.when(desc_ref[6, i] != 0)
-                def _live():
-                    write(i, slot).wait()
+    del old_ref  # out_ref aliases the pooled input, including untouched bytes.
+    io = ShortQueryIO(
+        desc_ref,
+        raw_ref,
+        out_ref.bitcast(jnp.uint32),
+        raw_buf,
+        out_buf,
+        read_sem,
+        old_sem,
+        write_sem,
+    )
+    ShortQueryPipeline(group_size).emit(io, ape_ref, mask_ref)
 
 
 def _long_kernel(
@@ -259,106 +129,19 @@ def _long_kernel(
     *,
     tile_rows,
 ):
-    del old_ref  # out_ref aliases this input, including untouched bytes.
-    words = out_ref.bitcast(jnp.uint32)
-    count = count_ref[0]
-    word_rows = tile_rows // 16
-
-    def read(i):
-        return pltpu.make_async_copy(
-            # Keep alignment visible after scalar-prefetched descriptors cross
-            # the call boundary: row 5 holds a tile index, not a byte/row offset.
-            raw_ref.at[desc_ref[0, i], pl.ds(desc_ref[5, i] * tile_rows, tile_rows), :],
-            raw_buf.at[i % 2],
-            read_sem.at[i % 2],
-        )
-
-    def write(i):
-        return pltpu.make_async_copy(
-            out_buf.at[i % 2],
-            words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], word_rows), 0, :],
-            write_sem.at[i % 2],
-        )
-
-    for initial in range(2):
-
-        @pl.when(count > initial)
-        def _prime(initial=initial):
-            read(initial).start()
-
-    def _page(i, slot):
-        read(i).wait()
-
-        if tile_rows == 32:
-            pooled = _pool_rows(raw_buf[slot], ape_ref[...])
-        else:
-            # Retain the larger DMA while bounding pooling's register live
-            # set. The VMEM staging also bounds values carried across loops.
-            @pl.loop(0, tile_rows // 32)
-            def _pool_chunk(chunk):
-                value = _pool_rows(
-                    raw_buf[slot, pl.ds(chunk * 32, 32), :], ape_ref[...]
-                )
-                # BF16 staging tiles require 16-row alignment in this runtime;
-                # FP32 permits an 8-row store. Preserve the BF16 rounding above.
-                pooled_buf[pl.ds(chunk * 8, 8), :] = value.astype(jnp.float32)
-
-            pooled = pooled_buf[...]
-
-        # Every raw Ref load precedes this refill. Subsequent stages only use
-        # SSA values; no consumer rereads the overwritten VMEM generation.
-        @pl.when(i + 2 < count)
-        def _refill():
-            read(i + 2).start()
-
-        packed = _pack_pools(pooled)
-        mask = jnp.zeros((word_rows, 256), jnp.uint32)
-        for lane in range(4):
-            ends = (
-                jax.lax.broadcasted_iota(jnp.int32, (word_rows, 256), 0) * 16
-                + lane * 4
-                + 3
-            )
-            live = (ends >= desc_ref[3, i]) & (ends < desc_ref[4, i])
-            mask = mask | (
-                jnp.where(live, jnp.uint32(255), jnp.uint32(0)) << (lane * 8)
-            )
-
-        # Serialize the *read* too. A later tile may update different bytes
-        # in exactly the same physical destination block as an earlier tile.
-        @pl.when(i > 0)
-        def _prior_store():
-            write(i - 1).wait()
-
-        @pl.when((desc_ref[3, i] > 3) | (desc_ref[4, i] < tile_rows))
-        def _preserve():
-            old = pltpu.make_async_copy(
-                words.at[desc_ref[1, i], pl.ds(desc_ref[2, i], word_rows), 0, :],
-                out_buf.at[slot],
-                old_sem,
-            )
-            old.start()
-            old.wait()
-            out_buf[slot, :, :] = (out_buf[slot, :, :] & ~mask) | (packed & mask)
-
-        @pl.when((desc_ref[3, i] <= 3) & (desc_ref[4, i] >= tile_rows))
-        def _overwrite():
-            out_buf[slot, :, :] = packed
-
-        write(i).start()
-
-    # Keep the two-slot period explicit; the number of pages stays dynamic.
-    @pl.loop(0, pl.cdiv(count, 2))
-    def _pair(pair):
-        for slot in range(2):
-
-            @pl.when(pair * 2 + slot < count)
-            def _active(slot=slot):
-                _page(pair * 2 + slot, slot)
-
-    @pl.when(count > 0)
-    def _drain():
-        write(count - 1).wait()
+    del old_ref
+    io = LongQueryIO(
+        desc_ref,
+        raw_ref,
+        out_ref.bitcast(jnp.uint32),
+        raw_buf,
+        out_buf,
+        read_sem,
+        write_sem,
+        old_sem,
+        tile_rows,
+    )
+    LongQueryPipeline(tile_rows).emit(io, ape_ref, pooled_buf, count_ref[0])
 
 
 def compress_and_store(

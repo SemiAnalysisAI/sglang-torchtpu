@@ -5,8 +5,10 @@ import argparse
 import hashlib
 import importlib.metadata
 import importlib.util
+import inspect
 import json
 import subprocess
+import sys
 import traceback
 from functools import partial
 from pathlib import Path
@@ -21,10 +23,50 @@ import shape_matrix
 def load_candidate(root, source=None):
     """Load the standalone kernel without importing the serving plugin."""
     path = source or root / "sglang_tpu/attention/pallas/kpool_compress.py"
-    spec = importlib.util.spec_from_file_location("kpool_candidate", path)
+    sources = [path, *sorted((path.parent / "kpool").glob("*.py"))]
+    digest = hashlib.sha256()
+    for file in sources:
+        if len(sources) > 1:
+            digest.update(str(file.relative_to(path.parent)).encode() + b"\0")
+        digest.update(file.read_bytes())
+    name = f"kpool_candidate_{digest.hexdigest()}"
+    # A private package permits relative imports without loading the serving
+    # plugin, and keeps a frozen baseline's helpers separate from the candidate.
+    spec = importlib.util.spec_from_file_location(
+        name, path, submodule_search_locations=[str(path.parent)]
+    )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module.compress_and_store, hashlib.sha256(path.read_bytes()).hexdigest()
+    return module.compress_and_store, digest.hexdigest()
+
+
+def load_revision(root, revision, output):
+    """Restore the kernel and its helper modules as one immutable snapshot."""
+    prefix = "sglang_tpu/attention/pallas/"
+    files = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(root),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            revision,
+            prefix + "kpool_compress.py",
+            prefix + "kpool",
+        ],
+        text=True,
+    ).splitlines()
+    for file in files:
+        target = output / file.removeprefix(prefix)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            subprocess.check_output(
+                ["git", "-C", str(root), "show", f"{revision}:{file}"]
+            )
+        )
+    return load_candidate(root, source=output / "kpool_compress.py")
 
 
 def inputs(pages, tokens, decode, batch=1, query_len=1, raw=None):
@@ -81,9 +123,13 @@ def benchmark_case(
     if baseline is not None:
         variants = {
             "reference": reference.computation,
-            "baseline": partial(baseline, decode=True, decode_max_q=query_len)
-            if decode
-            else baseline,
+            "baseline": (
+                partial(baseline, max_query_length=query_len)
+                if "max_query_length" in inspect.signature(baseline).parameters
+                else partial(baseline, decode=True, decode_max_q=query_len)
+                if decode
+                else baseline
+            ),
             "fused": variants["fused"],
         }
     states = {}
@@ -239,19 +285,9 @@ def main():
         baseline = None
         baseline_digest = None
         if opts.baseline_revision:
-            path = opts.output / "baseline.py"
-            path.write_bytes(
-                subprocess.check_output(
-                    [
-                        "git",
-                        "-C",
-                        str(root),
-                        "show",
-                        f"{opts.baseline_revision}:sglang_tpu/attention/pallas/kpool_compress.py",
-                    ]
-                )
+            baseline, baseline_digest = load_revision(
+                root, opts.baseline_revision, opts.output / "baseline"
             )
-            baseline, baseline_digest = load_candidate(root, source=path)
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
