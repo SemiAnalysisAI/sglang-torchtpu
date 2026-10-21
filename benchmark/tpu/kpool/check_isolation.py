@@ -36,6 +36,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--baseline-unrolled",
+        action="store_true",
+        help="Baseline uses unrolling by default; verify opt-in graph equivalence",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[3]
     relative = "sglang_tpu/attention/pallas/kpool_compress.py"
@@ -74,13 +79,25 @@ def main():
             for pipeline in (False, True)
         ]
         configurations.append((32, {"decode": True}))
+        configurations = [
+            (tokens, {**options, "decode_q1_unroll": unroll})
+            for tokens, options in configurations
+            for unroll in ((True,) if args.baseline_unrolled else (False, True))
+        ]
         for tokens, options in configurations:
             changed = (
                 options.get("decode_max_q") == 1
                 and options.get("decode_pipeline")
                 and batch > 1
+                and options["decode_q1_unroll"]
+                and not args.baseline_unrolled
             )
-            left = graph(old, specs, tokens, options)
+            baseline_options = {
+                key: value
+                for key, value in options.items()
+                if key != "decode_q1_unroll"
+            }
+            left = graph(old, specs, tokens, baseline_options)
             right = graph(new, specs, tokens, options)
             passed = (left != right) if changed else (left == right)
             cases.append(
