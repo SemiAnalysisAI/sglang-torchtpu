@@ -22,7 +22,7 @@ def manifest(
     if bool(wheelhouse_bucket) != bool(wheelhouse_prefix):
         raise ValueError("Set both wheelhouse bucket and prefix, or neither")
     if (
-        mode not in ("performance", "decode-performance", "aot")
+        mode not in ("performance", "decode-performance", "aot", "profile-analysis", "device-profile")
         or not 0 <= hold_seconds <= 1800
     ):
         raise ValueError("Invalid task mode or artifact retrieval window")
@@ -61,6 +61,8 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             + " ".join(shlex.quote(case) for case in benchmark_cases)
             + "\n"
         )
+    if mode == "profile-analysis":
+        workload = "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -80,7 +82,7 @@ ulimit -c 0
 export TMPDIR=/tmp/tpu_logs/tmp
 export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
 export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
-export JAX_PLATFORMS={"cpu" if mode == "aot" else "tpu"}
+export JAX_PLATFORMS={"cpu" if mode in ("aot", "profile-analysis") else "tpu"}
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export PYTHONUNBUFFERED=1
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
@@ -106,7 +108,7 @@ export PATH="$task_root/venv/bin:$PATH"
         "device_topo": "2x2x1",
         "command": "bash -c " + shlex.quote(script),
     }
-    if mode == "aot":
+    if mode in ("aot", "profile-analysis"):
         task.update(
             device_type="cpu",
             device_count=1,
@@ -130,6 +132,13 @@ export PATH="$task_root/venv/bin:$PATH"
                 "mount_options": ["implicit-dirs"],
             }
         ]
+    if mode == "profile-analysis":
+        task.setdefault("mounts", []).append({
+            "name": "profiles", "type": "gcs",
+            "bucket": "tpu-for-training-falcon-logs", "prefix": "experiments",
+            "mount_path": "/profiles", "read_only": True,
+            "mount_options": ["implicit-dirs"],
+        })
     return {
         "name": f"kpool-{mode}-{revision[:12]}",
         "cluster_name": cluster,
@@ -150,7 +159,7 @@ def main():
     parser.add_argument("--wheelhouse-prefix")
     parser.add_argument(
         "--mode",
-        choices=("performance", "decode-performance", "aot"),
+        choices=("performance", "decode-performance", "aot", "profile-analysis", "device-profile"),
         default="performance",
     )
     parser.add_argument("--hold-seconds", type=int, default=0)
