@@ -155,10 +155,9 @@ class TpuChainSpecWorker(TpuSpecWorker):
         # Host KV bound past the last draft row; RPA reads the exact length per step.
         seq_lens_cpu, _ = verify_input.padded_kv_lens_after_rows(self.num_drafts)
         sampled = self._sampled_drafts
-        sampling_info = batch.sampling_info
         sampling_seed = None
-        if sampled and sampling_info.sampling_seed is not None:
-            sampling_seed = sampling_info.host_params_at(
+        if sampled and batch.sampling_info.sampling_seed is not None:
+            sampling_seed = batch.sampling_info.host_params_at(
                 bucket.state.seq_lens.shape[0]
             )["sampling_seed"].to(self.device, non_blocking=True)
         return self._draft_chain(

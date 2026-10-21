@@ -578,11 +578,38 @@ class TestExperimentalEagle3(CustomTestCase):
         verify_input = SimpleNamespace(
             req_pool_indices_cpu=None, padded_kv_lens_after_rows=lambda rows: (None, 0)
         )
+        batch = SimpleNamespace(sampling_info=SimpleNamespace(sampling_seed=None))
         for sampled in (True, False):
             worker._sampled_drafts = sampled
-            worker.draft(None, bucket, None, verify_input)
+            worker.draft(batch, bucket, None, verify_input)
         self.assertIs(seen[0], bucket.temperatures)
         self.assertIsNone(seen[1])
+
+    def test_seeded_sampled_drafts_take_the_bucket_padded_seeds(self):
+        worker = _chain_worker()
+        worker.num_drafts = 2
+        worker._sampled_drafts = True
+        seen = []
+        worker._draft_chain = lambda **kwargs: seen.append(kwargs["sampling_seed"])
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.zeros(4, dtype=torch.int64)),
+            temperatures=torch.ones(4),
+            top_ks=torch.ones(4),
+        )
+        verify_input = SimpleNamespace(
+            req_pool_indices_cpu=None, padded_kv_lens_after_rows=lambda rows: (None, 0)
+        )
+        seeds = torch.tensor([3, 5, 0, 0])
+        rows = []
+        sampling_info = SimpleNamespace(
+            sampling_seed=seeds[:2],
+            host_params_at=lambda n: rows.append(n) or {"sampling_seed": seeds},
+        )
+        worker.draft(
+            SimpleNamespace(sampling_info=sampling_info), bucket, None, verify_input
+        )
+        self.assertEqual(rows, [4])
+        torch.testing.assert_close(seen[0], seeds)
 
 
 if __name__ == "__main__":
