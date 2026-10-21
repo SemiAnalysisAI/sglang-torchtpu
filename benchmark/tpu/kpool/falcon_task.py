@@ -52,7 +52,7 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
         )
         workload = workload.replace(
             "echo PHASE_BENCHMARK",
-            "echo PHASE_BENCHMARK\ngit fetch --depth=1 origin 08ab4f9395b2753a8c7a4f86fa269a559f4a0b4f",
+            "echo PHASE_BENCHMARK\ngit fetch --depth=1 origin de72e465f066024c2e678b63de7d4cd73212a404",
         )
     if benchmark_cases and mode != "decode-performance":
         workload = (
@@ -67,7 +67,10 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
             cases = " --cases " + " ".join(shlex.quote(case) for case in aot_cases)
         workload = f"""echo PHASE_AOT
 git fetch --depth=1 origin 75a03373e46643a9373cf9bcd1ed7fdfd794385d
+git fetch --depth=1 origin de72e465f066024c2e678b63de7d4cd73212a404
 out="${{ARTIFACT_LOCAL_DIR:?}}/rank-${{FALCON_RANK:-0}}/aot"
+python benchmark/tpu/kpool/check_isolation.py \\
+  --baseline de72e465f066024c2e678b63de7d4cd73212a404 --output "$out/isolation.json"
 timeout 3600 python benchmark/tpu/kpool/aot.py --output "$out"{cases} \\
   --archive /tmp/tpu_logs/kpool-aot.tar.gz
 sleep {hold_seconds}

@@ -19,7 +19,7 @@ import reference
 
 PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
 DOUBLE_PREFETCH_REVISION = "61edd0e421a877158f7bfdfdfd2ae6133173cbfc"
-PREVIOUS_DECODE_REVISION = "08ab4f9395b2753a8c7a4f86fa269a559f4a0b4f"
+PREVIOUS_DECODE_REVISION = "de72e465f066024c2e678b63de7d4cd73212a404"
 PREVIOUS_CANDIDATE_REVISION = "880e8ace2f2f3f06cc66eb9a1235b6e6d7bf2335"
 
 
@@ -112,10 +112,8 @@ def benchmark_case(
     if decode and opts.decode_pipeline:
         variants = {
             "reference": reference.computation,
-            "previous_candidate": (
-                partial(previous, decode=True, decode_tile_rows=16)
-                if query_len == 1
-                else previous
+            "previous_candidate": partial(
+                previous, decode=True, decode_tile_rows=16, decode_max_q=query_len
             ),
             "decode_serial": partial(
                 candidate, decode=True, decode_max_q=query_len, decode_pipeline=False
@@ -216,9 +214,7 @@ def benchmark_case(
                 if decode
                 else tokens // 4
             ),
-            "previous_decode_branch": bool(
-                decode and opts.decode_pipeline and query_len == 1
-            ),
+            "previous_decode_branch": bool(decode and opts.decode_pipeline),
             "variants": rows,
             "speedup_pending_accuracy": rows["reference"]["median_ms"]
             / rows["candidate"]["median_ms"],

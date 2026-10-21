@@ -31,6 +31,7 @@ CASES = (
     "candidate_decode",
     "candidate_decode32",
     "candidate_decode_b32",
+    "candidate_decode_b3",
     "candidate_decode_q6_b32",
     "candidate_decode_q6_serial_b32",
     "reference_prefill",
@@ -104,7 +105,7 @@ def build(case, root, out):
         return call, (jax.ShapeDtypeStruct(shape, dtype),), ()
 
     pages = 17 if case.startswith("original_") else 14849
-    batch = 32 if case.endswith("_b32") else 1
+    batch = 32 if case.endswith("_b32") else 3 if case.endswith("_b3") else 1
     query_len = 6 if "_q6" in case else 1
     tokens = (
         256
@@ -298,6 +299,7 @@ def main():
         # Keep complete final LLO and the matching pre-delay companion. The
         # full set of compiler intermediate dumps remains in the task artifact.
         names = {
+            "isolation.json",
             "summary.json",
             "result.json",
             "manifest.json",
