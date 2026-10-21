@@ -489,6 +489,7 @@ def kernel_main_fused_rs(
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
     defer_writes: bool = False,
+    skip_out_zero: bool = False,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -581,8 +582,11 @@ def kernel_main_fused_rs(
         if fp8_direct_write
         else scatter_staging_3x_ref.at[0]
     )
-    zero_size = zero_out_start_3d(out_buf_ref, zero_src, zero_sem_ref)
-    zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
+    # Expert TP writes every out_buf row exactly once: each device sends its
+    # slice of every routed (token, slot) row, padding tokens included.
+    if not skip_out_zero:
+        zero_size = zero_out_start_3d(out_buf_ref, zero_src, zero_sem_ref)
+        zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
 
     # Entry barrier: synchronize across all cores after output buffer zeroing
     sync_barrier()
@@ -1482,6 +1486,7 @@ def kernel_main_fused_rs_fp8(
     top_k: int,
     pack_indices: bool = True,
     defer_writes: bool = False,
+    skip_out_zero: bool = False,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -1574,6 +1579,7 @@ def kernel_main_fused_rs_fp8(
         "expert_tp",
         "local_rows",
         "tiled_output",
+        "skip_out_zero",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1605,11 +1611,13 @@ def gmm_v2_fused_rs(
     expert_tp: bool = False,
     local_rows: bool = False,
     tiled_output: bool = False,
+    skip_out_zero: bool = False,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
     ``local_rows`` (expert TP only): the scalar-prefetched row indices hold just
     this device's contiguous block of routed rows instead of all ``ep_size`` blocks.
+    ``skip_out_zero`` (expert TP): do not zero out_buf before the writes.
     ``tiled_output``: return the bf16 result in the kernel's own
     (rows, size_n2 // 128, 128) layout when N2 is unpadded, so a row-split
     reduction can read it without a relayout copy.
@@ -2155,6 +2163,7 @@ def gmm_v2_fused_rs(
         top_k=top_k,
         pack_indices=pack_indices,
         defer_writes=expert_tp,
+        skip_out_zero=skip_out_zero and expert_tp and not fp8_direct_write,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d

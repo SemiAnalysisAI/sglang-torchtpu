@@ -322,6 +322,8 @@ def moe_gmm_local_rs_nodedup(
         expert_tp=expert_tp,
         local_rows=local_rows,
         tiled_output=tiled_output,
+        skip_out_zero=expert_tp
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
