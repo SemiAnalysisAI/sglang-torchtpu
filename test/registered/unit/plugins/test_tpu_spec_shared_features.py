@@ -366,6 +366,38 @@ class TestSharedFeatures(CustomTestCase):
         coins, _ = verify_coins(seed, seq_lens, 4)
         self.assertFalse(torch.isin(uniforms, coins).any())
 
+    def test_chain_draft_never_proposes_a_zero_probability_token(self):
+        from sglang_tpu.experimental.speculative.chain_draft_worker import (
+            TpuChainDraftWorker,
+        )
+        from sglang_tpu.experimental.speculative.spec_ops import accept_drafts_sampled
+
+        drafter = SimpleNamespace(target_logits=lambda logits: logits)
+        # Token 0 is outside the draft vocabulary and the target forbids it too.
+        logits = torch.tensor([[float("-inf"), 4.0, float("-inf")]])
+        target = torch.tensor([[float("-inf"), 4.0, float("-inf")]]).repeat(2, 1)
+        for uniform in (0.0, 0.5, 1.0 - 2**-24):
+            with self.subTest(uniform=uniform):
+                token, dense = TpuChainDraftWorker._choose_token(
+                    drafter,
+                    logits,
+                    temperatures=torch.ones(1),
+                    top_ks=torch.full((1,), 3),
+                    uniforms=torch.tensor([uniform]),
+                )
+                self.assertEqual(token.tolist(), [1])
+                num_correct, _ = accept_drafts_sampled(
+                    target,
+                    token[:, None],
+                    torch.tensor([1]),
+                    dense[:, None],
+                    torch.ones(1),
+                    torch.full((1,), 3),
+                    coins=torch.tensor([[0.5]]),
+                    final_sampling_coins=torch.tensor([0.5]),
+                )
+                self.assertEqual(num_correct.tolist(), [1])
+
     def test_seeded_chain_draft_ignores_the_ambient_rng(self):
         from sglang_tpu.experimental.speculative import chain_spec_worker
         from sglang_tpu.sampling.seeded import draft_uniforms
