@@ -17,6 +17,7 @@ def manifest(
     aot_cases=None,
     benchmark_cases=None,
     analysis_input=None,
+    profile_bucket=None,
 ):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("revision must be a full Git commit SHA")
@@ -163,11 +164,13 @@ export PATH="$task_root/venv/bin:$PATH"
             }
         ]
     if mode == "profile-analysis":
+        if not profile_bucket:
+            raise ValueError("Set profile_bucket for the private capture storage")
         task.setdefault("mounts", []).append(
             {
                 "name": "profiles",
                 "type": "gcs",
-                "bucket": "tpu-for-training-falcon-logs",
+                "bucket": profile_bucket,
                 "prefix": "experiments",
                 "mount_path": "/profiles",
                 "read_only": True,
@@ -213,6 +216,7 @@ def main():
     parser.add_argument("--aot-cases", nargs="+")
     parser.add_argument("--benchmark-cases", nargs="+", choices=("decode", "prefill"))
     parser.add_argument("--analysis-input")
+    parser.add_argument("--profile-bucket")
     args = parser.parse_args()
     print(
         json.dumps(
@@ -226,6 +230,7 @@ def main():
                 args.aot_cases,
                 args.benchmark_cases,
                 args.analysis_input,
+                args.profile_bucket,
             ),
             indent=2,
         )

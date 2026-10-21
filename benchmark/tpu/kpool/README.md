@@ -84,8 +84,8 @@ site remains unchanged; full-indexer and end-to-end validation are still pending
 
 ### Verified checkpoint (2026-10-21)
 
-Capture `exp-qf61nxopdt` at `3249725411ececc90b2913b9e60728672bba18fd`
-and CPU analysis `exp-7jca1l6kgl` use the runtime and sampling recipe above.
+The capture at `3249725411ececc90b2913b9e60728672bba18fd` and CPU analysis
+use the runtime and sampling recipe above.
 For independent Q1/B32 requests, XProf device medians are:
 
 | Implementation | Full module (us) | Pallas event (us) |
@@ -102,7 +102,7 @@ counts and attribution: 2,000 module samples and 1,600 Pallas samples. Q6/B1
 and Q6/B32 reuse their previous executables. Shared-quad speed is not measured.
 
 Automatic dispatch at `66949064d894638271ce096e831b3bbbe2c324eb` has the same
-traced Q1/B32 graph as this capture. Accuracy task `exp-i7y4s1awpt` passed all
+traced Q1/B32 graph as this capture. Accuracy validation passed all
 14 candidate cases and all nine automatic B32 cases, with zero differing
 cache bytes. This is module-level evidence on one TPU device, not a serving
 or multi-device performance result. Prefill/Q>1 numerical gates and serving
