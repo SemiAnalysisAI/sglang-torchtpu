@@ -1695,7 +1695,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # so precompile traces the same DP graph serving uses. Without it,
         # precompile traces a different graph.
         if is_dp_attention_enabled():
-            self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
+            self.set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
         forward_batch.logits_output_mode = logits_output_mode
 
@@ -1759,7 +1759,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def warmup_eager_logits(self, cases: Sequence[EagerLogitsCase]) -> None:
         """Warm the logits a wrapper runs eagerly after its compiled decoder, one run per case."""
 
-    def _set_dp_attention_metadata(
+    def set_dp_attention_metadata(
         self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
     ) -> None:
         """Set the DP metadata in the same way as serving.
@@ -1801,6 +1801,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _dummy_mm_inputs(self, bs: int) -> Any:
         """``mm_inputs`` field for the dummy batch (``None`` for plain decoders)."""
         return None
+
+    def live_cache_loc_dtype(self) -> torch.dtype:
+        """Dtype of the extend cache locations the live allocator hands out."""
+        return self._dummy_out_cache_loc_dtype(ForwardMode.EXTEND)
 
     def _dummy_out_cache_loc_dtype(self, mode: ForwardMode) -> torch.dtype:
         """Match cache-location indices produced by the live allocator."""

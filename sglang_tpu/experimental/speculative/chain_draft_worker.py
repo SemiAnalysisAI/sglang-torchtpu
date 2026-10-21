@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import torch
 
+from sglang.srt.layers.dp_attention import set_is_extend_in_batch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
@@ -168,6 +169,9 @@ class TpuChainDraftWorker(TpuDraftWorker):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Drafts [pbs, N] (and dense q logits when sampling) from one compiled program."""
         assert self._fused_draft is not None, "precompile_draft has not run"
+        # The fused program guards on this flag; it is a decode program, but the last
+        # extend (or an extend warmup) under DP attention may have left it True.
+        set_is_extend_in_batch(False)
         backend = self.model_runner.attn_backend
         backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()

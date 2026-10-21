@@ -117,9 +117,11 @@ policy mixin, and routes all three.
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
-prefill and mixed prefill/decode DP steps. Neither family supports DP
-attention, and the chain family (MTP) does not support a draft sliding window.
-Each raises at startup.
+prefill and mixed prefill/decode DP steps. The chain family (MTP) does not
+support a draft sliding window. Each raises at startup.
+
+Under DP attention both families draft greedily, so an idle DP rank can mirror
+its peers' draft syncs; sampled requests take the target-only accept.
 
 ## P/D disaggregation
 
