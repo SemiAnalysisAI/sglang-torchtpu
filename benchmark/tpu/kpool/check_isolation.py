@@ -36,6 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--q1-batch", action="store_true")
     parser.add_argument(
         "--baseline-unrolled",
         action="store_true",
@@ -85,6 +86,8 @@ def main():
             for unroll in ((True,) if args.baseline_unrolled else (False, True))
         ]
         for tokens, options in configurations:
+            if args.q1_batch:
+                options = {**options, "decode_q1_batch": True}
             changed = (
                 options.get("decode_max_q") == 1
                 and options.get("decode_pipeline")
@@ -97,6 +100,18 @@ def main():
                 for key, value in options.items()
                 if key != "decode_q1_unroll"
             }
+            if args.q1_batch:
+                changed = (
+                    options.get("decode_max_q") == 1
+                    and options.get("decode_pipeline")
+                    and options.get("decode_tile_rows") == 16
+                    and batch > 1
+                )
+                baseline_options = {
+                    key: value
+                    for key, value in options.items()
+                    if key != "decode_q1_batch"
+                }
             left = graph(old, specs, tokens, baseline_options)
             right = graph(new, specs, tokens, options)
             passed = (left != right) if changed else (left == right)

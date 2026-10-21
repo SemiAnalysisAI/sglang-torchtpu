@@ -122,6 +122,12 @@ def benchmark_case(
                 decode_pipeline=True,
                 decode_q1_unroll=True,
             ),
+            "q1_batch": partial(
+                candidate,
+                decode=True,
+                decode_max_q=query_len,
+                decode_q1_batch=True,
+            ),
         }
     states = {}
     try:

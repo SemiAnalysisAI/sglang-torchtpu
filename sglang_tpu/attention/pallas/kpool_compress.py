@@ -272,6 +272,144 @@ def _decode_kernel(
             write(count - 1).wait()
 
 
+def _q1_batch_kernel(
+    desc_ref,
+    raw_ref,
+    old_ref,
+    ape_ref,
+    mask_ref,
+    out_ref,
+    raw_batch,
+    old_batch,
+    batch_read_sem,
+    batch_old_sem,
+    batch_write_sem,
+    raw_serial,
+    out_serial,
+    read_sem,
+    old_sem,
+    write_sem,
+):
+    """Gather independent Q1 pools together, then compute all requests at once.
+
+    A shared physical quad uses the existing ordered RMW implementation. This
+    decision stays inside the aliased Pallas call, without a whole-cache select.
+    """
+    count = desc_ref.shape[1]
+
+    @pl.when(desc_ref[7, 0] != 0)
+    def _shared_quad():
+        _decode_kernel(
+            desc_ref,
+            raw_ref,
+            old_ref,
+            ape_ref,
+            out_ref,
+            raw_serial,
+            out_serial,
+            read_sem,
+            old_sem,
+            write_sem,
+            tile_rows=16,
+            pipeline=True,
+            single_query=True,
+            q1_unroll=False,
+        )
+
+    @pl.when(desc_ref[7, 0] == 0)
+    def _independent():
+        words = out_ref.bitcast(jnp.uint32)
+
+        def destination(i):
+            return words.at[desc_ref[2, i], pl.ds(desc_ref[3, i], 1), 0, :]
+
+        def raw_read(i):
+            row = desc_ref[1, i] * 16 + ((desc_ref[5, i] - 1) // 4) * 4
+            return pltpu.make_async_copy(
+                raw_ref.at[desc_ref[0, i], pl.ds(row, 4), :],
+                raw_batch.at[i],
+                batch_read_sem.at[i],
+            )
+
+        def old_read(i):
+            return pltpu.make_async_copy(
+                destination(i),
+                old_batch.at[i],
+                batch_old_sem.at[i],
+            )
+
+        def write(i):
+            return pltpu.make_async_copy(
+                old_batch.at[i],
+                destination(i),
+                batch_write_sem.at[i],
+            )
+
+        @pl.loop(0, count)
+        def _start(i):
+            @pl.when(desc_ref[6, i] != 0)
+            def _live():
+                raw_read(i).start()
+                old_read(i).start()
+
+        @pl.loop(0, count)
+        def _wait_raw(i):
+            @pl.when(desc_ref[6, i] != 0)
+            def _live():
+                raw_read(i).wait()
+
+        # The batch dimension contains independent requests. Reduce only their
+        # four member rows, never across requests or inactive padding rows.
+        raw = raw_batch[...].astype(jnp.float32)
+        keys = raw[:, :, :128]
+        scores = raw[:, :, 128:] + ape_ref[...][None, :, :]
+        scores -= jnp.max(scores, axis=1, keepdims=True)
+        weight = jnp.exp(scores)
+        weight /= jnp.sum(weight, axis=1, keepdims=True)
+        pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
+        rotated = _hadamard128(pooled.astype(jnp.float32))
+        rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
+        amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
+        exponent = jnp.ceil(jnp.log2(amax / 448.0))
+        q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(
+            jnp.float8_e4m3fn
+        )
+        # Expand individual bytes to words; packing adjacent batch rows here
+        # would mix different requests instead of preserving each cache quad.
+        key_bytes = jax.lax.bitcast_convert_type(q, jnp.uint8).astype(jnp.uint32)
+        scale_bytes = jnp.where(
+            jnp.arange(128)[None, :] == 0,
+            (exponent + 127).astype(jnp.uint32),
+            jnp.uint32(0),
+        )
+        packed = jnp.concatenate((key_bytes, scale_bytes), axis=1)
+        shift = mask_ref[...]
+        mask = jnp.uint32(255) << shift
+        packed = (packed << shift) & mask
+
+        @pl.loop(0, count)
+        def _wait_old(i):
+            @pl.when(desc_ref[6, i] != 0)
+            def _live():
+                old_read(i).wait()
+
+        old_batch[...] = (
+            old_batch[...].reshape((count, 256)) & ~mask | packed
+        ).reshape((count, 1, 256))
+
+        @pl.loop(0, count)
+        def _start_write(i):
+            @pl.when(desc_ref[6, i] != 0)
+            def _live():
+                write(i).start()
+
+        @pl.loop(0, count)
+        def _wait_write(i):
+            @pl.when(desc_ref[6, i] != 0)
+            def _live():
+                write(i).wait()
+
+
 def _kernel(
     count_ref,
     desc_ref,
@@ -421,6 +559,7 @@ def compress_and_store(
     decode_max_q=None,
     decode_pipeline=True,
     decode_q1_unroll=False,
+    decode_q1_batch=False,
 ):
     """Pool newly closed K4 groups; the returned native cache aliases its input.
 
@@ -453,6 +592,49 @@ def compress_and_store(
         )
         pipeline = decode_pipeline and desc.shape[1] > 1
         buffers = 2 if pipeline else 1
+        if decode_q1_batch and max_q == 1 and pipeline and decode_tile_rows == 16:
+            count = desc.shape[1]
+            index = jnp.arange(count)
+            same_quad = (desc[2, :, None] == desc[2, None, :]) & (
+                desc[3, :, None] == desc[3, None, :]
+            )
+            live_pair = (desc[6, :, None] != 0) & (desc[6, None, :] != 0)
+            conflict = jnp.any(
+                same_quad & live_pair & (index[:, None] < index[None, :])
+            )
+            batch_desc = jnp.concatenate(
+                (desc, jnp.broadcast_to(conflict.astype(jnp.int32), (1, count))), axis=0
+            )
+            shifts = (((desc[5] - 1) // 4 % 4) * 8).astype(jnp.uint32)[:, None]
+            return pl.pallas_call(
+                _q1_batch_kernel,
+                out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=1,
+                    grid=(1,),
+                    in_specs=(
+                        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                        pl.BlockSpec(),
+                        pl.BlockSpec(),
+                    ),
+                    out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                    scratch_shapes=(
+                        pltpu.VMEM((count, 4, 256), jnp.bfloat16),
+                        pltpu.VMEM((count, 1, 256), jnp.uint32),
+                        pltpu.SemaphoreType.DMA((count,)),
+                        pltpu.SemaphoreType.DMA((count,)),
+                        pltpu.SemaphoreType.DMA((count,)),
+                        pltpu.VMEM((2, 16, 256), jnp.bfloat16),
+                        pltpu.VMEM((2, 1, 256), jnp.uint32),
+                        pltpu.SemaphoreType.DMA((2,)),
+                        pltpu.SemaphoreType.DMA((2,)),
+                        pltpu.SemaphoreType.DMA((2,)),
+                    ),
+                ),
+                input_output_aliases={2: 0},
+                name="kpool_decode_store_q1_batch",
+            )(batch_desc, raw_cache, pooled_cache, ape.astype(jnp.float32), shifts)
         return pl.pallas_call(
             partial(
                 _decode_kernel,
