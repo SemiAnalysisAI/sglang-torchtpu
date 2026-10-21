@@ -23,7 +23,14 @@ def manifest(
     if bool(wheelhouse_bucket) != bool(wheelhouse_prefix):
         raise ValueError("Set both wheelhouse bucket and prefix, or neither")
     if (
-        mode not in ("performance", "decode-performance", "aot", "profile-analysis", "device-profile")
+        mode
+        not in (
+            "performance",
+            "decode-performance",
+            "aot",
+            "profile-analysis",
+            "device-profile",
+        )
         or not 0 <= hold_seconds <= 1800
     ):
         raise ValueError("Invalid task mode or artifact retrieval window")
@@ -66,11 +73,18 @@ timeout 1800 python benchmark/tpu/kpool/benchmark.py \\
         capture_cases = ["decode"] if mode == "decode-performance" else benchmark_cases
         capture_args = (
             " --cases " + " ".join(shlex.quote(case) for case in capture_cases)
-            if capture_cases else ""
+            if capture_cases
+            else ""
         )
-        workload = "bash benchmark/tpu/kpool/profile_capture_task.sh" + capture_args + "\n"
+        workload = (
+            "bash benchmark/tpu/kpool/profile_capture_task.sh" + capture_args + "\n"
+        )
     if mode == "profile-analysis":
-        workload = (f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n" if analysis_input else "") + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
+        workload = (
+            f"export KPOOL_CAPTURE_ROOT={shlex.quote(analysis_input)}\n"
+            if analysis_input
+            else ""
+        ) + "bash benchmark/tpu/kpool/profile_analysis_task.sh\n"
     if mode == "aot":
         cases = ""
         if aot_cases:
@@ -141,12 +155,17 @@ export PATH="$task_root/venv/bin:$PATH"
             }
         ]
     if mode == "profile-analysis":
-        task.setdefault("mounts", []).append({
-            "name": "profiles", "type": "gcs",
-            "bucket": "tpu-for-training-falcon-logs", "prefix": "experiments",
-            "mount_path": "/profiles", "read_only": True,
-            "mount_options": ["implicit-dirs"],
-        })
+        task.setdefault("mounts", []).append(
+            {
+                "name": "profiles",
+                "type": "gcs",
+                "bucket": "tpu-for-training-falcon-logs",
+                "prefix": "experiments",
+                "mount_path": "/profiles",
+                "read_only": True,
+                "mount_options": ["implicit-dirs"],
+            }
+        )
     return {
         "name": f"kpool-{mode}-{revision[:12]}",
         "cluster_name": cluster,
@@ -167,7 +186,13 @@ def main():
     parser.add_argument("--wheelhouse-prefix")
     parser.add_argument(
         "--mode",
-        choices=("performance", "decode-performance", "aot", "profile-analysis", "device-profile"),
+        choices=(
+            "performance",
+            "decode-performance",
+            "aot",
+            "profile-analysis",
+            "device-profile",
+        ),
         default="device-profile",
     )
     parser.add_argument("--hold-seconds", type=int, default=0)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,8 +67,7 @@ SKILL_DIRNAME = "xprof"
 # requirements-client.txt, which a test holds it to: this script runs under the
 # XProf interpreter, from the installed package, where that file is not.
 MINIMUM_VERSION = "2.24.2a20260923"
-UPGRADE = (f"{sys.executable} -m pip install -U "
-           f"'xprof-nightly>={MINIMUM_VERSION}'")
+UPGRADE = f"{sys.executable} -m pip install -U 'xprof-nightly>={MINIMUM_VERSION}'"
 
 
 def installed_distributions() -> dict[str, str]:
@@ -91,15 +89,20 @@ def _nightly_key(version: str) -> tuple[int, ...] | None:
     Nightlies are re-cut as `.postM` (internal mirrors serve
     2.24.2a20260922.post1), and one must not read as uncomparable.
     """
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:a(\d+))?(?:\.post(\d+))?",
-                         version)
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:a(\d+))?(?:\.post(\d+))?", version)
     if not match:
         return None
     major, minor, patch, alpha, post = match.groups()
     # A pre-release sorts before the release it leads up to; a post-release
     # after the version it amends.
-    return (int(major), int(minor), int(patch), 0 if alpha else 1,
-            int(alpha or 0), int(post or 0))
+    return (
+        int(major),
+        int(minor),
+        int(patch),
+        0 if alpha else 1,
+        int(alpha or 0),
+        int(post or 0),
+    )
 
 
 def below_floor(version: str) -> bool | None:
@@ -137,7 +140,8 @@ def locate() -> dict[str, Any]:
     if not dists:
         result["errors"].append(
             "no xprof distribution is installed under "
-            f"{sys.executable}. Ask the user to run: {UPGRADE}")
+            f"{sys.executable}. Ask the user to run: {UPGRADE}"
+        )
         return result
 
     if "xprof" in dists:
@@ -148,7 +152,8 @@ def locate() -> dict[str, Any]:
             "the same package directory with no pip conflict, so the skill "
             "found here may describe a binary supplied by the other. Ask the "
             f"user to run: {sys.executable} -m pip uninstall -y xprof && "
-            f"{UPGRADE}")
+            f"{UPGRADE}"
+        )
         return result
 
     nightly = dists["xprof-nightly"]
@@ -157,12 +162,14 @@ def locate() -> dict[str, Any]:
         result["errors"].append(
             f"xprof-nightly=={nightly} is older than this package's floor "
             f"({MINIMUM_VERSION}), so its skill describes a CLI missing tools "
-            f"the package relies on. Ask the user to run: {UPGRADE}")
+            f"the package relies on. Ask the user to run: {UPGRADE}"
+        )
         return result
     if old is None:
         result["warnings"].append(
             f"could not compare xprof-nightly=={nightly} with the floor "
-            f"{MINIMUM_VERSION}; using it unchecked")
+            f"{MINIMUM_VERSION}; using it unchecked"
+        )
 
     from importlib.resources import files
 
@@ -175,13 +182,15 @@ def locate() -> dict[str, Any]:
         result["errors"].append(
             f"xprof-nightly=={nightly} has no {SKILL_PACKAGE}.{SKILL_DIRNAME}"
             f"/SKILL.md, so the install is incomplete. Ask the user to run: "
-            f"{UPGRADE}")
+            f"{UPGRADE}"
+        )
         return result
 
     result["skill_dir"] = str(skill_dir)
     result["skill_md"] = str(skill_md)
     result["references"] = sorted(
-        path.stem for path in (skill_dir / "references").glob("*.md"))
+        path.stem for path in (skill_dir / "references").glob("*.md")
+    )
     return result
 
 
@@ -201,8 +210,10 @@ def render(report: dict[str, Any], reference: str | None) -> tuple[str, int]:
 
     skill_dir = Path(report["skill_dir"])
     header = [
-        f"XProf skill from xprof-nightly=={report['version']}, "
-        f"the CLI under {report['interpreter']}.",
+        (
+            f"XProf skill from xprof-nightly=={report['version']}, "
+            f"the CLI under {report['interpreter']}."
+        ),
     ]
     header += [f"Warning: {warning}" for warning in report["warnings"]]
 
@@ -218,8 +229,10 @@ def render(report: dict[str, Any], reference: str | None) -> tuple[str, int]:
     else:
         name = reference_name(reference)
         if name not in report["references"]:
-            return (f"No XProf reference named {reference!r}. References: " +
-                    ", ".join(report["references"])), 2
+            return (
+                f"No XProf reference named {reference!r}. References: "
+                + ", ".join(report["references"])
+            ), 2
         body = str(skill_dir / "references" / f"{name}.md")
         title = f"references/{name}.md"
 
@@ -232,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--reference",
         help="print this reference instead of SKILL.md, named as SKILL.md "
-        "links it, e.g. references/collect_profile.md")
+        "links it, e.g. references/collect_profile.md",
+    )
     args = parser.parse_args(argv)
     text, status = render(locate(), args.reference)
     print(text)

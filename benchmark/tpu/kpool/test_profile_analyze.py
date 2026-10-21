@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks interval accounting only; this is not a kernel accuracy test."""
+
 import unittest
 
 from profile_analyze import fusion_context, module_ops, outermost, union_ns
