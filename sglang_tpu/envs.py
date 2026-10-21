@@ -117,6 +117,9 @@ class TpuEnvs:
     # Raiden HiCache: per-rank host RAM budget (GB) for the full, SWA and draft host pools
     # together, replacing the free-RAM / local-ranks sample taken as each rank arrives.
     SGLANG_TPU_HICACHE_HOST_BUDGET_GB = EnvFloat(None)
+    # Raiden HiCache: before building the host pools, release freed heap pages and wait for
+    # every rank, so no rank allocates while a peer still holds its weight-loading buffers.
+    SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC = EnvBool(False)
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)

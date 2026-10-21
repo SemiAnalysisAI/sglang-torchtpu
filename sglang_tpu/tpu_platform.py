@@ -1057,6 +1057,8 @@ class TpuSRTPlatform(SRTPlatform):
         # sampled budget is free RAM / local ranks at the moment this rank arrives,
         # so ranks that arrive after their peers allocated get a shrunken share.
         budget_gb = tpu_envs.SGLANG_TPU_HICACHE_HOST_BUDGET_GB.get()
+        if tpu_envs.SGLANG_TPU_HICACHE_TRIM_BEFORE_ALLOC.get():
+            _release_host_heap_on_all_ranks()
         if budget_gb is not None:
             return host_memory_budget_scope(int(budget_gb * 1e9))
         return host_memory_budget_scope(host_memory_budget_bytes())
@@ -1390,3 +1392,20 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+
+def _release_host_heap_on_all_ranks() -> None:
+    """Return freed startup heap pages to the OS, then wait for every rank.
+
+    Pools are pinned host memory sized near the node's RAM, so they only fit once every
+    rank has released its weight-loading buffers.
+    """
+    import gc
+
+    from sglang.srt.runtime_context import get_parallel
+    from sglang_tpu.host_heap_trim import trim_host_heap
+
+    gc.collect()
+    trim_host_heap("before HiCache host pools")
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
