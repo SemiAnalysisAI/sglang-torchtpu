@@ -111,11 +111,20 @@ def main():
     parser.add_argument(
         "--section", choices=("all", "decode", "prefill"), default="all"
     )
+    parser.add_argument("--queries", nargs="+", type=int)
+    parser.add_argument("--batches", nargs="+", type=int)
     opts = parser.parse_args()
     opts.output.mkdir(parents=True, exist_ok=True)
     candidate, digest = load_candidate(Path(__file__).resolve().parents[3])
     baseline = jax.jit(reference.computation, static_argnums=(7, 8))
-    cases = validation_cases(opts.section)
+    cases = [
+        case
+        for case in validation_cases(opts.section)
+        if (opts.queries is None or case["query_length"] in opts.queries)
+        and (opts.batches is None or case["batch"] in opts.batches)
+    ]
+    if not cases:
+        parser.error("Empty validation selection")
     result = {
         "candidate_sha256": digest,
         "reference_sha256": hashlib.sha256(
@@ -130,6 +139,11 @@ def main():
             for name in ("jax", "jaxlib", "libtpu", "numpy")
         },
         "expected_cases": len(cases),
+        "selection": {
+            "section": opts.section,
+            "queries": opts.queries,
+            "batches": opts.batches,
+        },
         "rule": "exact entire cache byte equality",
         "cases": [],
         "complete": False,
