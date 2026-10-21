@@ -2291,6 +2291,7 @@ class TestOutOfTreePlatformKvApi(CustomTestCase):
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(),
                 head_dim=64,
+                v_head_dim=64,
                 get_num_kv_heads=lambda *_: 2,
             ),
             layer_info=SimpleNamespace(
@@ -2336,6 +2337,31 @@ class TestOutOfTreePlatformKvApi(CustomTestCase):
                     req_to_token_pool=MagicMock(),
                 )
                 self.assertIs(type(pool), expected)
+
+    def test_in_tree_fallback_stores_v_at_the_model_width(self):
+        """A K width of 192 with a V width of 128 (MiMo-style): the in-tree pool
+        the fallback builds sizes V as the ordinary MHA builder does, and takes
+        a V write at the model's width."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = self._fake_configurator()
+        fake.model_config.head_dim = 192
+        fake.model_config.v_head_dim = 128
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform",
+            self._Platform(None),
+        ):
+            pool = KVCacheConfigurator._build_oot_mha_kv_pool(
+                fake, max_total_num_tokens=128
+            )
+        self.assertEqual(pool.get_key_buffer(0).shape[1:], (2, 192))
+        self.assertEqual(pool.get_value_buffer(0).shape[1:], (2, 128))
+        layer = SimpleNamespace(layer_id=0, k_scale=None, v_scale=None)
+        loc = torch.tensor([3])
+        k = torch.randn(1, 2, 192, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, 128, dtype=torch.bfloat16)
+        pool.set_kv_buffer(layer, loc, k, v)
+        torch.testing.assert_close(pool.get_value_buffer(0)[3], v[0])
 
     def test_dsa_uses_the_platform_hook_or_the_in_tree_build(self):
         from functools import partial

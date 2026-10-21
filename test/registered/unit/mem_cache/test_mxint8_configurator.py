@@ -10,6 +10,10 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    PageMajorMHATokenToKVPool,
+)
 from sglang.srt.mem_cache.page_interleave import make_page_shard_spec
 from sglang.srt.runtime_context import (
     get_context,
@@ -62,6 +66,9 @@ def _load_configurator(**dependencies):
         "make_page_shard_spec": make_page_shard_spec,
         # The hybrid full-attention pool choice branches on NPU first.
         "_is_npu": False,
+        # The out-of-tree MHA build tells the in-tree pools from a platform's.
+        "MHATokenToKVPool": MHATokenToKVPool,
+        "PageMajorMHATokenToKVPool": PageMajorMHATokenToKVPool,
         **dependencies,
     }
     module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))

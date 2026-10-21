@@ -2068,6 +2068,14 @@ class KVCacheConfigurator:
 
     def _build_oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         PoolCls = self._tpu_mha_pool_class()
+        # An in-tree pool stores V at the model's width, as _build_mha_kv_pool
+        # sizes it; a platform's own pool lays V out itself (TPU's fused pool
+        # pads it into K's slot).
+        v_head_dim_kwargs = (
+            {"v_head_dim": self.model_config.v_head_dim}
+            if PoolCls in (MHATokenToKVPool, PageMajorMHATokenToKVPool)
+            else {}
+        )
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             **self._mxint8_pool_kwargs(),
@@ -2077,6 +2085,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            **v_head_dim_kwargs,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
