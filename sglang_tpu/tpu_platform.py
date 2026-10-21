@@ -627,7 +627,8 @@ def _processor_min_pixels(cfg) -> int | None:
             return None
         with open(path) as f:
             processor_config = json.load(f)
-    except Exception:
+    except (OSError, ValueError):
+        # Unreadable or malformed: no known minimum, so no cap.
         return None
     return processor_config.get("size", {}).get(
         "shortest_edge"
