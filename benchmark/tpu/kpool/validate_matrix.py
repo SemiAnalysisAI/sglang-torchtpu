@@ -3,7 +3,9 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import subprocess
 from functools import partial
 from pathlib import Path
 
@@ -116,13 +118,24 @@ def main():
     cases = validation_cases(opts.section)
     result = {
         "candidate_sha256": digest,
+        "reference_sha256": hashlib.sha256(
+            Path(reference.__file__).read_bytes()
+        ).hexdigest(),
+        "source_revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
         "jax": jax.__version__,
+        "runtime": {
+            name: importlib.metadata.version(name)
+            for name in ("jax", "jaxlib", "libtpu", "numpy")
+        },
         "expected_cases": len(cases),
         "rule": "exact entire cache byte equality",
         "cases": [],
         "complete": False,
         "passed": False,
     }
+    print("MATRIX_ACCURACY_IDENTITY", json.dumps(result), flush=True)
     for case in cases:
         name, args, old = make_inputs(case)
         print("MATRIX_ACCURACY_START", name, flush=True)
@@ -166,6 +179,18 @@ def main():
             raise RuntimeError(f"{name}: runtime error; results preserved")
         del expected, actual, old, args, fused
         jax.clear_caches()
+    print(
+        "MATRIX_ACCURACY_SUMMARY",
+        json.dumps(
+            {
+                "complete": result["complete"],
+                "passed": result["passed"],
+                "cases": len(result["cases"]),
+                "failed_cases": sum(not row["passed"] for row in result["cases"]),
+            }
+        ),
+        flush=True,
+    )
     if not result["passed"]:
         raise SystemExit(1)
 

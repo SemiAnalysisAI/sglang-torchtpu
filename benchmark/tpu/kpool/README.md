@@ -4,7 +4,7 @@
 produce speedup claims. Numerical accuracy and serving tests are separate
 validation gates.
 
-The default matrix uses 14,849 raw-cache pages, donated pooled-cache output,
+The targeted benchmark uses 14,849 raw-cache pages, donated pooled-cache output,
 10 warmup calls, and 100 recorded calls per variant. It covers decode Q1/Q6 at
 B1/B32 and prefill T8192. Each case alternates variant order between rounds.
 All variants use one device and one runtime in the same process.
@@ -17,7 +17,7 @@ profiler. Every comparison uses the same runtime. The captured manifest and
 resolved requirements record it. Custom-call runtime instrumentation stays
 disabled.
 
-Use `falcon_task.py --mode profile-analysis --analysis-input PATH` for the CPU
+Use `falcon_task.py --mode profile-analysis --analysis-input PATH --profile-bucket BUCKET` for the CPU
 analysis task. PATH is the mounted capture's `rank-0/device-profile` directory.
 The task uses XProf 2.25.0a20261020 and keeps full traces, HLO, and event tables
 remote. Collect `summary.json`, `samples.json`, and selected raw tool outputs.
@@ -107,3 +107,44 @@ traced Q1/B32 graph as this capture. Accuracy validation passed all
 cache bytes. This is module-level evidence on one TPU device, not a serving
 or multi-device performance result. Prefill/Q>1 numerical gates and serving
 integration remain open.
+
+## Full Q/B coverage
+
+The fixed dimensions remain K=4, D=128, raw page=128, and raw dtype=BF16.
+`shape_matrix.py` declares 301 combinations:
+
+- Decode/verify: every Q from 1 through 32, crossed with B=1/2/4/8/16/32/64
+  (224 cases). T=B*Q matches fixed-width decode/verify token bucketing.
+- Prefill: Q=1/2/4/.../8192, crossed with the same B values, subject to
+  B*Q<=8192 (77 cases). T=max(64,B*Q). This is standalone coverage;
+  a model's serving configuration can impose a larger minimum bucket.
+
+Pass `--shape-matrix --matrix-section decode` or `prefill` to `benchmark.py`.
+These runs compare only the frozen JAX reference and the current default fused
+path. Each uses the same 10-warmup, 100-sample XProf recipe described above.
+The older targeted benchmark retains its historical small-batch token padding;
+use the full matrix for exact T=B*Q decode comparisons.
+
+For Falcon, pass these arguments after `falcon_task.py --benchmark-args`.
+Use `--analysis-workers 4` on the CPU analysis task. Collect its compact timing
+result. Internal capture locations and task identifiers belong in private run
+records and must be supplied at launch, never committed to this repository.
+
+After the performance checkpoint, `--mode matrix-accuracy` runs 414 exact-byte
+checks: every measured pair plus ragged lengths, padding, inactive requests,
+page boundaries, shared destination quads, and zero/tiny/nonfinite values.
+Coverage is declared by the script; it is not a claim that these checks passed.
+
+Export public tables with:
+
+```sh
+python benchmark/tpu/kpool/report_matrix.py \
+  --input PREFILL_COMPACT_JSON DECODE_COMPACT_JSON \
+  --accuracy ACCURACY_JSON --output OUTPUT_DIRECTORY
+```
+
+The report includes full module p10/p50/p90, Pallas p50, sample counts, source
+revisions and per-shape accuracy. Without an accuracy file, it labels every row
+`not_run`. It rejects missing or duplicate shapes, wrong token buckets,
+incomplete samples, and mismatched sources or runtimes. It exports no internal
+task identifiers or storage paths.
