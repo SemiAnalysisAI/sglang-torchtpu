@@ -98,7 +98,6 @@ def _short_kernel(
     write_sem,
     *,
     group_size,
-    pools_per_tile,
 ):
     del old_ref  # out_ref aliases the pooled input, including untouched bytes.
     io = ShortQueryIO(
@@ -111,7 +110,7 @@ def _short_kernel(
         old_sem,
         write_sem,
     )
-    ShortQueryPipeline(group_size, pools_per_tile).emit(io, ape_ref, mask_ref)
+    ShortQueryPipeline(group_size).emit(io, ape_ref, mask_ref)
 
 
 def _long_kernel(
@@ -178,7 +177,9 @@ def compress_and_store(
     max_q = num_tokens if max_query_length is None else max_query_length
     if not isinstance(max_q, int) or max_q < 1:
         raise ValueError("max_query_length must be a positive static integer")
-    if max_q <= 32:
+    # Request descriptors avoid token-wide metadata expansion for small
+    # query spans. Grouped transfers amortize per-tile launch and waits.
+    if max_q <= 256:
         desc = _request_descriptors(
             kv_lens, page_indices, cu_q_lens, distribution, 16, max_q
         )
@@ -207,11 +208,7 @@ def compress_and_store(
             axis=1,
         )[:, None]
         return pl.pallas_call(
-            partial(
-                _short_kernel,
-                group_size=group_size,
-                pools_per_tile=min(4, (max_q + 3) // 4),
-            ),
+            partial(_short_kernel, group_size=group_size),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
