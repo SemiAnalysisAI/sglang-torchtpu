@@ -17,28 +17,10 @@ import numpy as np
 import reference
 import shape_matrix
 
-PIPELINE_BASELINE_REVISION = "985b4f8c9f2151cfae7c110156f7433892e1ee60"
-DOUBLE_PREFETCH_REVISION = "61edd0e421a877158f7bfdfdfd2ae6133173cbfc"
-PREVIOUS_DECODE_REVISION = "de72e465f066024c2e678b63de7d4cd73212a404"
-PREVIOUS_CANDIDATE_REVISION = "880e8ace2f2f3f06cc66eb9a1235b6e6d7bf2335"
 
-
-def load_candidate(root, baseline_output=None, revision=PIPELINE_BASELINE_REVISION):
-    relative = "sglang_tpu/attention/pallas/kpool_compress.py"
-    path = root / relative
-    if baseline_output is not None:
-        path = baseline_output / f"baseline-{revision[:12]}.py"
-        path.write_bytes(
-            subprocess.check_output(
-                [
-                    "git",
-                    "-C",
-                    str(root),
-                    "show",
-                    f"{revision}:{relative}",
-                ]
-            )
-        )
+def load_candidate(root):
+    """Load the standalone kernel without importing the serving plugin."""
+    path = root / "sglang_tpu/attention/pallas/kpool_compress.py"
     spec = importlib.util.spec_from_file_location("kpool_candidate", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -75,9 +57,6 @@ def inputs(pages, tokens, decode, batch=1, query_len=1, raw=None):
 
 def benchmark_case(
     candidate,
-    baseline,
-    double_prefetch,
-    previous,
     pages,
     tokens,
     decode,
@@ -96,46 +75,10 @@ def benchmark_case(
     raw, tail = inputs(pages, tokens, decode, batch, query_len, raw)
     variants = {
         "reference": reference.computation,
-        "single_prefetch": baseline,
-        "double_prefetch": double_prefetch,
-        "current_default": candidate,
+        "fused": partial(candidate, decode=True, decode_max_q=query_len)
+        if decode
+        else candidate,
     }
-    if decode:
-        variants = {
-            "reference": reference.computation,
-            "previous_pipeline": partial(
-                candidate,
-                decode=True,
-                decode_max_q=query_len,
-                decode_q1_batch=False,
-            ),
-            "decode_serial": partial(
-                candidate,
-                decode=True,
-                decode_max_q=query_len,
-                decode_pipeline=False,
-            ),
-            "q1_unroll": partial(
-                candidate,
-                decode=True,
-                decode_max_q=query_len,
-                decode_pipeline=True,
-                decode_q1_unroll=True,
-            ),
-            "q1_batch": partial(
-                candidate,
-                decode=True,
-                decode_max_q=query_len,
-                decode_q1_batch=True,
-            ),
-        }
-    if opts.reference_pair:
-        variants = {
-            "reference": reference.computation,
-            "fused": partial(candidate, decode=True, decode_max_q=query_len)
-            if decode
-            else candidate,
-        }
     states = {}
     try:
         for label, function in variants.items():
@@ -204,12 +147,11 @@ def benchmark_case(
                     np.asarray(tail[1]) // 4 - (np.asarray(tail[1]) - query_len) // 4
                 )
             ),
-            "previous_decode_branch": bool(decode and opts.decode_pipeline),
             "variants": rows,
             "device_profile": str(output / name / "xprof"),
             "profile_status": "requested",
             "expected_samples_per_variant": opts.repeats,
-            "timing_source": "XProf device module events; analyze on Falcon CPU",
+            "timing_source": "XProf device module events",
         }
         # Persist identity before profiler startup, which can fail in native code.
         manifest_path = output / f"{name}-capture.json"
@@ -249,43 +191,19 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=100)
-    parser.add_argument(
-        "--cases",
-        nargs="+",
-        choices=("decode", "prefill"),
-        default=["decode", "prefill"],
-    )
     parser.add_argument("--hlo-text", action="store_true")
-    parser.add_argument("--decode-batches", nargs="+", type=int, default=[1, 32])
-    parser.add_argument("--decode-query-lengths", nargs="+", type=int, default=[1])
-    parser.add_argument("--decode-pipeline", action="store_true")
-    parser.add_argument("--reference-pair", action="store_true")
-    parser.add_argument("--shape-matrix", action="store_true")
     parser.add_argument(
         "--matrix-section", choices=("all", "decode", "prefill"), default="all"
     )
     parser.add_argument("--matrix-start", type=int, default=0)
     parser.add_argument("--matrix-stop", type=int)
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Compatibility flag; all benchmark runs now capture XProf device events",
-    )
     opts = parser.parse_args()
-    if opts.shape_matrix:
-        opts.reference_pair = True
     if opts.matrix_start < 0 or (
         opts.matrix_stop is not None and opts.matrix_stop <= opts.matrix_start
     ):
         parser.error("Require 0 <= matrix_start < matrix_stop")
     if opts.warmup < 1 or opts.repeats < 2:
         parser.error("Require warmup >= 1 and repeats >= 2")
-    if any(b < 1 or b > 64 for b in opts.decode_batches):
-        parser.error("decode batches must be between 1 and 64")
-    if any(q < 1 or q > 32 for q in opts.decode_query_lengths):
-        parser.error("decode query lengths must be between 1 and 32")
-    if not opts.decode_pipeline and opts.decode_query_lengths != [1]:
-        parser.error("multi-token decode requires --decode-pipeline")
     root = Path(__file__).resolve().parents[3]
     opts.output.mkdir(parents=True, exist_ok=True)
     result = {
@@ -301,21 +219,6 @@ def main():
         if jax.default_backend() != "tpu":
             raise RuntimeError("This benchmark requires a TPU")
         candidate, digest = load_candidate(root)
-        baseline = double_prefetch = previous = None
-        baseline_digest = double_digest = previous_digest = None
-        previous_revision = (
-            PREVIOUS_DECODE_REVISION
-            if opts.decode_pipeline
-            else PREVIOUS_CANDIDATE_REVISION
-        )
-        if not opts.reference_pair:
-            baseline, baseline_digest = load_candidate(root, opts.output)
-            double_prefetch, double_digest = load_candidate(
-                root, opts.output, DOUBLE_PREFETCH_REVISION
-            )
-            previous, previous_digest = load_candidate(
-                root, opts.output, previous_revision
-            )
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -324,12 +227,6 @@ def main():
             reference_sha256=hashlib.sha256(
                 Path(reference.__file__).read_bytes()
             ).hexdigest(),
-            pipeline_baseline_revision=PIPELINE_BASELINE_REVISION,
-            pipeline_baseline_sha256=baseline_digest,
-            double_prefetch_revision=DOUBLE_PREFETCH_REVISION,
-            double_prefetch_sha256=double_digest,
-            previous_candidate_revision=previous_revision,
-            previous_candidate_sha256=previous_digest,
             devices=[str(d) for d in jax.devices()],
             device_kind=jax.devices()[0].device_kind,
             runtime={
@@ -337,21 +234,18 @@ def main():
                 for name in ("jax", "jaxlib", "libtpu", "numpy")
             },
         )
-        if opts.shape_matrix:
-            matrix = shape_matrix.cases(opts.matrix_section)[
-                opts.matrix_start : opts.matrix_stop
-            ]
-            if not matrix:
-                raise ValueError("Empty matrix selection")
-            result["matrix"] = matrix
+        matrix = shape_matrix.cases(opts.matrix_section)[
+            opts.matrix_start : opts.matrix_stop
+        ]
+        if not matrix:
+            raise ValueError("Empty matrix selection")
+        result["matrix"] = matrix
+        with jax.default_device(jax.devices()[0]):
             shared_raw, _ = inputs(14849, 32, True)
             for case in matrix:
                 result["cases"].append(
                     benchmark_case(
                         candidate,
-                        baseline,
-                        double_prefetch,
-                        previous,
                         14849,
                         case["tokens"],
                         case["mode"] == "decode",
@@ -363,40 +257,6 @@ def main():
                     )
                 )
                 (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
-            result["status"] = "completed_pending_accuracy"
-            return
-        # The small default matrix is retained for targeted regression checks.
-        for pages, tokens, decode in (
-            (14849, 32, True),
-            (14849, 8192, False),
-        ):
-            if ("decode" if decode else "prefill") not in opts.cases:
-                continue
-            shared_raw = None
-            if decode and opts.decode_pipeline:
-                print("INPUT_START", pages, flush=True)
-                shared_raw, _ = inputs(pages, 32, True)
-                print("INPUT_READY", pages, flush=True)
-            for query_len in opts.decode_query_lengths if decode else [tokens]:
-                for batch in opts.decode_batches if decode else [1]:
-                    bucket = ((batch * query_len + 31) // 32) * 32 if decode else tokens
-                    result["cases"].append(
-                        benchmark_case(
-                            candidate,
-                            baseline,
-                            double_prefetch,
-                            previous,
-                            pages,
-                            bucket,
-                            decode,
-                            opts,
-                            opts.output,
-                            batch,
-                            query_len,
-                            shared_raw,
-                        )
-                    )
-            del shared_raw
         result["status"] = "completed_pending_accuracy"
     except Exception:
         result["status"] = "failed"
