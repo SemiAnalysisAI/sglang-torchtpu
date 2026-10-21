@@ -111,13 +111,13 @@ def main():
                 "passed",
                 "mismatched_bytes",
             )
-            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
             writer.writeheader()
             writer.writerows(
                 {key: case.get(key) for key in fields} for case in result["cases"]
             )
     with (opts.output / "matrix.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     lines = [
