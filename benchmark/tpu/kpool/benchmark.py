@@ -105,14 +105,22 @@ def benchmark_case(
         variants = {
             "reference": reference.computation,
             "current_default": partial(
-                candidate, decode=True, decode_max_q=query_len,
+                candidate,
+                decode=True,
+                decode_max_q=query_len,
             ),
             "decode_serial": partial(
-                candidate, decode=True, decode_max_q=query_len, decode_pipeline=False,
+                candidate,
+                decode=True,
+                decode_max_q=query_len,
+                decode_pipeline=False,
             ),
             "q1_unroll": partial(
-                candidate, decode=True, decode_max_q=query_len,
-                decode_pipeline=True, decode_q1_unroll=True,
+                candidate,
+                decode=True,
+                decode_max_q=query_len,
+                decode_pipeline=True,
+                decode_q1_unroll=True,
             ),
         }
     states = {}
@@ -287,7 +295,9 @@ def main():
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
             ).strip(),
             candidate_sha256=digest,
-            reference_sha256=hashlib.sha256(Path(reference.__file__).read_bytes()).hexdigest(),
+            reference_sha256=hashlib.sha256(
+                Path(reference.__file__).read_bytes()
+            ).hexdigest(),
             pipeline_baseline_revision=PIPELINE_BASELINE_REVISION,
             pipeline_baseline_sha256=baseline_digest,
             double_prefetch_revision=DOUBLE_PREFETCH_REVISION,

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Profiler ABI smoke only. This does not check numerical accuracy."""
+
 import argparse
 import importlib.metadata
 import json
@@ -17,7 +18,13 @@ x = jnp.ones((128, 128), jnp.float32)
 for _ in range(5):
     x = fn(x)
     x.block_until_ready()
-print("PROFILER_ABI_SMOKE", json.dumps({name: importlib.metadata.version(name) for name in ("jax", "jaxlib", "libtpu")}), flush=True)
+print(
+    "PROFILER_ABI_SMOKE",
+    json.dumps(
+        {name: importlib.metadata.version(name) for name in ("jax", "jaxlib", "libtpu")}
+    ),
+    flush=True,
+)
 with jax.profiler.trace(str(args.output)):
     for _ in range(3):
         x = fn(x)

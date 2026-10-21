@@ -4,8 +4,8 @@
 Full traces, event tables and HLO remain remote. summary.json and the selected
 sample tables are small evidence outputs. Host annotations never supply times.
 """
+
 import argparse
-from collections import defaultdict
 import hashlib
 import importlib.metadata
 import json
@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,11 @@ def outermost(rows):
     """Remove exact duplicates and children, separately for each device."""
     out = []
     for row in sorted(rows, key=lambda r: (r["device"], r["start_ns"], -r["end_ns"])):
-        if out and row["device"] == out[-1]["device"] and row["end_ns"] <= out[-1]["end_ns"]:
+        if (
+            out
+            and row["device"] == out[-1]["device"]
+            and row["end_ns"] <= out[-1]["end_ns"]
+        ):
             continue
         out.append(row)
     return out
@@ -61,7 +66,8 @@ def module_ops(events, module):
     # An op sharing the module end can therefore end 1 ns after its parent.
     # This tolerance joins records; it does not alter either measured duration.
     return [
-        event for event in events
+        event
+        for event in events
         if event["device"] == module["device"]
         and event["category"] == "XLA Ops"
         and event["start_ns"] >= module["start_ns"] - 1
@@ -88,13 +94,25 @@ def fusion_context(graph, instruction):
                 computations[computation].append(f"{name} ({opcode.group(1)})")
     body = instructions.get(instruction.lstrip("%"))
     if body is None:
-        return None, [], "Fusion was not determined: instruction absent from selected graph text."
+        return (
+            None,
+            [],
+            "Fusion was not determined: instruction absent from selected graph text.",
+        )
     if not re.search(r"\bfusion\(", body):
         return None, [], "Selected HLO instruction is not fused."
     called = re.search(r"calls=%?([\w.-]+)", body)
     if not called or called.group(1) not in computations:
-        return instruction, [], "Fusion owner is known; fused computation members were unavailable."
-    return instruction, computations[called.group(1)], "Members are from the compiled fused computation."
+        return (
+            instruction,
+            [],
+            "Fusion owner is known; fused computation members were unavailable.",
+        )
+    return (
+        instruction,
+        computations[called.group(1)],
+        "Members are from the compiled fused computation.",
+    )
 
 
 def main():
@@ -129,13 +147,29 @@ def main():
         shutil.copyfile(source, local)
         tool_outputs = []
 
-        def run(tool, label=None, **kwargs):
+        def run(
+            tool,
+            label=None,
+            *,
+            local=local,
+            dest=dest,
+            tool_outputs=tool_outputs,
+            **kwargs,
+        ):
             label = label or tool
             cmd = [xprof, tool, str(local)] + [f"--{k}={v}" for k, v in kwargs.items()]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=900, check=False
+            )
             (dest / f"{label}.stdout.json").write_text(proc.stdout)
             (dest / f"{label}.stderr.txt").write_text(proc.stderr)
-            tool_outputs.append({"tool": tool, "path": str(dest / f"{label}.stdout.json"), "returncode": proc.returncode})
+            tool_outputs.append(
+                {
+                    "tool": tool,
+                    "path": str(dest / f"{label}.stdout.json"),
+                    "returncode": proc.returncode,
+                }
+            )
             if proc.returncode:
                 return {"error": proc.stderr, "returncode": proc.returncode}
             try:
@@ -148,26 +182,44 @@ def main():
             if isinstance(value, dict) and value.get("status") == "SAVED_TO_FILE":
                 value = json.loads(Path(value["file_path"]).read_text())
                 (dest / f"{label}.json").write_text(json.dumps(value))
-            if tool == "query_events_db" and isinstance(value, dict) and "path" in value:
+            if (
+                tool == "query_events_db"
+                and isinstance(value, dict)
+                and "path" in value
+            ):
                 value = json.loads(Path(value["path"]).read_text())
                 (dest / f"{label}.json").write_text(json.dumps(value))
             return value
 
-        kernels = run("get_kernel_stats", include_summary=True, limit=0)
+        run("get_kernel_stats", include_summary=True, limit=0)
         overview = run("get_overview")
         tops = run("get_top_hlo_ops", limit=0)
         run("create_events_db")
-        coverage = run("query_events_db", "coverage", query="SELECT device, category, COUNT(*) AS count FROM Events GROUP BY device, category ORDER BY device,category")
+        coverage = run(
+            "query_events_db",
+            "coverage",
+            query="SELECT device, category, COUNT(*) AS count FROM Events GROUP BY device, category ORDER BY device,category",
+        )
         # Keep the complete device op/module input table remote for auditing.
-        events = run("query_events_db", "device_events", query="SELECT device,category,start_ns,end_ns,self_time_ns,hlo_op,hlo_module,kernel_name,source_line FROM Events WHERE device LIKE 'TPU:%' AND category IN ('XLA Modules','XLA Ops') ORDER BY device,start_ns,end_ns DESC")
+        events = run(
+            "query_events_db",
+            "device_events",
+            query="SELECT device,category,start_ns,end_ns,self_time_ns,hlo_op,hlo_module,kernel_name,source_line FROM Events WHERE device LIKE 'TPU:%' AND category IN ('XLA Modules','XLA Ops') ORDER BY device,start_ns,end_ns DESC",
+        )
         if not isinstance(events, list) or not events:
             raise RuntimeError(f"{name}: no usable device events: {events}")
-        markers = run("query_events_db", "sample_markers", query="SELECT start_ns,kernel_name,trace_args FROM Events WHERE kernel_name LIKE 'sample/%' ORDER BY start_ns")
+        markers = run(
+            "query_events_db",
+            "sample_markers",
+            query="SELECT start_ns,kernel_name,trace_args FROM Events WHERE kernel_name LIKE 'sample/%' ORDER BY start_ns",
+        )
         expected_labels = []
         for repetition in range(case["expected_samples_per_variant"]):
             order = list(case["variants"])
             expected_labels.extend(order if repetition % 2 == 0 else reversed(order))
-        actual_labels = [r["kernel_name"].removeprefix(f"sample/{name}/") for r in markers]
+        actual_labels = [
+            r["kernel_name"].removeprefix(f"sample/{name}/") for r in markers
+        ]
         if actual_labels != expected_labels:
             raise RuntimeError(f"{name}: sample marker order/count is incomplete")
         all_modules = outermost([r for r in events if r["category"] == "XLA Modules"])
@@ -175,7 +227,9 @@ def main():
         for device in sorted({r["device"] for r in all_modules}):
             ordered = [r for r in all_modules if r["device"] == device]
             if len(ordered) != len(expected_labels):
-                raise RuntimeError(f"{name}/{device}: incomplete module events: {len(ordered)} != {len(expected_labels)}")
+                raise RuntimeError(
+                    f"{name}/{device}: incomplete module events: {len(ordered)} != {len(expected_labels)}"
+                )
             for row, label in zip(ordered, expected_labels, strict=True):
                 module_by_label[label].append(row)
         records = {}
@@ -188,7 +242,9 @@ def main():
             for device in sorted({r["device"] for r in modules}):
                 module_rows = [r for r in modules if r["device"] == device]
                 samples = []
-                op_totals = defaultdict(lambda: {"count": 0, "self_us": 0.0, "inclusive_us": 0.0})
+                op_totals = defaultdict(
+                    lambda: {"count": 0, "self_us": 0.0, "inclusive_us": 0.0}
+                )
                 for index, row in enumerate(module_rows):
                     child = module_ops(events, row)
                     for op in child:
@@ -197,40 +253,77 @@ def main():
                         totals["count"] += 1
                         totals["self_us"] += (op["self_time_ns"] or 0) / 1000
                         totals["inclusive_us"] += (op["end_ns"] - op["start_ns"]) / 1000
-                    pallas = outermost([r for r in child if re.search(r"^%?kpool_(?:decode_store|compress_store)", r.get("hlo_op") or r["kernel_name"].split(" = ", 1)[0])])
+                    pallas = outermost(
+                        [
+                            r
+                            for r in child
+                            if re.search(
+                                r"^%?kpool_(?:decode_store|compress_store)",
+                                r.get("hlo_op") or r["kernel_name"].split(" = ", 1)[0],
+                            )
+                        ]
+                    )
                     sample = {
-                        "variant": label, "device": device, "index": index,
+                        "variant": label,
+                        "device": device,
+                        "index": index,
                         "observed_module": row["kernel_name"],
-                        "start_ns": row["start_ns"], "end_ns": row["end_ns"],
+                        "start_ns": row["start_ns"],
+                        "end_ns": row["end_ns"],
                         "module_us": (row["end_ns"] - row["start_ns"]) / 1000,
                         "pallas_us": union_ns(pallas) / 1000 if pallas else None,
                         "pallas_event_count": len(pallas),
-                        "pallas_names": sorted({r["hlo_op"] or r["kernel_name"] for r in pallas}),
+                        "pallas_names": sorted(
+                            {r["hlo_op"] or r["kernel_name"] for r in pallas}
+                        ),
                         "ops_union_us": union_ns(child) / 1000,
                     }
                     samples.append(sample)
                     sample_evidence.append(sample)
-                if label != "reference" and any(s["pallas_event_count"] != 1 for s in samples):
-                    raise RuntimeError(f"{name}/{label}/{device}: expected one outer Pallas event in every module")
+                if label != "reference" and any(
+                    s["pallas_event_count"] != 1 for s in samples
+                ):
+                    raise RuntimeError(
+                        f"{name}/{label}/{device}: expected one outer Pallas event in every module"
+                    )
                 records[label][device] = {
                     "module_us": distribution([s["module_us"] for s in samples]),
-                    "pallas_us": distribution([s["pallas_us"] for s in samples if s["pallas_us"] is not None]),
+                    "pallas_us": distribution(
+                        [s["pallas_us"] for s in samples if s["pallas_us"] is not None]
+                    ),
                     "ops_union_us": distribution([s["ops_union_us"] for s in samples]),
-                    "device_op_totals": dict(sorted(op_totals.items(), key=lambda item: -item[1]["self_us"])),
+                    "device_op_totals": dict(
+                        sorted(op_totals.items(), key=lambda item: -item[1]["self_us"])
+                    ),
                     "observed_modules": sorted({s["observed_module"] for s in samples}),
-                    "pallas_event_counts": sorted({s["pallas_event_count"] for s in samples}),
-                    "pallas_names": sorted({n for s in samples for n in s["pallas_names"]}),
+                    "pallas_event_counts": sorted(
+                        {s["pallas_event_count"] for s in samples}
+                    ),
+                    "pallas_names": sorted(
+                        {n for s in samples for n in s["pallas_names"]}
+                    ),
                     "expected_samples": case["expected_samples_per_variant"],
                     "complete": len(samples) == case["expected_samples_per_variant"],
                 }
             # XLA may deduplicate identical variants. Ask for the name that
             # the trace records, not a name erased by executable reuse.
-            observed = sorted({r["kernel_name"].removeprefix("HLO Module:") for r in modules})
+            observed = sorted(
+                {r["kernel_name"].removeprefix("HLO Module:") for r in modules}
+            )
             if len(observed) != 1:
-                raise RuntimeError(f"{name}/{label}: changing executable identity: {observed}")
+                raise RuntimeError(
+                    f"{name}/{label}: changing executable identity: {observed}"
+                )
             if label == "reference" and "_reference(" not in observed[0]:
-                raise RuntimeError(f"{name}: serialized attribution does not match reference module")
-            graphs[observed[0]] = run("get_graph_viewer", f"graph_{label}", module_name=observed[0], output_type="short_txt")
+                raise RuntimeError(
+                    f"{name}: serialized attribution does not match reference module"
+                )
+            graphs[observed[0]] = run(
+                "get_graph_viewer",
+                f"graph_{label}",
+                module_name=observed[0],
+                output_type="short_txt",
+            )
         hot_ops = []
         for op in tops.get("top_by_time", []):
             if op.get("category") == "IDLE":
@@ -241,22 +334,35 @@ def main():
             module, instruction = match.groups()
             graph = graphs.get(module)
             fusion, fused_with, fusion_note = fusion_context(graph, instruction)
-            hot_ops.append({
-                "trace_name": op["name"], "hlo_op": instruction,
-                "source": f"{op['source_file']}:{op['source_line']}" if op.get("source_file") else "empty in trace",
-                "per_call_us": op["total_self_time_ms"] * 1000 / op["occurrences"] if op.get("occurrences") else "N/A",
-                "fusion": fusion, "fused_with": fused_with,
-                "source_tool": "get_top_hlo_ops, get_graph_viewer",
-                "note": fusion_note + " Per-call is measured self-time divided by occurrences. XProf may merge identical executable variants in this op table; sample attribution uses serialized module order.",
-            })
+            hot_ops.append(
+                {
+                    "trace_name": op["name"],
+                    "hlo_op": instruction,
+                    "source": f"{op['source_file']}:{op['source_line']}"
+                    if op.get("source_file")
+                    else "empty in trace",
+                    "per_call_us": op["total_self_time_ms"] * 1000 / op["occurrences"]
+                    if op.get("occurrences")
+                    else "N/A",
+                    "fusion": fusion,
+                    "fused_with": fused_with,
+                    "source_tool": "get_top_hlo_ops, get_graph_viewer",
+                    "note": fusion_note
+                    + " Per-call is measured self-time divided by occurrences. XProf may merge identical executable variants in this op table; sample attribution uses serialized module order.",
+                }
+            )
             if len(hot_ops) == 15:
                 break
         (dest / "hot_ops.json").write_text(json.dumps(hot_ops, indent=2))
         (dest / "samples.json").write_text(json.dumps(sample_evidence, indent=2))
         case_summary = {
-            "case": name, "trace_path": str(source), "trace_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "session_id": source.parent.name, "coverage": coverage,
-            "variants": records, "hot_ops": hot_ops,
+            "case": name,
+            "trace_path": str(source),
+            "trace_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "session_id": source.parent.name,
+            "coverage": coverage,
+            "variants": records,
+            "hot_ops": hot_ops,
             "run_environment": overview.get("run_environment"),
             "read_duration_seconds": time.monotonic() - start_time,
             "tool_outputs": tool_outputs,
