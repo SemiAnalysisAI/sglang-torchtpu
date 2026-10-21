@@ -4,6 +4,28 @@
 produce speedup claims. Numerical accuracy and serving tests are separate
 validation gates.
 
+**Current status: the expanded Q/B matrix fails exact-byte validation.** Of the
+301 uniform shapes, only Q1/B32 decode and the 14 no-output prefill Q1/Q2 cases
+pass. The other 286 shapes differ from the frozen JAX reference. This candidate
+is not ready to replace the serving implementation. See the [full matrix](results/matrix.md),
+[timing CSV](results/matrix.csv), and [accuracy cases](results/accuracy.csv).
+
+The full 414-case exact-byte gate completed: 53 passed and 361 failed, with no
+runtime exceptions. Performance was measured first; this accuracy gate ran
+after all device timings were extracted. No kernel changes were made during
+the matrix run. Serving integration and end-to-end validation remain pending.
+
+| Mode | Measured shapes | Lower fused device p50 | Higher fused device p50 | Uniform exact-byte passes |
+|---|---:|---:|---:|---:|
+| Decode/verify | 224 | 223 | 1 | 1 |
+| Prefill | 77 | 43 | 34 | 14 (no closed pools) |
+
+These latency comparisons do not establish correctness. Q1/B32 decode has
+JAX/fused module p50 of 25.744/14.1905 us and passes the uniform byte gate.
+Q1/B64 is the only decode timing regression: 32.722/52.934 us. Prefill Q4/B16
+regresses from 37.9035 to 64.710 us. Full percentiles and each shape's validation
+status are in the linked tables. Each variant has 100 verified module events.
+
 The targeted benchmark uses 14,849 raw-cache pages, donated pooled-cache output,
 10 warmup calls, and 100 recorded calls per variant. It covers decode Q1/Q6 at
 B1/B32 and prefill T8192. Each case alternates variant order between rounds.
