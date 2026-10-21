@@ -5,10 +5,11 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+import torch
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -17,12 +18,12 @@ from sglang.srt.runtime_context import get_disagg
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.draft_worker_common import make_draft_block_spec_info
 from sglang_tpu._logging import get_logger
-from sglang_tpu.compilation.pending_call import PendingCall
 from sglang_tpu.compilation.recompilation_checker import (
     install_recompilation_checker,
 )
-from sglang_tpu.compilation.spec_decode_compile_policy_dflash import (
-    DFlashSpecDecodeCompilePolicyMixin,
+from sglang_tpu.dflash_utils_tpu import register_argmax_draft_top_k
+from sglang_tpu.experimental.compilation.spec_compile_policy import (
+    TpuSpecDecodeCompilePolicyMixin,
 )
 
 logger = get_logger(__name__)
@@ -36,26 +37,14 @@ def block_draft_width(model: DFlashDraftModel, num_verify_rows: int) -> int:
     return num_verify_rows
 
 
-class TpuBlockSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
-    """Target warms TARGET_VERIFY and EXTEND(FULL); the draft warms its block forward and KV writer.
+class TpuBlockSpecDecodeCompilePolicyMixin(TpuSpecDecodeCompilePolicyMixin):
+    """The draft warms its block forward and KV writer.
 
     DFlash and DSpark drafts share the spec inputs and K/V layout, so the target
     verify grid and the draft KV writer carry over. The target scores
     [r, d_1..d_gamma] (draft_token_num = gamma + 1 rows); the draft forwards
     [r, m, ..., m] (draft_block_width rows) and never runs EXTEND.
     """
-
-    @property
-    def algo_label(self) -> str:
-        return self.model_runner.spec_algorithm.name
-
-    # TpuSpecWorker never sends the target DECODE (decode is TARGET_VERIFY) or a
-    # capture-NULL EXTEND (extend always captures hidden for the draft KV).
-    def _precompile_decode(self) -> list[PendingCall]:
-        return []
-
-    def _precompile_extend(self) -> list[PendingCall]:
-        return []
 
     @property
     def draft_block_width(self) -> int:
@@ -71,32 +60,11 @@ class TpuBlockSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
             draft_token_num=width, device=self.model_runner.device
         )
 
-    def _make_dummy_forward_batch(
-        self,
-        num_tokens: int,
-        bs: int,
-        mode: ForwardMode,
-        *,
-        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-        spec_info: DFlashVerifyInput | None = None,
-    ) -> ForwardBatch:
-        batch = super()._make_dummy_forward_batch(
-            num_tokens=num_tokens,
-            bs=bs,
-            mode=mode,
-            capture_hidden_mode=capture_hidden_mode,
-            spec_info=spec_info,
-        )
-        # The draft embeds input_ids in-graph with the attached embedding.
-        if self.is_draft_worker:
-            batch.input_embeds = None
-        return batch
-
     def precompile_draft(
         self,
         draft_attn_backend: AttentionBackend,
         *,
-        kv_writer: Callable[..., None],
+        kv_writer: Callable[..., torch.Tensor],
     ) -> None:
         """Compile the draft block forward and the draft KV writer."""
         if not self.is_draft_worker:
@@ -125,6 +93,9 @@ class TpuBlockSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
     def _precompile_draft_block(self, draft_attn_backend: AttentionBackend) -> None:
         assert self.b_bucketer is not None
         width = self.draft_block_width
+        lm_head = self.model_runner.model.lm_head
+        if lm_head is not None:
+            register_argmax_draft_top_k(lm_head)
         shapes = [(bs, bs * width) for bs in self.b_bucketer.buckets]
         logger.info(
             "[spec compile policy] %s DRAFT BLOCK: %d shapes (bs=%s, width=%d)",

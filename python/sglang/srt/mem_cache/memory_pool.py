@@ -1538,11 +1538,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req_pool_size, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
+            # Kept with the slot IDs: set_mamba_track_indices_from_reqs reads it
+            # only when they live on the device, so a host allocator needs no
+            # per-request device writes.
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int64,
-                    device=self.device,
+                    device=self.mamba_pool.slot_allocator_device,
                 )
             )
 
@@ -1640,7 +1643,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                self.device
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping.device
             )
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
@@ -1806,8 +1809,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
         req.kv.mamba_ping_pong_track_buffer[idx] = value
-        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
-            req.kv.mamba_ping_pong_track_buffer.to(self.device)
+        mapping = self.req_index_to_mamba_ping_pong_track_buffer_mapping
+        mapping[req.kv.req_pool_idx] = req.kv.mamba_ping_pong_track_buffer.to(
+            mapping.device
         )
 
     def donate_mamba_ping_pong_slot(
@@ -4440,10 +4444,11 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
-        if self.use_mla and _is_npu and layer_ids:
-            data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
-        return layer_ids if self.use_mla else layer_ids * 2
+        if not layer_ids:
+            return []
+        # One id per registered buffer: K and V for MHA, one for MLA or a fused K+V pool.
+        data_ptrs, _, _ = self.get_contiguous_buf_infos()
+        return layer_ids * (len(data_ptrs) // len(layer_ids))
 
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (

@@ -436,6 +436,18 @@ class _HybridReqPool(HybridReqToTokenPool):
         self.mamba_pool = mamba_pool
 
 
+def _linear_attention() -> RadixLinearAttention:
+    return RadixLinearAttention(
+        layer_id=0,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_q_dim=1,
+        head_k_dim=1,
+        head_v_dim=1,
+    )
+
+
 def _gdn_metadata(fill: int) -> GdnTracedMetadata:
     def tensor():
         return torch.full((2,), fill, dtype=torch.int32)
@@ -546,6 +558,7 @@ class TestHybridLinearDirectCompile(CustomTestCase):
         full_kv_pool = _FullKVPool(num_layers)
         mamba_pool = _cpu_mamba_pool(num_layers)
         model_runner = _model_runner()
+        model_runner.model.gdn = _linear_attention()
         model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
         model_runner.req_to_token_pool = _HybridReqPool(mamba_pool)
         policy = DecoderTpuCompilePolicy(
@@ -572,6 +585,22 @@ class TestHybridLinearDirectCompile(CustomTestCase):
             [id(t) for t in mamba_pool.get_state()],
             [id(t) for t in replacement[num_full:]],
         )
+
+    def test_kv_pool_without_linear_layers_leaves_linear_state_out(self):
+        """An MTP draft shares the target's hybrid pools but runs no GDN layer.
+
+        Lifting the GDN state would copy_ fresh buffers into it on every draft
+        forward, so Raiden P/D would move rows of the stale registered buffers.
+        """
+        full_kv_pool = _FullKVPool(2)
+        model_runner = _model_runner()
+        model_runner.token_to_kv_pool = _HybridKVPool(full_kv_pool)
+        model_runner.req_to_token_pool = _HybridReqPool(_cpu_mamba_pool(2))
+        policy = DecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+
+        self.assertIs(policy.get_direct_compile_kv_pool(), full_kv_pool)
 
     def test_trace_derives_conv_weights_from_the_traced_conv1d_weight(self):
         """RadixLinearAttention keeps conv_weights as a view of conv1d.weight.
@@ -1426,6 +1455,42 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
 
         self.assertEqual(result["hidden_states"].shape, (5, 4))
         self.assertEqual(result["residual"].shape, (5, 4))
+
+    def test_spec_full_capture_extend_warms_text_ids(self):
+        """A speculative multimodal target still serves text-only prefills.
+
+        Those take the positional token-ID call with FULL capture. Warming only
+        the input_embeds variant let the server's image warmup request freeze
+        compilation first, so the first text prefill tripped fail_on_recompile.
+        """
+
+        class _SpecQwenPolicy(
+            Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
+            pass
+
+        policy = object.__new__(_SpecQwenPolicy)
+        policy.model_runner = SimpleNamespace(model=SimpleNamespace())
+        policy.owner = policy.model_runner.model
+        policy.t_bucketer = SimpleNamespace(buckets=(1024,))
+        policy.b_bucketer = SimpleNamespace(buckets=(1,))
+        policy._extend_compile_cap = lambda: 1
+        policy._uses_input_embeds = lambda target: True
+        policy.make_null_spec_info = MagicMock()
+        policy._run_one = MagicMock(return_value=None)
+
+        with patch(
+            "sglang_tpu.compilation.spec_decode_compile_policy.get_parallel",
+            return_value=SimpleNamespace(tp_rank=1),
+        ):
+            policy._precompile_extend_full()
+
+        warmed = {
+            (call.kwargs["variant"], call.kwargs["capture_hidden_mode"])
+            for call in policy._run_one.call_args_list
+        }
+        self.assertIn(("text_ids", CaptureHiddenMode.FULL), warmed)
+        self.assertIn(("text_only", CaptureHiddenMode.FULL), warmed)
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
         class _SpecQwenPolicy(
@@ -3007,11 +3072,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with get_parallel().override(
@@ -3032,6 +3101,10 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
         self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
+        self.assertEqual(
+            worker.prepare_draft_block_fused, policy._prepare_draft_block_fused
+        )
+        self.assertEqual(mock_draft_block.call_count, 2)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -3226,11 +3299,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
@@ -3254,6 +3331,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mock_append_kernel.call_count, 2)
         # Block embed warmup is not mode-gated: one call per bs bucket.
         self.assertEqual(mock_block_embedder.call_count, 2)
+        # A prefill-only engine never builds a draft block.
+        self.assertEqual(mock_draft_block.call_count, 0)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -3263,11 +3342,15 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         policy._compiled_kv_appender = mock_append_kernel
         mock_block_embedder = MagicMock()
         policy._compiled_block_embedder = mock_block_embedder
+        mock_draft_block = MagicMock()
+        policy._compiled_draft_block = mock_draft_block
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
             embed_draft_block_ids=MagicMock(),
+            _full_embed_gpu=None,
+            _block_pos_offsets=torch.arange(4),
         )
 
         with (
@@ -3289,6 +3372,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
         self.assertEqual(mock_block_embedder.call_count, 2)
+        self.assertEqual(mock_draft_block.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2

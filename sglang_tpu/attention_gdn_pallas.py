@@ -30,6 +30,7 @@ Sibling to :mod:`sglang_tpu.attention_pallas_rpa_v3`
 # reject them.
 
 import logging
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -40,7 +41,8 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang_tpu.mamba_pool import AT_SLOT
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -64,13 +66,12 @@ def build_gdn_pallas_op():
             seq_lens, n_kq, n_v, d_k, d_v, kernel_size, kda=False,
             gate_lower_bound=None, batched_only=False, prefill_only=False,
             fused_qkvg=False, packed_weights=None, track_indices=None,
-            track_end=None, read_offsets=None, num_spec_tokens=0,
-            spec_window=1) -> output
+            track_end=None, read_offsets=None, num_spec_tokens=0) -> output
 
-    With ``spec_window > 1`` the state pool holds ``spec_window`` checkpoint
-    rows per slot: ``state_indices`` (and ``track_indices``) are slot ids,
-    ``read_offsets`` is the pool's whole per-slot offset table, and the row
-    arithmetic is traced into the graph.
+    ``state_indices`` and ``track_indices`` are state rows. A verify window
+    (``num_spec_tokens > 0``) reads row ``state_indices + read_offsets`` and
+    writes its checkpoints from ``state_indices``; the backend maps slots and
+    request windows to rows.
 
     ``conv_state`` and ``recurrent_state`` are updated in place (declared as
     ``mutates_args``); the returned tensor is the fused attention output of
@@ -131,7 +132,6 @@ def build_gdn_pallas_op():
         track_end: Optional[jax.Array] = None,
         read_offsets: Optional[jax.Array] = None,
         num_spec_tokens: int = 0,
-        spec_window: int = 1,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         conv_dim = n_kq * d_k * 2 + n_v * d_v
         if fused_qkvg:
@@ -147,12 +147,6 @@ def build_gdn_pallas_op():
         # The DP-attention pad sentinel -1 is not a skip for this kernel; slot 0
         # is the reserved null block. Clamped here, not as a per-forward launch.
         state_indices = jax.numpy.maximum(state_indices, 0)
-        if spec_window > 1:
-            if num_spec_tokens > 0:
-                read_offsets = read_offsets[state_indices]
-            state_indices = state_indices * spec_window
-            if track_indices is not None:
-                track_indices = track_indices * spec_window
         # The GDN kernel sizes its tiling from `pltpu.get_tpu_info().num_lanes`
         # (gdn/wrapper.py), but distributed Pallas programs are exported through
         # a logical CPU mesh, so at trace time JAX reports device_kind="cpu" and
@@ -206,8 +200,8 @@ def build_gdn_pallas_op():
         _wrapped,
         name=f"jax_{op_name}",
         # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound, batched_only,
-        # prefill_only, fused_qkvg, num_spec_tokens and spec_window are static.
-        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28),
+        # prefill_only, fused_qkvg and num_spec_tokens are static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -247,7 +241,6 @@ def build_gdn_pallas_op():
         track_end: Optional[torch.Tensor] = None,
         read_offsets: Optional[torch.Tensor] = None,
         num_spec_tokens: int = 0,
-        spec_window: int = 1,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -293,7 +286,6 @@ def build_gdn_pallas_op():
             prefill_only,
             fused_qkvg,
             num_spec_tokens,
-            spec_window,
         )
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
@@ -325,7 +317,6 @@ def build_gdn_pallas_op():
                 track_end,
                 read_offsets,
                 num_spec_tokens,
-                spec_window,
             )
         else:
             with (
@@ -361,7 +352,6 @@ def build_gdn_pallas_op():
                     track_end,
                     read_offsets,
                     num_spec_tokens,
-                    spec_window,
                 )
             _exported_shapes.add(key)
         return output
@@ -395,7 +385,6 @@ def build_gdn_pallas_op():
         track_end: Optional[torch.Tensor] = None,
         read_offsets: Optional[torch.Tensor] = None,
         num_spec_tokens: int = 0,
-        spec_window: int = 1,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
         return qkv.new_empty((num_tokens, n_v, d_v))
@@ -416,6 +405,8 @@ class GdnTracedMetadata(NamedTuple):
     track_indices: Optional[torch.Tensor]
     track_end: Optional[torch.Tensor]
     read_offsets: Optional[torch.Tensor]
+    # A verify's request pool rows, which select its checkpoint windows.
+    req_pool_indices: Optional[torch.Tensor] = None
 
 
 class TpuGDNAttnBackend(MambaAttnBackendBase):
@@ -441,13 +432,16 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # the heavyweight export does not happen inside a torch.compile trace.
         self._op = build_gdn_pallas_op()
         self._extra_buffer_enabled = get_exec().mamba.enable_mamba_extra_buffer
-        if (
-            self._extra_buffer_enabled
-            and self.req_to_token_pool.mamba_pool.checkpoint_width > 1
-        ):
-            raise NotImplementedError(
-                "TPU GDN speculative prefix caching is unsupported"
-            )
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        if mamba_pool.checkpoint_width > 1:
+            # Verify windows are indexed by request pool row; a larger request
+            # pool would write other requests' windows.
+            num_req_rows = self.req_to_token_pool.req_to_token.shape[0]
+            if num_req_rows > mamba_pool.spec_state_size + 1:
+                raise ValueError(
+                    f"TPU GDN checkpoint windows cover {mamba_pool.spec_state_size + 1} "
+                    f"request rows, but the request pool has {num_req_rows}."
+                )
         if self._extra_buffer_enabled:
             self.req_to_token_pool.mamba_pool.warmup_state_copy(
                 self.req_to_token_pool.size
@@ -469,11 +463,49 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._spec_window = mamba_pool.checkpoint_width
         self._read_offsets_pool = mamba_pool.checkpoint_read_offsets
         self._read_offsets: Optional[torch.Tensor] = None
+        self._req_pool_indices: Optional[torch.Tensor] = None
         self._num_spec_tokens = 0
         # Cache the (shape-static) distribution vector across forwards, keyed by
         # (is_decode, bs, device) — same rationale as RPA v3's distribution cache.
         self._distribution_cache: dict = {}
         self._query_start_loc_cache: dict = {}
+        self._slot_memo: Optional[tuple] = None
+
+    def _slot_indices(
+        self, req_pool_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(int64 slot ids, int32 slot ids) of the batch's requests.
+
+        An unchanged batch reuses the last result: the gather and the cast are
+        two launches per round otherwise. Valid only while every write to the
+        request-to-slot table is an eager in-place op (it is written when a
+        request is allocated), which bumps ``_version``; a write from inside a
+        compiled graph would not, and must clear ``_slot_memo``.
+        """
+        pool = self.req_to_token_pool
+        table = pool.req_index_to_mamba_index_mapping
+        memo = self._slot_memo
+        if (
+            memo is not None
+            and memo[0]() is req_pool_indices
+            and memo[1] == req_pool_indices._version
+            and memo[2] == table._version
+        ):
+            return memo[3], memo[4]
+        slots = self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices))
+        slots_i32 = slots.to(torch.int32)
+        # int64 for the verify commit's index_copy_ (the table itself is int32).
+        if slots.dtype != torch.int64:
+            slots = slots.long()
+        if pool.mamba_v2p_table is None:
+            self._slot_memo = (
+                weakref.ref(req_pool_indices),
+                req_pool_indices._version,
+                table._version,
+                slots,
+                slots_i32,
+            )
+        return slots, slots_i32
 
     def _warmup_slot_bookkeeping(self) -> None:
         """Slot allocation's mapping write and clear_slots, once per new-request count."""
@@ -489,6 +521,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 )
                 pool.mamba_pool.clear_slots(slots)
             mapping[0:1].cpu()
+            if get_disagg().disaggregation_mode != "null":
+                # The P/D state payload reads one row by Python int, a constant
+                # baked into each program, so every row is a separate program.
+                for row in range(mapping.shape[0]):
+                    mapping[row].cpu()
 
     def _uniform_query_start_loc(
         self, padded_bs: int, step: int, device: torch.device
@@ -544,10 +581,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # tracked-row selections and reads device masks on the host. Here every
         # row retains its bucket slot and disabled snapshots use end=-1.
         # Slot ids; the op clamps the -1 pad in-graph (see build_gdn_pallas_op).
-        slots = self._translate_mamba_indices(
-            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-        )
-        self._state_indices = slots.to(torch.int32)
+        slots, self._state_indices = self._slot_indices(forward_batch.req_pool_indices)
         padded_bs = forward_batch.seq_lens.shape[0]
         if is_decode:
             # One token per request, or the verify window per request.
@@ -579,7 +613,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
                 ends = self._query_start_loc[:-1] + lengths.to(torch.int32)
             valid = mask & (torch.arange(padded_bs, device=device) < bs)
             self._track_end = torch.where(valid, ends, -1).to(torch.int32)
-        elif self._extra_buffer_enabled:
+        elif self._extra_buffer_enabled and not is_verify:
+            # Verify snapshots are taken after acceptance (commit_verified_states).
             # Warmup batches carry no tracking plan. Keep the same optional
             # tensor signature as live requests to precompile the cache path.
             self._track_indices = torch.zeros_like(self._state_indices)
@@ -593,6 +628,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
 
     def _init_spec_metadata(self, forward_batch: "ForwardBatch") -> None:
         self._read_offsets = None
+        self._req_pool_indices = None
         self._num_spec_tokens = 0
         if self._spec_window == 1:
             return
@@ -602,12 +638,28 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             # width (adaptive spec) would read and commit the wrong rows.
             assert forward_batch.spec_info.num_tokens_per_req == self._spec_window
             self._read_offsets = self._read_offsets_pool
+            self._req_pool_indices = forward_batch.req_pool_indices
             self._num_spec_tokens = self._spec_window - 1
         elif mode.is_extend():
-            # Extend writes its final state to checkpoint row 0 of the group.
+            # Extend reads and writes the slot row, so that row is committed.
             self._read_offsets_pool.index_fill_(
-                0, self._state_indices.clamp(min=0).long(), 0
+                0, self._state_indices.clamp(min=0).long(), AT_SLOT
             )
+
+    def _state_rows(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """(base state rows, per-sequence read offsets) the kernel addresses.
+
+        A verify writes its checkpoints into the request's window and reads the
+        committed state: the slot row for AT_SLOT, else a window row.
+        """
+        if self._read_offsets is None:
+            return self._state_indices, None
+        slots = self._state_indices.clamp(min=0)
+        bases = self.req_to_token_pool.mamba_pool.window_bases(
+            self._req_pool_indices
+        ).to(torch.int32)
+        offsets = self._read_offsets.index_select(0, slots.to(torch.int64))
+        return bases, torch.where(offsets < 0, slots - bases, offsets)
 
     def traced_metadata(self) -> GdnTracedMetadata:
         return GdnTracedMetadata(
@@ -618,6 +670,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             track_indices=self._track_indices,
             track_end=self._track_end,
             read_offsets=self._read_offsets,
+            req_pool_indices=self._req_pool_indices,
         )
 
     @contextmanager
@@ -638,6 +691,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         self._track_indices = metadata.track_indices
         self._track_end = metadata.track_end
         self._read_offsets = metadata.read_offsets
+        self._req_pool_indices = metadata.req_pool_indices
 
     def commit_verified_states(
         self,
@@ -648,14 +702,25 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         mamba_steps_to_track: Optional[torch.Tensor],
         src_indices_raw: Optional[torch.Tensor],
     ) -> None:
-        """Point each verified slot's next read at its last accepted checkpoint."""
-        if mamba_track_indices is not None:
-            raise NotImplementedError(
-                "TPU GDN/KDA speculative decoding does not support the radix "
-                "prefix cache."
-            )
-        self.req_to_token_pool.mamba_pool.select_checkpoints(
+        """Point each verified slot's next read at its last accepted checkpoint,
+        and snapshot boundary checkpoints into radix track slots."""
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_pool.select_checkpoints(
             state_indices_tensor.clamp(min=0), last_correct_step_indices
+        )
+        if mamba_track_indices is None:
+            return
+        # As core's PLE commit, the caller resolves the boundary steps.
+        assert mamba_steps_to_track is not None
+        num_rows = last_correct_step_indices.shape[0]
+        # Track ids come per live request; pad on host so device shapes stay bucketed.
+        track_slots = mamba_track_indices.to(torch.int32)
+        if track_slots.shape[0] < num_rows:
+            track_slots = torch.nn.functional.pad(
+                track_slots, (0, num_rows - track_slots.shape[0]), value=-1
+            )
+        mamba_pool.snapshot_checkpoints(
+            track_slots, self._req_pool_indices, mamba_steps_to_track
         )
 
     def _run(
@@ -669,7 +734,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         conv_state = layer_cache.conv[0]  # [size+1, K-1, 1, dim]
         recurrent_state = layer_cache.temporal  # [size+1, n_v, d_k, d_v]
 
-        state_indices = self._state_indices
+        state_rows, read_offsets = self._state_rows()
         query_start_loc = self._query_start_loc
 
         # RadixLinearAttention stores conv weight as [dim, K]; the kernel wants
@@ -691,7 +756,7 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             layer.A_log,
             layer.dt_bias,
             query_start_loc,
-            state_indices,
+            state_rows,
             self._distribution,
             self._seq_lens,
             layer.num_k_heads,
@@ -703,9 +768,8 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
             prefill_only=not self._is_decode,
             track_indices=self._track_indices,
             track_end=self._track_end,
-            read_offsets=self._read_offsets,
+            read_offsets=read_offsets,
             num_spec_tokens=self._num_spec_tokens,
-            spec_window=self._spec_window,
         )
         # Per-head [num_tokens, n_v, d_v], as the model's output-gate norm expects.
         return out

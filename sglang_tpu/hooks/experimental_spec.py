@@ -2,6 +2,11 @@
 
 Why: filter/merge and H2D staging must be intercepted before device operations,
 not repaired afterward. All non-experimental calls delegate unchanged.
+kimi_spec_defaults: core refuses speculation for Kimi hybrid (KDA) targets on
+TPU and otherwise pins GPU verify/draft backends; the experimental worker
+serves DSPARK on the TPU KDA checkpoint verify, so it skips both.
+materialize_future_map: the live FutureMap's lazy torch.empty buffers would fuse
+into their first store, compiling at whatever shape the first batch has.
 Upstream seam issue: not filed (local prototype). Before proposing upstream,
 replace these hooks with agreed factories/overrides for the extracted operations.
 Remove when: the experiment is removed or those upstream seams are available.
@@ -9,23 +14,33 @@ Remove when: the experiment is removed or those upstream seams are available.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
+from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
     get_host_batch_padder,
+    is_experimental_chain,
     is_experimental_spec,
     uses_host_batch,
 )
+from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
 
 def initialize_host_batch(result, *args, **kwargs):
-    if is_experimental_spec(result.spec_algorithm):
+    # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
+    padder = get_host_batch_padder()
+    if padder is not None:
         if not result.enable_overlap:
             raise ValueError(
                 "The experimental TPU spec worker requires overlap scheduling"
             )
-        result.host_pad_bs = get_host_batch_padder()
+        result.host_pad_bs = padder
     return result
 
 
@@ -108,27 +123,113 @@ def prepare_spec_decode(original, batch):
     batch.spec_info.prepare_for_decode(batch)
 
 
-def build_disagg_eagle_input(original, batch, last_tokens_tensor, future_map):
-    # Core builds and relays the PD seed; the experimental worker reads it back
-    # through its own input type.
-    spec_info = original(batch, last_tokens_tensor, future_map)
+SeedBuilder = Callable[[ScheduleBatch, torch.Tensor, FutureMap], SpecInput]
+
+
+def build_disagg_eagle_input(
+    original: SeedBuilder,
+    batch: ScheduleBatch,
+    last_tokens_tensor: torch.Tensor,
+    future_map: FutureMap,
+) -> SpecInput:
+    # Core stacks the seed on device at the live bs, one compile per bs. The chain
+    # worker (MTP, EAGLE3) keeps the draft hidden in its carry table instead.
     if not uses_host_batch(batch):
-        return spec_info
-    from sglang_tpu.experimental.speculative.eagle_info import (
-        HostPaddedEagleDraftInput,
+        return original(batch, last_tokens_tensor, future_map)
+    from sglang_tpu.experimental import get_pd_carry_seeder
+    from sglang_tpu.experimental.speculative.chain_info import (
+        HostPaddedChainDraftInput,
     )
 
-    if spec_info.dsa_topk_indices is not None:
-        raise NotImplementedError("TpuEagle3Worker does not support DSA PD seeds.")
-    draft_input = HostPaddedEagleDraftInput(
-        bonus_tokens=spec_info.bonus_tokens,
-        new_seq_lens=batch.seq_lens.to(torch.int64),
-        topk_p=spec_info.topk_p,
-        topk_index=spec_info.topk_index,
-        hidden_states=spec_info.hidden_states,
+    assert is_experimental_chain(batch.spec_algorithm), batch.spec_algorithm
+    if any(req.output_dsa_topk_indices is not None for req in batch.reqs):
+        raise NotImplementedError("TpuChainSpecWorker does not support DSA PD seeds.")
+    get_pd_carry_seeder()(
+        batch.req_pool_indices_cpu,
+        torch.stack([req.hidden_states_tensor for req in batch.reqs]),
     )
-    draft_input.future_indices = spec_info.future_indices
+    draft_input = HostPaddedChainDraftInput(
+        bonus_tokens=last_tokens_tensor,
+        new_seq_lens=batch.seq_lens.to(torch.int64),
+    )
+    return _relay_disagg_seed(batch, draft_input, future_map)
+
+
+def build_disagg_block_input(
+    original: SeedBuilder,
+    batch: ScheduleBatch,
+    last_tokens_tensor: torch.Tensor,
+    future_map: FutureMap,
+) -> SpecInput:
+    # DFlash/DSpark seed only the bonus token; the draft context KV arrives with
+    # the PD transfer of the draft pool.
+    if not uses_host_batch(batch):
+        return original(batch, last_tokens_tensor, future_map)
+    from sglang_tpu.experimental.speculative.block_info import (
+        HostPaddedBlockDraftInput,
+    )
+
+    draft_input = HostPaddedBlockDraftInput(
+        bonus_tokens=last_tokens_tensor,
+        new_seq_lens=batch.seq_lens.to(torch.int64),
+    )
+    return _relay_disagg_seed(batch, draft_input, future_map)
+
+
+def _relay_disagg_seed(
+    batch: ScheduleBatch, draft_input: HostPaddedDraftInput, future_map: FutureMap
+) -> HostPaddedDraftInput:
+    """Publish and stash the seed by pool row, as core's PD seed builders do."""
+    from sglang.srt.managers.overlap_utils import RelayPayload
+
+    assert batch.enable_overlap
+    _reset_pd_checkpoints(batch)
+    draft_input.future_indices = batch.req_pool_indices
+    future_map.publish(draft_input.future_indices, batch.seq_lens)
+    future_map.stash(
+        draft_input.future_indices, RelayPayload.from_draft_input(draft_input)
+    )
     return draft_input
+
+
+def _reset_pd_checkpoints(batch: ScheduleBatch) -> None:
+    # The transferred GDN state lands in each slot's own row, but a reused decode
+    # slot keeps its previous read offset; prebuilt skips extend's reset.
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang_tpu.mamba_pool import TpuMambaPool
+
+    pool = batch.req_to_token_pool
+    if not isinstance(pool, HybridReqToTokenPool):
+        return
+    mamba_pool = pool.mamba_pool
+    assert isinstance(mamba_pool, TpuMambaPool), type(mamba_pool)
+    if mamba_pool.checkpoint_read_offsets is not None:
+        mamba_pool.clear_slots(
+            torch.stack([req.kv.mamba_pool_idx.reshape(()) for req in batch.reqs])
+        )
+
+
+def materialize_future_map(
+    result: FutureMap, algorithm: SpeculativeAlgorithm, *args, **kwargs
+) -> FutureMap:
+    # A torch.empty buffer stays lazy and fuses into its first store, one program
+    # per first-batch shape; an uploaded buffer is concrete.
+    if algorithm.is_none():
+        return result
+    from sglang_tpu.compilation.recompilation_checker import (
+        snapshot_recompilation_baseline,
+    )
+
+    result.output_tokens_buf = _uploaded_zeros_like(result.output_tokens_buf)
+    result.new_seq_lens_buf = _uploaded_zeros_like(result.new_seq_lens_buf)
+    # The map is built after the scheduler's warmup baseline.
+    torch.accelerator.synchronize()
+    snapshot_recompilation_baseline()
+    return result
+
+
+def _uploaded_zeros_like(buf: torch.Tensor) -> torch.Tensor:
+    return torch.zeros(buf.shape, dtype=buf.dtype).to(buf.device)
 
 
 def stage_prefill_tokens(original, batch):
@@ -222,11 +323,57 @@ def sample_dflash2_draft_tokens(original, model, hidden_states, input_ids):
     return sample(model, hidden_states, input_ids)
 
 
+def supports_kv_free_fence(original, spec_algorithm, *, copies_draft_tail):
+    if is_experimental_spec(spec_algorithm):
+        # commit writes draft KV after the accept tensors the result copies;
+        # the copied draft tail (kv_fence_tail) is an output of that write.
+        return copies_draft_tail
+    return original(spec_algorithm, copies_draft_tail=copies_draft_tail)
+
+
+def need_topk(original, spec_algorithm):
+    # HostPaddedDraftInput carries an empty topk placeholder; an EAGLE topk relay
+    # would route it through the EAGLE device-accept resolve.
+    if is_experimental_chain(spec_algorithm):
+        return False
+    return original(spec_algorithm)
+
+
+def supports_tpu_direct_compile(original, spec_algorithm):
+    # The chain worker's fused draft and draft rows are direct-compiled.
+    if is_experimental_chain(spec_algorithm):
+        return True
+    return original(spec_algorithm)
+
+
+def spec_need_hidden_states(original):
+    # The chain carry lives in a req-pool-indexed device table, never in FutureMap.
+    algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    if is_experimental_chain(algorithm):
+        return False
+    return original()
+
+
+def kimi_spec_defaults(original, server_args):
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang_tpu.experimental import experimental_spec_enabled
+
+    cfg = resolving_view(server_args)
+    if cfg.speculative_algorithm == "DSPARK" and experimental_spec_enabled():
+        return None
+    return original(server_args)
+
+
 def hook_specs():
     from sglang.srt.plugins.hook_registry import HookType
 
     schedule = "sglang.srt.managers.schedule_batch.ScheduleBatch."
     hooks = [
+        (
+            "sglang.srt.arg_groups.kimi_k3_hook.apply_kimi_k3_spec_backend_defaults",
+            kimi_spec_defaults,
+            HookType.AROUND,
+        ),
         (
             "sglang.srt.models.dspark.DSparkDraftModel.sample_draft_tokens_tpu",
             sample_draft_tokens,
@@ -235,6 +382,26 @@ def hook_specs():
         (
             "sglang.srt.models.dflash.DFlash2DraftModel.sample_draft_tokens_tpu",
             sample_dflash2_draft_tokens,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            spec_need_hidden_states,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.need_topk",
+            need_topk,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_kv_free_fence",
+            supports_kv_free_fence,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.supports_tpu_direct_compile",
+            supports_tpu_direct_compile,
             HookType.AROUND,
         ),
         (schedule + "init_new", initialize_host_batch, HookType.AFTER),
@@ -274,9 +441,27 @@ def hook_specs():
                 HookType.AROUND,
             ),
             (
+                "sglang.srt.speculative.spec_info.SpeculativeAlgorithm."
+                "create_future_map",
+                materialize_future_map,
+                HookType.AFTER,
+            ),
+            (
                 "sglang.srt.speculative.eagle_disaggregation."
                 "build_eagle_disagg_draft_input",
                 build_disagg_eagle_input,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.speculative.dflash_disaggregation."
+                "build_dflash_disagg_draft_input",
+                build_disagg_block_input,
+                HookType.AROUND,
+            ),
+            (
+                "sglang.srt.speculative.dspark_disaggregation."
+                "build_dspark_disagg_draft_input",
+                build_disagg_block_input,
                 HookType.AROUND,
             ),
             (

@@ -37,6 +37,19 @@ class SpecState(NamedTuple):
     draft_carry: Any = None
 
 
+class CommitResult(NamedTuple):
+    """commit's output.
+
+    Attributes:
+      state: The advanced SpecState.
+      kv_fence_tail: A small device tensor computed after the step's last KV
+        write; the TPU KV free fence's result copy waits on it.
+    """
+
+    state: SpecState
+    kv_fence_tail: torch.Tensor
+
+
 def map_carry(carry: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
     """Apply fn to every row-aligned tensor of a draft_carry NamedTuple."""
     # A list, not a generator: Dynamo cannot reconstruct a generator in pad_state_rows.
@@ -130,6 +143,9 @@ class AcceptResult(NamedTuple):
       window_tokens: flat [pbs * (N + 1)] accept_tokens with 0 for -1, for a
         commit that rewrites the whole verify window (EAGLE3 draft extend).
       window_seq_lens: [pbs] seq_lens + N + 1, the length once that window is written.
+      live_mask: [pbs] bool, False on padded rows.
+      last_steps: [pbs] int64 accept_lens - 1, the verify step each row's
+        linear-attention state commits (-1 on padded rows).
     """
 
     num_correct_drafts: torch.Tensor
@@ -139,17 +155,20 @@ class AcceptResult(NamedTuple):
     next_seq_lens: torch.Tensor
     window_tokens: torch.Tensor
     window_seq_lens: torch.Tensor
+    live_mask: torch.Tensor
+    last_steps: torch.Tensor
 
 
 class DraftBlockInputs(NamedTuple):
-    """Device fields of a block-parallel draft forward over [r, m, ..., m], [pbs] rows.
+    """Device fields of a draft forward over width verify rows, [pbs] rows.
 
     Attributes:
-      input_ids: [pbs * width] root token then mask tokens.
+      input_ids: [pbs * width] tokens of the block.
       positions: [pbs * width] int64.
       cache_locs: [pbs * width] int64 KV slots.
-      seq_lens: [pbs] post-block lengths, 0 on padded rows.
-      extend_prefix_lens: [pbs] int32 pre-block lengths.
+      seq_lens: [pbs] length handed to the forward, 0 on padded rows: post-block
+        for the block drafter, pre-row for the chain drafter (RPA adds the width).
+      extend_prefix_lens: [pbs] int32 pre-block lengths, 0 on padded rows.
       extend_seq_lens: [pbs] int32, width on live rows and 0 on padded rows.
     """
 
