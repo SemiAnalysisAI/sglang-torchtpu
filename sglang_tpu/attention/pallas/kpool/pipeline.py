@@ -26,21 +26,6 @@ class ShortQueryPipeline:
         group_size = self.group_size
         desc_ref, raw_buf, out_buf = io.desc, io.raw_buffer, io.output_buffer
 
-        def _start_old(i, slot):
-            @pl.when(io.needs_old(i))
-            def _preserve():
-                io.read_old(i, slot).start()
-
-            @pl.when(~io.needs_old(i))
-            def _overwrite():
-                # Initialize the merge input without reading the old HBM quad.
-                out_buf[slot] = jnp.zeros((1, 256), jnp.uint32)
-
-        def _await_old(i, slot):
-            @pl.when(io.needs_old(i))
-            def _preserve():
-                io.read_old(i, slot).wait()
-
         @pl.loop(0, desc_ref.shape[1] // group_size)
         def _group(group):
             begin = group * group_size
@@ -54,11 +39,11 @@ class ShortQueryPipeline:
                     @pl.when(desc_ref[6, i] != 0)
                     def _live():
                         io.read(i, slot).start()
-                        _start_old(i, slot)
+                        io.read_old(i, slot).start()
                         io.read(i, slot).wait()
                         packed = pack_pools(pool_rows(raw_buf[slot], ape_ref[...]))
                         mask = mask_ref[pl.ds(i, 1), :]
-                        _await_old(i, slot)
+                        io.read_old(i, slot).wait()
                         out_buf[slot] = (out_buf[slot] & ~mask) | (packed & mask)
                         io.write(i, slot).start()
                         io.write(i, slot).wait()
@@ -72,7 +57,7 @@ class ShortQueryPipeline:
                     @pl.when(desc_ref[6, i] != 0)
                     def _live():
                         io.read(i, slot).start()
-                        _start_old(i, slot)
+                        io.read_old(i, slot).start()
 
                 @pl.loop(0, group_size)
                 def _wait_raw(slot):
@@ -94,7 +79,7 @@ class ShortQueryPipeline:
 
                     @pl.when(desc_ref[6, i] != 0)
                     def _live():
-                        _await_old(i, slot)
+                        io.read_old(i, slot).wait()
 
                 old = out_buf[...].reshape((group_size, 256))
                 out_buf[...] = ((old & ~mask) | (packed & mask)).reshape(

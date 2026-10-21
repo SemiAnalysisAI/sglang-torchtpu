@@ -17,6 +17,11 @@ from .kpool.io import LongQueryIO, ShortQueryIO
 from .kpool.pipeline import LongQueryPipeline, ShortQueryPipeline
 
 
+def _tile_slots(max_q, tile_rows):
+    """Bound aligned tiles touched by newly closed pools in one request."""
+    return (max_q + tile_rows - 5) // tile_rows + 1
+
+
 def _descriptors(
     kv_lens, page_indices, cu_q_lens, distribution, num_tokens, tile_rows, max_q
 ):
@@ -44,7 +49,7 @@ def _request_descriptors(
     batch = kv_lens.shape[0]
     # Closed groups end at 3 mod 4. A request's first end can be at the last
     # group in a tile; account for that alignment when bounding tile slots.
-    slots = (max_q + tile_rows - 5) // tile_rows + 1
+    slots = _tile_slots(max_q, tile_rows)
     req = jnp.arange(batch, dtype=jnp.int32)[None, :]
     q_len = cu_q_lens[1:] - cu_q_lens[:-1]
     start = kv_lens - q_len
@@ -168,7 +173,10 @@ def compress_and_store(
     max_q = num_tokens if max_query_length is None else max_query_length
     if not isinstance(max_q, int) or max_q < 1:
         raise ValueError("max_query_length must be a positive static integer")
-    if max_q <= 32:
+    # Small query spans amortize DMA across requests. A single group of
+    # tiles also avoids the streaming descriptor compaction overhead.
+    short_tiles = _tile_slots(max_q, 16) * kv_lens.shape[0]
+    if max_q <= 64 or short_tiles <= 16:
         desc = _request_descriptors(
             kv_lens, page_indices, cu_q_lens, distribution, 16, max_q
         )
