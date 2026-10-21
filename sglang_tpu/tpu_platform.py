@@ -638,10 +638,12 @@ def _vit_bucket_image_size(cfg) -> dict | None:
     """The image processor ``size`` that keeps every image inside the
     precompiled ViT, as ``{"longest_edge": max pixels, "shortest_edge": min}``.
 
-    None when the cap does not apply: no compiled ViT, not a Qwen3-VL model,
-    precompile disabled, or the user already chose an image size.
+    None when the cap does not apply: turned off, no compiled ViT, not a Qwen3-VL
+    model, precompile disabled, or the user already chose an image size.
     """
     if not cfg.enable_torch_compile:
+        return None
+    if not envs.SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP.get():
         return None
     try:
         from sglang.srt.utils.hf_transformers.config import get_config
@@ -702,8 +704,10 @@ def _apply_vit_max_pixels_default(server_args, cfg) -> None:
         mm_process_config=mm_process_config,
     )
     logger.info(
-        "Capping images at %d pixels, the largest precompiled ViT bucket; set an "
-        "image size in --mm-process-config to change it.",
+        "Capping images at %d pixels, the largest precompiled ViT bucket. Set an "
+        "image size in --mm-process-config to change it, "
+        "SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP=0 to turn it off, or "
+        "SGLANG_LOG_IMAGE_DOWNSCALE=1 to log each image it shrinks.",
         size["longest_edge"],
     )
 

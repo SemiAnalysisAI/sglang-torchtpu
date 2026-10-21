@@ -563,6 +563,7 @@ class TestVitMaxPixelsDefault(CustomTestCase):
             envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES,
             envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES,
             envs.SGLANG_IMAGE_MAX_PIXELS,
+            envs.SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP,
         ):
             override = field.override("1")
             override.__enter__()
@@ -666,6 +667,10 @@ class TestVitMaxPixelsDefault(CustomTestCase):
                     {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}, f
                 )
             self.assertEqual(_processor_min_pixels(args), 65536)
+
+    def test_switch_turns_the_cap_off(self):
+        with envs.SGLANG_TPU_ENABLE_VIT_IMAGE_SIZE_CAP.override(False):
+            self.assertEqual(self._apply_vl(), {})
 
     def test_no_cap_where_nothing_is_precompiled(self):
         # Eager ViT, a model without the Qwen3-VL ViT policy, and precompile
