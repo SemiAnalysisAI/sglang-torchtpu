@@ -32,7 +32,9 @@ order, counts, and executable identities, then pairs them with the serialized
 device module events in order. It does not use host durations or host/device
 time containment. Cross-clock offsets can make that containment incorrect.
 Missing or extra module events fail the analysis instead of producing a partial
-comparison. The full module span excludes gaps between separate calls.
+comparison. Event-to-module joins allow 1 ns for XProf integer timestamp rounding;
+this does not change any measured duration. Every non-reference sample must
+contain exactly one outer Pallas event. The full module span excludes gaps between separate calls.
 
 The prior `perf_counter + block_until_ready` comparisons measured host dispatch
 and synchronization. Those numbers do not establish device speedups or
