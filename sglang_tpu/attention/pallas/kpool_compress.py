@@ -123,6 +123,7 @@ def _decode_kernel(
     pipeline,
     single_query,
     q1_unroll,
+    q1_reference_precision=False,
 ):
     del old_ref  # Aliased output preserves every inactive record and byte.
     words = out_ref.bitcast(jnp.uint32)
@@ -192,7 +193,14 @@ def _decode_kernel(
                 # Ref loads finished; later compute uses SSA values only.
                 refill(i, fixed_slot)
             rotated = _hadamard128(pooled.astype(jnp.float32))
-            rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
+            if q1_reference_precision:
+                # Match the complete reference executable: its final BF16->F32
+                # round trip is eliminated before quantization (JAX 0.11.2).
+                rotated = rotated * (128**-0.5)
+            else:
+                rotated = (
+                    (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
+                )
             amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
             exponent = jnp.ceil(jnp.log2(amax / 448.0))
             q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(
@@ -314,6 +322,7 @@ def _q1_batch_kernel(
             pipeline=True,
             single_query=True,
             q1_unroll=False,
+            q1_reference_precision=True,
         )
 
     @pl.when(desc_ref[7, 0] == 0)
@@ -381,7 +390,9 @@ def _q1_batch_kernel(
         weight /= jnp.sum(weight, axis=1, keepdims=True)
         pooled = jnp.sum(weight * keys, axis=1).astype(jnp.bfloat16)
         rotated = _hadamard128(pooled.astype(jnp.float32))
-        rotated = (rotated * (128**-0.5)).astype(jnp.bfloat16).astype(jnp.float32)
+        # The compiled reference retains BF16 pooling, but quantizes the F32
+        # rotation directly. An extra BF16 rounding changes FP8 tie outcomes.
+        rotated = rotated * (128**-0.5)
         amax = jnp.maximum(jnp.max(jnp.abs(rotated), axis=1, keepdims=True), 1e-4)
         exponent = jnp.ceil(jnp.log2(amax / 448.0))
         q = jnp.clip(rotated / jnp.exp2(exponent), -448.0, 448.0).astype(
@@ -654,6 +665,7 @@ def compress_and_store(
                 pipeline=pipeline,
                 single_query=max_q == 1,
                 q1_unroll=decode_q1_unroll,
+                q1_reference_precision=decode_q1_batch and max_q == 1,
             ),
             out_shape=jax.ShapeDtypeStruct(pooled_cache.shape, pooled_cache.dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
