@@ -108,6 +108,7 @@ def benchmark_case(
     query_len=1,
     raw=None,
     baseline=None,
+    comparisons=None,
 ):
     name = f"{'decode' if decode else 'prefill'}_p{pages}_t{tokens}"
     if batch != 1:
@@ -116,22 +117,19 @@ def benchmark_case(
         name += f"_q{query_len}"
     print("CASE_START", name, flush=True)
     raw, tail = inputs(pages, tokens, decode, batch, query_len, raw)
-    variants = {
-        "reference": reference.computation,
-        "fused": partial(candidate, max_query_length=query_len),
-    }
+    variants = {"reference": reference.computation}
+    compared = dict(comparisons or {})
     if baseline is not None:
-        variants = {
-            "reference": reference.computation,
-            "baseline": (
-                partial(baseline, max_query_length=query_len)
-                if "max_query_length" in inspect.signature(baseline).parameters
-                else partial(baseline, decode=True, decode_max_q=query_len)
-                if decode
-                else baseline
-            ),
-            "fused": variants["fused"],
-        }
+        compared = {"baseline": baseline, **compared}
+    for label, function in compared.items():
+        variants[label] = (
+            partial(function, max_query_length=query_len)
+            if "max_query_length" in inspect.signature(function).parameters
+            else partial(function, decode=True, decode_max_q=query_len)
+            if decode
+            else function
+        )
+    variants["fused"] = partial(candidate, max_query_length=query_len)
     states = {}
     try:
         for label, function in variants.items():
@@ -255,6 +253,13 @@ def main():
         help="Compare the previous kernel API from a Git revision",
     )
     parser.add_argument(
+        "--comparison-revision",
+        action="append",
+        default=[],
+        metavar="LABEL=REVISION",
+        help="Add a named revision to the same alternating capture",
+    )
+    parser.add_argument(
         "--queries", nargs="+", type=int, help="Filter the declared matrix by Q"
     )
     parser.add_argument(
@@ -288,6 +293,24 @@ def main():
             baseline, baseline_digest = load_revision(
                 root, opts.baseline_revision, opts.output / "baseline"
             )
+        comparisons = {}
+        comparison_identities = {}
+        for item in opts.comparison_revision:
+            label, separator, revision = item.partition("=")
+            if (
+                not separator
+                or not label.isidentifier()
+                or not revision
+                or label in ("reference", "baseline", "fused")
+                or label in comparisons
+            ):
+                raise ValueError("Require a unique LABEL=REVISION comparison")
+            function, source_hash = load_revision(root, revision, opts.output / label)
+            comparisons[label] = function
+            comparison_identities[label] = {
+                "revision": revision,
+                "source_sha256": source_hash,
+            }
         result.update(
             source_revision=subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -295,6 +318,7 @@ def main():
             candidate_sha256=digest,
             baseline_revision=opts.baseline_revision,
             baseline_sha256=baseline_digest,
+            comparison_revisions=comparison_identities,
             reference_sha256=hashlib.sha256(
                 Path(reference.__file__).read_bytes()
             ).hexdigest(),
@@ -332,6 +356,7 @@ def main():
                         case["query_length"],
                         shared_raw,
                         baseline=baseline,
+                        comparisons=comparisons,
                     )
                 )
                 (opts.output / "metrics.json").write_text(json.dumps(result, indent=2))
