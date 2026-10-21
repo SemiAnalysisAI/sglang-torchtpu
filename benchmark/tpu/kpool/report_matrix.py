@@ -81,10 +81,15 @@ def main():
     opts = parser.parse_args()
     rows = read_rows(opts.input)
     captures = [json.loads(path.read_text()) for path in opts.input]
+    result = None
     if opts.accuracy:
         result = json.loads(opts.accuracy.read_text())
-        if any(c["candidate_sha256"] != result["candidate_sha256"] for c in captures):
-            raise ValueError("Accuracy and performance candidates differ")
+        if any(
+            c[key] != result[key]
+            for c in captures
+            for key in ("candidate_sha256", "reference_sha256", "runtime")
+        ):
+            raise ValueError("Accuracy and performance sources or runtimes differ")
         checks = {
             (c["mode"], c["query_length"], c["batch"]): c
             for c in result["cases"]
@@ -95,6 +100,22 @@ def main():
             if case is not None:
                 row["accuracy"] = "pass" if case["passed"] else "FAIL"
     opts.output.mkdir(parents=True, exist_ok=True)
+    if result is not None:
+        with (opts.output / "accuracy.csv").open("w", newline="") as handle:
+            fields = (
+                "mode",
+                "batch",
+                "query_length",
+                "tokens",
+                "edge",
+                "passed",
+                "mismatched_bytes",
+            )
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(
+                {key: case.get(key) for key in fields} for case in result["cases"]
+            )
     with (opts.output / "matrix.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -106,9 +127,12 @@ def main():
         "is **JAX / fused (speedup)**. A speedup below 1 means a regression.",
         "Pallas event time is a subset of module time. The CSV includes p10/p90,",
         "Pallas medians, sample counts, source revisions, and accuracy status.",
+        "A dagger (†) marks a shape that failed exact-byte validation.",
         "",
         "Fixed K=4, D=128, raw page=128, raw dtype=BF16, raw pages=14,849.",
         "Decode uses T=B*Q. Prefill uses T=max(64,B*Q), with B*Q<=8192.",
+        "Prefill starts at sequence position zero: Q=1/2 closes no K4 pool and",
+        "measures metadata/call overhead. The CSV records the closed-pool count.",
         "These are single-device module tests; serving and end-to-end are separate.",
         "",
         "Runtime: "
@@ -120,6 +144,14 @@ def main():
         f"Warmups: {captures[0]['warmup']}; recorded calls per variant: {captures[0]['repeats']}.",
         "",
     ]
+    if result is None:
+        lines[2:2] = ["**Accuracy has not been validated for this matrix.**", ""]
+    elif not result["passed"]:
+        lines[2:2] = [
+            "**The candidate does not pass the full exact-byte accuracy gate.**",
+            "Timing ratios below are measurements of this candidate, not validated replacements.",
+            "",
+        ]
     for mode in ("decode", "prefill"):
         selected = [row for row in rows if row["mode"] == mode]
         lookup = {(row["Q"], row["B"]): row for row in selected}
@@ -135,7 +167,7 @@ def main():
                 row = lookup.get((q, b))
                 cells.append(
                     f"{row['reference_p50_us']:.2f} / {row['fused_p50_us']:.2f} "
-                    f"({row['speedup']:.2f}x)"
+                    f"({row['speedup']:.2f}x){'†' if row['accuracy'] == 'FAIL' else ''}"
                     if row
                     else "—"
                 )
@@ -145,7 +177,23 @@ def main():
         state: sum(r["accuracy"] == state for r in rows)
         for state in ("pass", "FAIL", "not_run")
     }
-    lines += [f"Uniform-shape exact-byte checks: {counts}.", ""]
+    lines += [
+        (
+            f"Uniform-shape exact-byte checks: {counts['pass']} passed, "
+            f"{counts['FAIL']} failed, {counts['not_run']} not run."
+        ),
+        "",
+    ]
+    if result is not None:
+        passed = sum(case["passed"] for case in result["cases"])
+        lines += [
+            (
+                f"Full accuracy gate (including edge cases): {passed}/{len(result['cases'])} "
+                f"passed, {len(result['cases'])}/{result['expected_cases']} executed."
+            ),
+            "See accuracy.csv for each case. A failed accuracy row is not a validated replacement.",
+            "",
+        ]
     (opts.output / "matrix.md").write_text("\n".join(lines))
     print(json.dumps({"cases": len(rows), "accuracy": counts}))
 
