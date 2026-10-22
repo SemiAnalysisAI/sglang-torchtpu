@@ -969,34 +969,38 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     # ------------------------------------------------------------------ #
     #
     # A page [page_size // kv_packing, kv_packing, dim] stores its tokens in
-    # order (token t at row t // kv_packing, lane t % kv_packing), so a layer
-    # viewed as [num_pages * page_size, dim] is indexed by token id.
+    # order (token t at row t // kv_packing, lane t % kv_packing), so a page
+    # flattened to [page_size, dim] is indexed by the token's offset in it.
 
     def _synchronize_device(self) -> None:
         if torch.device(self.device).type != "cpu":
             torch.accelerator.synchronize()
-
-    def _token_rows(self, layer: int) -> torch.Tensor:
-        buf = self.kv_buffer[layer]
-        return buf.view(buf.shape[0] * self.page_size, buf.shape[-1])
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Copy the latent rows of the tokens ``indices`` out to host.
 
         Returns ``cpu_offloading_chunk_size`` chunks of ``[tokens, dim]`` per
         layer, the format `load_cpu_copy` and `filter_cpu_copy` read.
+
+        Only the pages holding ``indices`` leave the device, and their token
+        rows are picked on host: viewing a whole layer as token rows on TPU
+        relays out the entire buffer, which needs the layer's size again in
+        scratch HBM and fails on a real pool.
         """
-        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return [[] for _ in range(self.layer_num)]
+        pages, page_pos = torch.unique(indices // self.page_size, return_inverse=True)
+        rows_in_pages = page_pos * self.page_size + indices % self.page_size
+        device_pages = pages.to(self.kv_buffer[0].device)
         self._synchronize_device()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
-        for layer in range(self.layer_num):
-            rows = self._token_rows(layer)
+        for buf in self.kv_buffer[: self.layer_num]:
+            held = buf.index_select(0, device_pages).to("cpu")
+            rows = held.view(-1, buf.shape[-1]).index_select(0, rows_in_pages)
             kv_cache_cpu.append(
-                [
-                    rows.index_select(0, indices[i : i + chunk_size]).to("cpu")
-                    for i in range(0, len(indices), chunk_size)
-                ]
+                [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
             )
         self._synchronize_device()
         return kv_cache_cpu
