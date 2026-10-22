@@ -980,6 +980,18 @@ class TpuSRTPlatform(SRTPlatform):
                     f"from tp_size={cfg.tp_size} and attn_dp_size={attn_dp_size}), "
                     "--enable-dp-lm-head must be enabled."
                 )
+            if (
+                not cfg.enable_dp_lm_head
+                and spec_algo in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                and _experimental_spec_enabled()
+            ):
+                # These drafts share the target lm_head but run in the attention-TP
+                # group; a head sharded over the full TP group would draft from one shard.
+                raise ValueError(
+                    f"The experimental TPU spec worker serves {spec_algo} under DP "
+                    "attention only with --enable-dp-lm-head, which shards the shared "
+                    "lm_head over the draft's attention-TP group."
+                )
 
         _apply_page_size_default(server_args)
         # After the page-size default: the DCP chunk check reads the page size.
@@ -1227,6 +1239,14 @@ class TpuSRTPlatform(SRTPlatform):
 
     def supports_fp8(self) -> bool:
         return False
+
+    def supports_speculative_dp_attention(self, algorithm: str) -> bool:
+        # Every experimental TpuSpecWorker serves DP attention; core's DFlash worker does not.
+        # Lazy: sglang_tpu.experimental imports spec_info, which loads after the platform.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang_tpu.experimental import is_experimental_spec
+
+        return is_experimental_spec(SpeculativeAlgorithm.from_string(algorithm))
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False
