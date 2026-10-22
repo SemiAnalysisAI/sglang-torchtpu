@@ -323,6 +323,7 @@ class RaidenDcpTestCase(CustomTestCase):
         m.chunked_transfer = True
         if not decode:
             m._push_executor = _InlineExecutor()
+            m._prefill.announce_pages = 1  # every offered chunk is announced
         m.endpoint = endpoint
         return m
 
@@ -987,6 +988,55 @@ class TestDcpReshardHandshake(RaidenDcpTestCase):
         )
         self.assertTrue(decode.is_failed(self.ROOM))
         self.assertIn("closing push alone", decode.failure_records[self.ROOM])
+
+    def test_chunks_offered_after_every_peer_asked_ride_the_closing_push(self):
+        """Under load the decode pair asks before the prefill runs a single
+        chunk; the chunk offers that follow are neither announced nor fatal
+        (the device crash: a one-peer unpack of a two-peer room)."""
+        prefills = [self._prefill(0), self._prefill(1)]
+        decodes = [self._decode(0), self._decode(1)]
+        with patch.dict(sys.modules, _pb2_modules()):
+            for decode in decodes:
+                decode.register_decode_request(
+                    self.ROOM,
+                    self.DECODE_PAGES,
+                    self.SWA_PAGES,
+                    None,
+                    self._infos(prefills),
+                )
+            for prefill in prefills:
+                for _ in decodes:
+                    prefill._on_reshard_req(
+                        self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+                    )
+                self.assertEqual(len(prefill._prefill.reshard_req[self.ROOM]), 2)
+                prefill.append_send_blocks(self.ROOM, self.PREFILL_PAGES[:2])
+                prefill.offer_chunk(self.ROOM, 0, self.PREFILL_PAGES[:2], 6)
+                prefill.append_send_blocks(self.ROOM, self.PREFILL_PAGES[2:4])
+                prefill.offer_chunk(self.ROOM, 2, self.PREFILL_PAGES[2:4], 6)
+                self.assertNotIn(self.ROOM, prefill._prefill.reshard_chunks)
+                prefill.append_send_blocks(
+                    self.ROOM, self.PREFILL_PAGES[4:], swa_block_ids=[90, 91]
+                )
+                prefill.finalize_send(self.ROOM, None)
+            for decode in decodes:
+                self.assertEqual(
+                    [f[0] for f in self.inboxes[decode.endpoint].frames],
+                    [MessageTag.RESHARD_BLOCKS] * len(prefills),
+                )
+                for _ in prefills:
+                    decode._on_reshard_blocks(
+                        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+                    )
+            for prefill in prefills:
+                for _ in decodes:
+                    prefill._on_reshard_ready(
+                        self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_READY)
+                    )
+                self.assertEqual(
+                    prefill._prefill.reshard_final_pushed[self.ROOM], {0, 1}
+                )
+                self.assertTrue(prefill.is_send_done(self.ROOM))
 
     def test_prefill_refuses_a_dcp_decode_of_another_attention_tp(self):
         prefill = self._prefill(0)

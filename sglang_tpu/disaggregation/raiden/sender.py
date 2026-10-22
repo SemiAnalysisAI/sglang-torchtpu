@@ -785,9 +785,12 @@ class RaidenSenderMixin:
                     # pages travel with the closing transfer, whose span the
                     # decode decides from the chunks that did arrive.
                     return
-                (req,) = self._prefill.reshard_req[room].values()
-                if req["dcp_size"] > 1:
-                    return  # the closing push moves a DCP room's pages
+                peers = self._prefill.reshard_req[room]
+                if any(meta["dcp_size"] > 1 for meta in peers.values()):
+                    # The closing push moves a DCP room's pages; its peers
+                    # may all have asked before the first chunk is offered.
+                    return
+                (req,) = peers.values()
                 window = chunk_pull_window(
                     start, len(block_ids), total_pages, len(req["decode_blocks"])
                 )
