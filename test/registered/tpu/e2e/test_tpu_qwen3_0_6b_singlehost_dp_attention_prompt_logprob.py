@@ -3,18 +3,22 @@
 The compiled forward serves input logprobs by re-running the LogitsProcessor
 eagerly after the forward. Its logits all-gather is a program over the whole
 mesh, so under DP attention every DP rank has to run it -- including the ones
-whose batch asked for nothing -- at one shape. The scheduler's MLP sync carries
-the largest gather of the step for that; without it a prompt-logprob request
-hung the worker group.
+whose batch asked for nothing -- as many times, at one shape. The scheduler's
+MLP sync carries the largest gather of the step for that, which every rank
+chunks alike; without it a prompt-logprob request hung the worker group.
 
 Served at TP4 with two attention-DP groups and the LM head on the attention-TP
 group, with plain traffic keeping the other group busy. Each position's top-1
 is checked against the same server's greedy next token after that prefix, and
 against an off-by-one control that a misaligned gather would match instead;
-and a request's logprobs must not change when the other group gathers too.
+and a request's logprobs must not change when the other group gathers in the
+same step, which the server's debug log of each step's gather confirms.
 """
 
+import json
 import os
+import re
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -45,11 +49,38 @@ PROMPTS = [
     "To make a cup of tea, first boil the water, then",
     "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
 ]
-# Many more rows than any of PROMPTS: the DP-wide gather shape grows.
-LONG_PROMPT = " ".join(["The quick brown fox jumps over the lazy dog."] * 12)
+# About 600 tokens, so it prefills over several --chunked-prefill-size steps,
+# each gathering many more rows than any of PROMPTS.
+LONG_PROMPT = " ".join(["The quick brown fox jumps over the lazy dog."] * 60)
 TOP_K = 5
 # A stalled collective shows as a request that never returns.
 TIMEOUT = 300
+# A pair shares a step when the short prompt reaches its scheduler while
+# LONG_PROMPT is still prefilling, and misses when it is scheduled first, so it
+# is retried until the log shows one did. The bound is arbitrary.
+PAIR_ATTEMPTS = 20
+# Loaded through SGLANG_LOGGING_CONFIG_PATH: the shim's per-step gather line is
+# a debug log, so turn that one logger up and leave the rest at INFO.
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "[%(asctime)s] %(message)s"}},
+    "handlers": {
+        "stderr": {
+            "class": "logging.StreamHandler",
+            "formatter": "plain",
+            "stream": "ext://sys.stderr",
+        }
+    },
+    "root": {"level": "INFO", "handlers": ["stderr"]},
+    "loggers": {"sglang_tpu.compilation.compiled_forward_shim": {"level": "DEBUG"}},
+}
+# One rank's gathers in one step: the DP-wide and local rows, then how many
+# gathers of how many rows. Local rows below the DP-wide count, but not zero,
+# mean another DP rank gathered more rows in that same step.
+GATHER_LINE = re.compile(
+    r"input-logprob gather: DP-wide (\d+) rows, local (\d+) rows \((\d+) x (\d+) rows\)"
+)
 
 
 def _skip_if_no_tpu():
@@ -70,11 +101,24 @@ class TestTpuQwen306bSinglehostDPAttentionPromptLogprob(CustomTestCase):
         cls._env_stack.enter_context(
             envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True)
         )
+        # Above every one of PROMPTS, below a LONG_PROMPT step: that step's
+        # rows take several gathers, which a short prompt sharing it tops its
+        # one chunk up to with zero rows.
+        cls._env_stack.enter_context(envs.SGLANG_LOGPROB_CHUNK_SIZE.override(32))
+        log_dir = cls._env_stack.enter_context(tempfile.TemporaryDirectory())
+        logging_config = os.path.join(log_dir, "logging.json")
+        with open(logging_config, "w") as f:
+            json.dump(LOGGING_CONFIG, f)
+        cls.log = cls._env_stack.enter_context(
+            open(os.path.join(log_dir, "server.log"), "w")
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             MODEL,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={"SGLANG_LOGGING_CONFIG_PATH": logging_config},
+            return_stdout_stderr=(cls.log, cls.log),
             other_args=[
                 "--dtype",
                 "bfloat16",
@@ -138,6 +182,31 @@ class TestTpuQwen306bSinglehostDPAttentionPromptLogprob(CustomTestCase):
                 "routed_dp_rank": rank,
             }
         )["output_ids"][0]
+
+    def _score_pair(self, prompt, rank):
+        """Score prompt on rank while the other DP rank scores LONG_PROMPT,
+        both sent at once."""
+        start = threading.Barrier(2)
+
+        def score(args):
+            start.wait()
+            return self._score(*args)
+
+        with ThreadPoolExecutor(2) as pool:
+            together, _long = pool.map(score, [(prompt, rank), (LONG_PROMPT, 1 - rank)])
+        return together
+
+    def _shared_a_step(self, since):
+        """Whether the server logged, past byte offset since, a DP rank
+        gathering input logprobs in one step with another holding more rows,
+        over several gathers: its own and the zero-row ones topping it up."""
+        with open(self.log.name, "rb") as f:
+            f.seek(since)
+            log = f.read().decode(errors="replace")
+        return any(
+            0 < int(local) < int(dp_wide) and int(count) > 1
+            for dp_wide, local, count, _rows in GATHER_LINE.findall(log)
+        )
 
     def _with_background_traffic(self, fn):
         """Run fn while plain requests keep both DP groups busy."""
@@ -214,24 +283,32 @@ class TestTpuQwen306bSinglehostDPAttentionPromptLogprob(CustomTestCase):
 
     def test_the_other_groups_gather_leaves_a_request_unchanged(self):
         """Both DP groups ask for input logprobs in one step, at different row
-        counts, so each runs the gather at the DP-wide shape; a request's
-        logprobs are bit-identical to its own rank's run alone."""
+        counts, so each runs the same DP-wide gathers: LONG_PROMPT's rows in
+        several chunks, the short prompt's one chunk topped up with zero rows.
+        A request's logprobs are bit-identical to its own rank's run alone.
+        The pair is retried until the server's log shows such a step."""
         for prompt in PROMPTS:
             for rank in (0, 1):
                 alone = self._score(prompt, rank)
-                with ThreadPoolExecutor(2) as pool:
-                    together, _long = pool.map(
-                        lambda args: self._score(*args),
-                        [(prompt, rank), (LONG_PROMPT, 1 - rank)],
+                since = os.path.getsize(self.log.name)
+                for attempt in range(1, PAIR_ATTEMPTS + 1):
+                    together = self._score_pair(prompt, rank)
+                    self.assertEqual(
+                        together["input_token_logprobs"],
+                        alone["input_token_logprobs"],
+                        f"rank {rank}: {prompt!r}",
                     )
-                self.assertEqual(
-                    together["input_token_logprobs"],
-                    alone["input_token_logprobs"],
-                    f"rank {rank}: {prompt!r}",
-                )
-                self.assertEqual(
-                    together["input_top_logprobs"], alone["input_top_logprobs"]
-                )
+                    self.assertEqual(
+                        together["input_top_logprobs"], alone["input_top_logprobs"]
+                    )
+                    if self._shared_a_step(since):
+                        break
+                else:
+                    self.fail(
+                        f"rank {rank}: {prompt!r} never gathered in one step with "
+                        f"the other DP rank in {PAIR_ATTEMPTS} attempts"
+                    )
+                print(f"rank {rank}: {prompt!r} shared a step on attempt {attempt}")
 
 
 if __name__ == "__main__":
