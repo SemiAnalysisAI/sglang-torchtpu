@@ -30,7 +30,7 @@ import threading
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -38,8 +38,11 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.test.separate_buffer_allocator_double import bind_separate_buffer_capacity
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -416,6 +419,12 @@ class TestDecodeTransferPageSizes(unittest.TestCase):
     """The decode lists its transfer pages at the device pools' page under
     DCP, where the allocator's page spans ``dcp_size`` pool pages."""
 
+    def setUp(self):
+        # pop_preallocated reads its config from the published bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @staticmethod
     def _queue(allocator_page, pool_page, swa_page, state_types):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -440,6 +449,126 @@ class TestDecodeTransferPageSizes(unittest.TestCase):
             # A model without a window pool pages everything at the full pool.
             queue = self._queue(1024, 512, 4096, [])
             self.assertEqual(queue._transfer_page_sizes(), (512, 512))
+
+    @staticmethod
+    def _preallocate(dcp_shards_every_kv_pool):
+        """Run one 20-token request through pop_preallocated on a DCP2 decode
+        whose pools page at 4 and whose allocator pages at 8, with the
+        request's rows hand-built in the widened location space: logical
+        (8-position) pages 5, 9, 2. Returns what reached send_metadata."""
+        page, dcp = 4, 2
+        req = SimpleNamespace(
+            rid="dcp-lists",
+            origin_input_ids=[0] * 20,
+            output_ids=[],
+            finished_reason=None,
+            sampling_params=SimpleNamespace(max_new_tokens=1),
+            kv=ReqKvInfo(),
+            time_stats=MagicMock(),
+        )
+        receiver = MagicMock(spec=["send_metadata", "abort", "clear"])
+        decode_req = SimpleNamespace(
+            req=req, kv_receiver=receiver, waiting_for_input=True, is_rebootstrap=False
+        )
+        rows = torch.cat(
+            [torch.arange(j * page * dcp, j * page * dcp + page * dcp) for j in (5, 9)]
+            + [torch.arange(2 * page * dcp, 2 * page * dcp + page)]
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue._num_published_destinations = 0
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[StateType.SWA])
+        )
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = page
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=16384)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            return_value=(16384, 8192)
+        )
+        queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8192)
+        queue._radix_full_available = MagicMock(return_value=16384)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        # The SWA pool mirrors the owner's local rows at an offset, physical
+        # page 4, as the unsplit window pool does.
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=page * dcp,
+            translate_kv_indices_for_transfer=lambda indices: indices,
+            translate_swa_indices_for_transfer=lambda loc: (
+                (loc // (page * dcp)) * page + loc % page + 400
+            ),
+        )
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.token_to_kv_pool = SimpleNamespace(
+            page_size=page, swa_kv_pool=SimpleNamespace(page_size=page)
+        )
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = False
+        queue._match_prefix_and_lock = MagicMock(
+            return_value=SimpleNamespace(
+                prefix_indices=[],
+                l1_prefix_len=0,
+                decode_prefix_len=0,
+                restore_token_count=0,
+            )
+        )
+
+        def allocate(req, _prefix_indices, prefix_len, total_prefix_len):
+            req.kv.req_pool_idx = 0
+            return rows
+
+        queue._pre_alloc = MagicMock(side_effect=allocate)
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_token_pool.req_to_token = rows.reshape(1, -1)
+        queue.tree_cache.req_to_token_pool = queue.req_to_token_pool
+        queue.req_to_token_pool.mamba_allocator.available_size.return_value = 1
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
+        scheduler.enable_decode_hicache = False
+        scheduler.sliding_window_size = 2 * page
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+        with (
+            get_parallel().override(attn_dcp_size=dcp),
+            patch.object(
+                type(current_platform),
+                "dcp_shards_every_kv_pool",
+                return_value=dcp_shards_every_kv_pool,
+            ),
+        ):
+            preallocated, failed = queue.pop_preallocated()
+        assert (preallocated, failed) == ([decode_req], [])
+        page_indices, _, state_indices = receiver.send_metadata.call_args.args
+        return page_indices.tolist(), state_indices[0].tolist()
+
+    def test_hand_built_request_lists_one_id_per_prefill_page(self):
+        # Rows 40..47, 72..79, 16..19: the full list names the five
+        # 4-token pages 10, 11, 18, 19, 4 (owners 0 1 0 1 0, local pages
+        # 5, 5, 9, 9, 2), and the 8-token window (rows 76..79 and 16..19)
+        # is two SWA-physical pages aligned at the pool's page, like the
+        # prefill's own window list.
+        full, swa = self._preallocate(dcp_shards_every_kv_pool=True)
+        self.assertEqual(full, [10, 11, 18, 19, 4])
+        self.assertEqual(swa, [(9 * 4 + 400) // 4, (2 * 4 + 400) // 4])
+
+    def test_relayout_platforms_keep_the_allocator_page(self):
+        # The MLA relayout path lists the allocator's (widened) pages: one
+        # per 8 positions, the window aligned at 8.
+        full, swa = self._preallocate(dcp_shards_every_kv_pool=False)
+        self.assertEqual(full, [5, 9, 2])
+        self.assertEqual(len(swa), 2)
 
     def test_without_dcp_or_widening_the_allocator_page_is_kept(self):
         queue = self._queue(1024, 512, 512, [StateType.SWA])
