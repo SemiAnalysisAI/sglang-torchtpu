@@ -157,6 +157,22 @@ class TestSeededSampling(CustomTestCase):
         self.assertEqual({column for *_, column in keys["draft"]}, {DRAFT_COLUMN})
         self.assertFalse(keys["draft"] & (keys["verify"] | keys["target"]))
 
+    def test_verify_coins_key_a_chain_as_gpu_eagle_does(self):
+        """A chain of N drafts verifies N + 1 rows. Given that width, as GPU
+        EAGLE is given draft_token_num, draft j's rejection coin hashes column
+        j and the final coin column N + 1."""
+        num_drafts = 3
+        seeds, seq_lens = torch.tensor([7, -3]), torch.tensor([10, 20])
+        coins, final = verify_coins(seeds, seq_lens, num_drafts + 1)
+
+        def column(c):
+            columns = torch.tensor([c])
+            return hash_to_uniform(murmur_hash32(seeds, seq_lens, columns))[:, 0]
+
+        for j in range(num_drafts):
+            torch.testing.assert_close(coins[:, j], column(j))
+        torch.testing.assert_close(final, column(num_drafts + 1))
+
     def test_inverse_cdf_skips_zero_mass_bins_at_both_edges(self):
         weights = torch.tensor([[0.0, 2.0, 0.0, 1.0, 0.0]]).repeat(3, 1)
         actual = sample_categorical(weights, torch.tensor([0.0, 0.5, 1.0 - 2**-24]))

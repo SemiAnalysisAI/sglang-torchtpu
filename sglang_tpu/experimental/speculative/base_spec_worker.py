@@ -482,6 +482,9 @@ class TpuSpecWorker(BaseSpecWorker):
             seeds = sampling_info.host_params_at(physical_bs)["sampling_seed"].to(
                 target_logits.device, non_blocking=True
             )
+            # Keyed as GPU EAGLE keys a chain of N drafts (draft_token_num is
+            # N + 1): draft j's rejection coin in column j, the final coin in
+            # column N + 1.
             coins, final_coins = verify_coins(
                 seeds, bucket.state.seq_lens, self.num_verify_rows
             )
