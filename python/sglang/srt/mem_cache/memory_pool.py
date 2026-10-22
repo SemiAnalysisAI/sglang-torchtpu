@@ -4423,6 +4423,10 @@ class HybridLinearKVPool(KVCache):
                 )
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
+            elif full_kv_pool_class is not None:
+                # Caller-selected MLA pool, e.g. an out-of-tree platform's
+                # get_kv_pool_cls(kind="mla").
+                TokenToKVPoolClass = full_kv_pool_class
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,

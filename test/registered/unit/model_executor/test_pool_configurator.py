@@ -2363,6 +2363,46 @@ class TestOutOfTreePlatformKvApi(CustomTestCase):
         pool.set_kv_buffer(layer, loc, k, v)
         torch.testing.assert_close(pool.get_value_buffer(0)[3], v[0])
 
+    def test_hybrid_linear_mla_pool_is_the_selected_class(self):
+        """A hybrid linear-attention MLA model on a non-TPU out-of-tree
+        platform builds its full-attention layers in the MLA pool the
+        configurator selected through get_kv_pool_cls(kind="mla")."""
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
+
+        class _PluginMLAPool(MLATokenToKVPool):
+            pass
+
+        _publish_config(self, page_size=1, disaggregation_mode="null")
+        for selected, expected in (
+            (_PluginMLAPool, _PluginMLAPool),
+            (None, MLATokenToKVPool),
+        ):
+            with (
+                self.subTest(selected=selected),
+                patch(
+                    "sglang.srt.mem_cache.memory_pool.current_platform",
+                    self._Platform(None),
+                ),
+            ):
+                pool = HybridLinearKVPool(
+                    size=16,
+                    dtype=torch.bfloat16,
+                    page_size=1,
+                    head_num=1,
+                    head_dim=24,
+                    full_attention_layer_ids=[1, 3],
+                    device="cpu",
+                    mamba_pool=None,
+                    use_mla=True,
+                    kv_lora_rank=16,
+                    qk_rope_head_dim=8,
+                    full_kv_pool_class=selected,
+                )
+                self.assertIs(type(pool.full_kv_pool), expected)
+
     def test_dsa_uses_the_platform_hook_or_the_in_tree_build(self):
         from functools import partial
 
