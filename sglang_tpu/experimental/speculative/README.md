@@ -114,14 +114,30 @@ policy mixin, and routes all three.
 - Accuracy: GSM8K with spec on matches spec off. Performance: A/B on identical
   server flags.
 
+## DP attention
+
+Both families serve `--enable-dp-attention`. Drafts are greedy under DP attention,
+so an idle DP rank can mirror its peers' draft syncs; sampled requests take the
+target-only accept.
+
+Startup checks:
+
+- `--enable-dp-lm-head` when the draft's head is sharded over a group other than
+  attention TP: always for MTP, DFlash and DSpark (they share the target head;
+  `tpu_platform.py`), and for an EAGLE3 draft without its own head
+  (`TpuSpecWorker` checks the bound head). TPU requires it anyway when attention
+  TP > 1.
+- `SGLANG_SPEC_TP_SYNC` syncs both spec-accept sites or neither when attention
+  TP > 1 (e.g. `rng,spec-accept-greedy` for DFlash).
+
+Known gap: DFlash with HiCache under DP attention passes GSM8K, but the KV
+offload probe sees one verify forward fewer on a host reload than on a device hit.
+
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
 prefill and mixed prefill/decode DP steps. The chain family (MTP) does not
 support a draft sliding window. Each raises at startup.
-
-Under DP attention both families draft greedily, so an idle DP rank can mirror
-its peers' draft syncs; sampled requests take the target-only accept.
 
 ## P/D disaggregation
 
