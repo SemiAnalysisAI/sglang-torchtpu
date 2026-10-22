@@ -352,10 +352,22 @@ def _page_pools(
     allocator: BaseTokenToKVPoolAllocator,
 ) -> List[BaseTokenToKVPoolAllocator]:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang_tpu.allocator_tpu import TpuPageInterleavePoolAllocator
 
     if type(allocator) is SWATokenToKVPoolAllocator:
-        return [allocator.full_attn_allocator, allocator.swa_attn_allocator]
-    return [allocator]
+        pools = [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+    else:
+        pools = [allocator]
+    # A page-interleaved pool holds and releases pages per owner class.
+    return [
+        page_pool
+        for pool in pools
+        for page_pool in (
+            pool.class_pools
+            if isinstance(pool, TpuPageInterleavePoolAllocator)
+            else [pool]
+        )
+    ]
 
 
 def kv_free_fence_unsupported_reason(

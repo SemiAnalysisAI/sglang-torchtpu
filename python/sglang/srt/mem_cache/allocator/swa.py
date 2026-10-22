@@ -55,7 +55,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
         req_to_token_pool=None,
+        full_shard_size: int = 1,
     ):
+        """``full_shard_size`` > 1: the full-attention side page-interleaves
+        ``size`` logical slots over that many owner classes at ``page_size``
+        (the platform's page-interleave allocator; decode context parallelism
+        with unsplit SWA KV); the SWA side stays a stock allocator over its own
+        rows."""
         assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
@@ -88,14 +94,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 PagedTokenToKVPoolAllocatorClass = TpuPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
-            self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
-                size,
-                page_size,
-                dtype,
-                device,
-                full_kv_pool,
-                need_sort,
-            )
+            if full_shard_size > 1:
+                from sglang.srt.platforms import current_platform
+
+                assert size % full_shard_size == 0, (size, full_shard_size)
+                self.full_attn_allocator = (
+                    current_platform.get_page_interleave_allocator_cls()
+                )(
+                    size // full_shard_size,
+                    page_size,
+                    full_shard_size,
+                    dtype,
+                    device,
+                    full_kv_pool,
+                    need_sort,
+                )
+            else:
+                self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
+                    size,
+                    page_size,
+                    dtype,
+                    device,
+                    full_kv_pool,
+                    need_sort,
+                )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size_swa,
                 page_size,
@@ -223,6 +245,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
             )
+        # A classed full side reports the min-class floor; one eviction can
+        # raise it by less than it freed (see common._evict_until_allocatable).
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
+
+        _evict_until_allocatable(tree_cache, self.full_attn_allocator, num_tokens)
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -775,6 +802,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return expanded
 
     def resize(self, config) -> None:
+        if self.full_attn_allocator.free_pages is None:
+            # The classed full side keeps per-class pools, not one size/num_pages.
+            raise NotImplementedError(
+                "post-capture KV resizing is not supported with a "
+                "page-interleaved full-attention allocator"
+            )
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
         self._size_full = size_full

@@ -60,6 +60,20 @@ class TestTpuPlatformIdentity(CustomTestCase):
         self.assertFalse(self.platform.support_cuda_graph())
         self.assertFalse(self.platform.support_piecewise_cuda_graph())
 
+    def test_dcp_replicates_swa_kv_follows_the_decode_backend(self):
+        from sglang_tpu import attention_pallas_rpa_base
+
+        for owns in (False, True):
+            with (
+                self.subTest(owns=owns),
+                patch.object(
+                    attention_pallas_rpa_base,
+                    "decode_backend_owns_dcp",
+                    return_value=owns,
+                ),
+            ):
+                self.assertEqual(self.platform.dcp_replicates_swa_kv(), owns)
+
     def test_decode_context_parallel_shards_every_kv_pool(self):
         self.assertTrue(self.platform.supports_decode_context_parallel())
         self.assertTrue(self.platform.dcp_shards_every_kv_pool())
@@ -713,6 +727,8 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
         _require_resolved_dp_layout(overrides)
         defaults = dict(
             attention_backend="pallas_tpu_rpa_batched",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
             tp_size=8,
             dcp_size=2,
             pp_size=1,
@@ -765,6 +781,50 @@ class TestTpuPlatformDecodeContextParallel(CustomTestCase):
     def test_accepts_the_benchmark_configuration(self):
         # pallas_tpu_rpa_batched, tp 8, dcp 2, no DP attention, torch compile on.
         self._validate(self._args())
+
+    def _owned_backend(self):
+        """A decode backend whose kernel spec owns DCP."""
+        from sglang_tpu import tpu_platform
+
+        spec = SimpleNamespace(owns_decode_context_parallel=True)
+        return patch.object(
+            tpu_platform,
+            "_rpa_kernel_spec",
+            side_effect=lambda backend: spec if backend == "owned_backend" else None,
+        )
+
+    def test_backend_owned_dcp_admits_its_own_combinations(self):
+        # The backend validates speculative decoding, disaggregation, the
+        # tracer, the KV layout and the chunk size itself.
+        owned = dict(
+            attention_backend="pallas_tpu_rpa_seq",
+            decode_attention_backend="owned_backend",
+            speculative_algorithm="SBD",
+            disaggregation_mode="decode",
+            tpu_compile_tracer="direct",
+            chunked_prefill_size=256,
+            page_size=512,
+        )
+        with self._owned_backend():
+            self._validate(self._args(**owned))
+            with patch.dict(os.environ, {"SGLANG_TPU_USE_SEQ_ALONG_LANE_KV": "1"}):
+                self._validate(self._args(**owned))
+        # Without the owning backend the same arguments are refused by name.
+        self._assert_refused("(?i)attention[-_ ]backend", **owned)
+
+    def test_backend_owned_dcp_keeps_the_topology_and_kv_checks(self):
+        owned = dict(decode_attention_backend="owned_backend")
+        with self._owned_backend():
+            for overrides, pattern in (
+                ({"kv_cache_dtype": "fp8_e4m3"}, "(?i)kv[-_ ]cache[-_ ]dtype"),
+                ({"dcp_size": 4, "tp_size": 8}, "(?i)1 or 2"),
+                ({"pp_size": 2}, "(?i)pipeline"),
+                ({"enable_hierarchical_cache": True}, "(?i)hierarchical"),
+                ({"enable_mixed_chunk": True}, "(?i)mixed[-_ ]chunk"),
+                ({"enable_torch_compile": False}, "(?i)torch[-_ ]compile"),
+            ):
+                with self.subTest(**overrides):
+                    self._assert_refused(pattern, **owned, **overrides)
 
     def test_accepts_the_host_req_to_token_default_when_unset(self):
         with patch.dict(os.environ, {}, clear=False):

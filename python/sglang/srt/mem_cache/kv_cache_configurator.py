@@ -1819,9 +1819,17 @@ class KVCacheConfigurator:
         # DCP ranks replicate KV, so the SWA heads shard across
         # attn_tp_size // attn_dcp_size groups, as get_num_kv_heads does for
         # the full sub-pool below. A draft model never joins the DCP group, so
-        # it shards over the whole attn TP group.
-        swa_dcp_size = get_parallel().attn_dcp_size
-        if swa_dcp_size > 1 and self.model_config.is_draft_model:
+        # it shards over the whole attn TP group. An unsplit SWA sub-pool
+        # (dcp_replicates_swa_kv) keeps plain-TP heads and every token on every
+        # DCP rank, paged like its allocator.
+        dcp_size = get_parallel().attn_dcp_size
+        swa_replicated = (
+            dcp_size > 1
+            and not self.model_config.is_draft_model
+            and current_platform.dcp_replicates_swa_kv()
+        )
+        swa_dcp_size = dcp_size
+        if swa_dcp_size > 1 and (self.model_config.is_draft_model or swa_replicated):
             swa_dcp_size = 1
         swa_head_num = max(
             1,
@@ -1833,6 +1841,11 @@ class KVCacheConfigurator:
             // (get_parallel().attn_tp_size // swa_dcp_size),
         )
         mxint8_subpool_kwargs = {}
+        if swa_replicated and self.kv_cache_dtype_str == "mxint8":
+            raise ValueError(
+                "An unsplit SWA KV pool under decode context parallelism "
+                "does not support MXINT8 KV."
+            )
         if self.kv_cache_dtype_str == "mxint8":
             common = {
                 "page_size": self.pool_page_size,
@@ -2453,15 +2466,24 @@ class KVCacheConfigurator:
                         if current_platform.dcp_shards_every_kv_pool()
                         else 1
                     )
+                    # An unsplit SWA sub-pool hands out its own rows at the
+                    # physical page, and the full side page-interleaves its
+                    # locations over `widening` classed sub-pools at that page
+                    # (PageInterleavePlacement); see _build_tpu_swa_kv_pool.
+                    swa_replicated = (
+                        widening > 1 and current_platform.dcp_replicates_swa_kv()
+                    )
+                    swa_widening = 1 if swa_replicated else widening
                     token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         sizes.full_max_total_num_tokens * widening,
-                        sizes.swa_max_total_num_tokens * widening,
-                        page_size=get_schedule().page_size * widening,
+                        sizes.swa_max_total_num_tokens * swa_widening,
+                        page_size=get_schedule().page_size * swa_widening,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                         req_to_token_pool=req_to_token_pool,
+                        full_shard_size=widening if swa_replicated else 1,
                     )
                 else:
                     if get_memory().enable_hisparse:

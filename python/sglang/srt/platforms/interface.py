@@ -249,6 +249,25 @@ class SRTPlatform(DeviceMixin):
         attn_tp_size // attn_dcp_size, not only the full-attention paged pool."""
         return False
 
+    def dcp_replicates_swa_kv(self) -> bool:
+        """Whether decode context parallelism leaves sliding-window KV unsplit.
+
+        Every DCP rank then stores every token of the SWA sub-pool, with plain-TP
+        K/V heads and paged like its allocator, and attends SWA layers without a
+        cross-rank merge. Only meaningful together with ``dcp_shards_every_kv_pool``.
+        """
+        return False
+
+    def get_page_interleave_allocator_cls(self) -> type:
+        """The classed page-interleave allocator (``PageInterleavePoolAllocator``
+        or a platform subclass) a hybrid-SWA pool uses for its full-attention
+        side under ``dcp_replicates_swa_kv``."""
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            PageInterleavePoolAllocator,
+        )
+
+        return PageInterleavePoolAllocator
+
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
     def supports_moe_dp_pipeline_stages(self) -> bool:

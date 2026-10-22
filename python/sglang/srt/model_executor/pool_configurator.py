@@ -771,6 +771,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             if current_platform.dcp_shards_every_kv_pool()
             else 1
         )
+        # An unsplit SWA sub-pool keeps plain-TP heads and counts rows at the
+        # physical page (see _build_tpu_swa_kv_pool).
+        self._swa_replicated = dcp_size > 1 and current_platform.dcp_replicates_swa_kv()
+        swa_dcp_size = 1 if self._swa_replicated else dcp_size
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
@@ -809,7 +813,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 layout=getattr(kvc, "kv_full_layout", None) or "merged",
             )
             self._swa_per_token = cache_bytes_per_token(
-                model_config.get_swa_num_kv_heads(tp_size, dcp_size),
+                model_config.get_swa_num_kv_heads(tp_size, swa_dcp_size),
                 model_config.swa_head_dim,
                 kvc.pool_page_size,
                 group_size=getattr(kvc, "kv_group_size", 32),
@@ -851,7 +855,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
             # SWA layer per-token memory (bytes)
             self._swa_per_token = _mha_bytes_per_token_per_layer(
-                num_kv_heads=model_config.get_swa_num_kv_heads(tp_size, dcp_size),
+                num_kv_heads=model_config.get_swa_num_kv_heads(tp_size, swa_dcp_size),
                 head_dim=model_config.swa_head_dim,
                 v_head_dim=model_config.swa_v_head_dim,
                 kv_cache_dtype=kv_cache_dtype,
@@ -864,7 +868,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.head_dim + model_config.v_head_dim)
             ) // scale_block_size
             self._swa_per_token += (
-                model_config.get_swa_num_kv_heads(tp_size, dcp_size)
+                model_config.get_swa_num_kv_heads(tp_size, swa_dcp_size)
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
@@ -1040,6 +1044,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 if current_platform.dcp_shards_every_kv_pool()
                 else 1
             )
+            if self._swa_replicated:
+                widening = 1
             self.validate_swa_pool_size(
                 swa_tokens * widening,
                 self._sliding_window_size,

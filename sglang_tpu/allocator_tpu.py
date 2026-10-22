@@ -33,6 +33,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.utils import get_num_new_pages
 from sglang_tpu.kv_free_fence import HeldPages
 
@@ -173,18 +174,24 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
         return num_pages <= len(self.free_pages)
 
+    def take_free_pages(self, num_pages: int) -> torch.Tensor | None:
+        """Pop ``num_pages`` free page ids (host int32) in free-list order, or
+        None when the pool cannot supply them."""
+        if not self._ensure_free_pages(num_pages):
+            return None
+        pages = self.free_pages[:num_pages]
+        self.free_pages = self.free_pages[num_pages:]
+        self._mark_handed_out(pages)
+        return pages
+
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.
         assert need_size % self.page_size == 0, (
             "The allocation size should be page-aligned"
         )
-        num_pages = need_size // self.page_size
-        if not self._ensure_free_pages(num_pages):
+        out_pages = self.take_free_pages(need_size // self.page_size)
+        if out_pages is None:
             return None
-
-        out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
-        self._mark_handed_out(out_pages)
 
         # Expand to per-token indices on CPU, then one async H2D.
         out_indices = (
@@ -219,7 +226,8 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         else:
             num_new_pages_item = num_new_pages
 
-        if not self._ensure_free_pages(num_new_pages_item):
+        free_pages_cpu = self.take_free_pages(num_new_pages_item)
+        if free_pages_cpu is None:
             return None
 
         # Compute the per-token page indices entirely on host, then do a
@@ -227,10 +235,6 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         # Python loop in ``alloc_extend_naive``. ``prefix_lens_cpu`` and
         # ``seq_lens_cpu`` are already mirrors of the device tensors, so only
         # ``last_loc`` needs a D2H copy when it is not already on the host.
-        if num_new_pages_item > 0:
-            free_pages_cpu = self.free_pages[:num_new_pages_item]
-        else:
-            free_pages_cpu = torch.empty((0,), dtype=torch.int32, device="cpu")
 
         if out_indices_cpu is None:
             out_indices_cpu = torch.empty(
@@ -255,8 +259,6 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages_item:]
-        self._mark_handed_out(free_pages_cpu)
         return out_indices.int()
 
     def alloc_decode(
@@ -282,7 +284,8 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         need_new_pages = (seq_lens_cpu % self.page_size == 1).to(torch.int32)
         num_new_pages = int(need_new_pages.sum())
 
-        if not self._ensure_free_pages(num_new_pages):
+        new_page_ids = self.take_free_pages(num_new_pages)
+        if new_page_ids is None:
             return None
 
         bs = int(seq_lens.shape[0])
@@ -291,12 +294,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         # below — the sentinel is harmless).
         per_req_new_page = torch.zeros(bs, dtype=torch.int32, device="cpu")
         if num_new_pages > 0:
-            new_page_ids = self.free_pages[:num_new_pages]
             start_new_pages = torch.cumsum(need_new_pages, 0) - need_new_pages
             mask = need_new_pages.to(torch.bool)
             per_req_new_page[mask] = new_page_ids[start_new_pages[mask].long()]
-            self.free_pages = self.free_pages[num_new_pages:]
-            self._mark_handed_out(new_page_ids)
 
         #   need_new_pages[i] == 1  →  out_indices[i] = new_page * page_size
         #   need_new_pages[i] == 0  →  out_indices[i] = last_loc + 1
@@ -416,3 +416,227 @@ def host_return_allocators(allocator) -> list[TpuPagedTokenToKVPoolAllocator]:
         ):
             return inner
     return []
+
+
+class TpuPageInterleavePoolAllocator(PageInterleavePoolAllocator):
+    """Page-interleaved full-attention allocator of a TPU decode-context-parallel
+    group: logical page ``l`` is rank ``l % N``'s local physical page ``l // N``
+    (``PageInterleavePlacement`` at the physical page), each class being a stock
+    TPU paged allocator with its own host-resident free list, KV free fence
+    hold and double-free guard.
+
+    Position page ``j`` of a request takes class ``j % N`` (rotation base 0):
+    a page's parity is its position parity on every rank, which the per-rank
+    attention metadata and the P/D page transfer rely on. Decode and
+    page-unaligned extends continue a request inside its current page and
+    open new pages by position, so no per-chain rotation base is kept.
+    ``available_size`` is the min-class capacity floor of the generic class.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        physical_page_size: int,
+        shard_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache,
+        need_sort: bool,
+    ):
+        assert size % physical_page_size == 0, (
+            f"per-rank size {size} is not a multiple of page_size {physical_page_size}"
+        )
+        # One stock pool per class, each over this rank's physical slots;
+        # built before super().__init__, whose clear() resets them.
+        self.class_pools = [
+            TpuPagedTokenToKVPoolAllocator(
+                size, physical_page_size, dtype, device, kvcache, need_sort
+            )
+            for _ in range(shard_size)
+        ]
+        super().__init__(
+            size,
+            physical_page_size,
+            shard_size,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+        )
+
+    def clear(self):
+        for pool in self.class_pools:
+            pool.clear()
+        self.free_group = None
+        self.free_page_ids_group = []
+        self.free_pages = None
+        self.release_pages = None
+
+    # ---- classed accounting over the class pools ------------------------------
+
+    def class_free_page_counts(self) -> list[int]:
+        return [pool.available_size() // self.page_size for pool in self.class_pools]
+
+    def merge_and_sort_free(self):
+        for pool in self.class_pools:
+            pool.merge_and_sort_free()
+
+    def get_all_free_pages(self) -> torch.Tensor:
+        return torch.cat(
+            [
+                pool.get_all_free_pages().to(torch.int64) * self.shard_size + r
+                for r, pool in enumerate(self.class_pools)
+            ]
+        )
+
+    def debug_check_classes(self):
+        for pool in self.class_pools:
+            pool._debug_check_no_duplicate_pages()
+
+    def _take_class_pages(self, classes: torch.Tensor) -> torch.Tensor | None:
+        """Logical page ids for new pages of the given classes (host int64),
+        or None when some class cannot supply its share. Every class is checked
+        before any page is taken, so a refusal leaves the pools untouched."""
+        n = self.shard_size
+        needs = [int((classes == c).sum()) for c in range(n)]
+        if any(
+            needs[c] * self.page_size > self.class_pools[c].available_size()
+            for c in range(n)
+        ):
+            return None
+        logical = torch.empty(classes.numel(), dtype=torch.int64)
+        for c in range(n):
+            if needs[c] == 0:
+                continue
+            pages = self.class_pools[c].take_free_pages(needs[c])
+            assert pages is not None, "a class pool refused pages it reported free"
+            logical[classes == c] = pages.to(torch.int64) * n + c
+        return logical
+
+    # ---- alloc / free -----------------------------------------------------------
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        num_new_pages: int = None,
+        out_indices_cpu: torch.Tensor = None,
+        return_host: bool = False,
+        rotation_bases=None,
+    ):
+        """Continue each request inside its current page from ``last_loc`` and
+        open its new position pages ``ceil(prefix / ps) .. ceil(seq / ps) - 1``
+        from class ``j % N``; prefixes need not be page-aligned."""
+        if rotation_bases is not None and any(
+            b not in (None, 0) for b in rotation_bases
+        ):
+            raise ValueError(
+                "TpuPageInterleavePoolAllocator keeps rotation base 0 (page "
+                f"parity = position parity), got rotation_bases={rotation_bases}"
+            )
+        ps, n = self.page_size, self.shard_size
+        prefix = prefix_lens_cpu.to(torch.int64)
+        seq = seq_lens_cpu.to(torch.int64)
+        if self.debug_mode:
+            assert torch.all((last_loc.cpu() + 1) % ps == prefix % ps)
+            assert extend_num_tokens == int((seq - prefix).sum())
+        first_new = (prefix + ps - 1) // ps
+        counts = ((seq + ps - 1) // ps - first_new).clamp(min=0)
+        total = int(counts.sum())
+        if num_new_pages is not None:
+            assert num_new_pages == total, (num_new_pages, total)
+        starts = torch.cumsum(counts, 0) - counts
+        req_of_page = torch.repeat_interleave(torch.arange(len(counts)), counts)
+        position_pages = (
+            first_new[req_of_page]
+            + torch.arange(total, dtype=torch.int64)
+            - starts[req_of_page]
+        )
+        assigned = self._take_class_pages(position_pages % n)
+        if assigned is None:
+            return None
+
+        if out_indices_cpu is None:
+            out_indices_cpu = torch.empty((extend_num_tokens,), dtype=torch.int32)
+        # The stock fill: request i's k-th new page is assigned[starts[i] + k].
+        alloc_extend_vectorized_cpu(
+            prefix_lens_cpu, seq_lens_cpu, last_loc.cpu(), assigned, out_indices_cpu, ps
+        )
+        if self.debug_mode:
+            assert len(torch.unique(out_indices_cpu)) == len(out_indices_cpu)
+        if return_host:
+            return out_indices_cpu
+        return out_indices_cpu.to(self.device, non_blocking=True).int()
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        out_indices_cpu: torch.Tensor | None = None,
+    ):
+        """One new page for each request whose new token opens position page
+        ``(seq_len - 1) // ps``, from class ``page % N``; the others continue
+        at ``last_loc + 1``. ``out_indices_cpu`` (optional host buffer) receives
+        the locations too and needs a host-resident ``last_loc``."""
+        ps, n = self.page_size, self.shard_size
+        seq = seq_lens_cpu.to(torch.int64)
+        if out_indices_cpu is not None and last_loc.device.type != "cpu":
+            raise ValueError("out_indices_cpu requires a host-resident last_loc")
+        if self.debug_mode:
+            assert torch.all((last_loc.cpu() + 2) % ps == seq % ps)
+        need_new = seq % ps == 1
+        opened = ((seq - 1) // ps)[need_new]
+        assigned = self._take_class_pages(opened % n)
+        if assigned is None:
+            return None
+        per_req_new_page = torch.zeros(seq.numel(), dtype=torch.int64)
+        per_req_new_page[need_new] = assigned
+        need_new_pages = need_new.to(torch.int64)
+        if last_loc.device.type != "cpu":
+            # Device formula on fixed-shape (bs,) inputs, as the stock pool does.
+            per_req_new_page = per_req_new_page.to(self.device, non_blocking=True)
+            need_new_pages = need_new_pages.to(self.device, non_blocking=True)
+        out_indices = (last_loc + 1) * (1 - need_new_pages) + (
+            per_req_new_page * ps * need_new_pages
+        )
+        if last_loc.device.type == "cpu":
+            if out_indices_cpu is not None:
+                out_indices_cpu.copy_(out_indices)
+            out_indices = out_indices.to(self.device, non_blocking=True)
+        return out_indices.int()
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        # The tree quantum is the physical page, so every free covers whole
+        # pages; split them by owner class, each pool defers inside its own
+        # free group and holds them behind the KV free fence.
+        self.free_page_ids(
+            torch.unique(free_index.to("cpu", torch.int64) // self.page_size)
+        )
+
+    def free_page_ids(self, page_ids: torch.Tensor):
+        if page_ids.numel() == 0:
+            return
+        page_ids = page_ids.to("cpu", torch.int64)
+        owners = page_ids % self.shard_size
+        for c, pool in enumerate(self.class_pools):
+            mine = page_ids[owners == c]
+            if mine.numel():
+                pool.free_page_ids((mine // self.shard_size).to(torch.int32))
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        self.free(free_index)
+
+    def free_group_begin(self):
+        for pool in self.class_pools:
+            pool.free_group_begin()
+
+    def free_group_end(self):
+        for pool in self.class_pools:
+            pool.free_group_end()

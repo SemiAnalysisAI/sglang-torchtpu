@@ -623,8 +623,13 @@ def _validate_decode_context_parallel(server_args) -> None:
     runs on the batched RPA backend with a host-resident ``req_to_token`` and a
     KV cache no other component reads -- every other attention backend,
     parallelism mode and KV consumer is refused.
+
+    A decode backend whose kernel spec owns DCP
+    (``RpaKernelSpec.owns_decode_context_parallel``) admits its own backend,
+    speculative, disaggregation, tracer and KV-layout combinations; only the
+    checks on the parallel topology and the KV cache stay.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
     from sglang.srt.environ import envs
 
     cfg = resolving_view(server_args)
@@ -632,7 +637,9 @@ def _validate_decode_context_parallel(server_args) -> None:
     if dcp_size <= 1:
         return
 
-    if cfg.attention_backend != _DCP_ATTENTION_BACKEND:
+    spec = _rpa_kernel_spec(attention_backends_of(cfg)[1])
+    backend_owned = spec is not None and spec.owns_decode_context_parallel
+    if not backend_owned and cfg.attention_backend != _DCP_ATTENTION_BACKEND:
         raise ValueError(
             "--decode-context-parallel-size > 1 on TPU requires "
             f"--attention-backend {_DCP_ATTENTION_BACKEND}, got "
@@ -648,7 +655,7 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--pipeline-parallel-size > 1 is not supported with "
             f"--decode-context-parallel-size > 1 on TPU (got pp_size={cfg.pp_size})."
         )
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm is not None and not backend_owned:
         raise ValueError(
             "--speculative-algorithm is not supported with "
             "--decode-context-parallel-size > 1 on TPU (got "
@@ -676,7 +683,7 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-prefill-cp is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.disaggregation_mode != "null":
+    if cfg.disaggregation_mode != "null" and not backend_owned:
         raise ValueError(
             "--disaggregation-mode is not supported with "
             "--decode-context-parallel-size > 1 on TPU (got "
@@ -705,7 +712,7 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-torch-compile is required with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.tpu_compile_tracer != "dynamo":
+    if cfg.tpu_compile_tracer != "dynamo" and not backend_owned:
         raise ValueError(
             "--tpu-compile-tracer must be 'dynamo' with "
             "--decode-context-parallel-size > 1 on TPU (got "
@@ -717,7 +724,7 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--decode-context-parallel-size > 1 on TPU: the DCP attention "
             "metadata is built from a host-resident req_to_token."
         )
-    if _uses_seq_along_lane_kv():
+    if not backend_owned and _uses_seq_along_lane_kv():
         raise ValueError(
             "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1 is not supported with "
             "--decode-context-parallel-size > 1 on TPU: the DCP KV write "
@@ -732,7 +739,8 @@ def _validate_decode_context_parallel(server_args) -> None:
     chunk = cfg.chunked_prefill_size
     if chunk is None:
         chunk = _UNSET_CHUNKED_PREFILL_SIZE
-    if 0 < chunk < cfg.page_size * dcp_size:
+    # Owned DCP pages at the physical page, so its chunks need no widening.
+    if not backend_owned and 0 < chunk < cfg.page_size * dcp_size:
         raise ValueError(
             f"--chunked-prefill-size ({chunk}) must be at least --page-size x "
             f"--decode-context-parallel-size ({cfg.page_size} x {dcp_size} = "
@@ -1161,6 +1169,11 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuPagedTokenToKVPoolAllocator
 
+    def get_page_interleave_allocator_cls(self) -> type:
+        from sglang_tpu.allocator_tpu import TpuPageInterleavePoolAllocator
+
+        return TpuPageInterleavePoolAllocator
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
 
@@ -1226,6 +1239,13 @@ class TpuSRTPlatform(SRTPlatform):
         # The batched RPA DCP path addresses every pool through the widened
         # location space and replicates K/V heads within a DCP group.
         return True
+
+    def dcp_replicates_swa_kv(self) -> bool:
+        # A backend that owns DCP attends sliding-window layers locally over
+        # every position; the base's DCP path splits SWA KV like full KV.
+        from sglang_tpu.attention_pallas_rpa_base import decode_backend_owns_dcp
+
+        return decode_backend_owns_dcp()
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True

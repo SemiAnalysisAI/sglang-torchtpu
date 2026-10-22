@@ -3,7 +3,7 @@
 import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
@@ -412,6 +412,51 @@ class TestHybridSWAConfigurator(CustomTestCase):
             return cfg._full_per_token, cfg._swa_per_token, floor.call_args
 
         self.assertEqual(geometry(2), geometry(1))
+
+    def test_dcp_unsplit_swa_keeps_plain_tp_heads_and_physical_page_floor(self):
+        """TPU DCP with an unsplit SWA sub-pool: full layers price tp // dcp
+        heads, SWA layers keep plain-TP heads, and the SWA admission floor
+        counts rows at the physical page; split keeps the widened floor."""
+        from sglang.srt.model_executor import pool_configurator
+
+        def geometry(dcp_size, unsplit):
+            mr = self._make_swa_runner(page_size=16)
+            mc = mr.model_config
+            mc.get_num_kv_heads = lambda tp_size, dcp_size=1: 8 // (tp_size // dcp_size)
+            mc.get_swa_num_kv_heads = mc.get_num_kv_heads
+            with (
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_shards_every_kv_pool",
+                    return_value=True,
+                ),
+                patch.object(
+                    pool_configurator.current_platform,
+                    "dcp_replicates_swa_kv",
+                    return_value=unsplit,
+                ),
+                patch.object(
+                    pool_configurator.MemoryPoolConfigurator, "validate_swa_pool_size"
+                ) as floor,
+            ):
+                cfg = pool_configurator.create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(10_000_000, 16)
+            return cfg, config, floor.call_args.args
+
+        base, _, _ = geometry(1, unsplit=True)
+        split, split_config, split_floor = geometry(2, unsplit=False)
+        unsplit, unsplit_config, unsplit_floor = geometry(2, unsplit=True)
+        self.assertEqual(unsplit._full_per_token, 2 * base._full_per_token)
+        self.assertEqual(split._swa_per_token, 2 * base._swa_per_token)
+        self.assertEqual(unsplit._swa_per_token, base._swa_per_token)
+        self.assertEqual(
+            split_floor, (2 * split_config.swa_max_total_num_tokens, ANY, 32)
+        )
+        self.assertEqual(
+            unsplit_floor, (unsplit_config.swa_max_total_num_tokens, ANY, 16)
+        )
 
     def test_draft_does_not_inherit_target_shared_byte_budget(self):
         """A separate draft pool must not allocate the target's byte envelope again."""
@@ -2117,6 +2162,135 @@ class TestOutOfTreeHybridSwaRouting(CustomTestCase):
             )
         platform.get_paged_allocator_cls.assert_not_called()
         swa_allocator.assert_called_once()
+
+
+class TestTpuDcpHybridSwaPools(CustomTestCase):
+    """TPU decode context parallelism on a hybrid-SWA model: the base backend
+    widens both sub-allocators; a backend that owns DCP (unsplit SWA KV) gets a
+    page-interleaved full side over 2x logical slots and a stock SWA side over
+    its own rows, both at the physical page, and plain-TP SWA heads."""
+
+    def _fake_configurator(self):
+        _publish_config(self, page_size=64, disaggregation_mode="decode")
+        return SimpleNamespace(
+            device="cpu",
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="auto",
+            is_draft_worker=False,
+            is_hybrid_swa=True,
+            use_mla_backend=False,
+            mambaish_config=None,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+
+    def _sizes(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import _PoolSizes
+
+        return _PoolSizes(
+            max_total_num_tokens=256,
+            max_running_requests=4,
+            full_max_total_num_tokens=256,
+            swa_max_total_num_tokens=128,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+            c4_state_dtype=None,
+            c128_state_dtype=None,
+        )
+
+    def _allocator_call(self, replicated):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        with (
+            get_parallel().override(attn_dcp_size=2),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+            ) as platform,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.SWATokenToKVPoolAllocator"
+            ) as swa_allocator,
+        ):
+            platform.is_out_of_tree.return_value = False
+            platform.is_tpu.return_value = True
+            platform.dcp_shards_every_kv_pool.return_value = True
+            platform.dcp_replicates_swa_kv.return_value = replicated
+            KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                self._fake_configurator(),
+                sizes=self._sizes(),
+                token_to_kv_pool=MagicMock(),
+                is_dsv4_model=False,
+                req_to_token_pool=MagicMock(),
+                token_to_kv_pool_allocator=None,
+            )
+        swa_allocator.assert_called_once()
+        return swa_allocator.call_args
+
+    def test_owned_dcp_pairs_a_classed_full_side_with_an_unwidened_swa_side(self):
+        call = self._allocator_call(replicated=True)
+        self.assertEqual(call.args, (512, 128))
+        self.assertEqual(call.kwargs["page_size"], 64)
+        self.assertEqual(call.kwargs["full_shard_size"], 2)
+
+    def test_base_dcp_keeps_both_sides_widened(self):
+        call = self._allocator_call(replicated=False)
+        self.assertEqual(call.args, (512, 256))
+        self.assertEqual(call.kwargs["page_size"], 128)
+        self.assertEqual(call.kwargs["full_shard_size"], 1)
+
+    def _swa_pool_call(self, dcp_size, replicated, kv_cache_dtype_str="auto"):
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc_module
+
+        model_config = SimpleNamespace(
+            is_draft_model=False,
+            head_dim=64,
+            v_head_dim=64,
+            swa_head_dim=64,
+            swa_v_head_dim=64,
+            hf_text_config=SimpleNamespace(num_key_value_heads=16),
+            get_num_kv_heads=lambda tp, dcp=1: max(1, 16 // (tp // dcp)),
+        )
+        fake = SimpleNamespace(
+            _tpu_mha_pool_class=lambda: MagicMock(name="pool_cls"),
+            layer_info=SimpleNamespace(
+                start_layer=0,
+                swa_attention_layer_ids=[1, 2],
+                full_attention_layer_ids=[0],
+            ),
+            kv_cache_dtype_str=kv_cache_dtype_str,
+            is_hybrid_swa_mtp_draft=False,
+            model_config=model_config,
+            pool_page_size=512,
+            kv_cache_dtype=torch.bfloat16,
+            device="cpu",
+            _mxint8_pool_kwargs=lambda: {},
+            kv_swa_layout=None,
+            kv_full_layout=None,
+        )
+        with (
+            get_parallel().override(attn_tp_size=16, attn_dcp_size=dcp_size),
+            patch.object(
+                kvc_module.current_platform,
+                "dcp_replicates_swa_kv",
+                return_value=replicated,
+            ),
+            patch.object(kvc_module, "SWAKVPool") as swa_pool,
+        ):
+            kvc_module.KVCacheConfigurator._build_tpu_swa_kv_pool(
+                fake, full_max_total_num_tokens=1024, swa_max_total_num_tokens=512
+            )
+        return swa_pool.call_args.kwargs
+
+    def test_swa_sub_pool_heads(self):
+        self.assertEqual(self._swa_pool_call(1, False)["head_num"], 1)
+        self.assertEqual(self._swa_pool_call(1, False)["swa_head_num"], 1)
+        split = self._swa_pool_call(2, False)
+        self.assertEqual((split["head_num"], split["swa_head_num"]), (2, 2))
+        unsplit = self._swa_pool_call(2, True)
+        self.assertEqual((unsplit["head_num"], unsplit["swa_head_num"]), (2, 1))
+        self.assertEqual(unsplit["page_size"], 512)
+        with self.assertRaisesRegex(ValueError, "MXINT8"):
+            self._swa_pool_call(2, True, kv_cache_dtype_str="mxint8")
 
 
 class TestTpuDsaRouting(CustomTestCase):

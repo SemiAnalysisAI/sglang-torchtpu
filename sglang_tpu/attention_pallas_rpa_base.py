@@ -305,6 +305,16 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
+    # Whether the backend runs decode context parallelism in its own forward:
+    # its kernel takes each rank's share of a request (local KV length, the
+    # new tokens the rank stores) and the backend merges the partials itself.
+    # The pool then page-interleaves full-attention KV (``PageInterleavePlacement``
+    # at the physical page) and keeps sliding-window KV unsplit, and the base
+    # builds unsharded metadata (global kv_lens, logical page tables at the
+    # physical page) with its own position-interleaved DCP path off. Declared on
+    # the spec, so the platform and the pool configurator can ask by backend
+    # name before the backend exists.
+    owns_decode_context_parallel: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -322,6 +332,21 @@ def _import_dcp_helpers():
     from sglang.srt.layers.dcp.layout import get_dcp_lens
 
     return get_dcp_lens
+
+
+def decode_backend_owns_dcp() -> bool:
+    """Whether this server's decode attention backend owns decode context
+    parallelism (``RpaKernelSpec.owns_decode_context_parallel``).
+
+    Decode is where DCP runs, so the decode backend's declaration governs every
+    RPA backend of the server: the prefill backend of a P/D decode instance is
+    built too and must build its metadata the same way.
+    """
+    from sglang.srt.runtime_context import attention_backends
+    from sglang_tpu.tpu_platform import _rpa_kernel_spec
+
+    spec = _rpa_kernel_spec(attention_backends()[1])
+    return spec is not None and spec.owns_decode_context_parallel
 
 
 def _check_dcp_kv_heads(*, layer: "RadixAttention", pool_kv_heads: int) -> None:
@@ -544,6 +569,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # The DCP group as seen by a backend that owns DCP (see
+    # RpaKernelSpec.owns_decode_context_parallel); class defaults so a backend
+    # built without __init__ reads "no DCP".
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_group = None
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -583,6 +615,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self._dcp = parallel.attn_dcp_size
         self._dcp_rank = parallel.attn_dcp_rank if self._dcp > 1 else 0
         self._dcp_group = parallel.dcp_group if self._dcp > 1 else None
+        # The DCP group as seen by a backend that owns DCP; (1, 0, None)
+        # otherwise. Owned DCP page-interleaves KV at the physical page, so the
+        # base keeps the physical page stride and its own DCP path off.
+        self.dcp_size, self.dcp_rank, self.dcp_group = 1, 0, None
+        if self._dcp > 1 and decode_backend_owns_dcp():
+            self.dcp_size, self.dcp_rank, self.dcp_group = (
+                self._dcp,
+                self._dcp_rank,
+                self._dcp_group,
+            )
+            self._dcp, self._dcp_rank, self._dcp_group = 1, 0, None
         self._page_stride = self.page_size * self._dcp
         self._cp_rank_t: torch.Tensor | None = None
         self._cp_rank_index: torch.Tensor | None = None

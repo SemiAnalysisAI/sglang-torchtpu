@@ -413,7 +413,10 @@ class SchedulerInvariantChecker:
                 sub
                 for n in ("full_attn_allocator", "swa_attn_allocator")
                 if (sub := getattr(alloc, n, None)) is not None
-                and getattr(sub, "free_pages", None) is not None
+                and (
+                    getattr(sub, "free_pages", None) is not None
+                    or page_interleave_shard_size(sub) > 1
+                )
             ]
         )
         if not sub_allocs:
