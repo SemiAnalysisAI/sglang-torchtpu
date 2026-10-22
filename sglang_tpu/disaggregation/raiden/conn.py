@@ -362,6 +362,18 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
+        # A push moves page_size tokens of every page it names, so the pool
+        # must page at the transfer page: a sub-pool paged differently (a
+        # window pool widened by the DCP size, say) would take wrong bytes.
+        page_tokens = int(tensor.shape[3] if is_head_major(tensor) else tensor.shape[1])
+        if page_tokens != int(self.kv_args.page_size):
+            raise RuntimeError(
+                "Raiden reshard needs the "
+                + ("sliding-window" if swa else "full-attention")
+                + f" KV pool paged at the transfer page {self.kv_args.page_size}, "
+                f"got {page_tokens}-token pages (layer tensor shape "
+                f"{tuple(tensor.shape)})"
+            )
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)

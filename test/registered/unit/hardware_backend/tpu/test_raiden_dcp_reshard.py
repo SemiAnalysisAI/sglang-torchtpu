@@ -656,6 +656,11 @@ class TestDcpRankMapping(RaidenDcpTestCase):
             decode._make_geometry(ATTN_TP, ATTN_TP // DCP)
         decode._kv_caches = [_head_major(64, DCP)]
         decode._make_geometry(ATTN_TP, ATTN_TP // DCP)
+        # A window pool paged at dcp_size times the transfer page (what a
+        # DCP-widened allocator would give it) cannot take whole-page pushes.
+        decode._swa_kv_caches = [_Tensor((64, 2, LANES, DCP * PAGE))]
+        with self.assertRaisesRegex(RuntimeError, "paged at the transfer page"):
+            decode._make_geometry(ATTN_TP, ATTN_TP, swa=True)
 
 
 class TestDcpReshardHandshake(RaidenDcpTestCase):
