@@ -1314,6 +1314,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if max_new_tokens is not None and (
+            isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int)
+        ):
+            # Reject before the length arithmetic below, which would raise a
+            # TypeError (HTTP 500) for e.g. a string.
+            raise ValueError(
+                "max_new_tokens must be an integer, got "
+                f"{type(max_new_tokens).__name__} {max_new_tokens!r}."
+            )
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
