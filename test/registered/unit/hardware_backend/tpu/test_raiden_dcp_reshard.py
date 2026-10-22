@@ -34,8 +34,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden import reshard_schedule as rs
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -406,6 +410,55 @@ class TestPagePlacement(unittest.TestCase):
         self.assertEqual(sequential_page_runs(rows, ps), ([0, 1, 2], 0, 12))
         rows = local[owner == 1]
         self.assertEqual(sequential_page_runs(rows, ps), ([0, 1], 0, 8))
+
+
+class TestDecodeTransferPageSizes(unittest.TestCase):
+    """The decode lists its transfer pages at the device pools' page under
+    DCP, where the allocator's page spans ``dcp_size`` pool pages."""
+
+    @staticmethod
+    def _queue(allocator_page, pool_page, swa_page, state_types):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=allocator_page)
+        queue.token_to_kv_pool = SimpleNamespace(
+            page_size=pool_page, swa_kv_pool=SimpleNamespace(page_size=swa_page)
+        )
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=list(state_types))
+        )
+        return queue
+
+    def test_dcp_lists_use_the_pools_pages(self):
+        queue = self._queue(1024, 512, 512, [StateType.SWA])
+        with (
+            get_parallel().override(attn_dcp_size=2),
+            patch.object(
+                type(current_platform), "dcp_shards_every_kv_pool", return_value=True
+            ),
+        ):
+            self.assertEqual(queue._transfer_page_sizes(), (512, 512))
+            # A model without a window pool pages everything at the full pool.
+            queue = self._queue(1024, 512, 4096, [])
+            self.assertEqual(queue._transfer_page_sizes(), (512, 512))
+
+    def test_without_dcp_or_widening_the_allocator_page_is_kept(self):
+        queue = self._queue(1024, 512, 512, [StateType.SWA])
+        with (
+            get_parallel().override(attn_dcp_size=1),
+            patch.object(
+                type(current_platform), "dcp_shards_every_kv_pool", return_value=True
+            ),
+        ):
+            self.assertEqual(queue._transfer_page_sizes(), (1024, 1024))
+        # A platform whose DCP relays tokens into the decode's wider pages
+        # (the MLA path) keeps listing the allocator's pages.
+        with (
+            get_parallel().override(attn_dcp_size=2),
+            patch.object(
+                type(current_platform), "dcp_shards_every_kv_pool", return_value=False
+            ),
+        ):
+            self.assertEqual(queue._transfer_page_sizes(), (1024, 1024))
 
 
 class TestHeadMajorGeometry(unittest.TestCase):
