@@ -330,6 +330,11 @@ class RaidenKVManager(
                 thread_name_prefix="raiden-reshard-push",
             )
             self._reshard_push_lock = threading.Lock()
+            # The host copy of a resharded room's state row: it waits for the
+            # forward in flight, so it runs off the scheduler thread.
+            self._state_copy_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="raiden-state-copy"
+            )
         else:
             self._reshard_plans: Dict[int, Dict[str, int]] = {}
         self._listener = threading.Thread(target=self._listen, daemon=True)
@@ -1276,6 +1281,7 @@ class RaidenKVManager(
                     self._prefill.replied,
                     self._prefill.reshard_final_pushed,
                     self._prefill.reshard_finalized,
+                    self._prefill.reshard_state_staged,
                     self._prefill.reshard_replied,
                     self._prefill.reshard_ready,
                     self._prefill.reshard_pushed,

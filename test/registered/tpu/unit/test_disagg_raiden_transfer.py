@@ -264,11 +264,12 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
     @staticmethod
     def _release(m) -> None:
-        # __init__ creates _push_executor only on the prefill branch, so a
-        # decode manager genuinely has no such attribute to shut down.
-        executor = m.__dict__.get("_push_executor")
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # __init__ creates these executors only on the prefill branch, so a
+        # decode manager genuinely has no such attributes to shut down.
+        for name in ("_push_executor", "_state_copy_executor"):
+            executor = m.__dict__.get(name)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     def _prefill(self, **kw):
         return self._manager(DisaggregationMode.PREFILL, **kw)
@@ -981,16 +982,27 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
             ),
         )
 
+    @staticmethod
+    def _drain_state_copies(prefill):
+        # One worker, first in first out: a no-op runs after every queued copy.
+        prefill._state_copy_executor.submit(lambda: None).result()
+
     def _send(self, prefill, room, prefill_slot, blocks=(1, 2)):
         prefill._on_reshard_req(
             self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
         )
+        self._finish_last_chunk(prefill, room, prefill_slot, blocks)
+        self._drain_state_copies(prefill)
+
+    @staticmethod
+    def _finish_last_chunk(prefill, room, prefill_slot, blocks=(1,)):
+        # What RaidenKVSender.send() runs once the room's last chunk is computed.
         rows = prefill._state_rows_from_state_indices(
             _mamba_state_indices(prefill_slot)
         )
         prefill.append_send_blocks(room, list(blocks), state_block_ids=rows)
-        prefill.snapshot_reshard_state(room, rows)
         prefill.finalize_send(room, aux_index=None)
+        prefill.stage_reshard_state(room)
 
     def test_decode_assembles_its_row_from_both_sources(self):
         sources = self._sources()
@@ -1075,7 +1087,7 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         )
         self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
 
-    def test_a_reshard_without_a_snapshot_fails_the_room(self):
+    def test_a_reshard_without_a_state_row_fails_the_room(self):
         (prefill, _) = self._sources()
         decode = self._decode(attn_tp_size=1)
         room = 7403
@@ -1092,18 +1104,86 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
                 swa_push_endpoint="",
             ).to_frames()
         )
-        prefill.append_send_blocks(room, [1], state_block_ids=[3])
+        prefill.append_send_blocks(room, [1])
         prefill.finalize_send(room, aux_index=None)
-        self.assertIn("no GDN state snapshot", prefill.failure_records[room])
+        prefill.stage_reshard_state(room)
+        self.assertIn("no GDN state row", prefill.failure_records[room])
 
-    def test_a_pulled_room_takes_no_snapshot(self):
+    def test_a_pulled_room_is_never_copied(self):
         (prefill, _) = self._sources()
         decode = self._decode()
         room = 7404
         prefill._on_pull_req(self._pull_req_frames(decode, room, 1))
         prefill.append_send_blocks(room, [1], state_block_ids=[2])
-        prefill.snapshot_reshard_state(room, [2])
+        prefill.stage_reshard_state(room)
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+
+    def test_a_late_pull_req_copies_no_state(self):
+        # A decode short of memory sends its PULL_REQ after the last chunk.
+        # The room is never resharded, so its row is not copied, either at
+        # the last chunk or when poll() runs after the request.
+        (prefill, _) = self._sources()
+        decode = self._decode()
+        room = 7408
+        prefill.request_status[room] = KVPoll.WaitingForInput
+        self._finish_last_chunk(prefill, room, prefill_slot=2)
+        prefill._on_pull_req(self._pull_req_frames(decode, room, 1))
+        prefill.stage_reshard_state(room)
+        self._drain_state_copies(prefill)
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
         self.assertNotIn(room, prefill._prefill.reshard_state)
+
+    def test_a_late_reshard_req_is_staged_by_poll_then_replied(self):
+        sources = self._sources()
+        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
+        room = 7406
+        self._register(decode, sources, room, [4], 1)
+        prefill = sources[0]
+        self._finish_last_chunk(prefill, room, prefill_slot=3)
+        # Nothing asked to reshard yet, so nothing was gathered.
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+        prefill._on_reshard_req(
+            self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+        )
+        # The listener does not read the pool, so the reply waits for poll().
+        self.assertNotIn(room, prefill._prefill.reshard_state_staged)
+        self.assertEqual(self.inboxes[decode.endpoint].frames, [])
+        prefill.stage_reshard_state(room)
+        self._drain_state_copies(prefill)
+        state = ReshardState.from_frames(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        np.testing.assert_array_equal(
+            state.rows[1], prefill._state_kv_caches[1][3].numpy()
+        )
+        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+
+    def test_the_host_copy_runs_on_the_state_copy_worker(self):
+        sources = self._sources()
+        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
+        room = 7407
+        self._register(decode, sources, room, [4], 1)
+        prefill = sources[0]
+        queued = []
+        worker = SimpleNamespace(submit=lambda fn, *args: queued.append((fn, args)))
+        with patch.object(prefill, "_state_copy_executor", worker):
+            prefill._on_reshard_req(
+                self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
+            )
+            self._finish_last_chunk(prefill, room, prefill_slot=2)
+        # The scheduler thread only gathered on device: no host copy, no reply.
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(room, prefill._prefill.reshard_state)
+        self.assertEqual(self.inboxes[decode.endpoint].frames, [])
+        fn, args = queued[0]
+        fn(*args)
+        state = ReshardState.from_frames(
+            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+        )
+        np.testing.assert_array_equal(
+            state.rows[1], prefill._state_kv_caches[1][2].numpy()
+        )
+        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
 
     def test_missing_source_rows_fail_the_room(self):
         sources = self._sources()

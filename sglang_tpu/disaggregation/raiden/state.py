@@ -24,6 +24,8 @@ class PrefillState:
     send_state_rows: Dict[int, List[int]] = field(default_factory=dict)
     # Host copy of that row (one array per state tensor), for a resharded room.
     reshard_state: Dict[int, List[Any]] = field(default_factory=dict)
+    # Resharded rooms whose row the scheduler thread has gathered for that copy.
+    reshard_state_staged: Set[int] = field(default_factory=set)
     send_aux: Dict[int, bytes] = field(default_factory=dict)
 
     # Decode reply address and the page counts it allocated.

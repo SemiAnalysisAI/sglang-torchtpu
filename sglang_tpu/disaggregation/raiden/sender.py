@@ -14,7 +14,7 @@ import errno
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -816,23 +816,37 @@ class RaidenSenderMixin:
             self._prefill.reshard_replied_at[room] = time.time()
         self._push_executor.submit(self._do_reshard_push, room, index, uuid)
 
-    def snapshot_reshard_state(self, room: int, state_rows: List[int]) -> None:
-        """Host copy of a room's committed GDN state row, for a resharded
-        transfer.
+    def stage_reshard_state(self, room: int) -> None:
+        """Start the host copy of a resharded room's committed GDN state row.
 
         A decode at a narrower attention TP holds wider state rows than any
         one source, so every source sends its row ahead of its RESHARD_BLOCKS
-        and the decode assembles its own (see ``assemble_state_fan_in``).
-        Runs on the scheduler thread once the room's last chunk is computed --
-        the thread whose forwards write the state -- so the copy reads it
-        after the final write. A room the decode already pulls symmetrically
-        moves its row on the state engine instead.
+        and the decode assembles its own (see ``assemble_state_fan_in``). Only
+        a room whose decode asked to reshard (RESHARD_REQ) is copied: a room
+        pulled at equal TP moves its row on the state engine, even when its
+        PULL_REQ comes after the last chunk.
+
+        Runs on the scheduler thread: from ``send()`` once the room's last
+        chunk is computed, and from ``poll()`` for a RESHARD_REQ that came
+        later. The device gather reads the row here, before a later forward
+        can donate the pool, and the room holds its slot until the transfer
+        ends. The host copy waits for the forward already in flight, so the
+        state-copy worker runs it and then replies.
         """
-        if self._state_engine is None or not state_rows:
+        if self._state_engine is None:
             return
         with self._state_lock:
-            if room in self._prefill.decode_addr or room in self._aborted:
+            if (
+                room not in self._prefill.reshard_req
+                or room not in self._prefill.reshard_finalized
+                or room in self._prefill.reshard_state_staged
+                or room in self._aborted
+            ):
                 return
+            state_rows = self._prefill.send_state_rows.get(room)
+            if not state_rows:
+                return  # _maybe_reshard_reply fails the room
+            self._prefill.reshard_state_staged.add(room)
         import torch
 
         row = int(state_rows[0])
@@ -842,14 +856,38 @@ class RaidenSenderMixin:
         by_shape = {}
         for i, tensor in enumerate(tensors):
             by_shape.setdefault((tuple(tensor.shape[1:]), tensor.dtype), []).append(i)
-        rows: List[Any] = [None] * len(tensors)
-        for indices in by_shape.values():
-            host = torch.stack([tensors[i][row] for i in indices]).cpu().numpy()
-            for i, value in zip(indices, host, strict=True):
-                rows[i] = value
+        groups = [
+            (indices, torch.stack([tensors[i][row] for i in indices]))
+            for indices in by_shape.values()
+        ]
+        self._state_copy_executor.submit(
+            self._finish_reshard_state, room, groups, len(tensors)
+        )
+
+    def _finish_reshard_state(
+        self, room: int, groups: List[Tuple[List[int], Any]], num_tensors: int
+    ) -> None:
+        """On the state-copy worker: copy the gathered rows to host, then reply."""
+        try:
+            rows: List[Any] = [None] * num_tensors
+            for indices, gathered in groups:
+                for i, value in zip(indices, gathered.cpu().numpy(), strict=True):
+                    rows[i] = value
+        except Exception as exc:
+            with self._state_lock:
+                if room in self._aborted:
+                    return
+                self._mark_aborted_locked(room)
+                self._fail_room_locked(
+                    room, f"Raiden reshard: room {room} state copy failed: {exc}"
+                )
+                self.update_status(room, KVPoll.Failed)
+            return
         with self._state_lock:
-            if room in self._prefill.send_blocks and room not in self._aborted:
-                self._prefill.reshard_state[room] = rows
+            if room not in self._prefill.send_blocks or room in self._aborted:
+                return
+            self._prefill.reshard_state[room] = rows
+        self._maybe_reshard_reply(room)
 
     def _maybe_reshard_reply(self, room: int) -> None:
         with self._state_lock:
@@ -871,16 +909,22 @@ class RaidenSenderMixin:
             aux_blob = self._prefill.send_aux.get(room, b"")
             state_rows = self._prefill.reshard_state.get(room)
             if self._state_engine is not None and state_rows is None:
-                reason = (
-                    f"Raiden reshard: room {room} has no GDN state snapshot to send"
-                )
+                if self._prefill.send_state_rows.get(room):
+                    # The state-copy worker replies once the host copy lands.
+                    return
+                reason = f"Raiden reshard: room {room} has no GDN state row to send"
                 self._mark_aborted_locked(room)
                 self._fail_room_locked(room, reason)
                 self.update_status(room, KVPoll.Failed)
                 return
         with self._announce_lock:
             with self._state_lock:
-                if room not in self._prefill.reshard_req:
+                # finalize_send, the RESHARD_REQ handler and the state-copy
+                # worker can all get here; only the first one replies.
+                if (
+                    room not in self._prefill.reshard_req
+                    or room in self._prefill.reshard_replied
+                ):
                     return
                 # Committed under the order lock: no announcement can follow.
                 self._prefill.reshard_replied.add(room)
@@ -1359,11 +1403,11 @@ class RaidenKVSender(CommonKVSender):
             self.kv_mgr._pipeline.offer_part(self.bootstrap_room, start, blocks)
         if self._last_chunk and not self._started:
             self._started = True
-            self.kv_mgr.snapshot_reshard_state(self.bootstrap_room, state_rows or [])
             # finalize_send turns the room Transferring itself, under the
             # lock an abort takes to fail it; a status update here could
             # overwrite a Failed that landed in between.
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
+            self.kv_mgr.stage_reshard_state(self.bootstrap_room)
 
     def _finalize_transfer_latency(self) -> None:
         if self._transfer_metric.transfer_latency_s is not None:
@@ -1384,6 +1428,9 @@ class RaidenKVSender(CommonKVSender):
         if self.kv_mgr.is_dummy_cp_rank:
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
+        # A RESHARD_REQ that came after the last chunk: stage its state row
+        # here, on the scheduler thread, not on the listener.
+        self.kv_mgr.stage_reshard_state(self.bootstrap_room)
         self.kv_mgr._drain_engine()
         # A recorded failure outranks a completion that lands after it, and
         # Failed is withheld while a stage or push still reads the room's

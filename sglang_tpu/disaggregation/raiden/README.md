@@ -107,16 +107,20 @@ but hybrid MLA + KDA models (Kimi-K3).
 Under push-resharding (`dst_tp < src_tp`) a decode rank's state row is wider
 than any source's: its conv channels are the q | k | v sub-blocks of `ratio`
 sources side by side, its recurrent heads theirs concatenated. The rows are
-small, so the state engine does not push them. Each source copies its
-committed row to host on the scheduler thread once the last chunk is computed
-(`snapshot_reshard_state`) and sends it as `RESHARD_STATE` ahead of its
-`RESHARD_BLOCKS` on the same ordered socket. The decode assembles its row
+small, so the state engine does not push them. Once a room's last chunk is
+computed and its decode has asked to reshard (`RESHARD_REQ`), each source
+gathers its committed row on the scheduler thread (`stage_reshard_state`, from
+`send()` or, for a later request, `poll()`); a worker copies it to host, so
+the scheduler does not wait for the forward in flight, and sends it as
+`RESHARD_STATE` ahead of its `RESHARD_BLOCKS` on the same ordered socket. A
+room pulled at equal TP is never copied, even when its `PULL_REQ` comes after
+the last chunk. The decode assembles its row
 (`reshard_schedule.assemble_state_fan_in`, from `TpuMambaPool`'s slice axes
 and conv sub-block widths), and its receiver poll writes it in place on the
 scheduler thread (`apply_state_uploads`, via `write_pages_torch`) before
-marking `state:<room>` received. A source without a snapshot, a decode
-missing a source's rows, or a pool without conv sub-block widths fails the
-room.
+marking `state:<room>` received. A source without a state row, a failed host
+copy, a decode missing a source's rows, or a pool without conv sub-block
+widths fails the room.
 
 ## MLA models (Kimi-K3)
 

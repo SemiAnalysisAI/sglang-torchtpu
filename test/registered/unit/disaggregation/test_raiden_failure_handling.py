@@ -85,6 +85,7 @@ def _prefill_manager():
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._swa_engine = None
+    mgr._state_engine = None
     mgr._reshard_slot_rooms = [None]
     mgr._reshard_slot_of = {}
     mgr._aborted = {}
@@ -553,6 +554,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
     def _sender(self, has_decode_request, bootstrap_timeout, age):
         mgr = SimpleNamespace(
             _drain_engine=lambda: None,
+            stage_reshard_state=lambda room: None,
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
@@ -1080,6 +1082,7 @@ class TestSenderTerminalPrecedence(unittest.TestCase):
     def _sender(self, **overrides):
         fields = dict(
             _drain_engine=lambda: None,
+            stage_reshard_state=lambda room: None,
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
