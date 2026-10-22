@@ -177,6 +177,15 @@ slice's quota is free:
 One ClusterQueue per `(lane, hosts)`. The shapes must not share a queue: a 2-host job needs
 8 chips, which a single-host flavor would satisfy on quota while being unschedulable.
 
+**The 1-host lanes share their slices.** `tpu-prgate-1h` and `tpu-nightly-1h` form the Kueue
+cohort `tpu-2x2x1` (`topology.yaml` `cohorts`), and both list both 2x2x1 pools, so a
+single-host job of either lane can run on either pool. `reconcile_quota.py` splits the live
+chips: pr-gate is guaranteed `reserve` slices (5) with `lendingLimit: 0`, and nightly holds
+the rest as nominal quota that pr-gate borrows while nightly is idle. Kueue admits a
+workload that fits its own quota before one that must borrow, so nightly takes freed slices
+first; borrowed PR jobs are never preempted (`reclaimWithinCohort: Never`), so nightly
+waits at most for them to finish. Multi-host lanes are not in the cohort.
+
 A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
 two pods inside a single slice.
 
@@ -268,7 +277,7 @@ _TODO._
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
-| `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips; refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
+| `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips (and the 1-host cohort's reserve split); refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
 | `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |

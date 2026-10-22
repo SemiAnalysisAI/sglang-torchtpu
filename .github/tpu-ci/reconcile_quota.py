@@ -17,12 +17,16 @@ Usage: reconcile_quota.py [--dry-run] [--pool=<ci-tpu-pool>]
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
 
 POOL_LABEL = "ci-tpu-pool"
 TPU = "google.com/tpu"
+TOPOLOGY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "topology.yaml"
+)
 
 
 def kget(kind):
@@ -92,6 +96,75 @@ def chips_per_pool(nodes):
     return chips
 
 
+def quantity(n, unit):
+    # The API server stores a zero quantity as "0", whatever unit it was written with.
+    return f"{n}{unit}" if n else "0"
+
+
+def resources(chips, lending_limit=None):
+    """TPU quota plus the cpu/memory derived from it, in the ClusterQueue's own shape."""
+    out = []
+    for name, per_chip, unit in ((TPU, 1, ""), ("cpu", 1, ""), ("memory", 8, "Gi")):
+        r = {"name": name, "nominalQuota": quantity(chips * per_chip, unit)}
+        if lending_limit is not None:
+            r["lendingLimit"] = quantity(lending_limit * per_chip, unit)
+        out.append(r)
+    return out
+
+
+def load_cohorts(path):
+    """[(hosts, {lane: queue}, {lane: reserved slices})] from topology.yaml `cohorts`."""
+    import yaml  # lazy: the lint job runs this module's tests without site-packages
+
+    with open(path) as f:
+        topo = yaml.safe_load(f)
+    out = []
+    for c in (topo.get("cohorts") or {}).values():
+        hosts = c["hosts"]
+        queues = {lane: topo["lanes"][lane][hosts]["queue"] for lane in c["lanes"]}
+        out.append((hosts, queues, dict(c.get("reserve") or {})))
+    return out
+
+
+def cohort_quotas(cohorts, cqs, flavor_pool, chips):
+    """{(queue, flavor): (nominal chips, lendingLimit chips or None)} for cohort members.
+
+    Each reserving lane takes its slices from the pools in its ClusterQueue's flavor order
+    and lends none of them; the one lane without a reserve gets every chip left over.
+    """
+    flavor_order = {
+        cq["metadata"]["name"]: [
+            fl["name"]
+            for g in cq["spec"].get("resourceGroups", [])
+            for fl in g.get("flavors", [])
+            if fl["name"] in flavor_pool
+        ]
+        for cq in cqs
+    }
+    out = {}
+    for hosts, queues, reserve in cohorts:
+        rest = [lane for lane in queues if lane not in reserve]
+        if len(rest) != 1:
+            sys.exit(
+                f"cohort {sorted(queues)} needs exactly one lane without a reserve"
+            )
+        flavors = list(
+            dict.fromkeys(f for q in queues.values() for f in flavor_order.get(q, []))
+        )
+        left = {f: chips.get(flavor_pool[f], 0) for f in flavors}
+        slice_chips = 4 * hosts
+        for lane, slices in reserve.items():
+            need = slices * slice_chips
+            for f in flavor_order.get(queues[lane], []):
+                take = min(need, left[f]) // slice_chips * slice_chips
+                out[(queues[lane], f)] = (take, 0)
+                left[f] -= take
+                need -= take
+        for f in flavors:
+            out[(queues[rest[0]], f)] = (left[f], None)
+    return out
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     pool = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--pool=")), "")
@@ -108,8 +181,15 @@ def main():
         for f in kget("resourceflavors")
         if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
     }
+    cqs = kget("clusterqueues")
+    shared = cohort_quotas(
+        cohorts=load_cohorts(TOPOLOGY_FILE),
+        cqs=cqs,
+        flavor_pool=flavor_pool,
+        chips=chips,
+    )
 
-    for cq in kget("clusterqueues"):
+    for cq in cqs:
         name = cq["metadata"]["name"]
         groups, changed = [], False
         for g in cq["spec"].get("resourceGroups", []):
@@ -119,20 +199,13 @@ def main():
                 if pool is None:
                     flavors.append(fl)
                     continue
-                n = chips.get(pool, 0)
-                want = {TPU: str(n), "cpu": str(n), "memory": f"{n * 8}Gi"}
-                have = {r["name"]: str(r["nominalQuota"]) for r in fl["resources"]}
-                if {k: have.get(k) for k in want} != want:
+                n, lend = shared.get((name, fl["name"]), (chips.get(pool, 0), None))
+                want = resources(chips=n, lending_limit=lend)
+                have = [{k: str(v) for k, v in r.items()} for r in fl["resources"]]
+                if have != want:
                     changed = True
                     print(f"{name}/{fl['name']} ({pool}): {have} -> {want}")
-                flavors.append(
-                    {
-                        "name": fl["name"],
-                        "resources": [
-                            {"name": k, "nominalQuota": v} for k, v in want.items()
-                        ],
-                    }
-                )
+                flavors.append({"name": fl["name"], "resources": want})
             groups.append(
                 {"coveredResources": g["coveredResources"], "flavors": flavors}
             )

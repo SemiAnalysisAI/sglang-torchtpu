@@ -78,6 +78,14 @@ def discover(nodes, lane, hosts):
     return found
 
 
+def member_lanes(topo, lane, hosts):
+    """`lane` plus every lane sharing its `hosts`-host slices through a topology.yaml cohort."""
+    for c in (topo.get("cohorts") or {}).values():
+        if c["hosts"] == hosts and lane in c["lanes"]:
+            return list(c["lanes"])
+    return [lane]
+
+
 def chips_in_pool(nodes, pool):
     return sum(
         int(n["status"]["allocatable"].get(TPU, 0))
@@ -187,10 +195,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    entry = (
-        yaml.safe_load(open(a.topology_file))["lanes"].get(a.lane, {}).get(a.hosts)
-        or {}
-    )
+    with open(a.topology_file) as f:
+        topo = yaml.safe_load(f)
+    entry = topo["lanes"].get(a.lane, {}).get(a.hosts) or {}
+    lanes = member_lanes(topo, a.lane, a.hosts)
     static = list(entry.get("pools", []))
     if not static:
         log(f"⚠️  no topology.yaml entry for lane={a.lane} hosts={a.hosts}")
@@ -199,7 +207,9 @@ def main():
         nodes = kget("nodes")
         if not nodes:
             raise RuntimeError("no nodes returned")
-        found = discover(nodes, a.lane, a.hosts)
+        found = {}
+        for lane in lanes:
+            found.update(discover(nodes, lane, a.hosts))
     except Exception as e:  # noqa: BLE001 -- discovery must never block a test
         log(f"⚠️  pool discovery skipped ({type(e).__name__}: {e}); using topology.yaml")
         print(" ".join(static))
@@ -223,13 +233,17 @@ def main():
                 for f in kget("resourceflavors")
                 if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
             }
-            queue = entry.get("queue")
+            queues = [
+                topo["lanes"][lane][a.hosts]["queue"]
+                for lane in lanes
+                if topo["lanes"].get(lane, {}).get(a.hosts, {}).get("queue")
+            ]
             for pool in new:
                 flavor = ensure_flavor(pool, found[pool], existing, a.dry_run)
-                if queue:
-                    ensure_in_queue(
-                        queue, flavor, chips_in_pool(nodes, pool), a.dry_run
-                    )
+                for queue in queues:
+                    # A cohort's split is reconcile_quota.py's to set; start shared pools at 0.
+                    chips = chips_in_pool(nodes, pool) if len(queues) == 1 else 0
+                    ensure_in_queue(queue, flavor, chips, a.dry_run)
         except Exception as e:  # noqa: BLE001 -- see above
             detail = getattr(e, "stderr", "") or ""
             log(

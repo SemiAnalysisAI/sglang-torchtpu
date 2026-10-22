@@ -81,7 +81,10 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# 2 nodes x 4 chips = 8, each node a whole slice.
+# The 1-host queues share both 2x2x1 pools as cohort tpu-2x2x1 (topology.yaml `cohorts`).
+# reconcile_quota.py sets the split from live chips: pr-gate keeps its reserve and never
+# lends it; nightly holds the rest and lends it to pr-gate while idle. The values here are
+# only a startup default (each lane owns its own pool) until the reconciler runs.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -89,6 +92,13 @@ metadata:
 spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
+  cohortName: tpu-2x2x1
+  # Take a pool where the job fits without borrowing before borrowing on the first one.
+  flavorFungibility:
+    whenCanBorrow: TryNextFlavor
+  # Lent chips come back as borrowed jobs finish; running jobs are never preempted.
+  preemption:
+    reclaimWithinCohort: Never
   resourceGroups:
     - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
@@ -96,10 +106,24 @@ spec:
           resources:
             - name: "google.com/tpu"
               nominalQuota: 8
+              lendingLimit: 0
             - name: "cpu"
               nominalQuota: 8
+              lendingLimit: 0
             - name: "memory"
               nominalQuota: 64Gi
+              lendingLimit: "0"
+        - name: tpu7x-2x2x1-nightly
+          resources:
+            - name: "google.com/tpu"
+              nominalQuota: 0
+              lendingLimit: 0
+            - name: "cpu"
+              nominalQuota: 0
+              lendingLimit: 0
+            - name: "memory"
+              nominalQuota: "0"
+              lendingLimit: "0"
 ---
 # One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
 # exactly 8, so any lower value admits nothing.
@@ -122,7 +146,6 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# 3 nodes x 4 = 12.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -130,6 +153,13 @@ metadata:
 spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
+  cohortName: tpu-2x2x1
+  # Take a pool where the job fits without borrowing before borrowing on the first one.
+  flavorFungibility:
+    whenCanBorrow: TryNextFlavor
+  # Lent chips come back as borrowed jobs finish; running jobs are never preempted.
+  preemption:
+    reclaimWithinCohort: Never
   resourceGroups:
     - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
@@ -141,6 +171,14 @@ spec:
               nominalQuota: 12
             - name: "memory"
               nominalQuota: 96Gi
+        - name: tpu7x-2x2x1-pr-gate
+          resources:
+            - name: "google.com/tpu"
+              nominalQuota: 0
+            - name: "cpu"
+              nominalQuota: 0
+            - name: "memory"
+              nominalQuota: "0"
 ---
 # One slice. A second = new pool + new flavor + one more entry here; no workflow change.
 apiVersion: kueue.x-k8s.io/v1beta2
