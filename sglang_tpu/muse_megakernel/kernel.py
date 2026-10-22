@@ -174,6 +174,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
+    # The expert loop runs owner block by owner block (peers from me+1 on, own rows last), so
+    # each block of reduce-scatter rows is final part-way through the loop and leaves for its
+    # owner as one DMA while the remaining experts run; y_rs then only waits. Same arithmetic
+    # (every (row, slot) is written by exactly one expert).
+    y_block_send: bool = False
     # xfull holds the bf16 expert inputs as packed bf16 pairs instead of f32 (exact: the
     # values are bf16): half its VMEM, for the larger steps.
     xfull_packed: bool = False
@@ -793,10 +798,20 @@ class _Coll:
 
         return wait
 
-    def reduce_scatter_rows(self, kind, send_ref, rows_per, n_live):
+    def block_copy(self, kind, send_ref, owner, rows_per):
+        """The ``reduce_scatter_rows`` DMA of rows ``[owner*rows_per, ...)`` to ``owner``."""
+        return self._copy(
+            kind,
+            send_ref.at[pl.ds(pl.multiple_of(owner * rows_per, rows_per), rows_per)],
+            self.pads[kind].at[self.me],
+            owner,
+        )
+
+    def reduce_scatter_rows(self, kind, send_ref, rows_per, n_live, started=False):
         """bf16-packed ``send_ref [tp*rows_per, ...]``: device m receives everyone's rows
         ``[m*rows_per, ...)``; returns the pad ``[tp, rows_per, ...]`` (own slot filled locally).
-        Devices whose rows are all past ``n_live`` neither receive nor get sent to."""
+        Devices whose rows are all past ``n_live`` neither receive nor get sent to.
+        ``started``: every live owner's ``block_copy`` was already started; only wait."""
         pad = self.pads[kind]
 
         def rows(ref, m):
@@ -811,8 +826,10 @@ class _Coll:
         cps = []
         for d in range(1, self.tp):
             peer = self._peer(d)
-            cp = self._copy(kind, rows(send_ref, peer), pad.at[self.me], peer)
+            cp = self.block_copy(kind, send_ref, peer, rows_per)
             cps.append((peer, cp))
+            if started:
+                continue
 
             @pl.when(peer * rows_per < n_live)
             def _(cp=cp):
@@ -1007,6 +1024,9 @@ def scratch_plan(cfg: MKConfig):
         ("dn_cnt", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("dn_end", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("dn_rows", pltpu.SMEM((R,), jnp.int32)),
+        # y_block_send: uniq index past the last expert first used by owner block b (b counted
+        # from the next rank on), so block b's rows are final once expert blk_end[b] - 1 is done
+        ("blk_end", pltpu.SMEM((16,), jnp.int32)),
         # collective pads: bf16 pairs packed into u32 (_pack_bf16x2)
         ("pad_o_rs", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
         ("pad_o_ag", pltpu.VMEM((c.tp, R, c.hidden_local // 2), jnp.uint32)),
@@ -1804,7 +1824,44 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 S["ex_cnt"][u] = S["ex_cnt"][u] + 1
                 return n + new.astype(jnp.int32)
 
-            n_u = jax.lax.fori_loop(0, n_live * K, count, 0)
+            if c.y_block_send and c.tp > 1:
+                # Scan the rows owner block by owner block, peers from me+1 on and own rows
+                # last: uniq comes out grouped by the block that first uses each expert, and
+                # blk_end[b] closes block b's group.
+                Rc = c.rows_per_dev
+
+                def count_in_block(row0):
+                    def body(t, n):
+                        r = row0 + t // K
+                        e = S["ids_s"][r, t % K]
+                        live = r < n_live
+                        new = (S["seen"][e] != stamp) & live
+
+                        @pl.when(new)
+                        def _():
+                            S["seen"][e] = stamp
+                            S["uniq"][n] = e
+                            S["ex_of"][e] = n
+                            S["ex_cnt"][n] = 0
+
+                        @pl.when(live)
+                        def _():
+                            u = S["ex_of"][e]
+                            S["ex_cnt"][u] = S["ex_cnt"][u] + 1
+
+                        return n + new.astype(jnp.int32)
+
+                    return body
+
+                n_u = 0
+                for b in range(c.tp):
+                    owner = jax.lax.rem(me + 1 + b, c.tp)
+                    n_u = jax.lax.fori_loop(
+                        0, Rc * K, count_in_block(owner * Rc), n_u
+                    )
+                    S["blk_end"][b] = n_u
+            else:
+                n_u = jax.lax.fori_loop(0, n_live * K, count, 0)
 
             def offsets(u, off):
                 S["ex_off"][u] = off
@@ -2175,6 +2232,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         return carry
 
                     jax.lax.fori_loop(0, S["dn_cnt"][i], send_row, 0)
+                elif c.y_block_send and c.tp > 1:
+                    # owner block b is final once its group's last expert is done (an empty
+                    # group fires with the group before it)
+                    for b in range(c.tp - 1):
+                        owner = jax.lax.rem(me + 1 + b, c.tp)
+
+                        @pl.when((i + 1 == S["blk_end"][b]) & (owner * Rc < n_live))
+                        def _(owner=owner):
+                            coll.block_copy("y", S["ysend"], owner, Rc).start()
+
                 return carry
 
             if gscale:
@@ -2186,7 +2253,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 if c.y_early:
                     pad = coll.reduce_scatter_rows_finish("y", S["ysend"], Rc, n_live)
                 else:
-                    pad = coll.reduce_scatter_rows("y", S["ysend"], Rc, n_live)
+                    pad = coll.reduce_scatter_rows(
+                        "y",
+                        S["ysend"],
+                        Rc,
+                        n_live,
+                        started=c.y_block_send and c.tp > 1,
+                    )
             with _scope("combine"):
                 if c.row_bounded_temps:
                     # one owned row at a time: the same per-(row, slot) norm and weighted sum

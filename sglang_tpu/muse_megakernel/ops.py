@@ -324,6 +324,7 @@ class MuseMegakernel(torch.nn.Module):
         kv_group = max(2, 2048 // kv_chunk_tokens) if kv_sal else 4
         if rows > _LARGE_STEP_ROWS:
             kv_group = 2
+        y_early = tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -372,7 +373,8 @@ class MuseMegakernel(torch.nn.Module):
             sal_fp8_dot=tpu_envs.SGLANG_TPU_MK_SAL_FP8_DOT.get() if kv_sal_fp8 else 0,
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound
-            y_early=tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16,
+            y_early=y_early,
+            y_block_send=tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.get() and not y_early,
             xfull_packed=rows > _BASE_STEP_MAX_ROWS,
             # the dense merge/combine/top-k fit VMEM up to 64 rows and run faster (per-slot
             # merge measured 3.2 vs 0.2 ms per 64-row step)

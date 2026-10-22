@@ -95,6 +95,10 @@ class TpuEnvs:
     # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
     # soon as the row's last expert is done (MKConfig.y_early).
     SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
+    # Megakernel MoE: run the experts owner block by owner block and send each block of
+    # reduce-scatter rows to its owner as one DMA while the remaining experts run
+    # (MKConfig.y_block_send; exact). Ignored where SGLANG_TPU_MK_Y_EARLY applies.
+    SGLANG_TPU_MK_Y_BLOCK_SEND = EnvBool(False)
     # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
     # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
     # (exact; measured at 32 rows / 100K context: 1 is -1.8%, 2 is +1% slower than 0).

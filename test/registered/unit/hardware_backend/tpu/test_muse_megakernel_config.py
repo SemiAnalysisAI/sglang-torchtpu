@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.muse_megakernel import kernel as K
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel import ops
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
@@ -180,6 +181,30 @@ class TestMuseMegakernelConfig(CustomTestCase):
                 self.assertLessEqual(
                     K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
                 )
+
+    def test_block_send_follows_the_env_and_yields_to_y_early(self):
+        def config(rows, n_req):
+            return ops.MuseMegakernel.config(
+                _megakernel(kv_packed=False),
+                rows=rows,
+                q=4,
+                n_req=n_req,
+                n_page_entries=n_req * 2048,
+                page_size=256,
+                capture=(1, 16, 30, 44, 59),
+                kv_sal=True,
+                kv_sal_fp8=True,
+            )
+
+        self.assertFalse(config(32, 8).y_block_send)
+        with tpu_envs.SGLANG_TPU_MK_Y_BLOCK_SEND.override(True):
+            self.assertTrue(config(32, 8).y_block_send)
+            self.assertTrue(config(64, 16).y_block_send)
+            with tpu_envs.SGLANG_TPU_MK_Y_EARLY.override(True):
+                # y_early owns the small steps' sends; the larger steps keep block sends
+                self.assertTrue(config(16, 4).y_early)
+                self.assertFalse(config(16, 4).y_block_send)
+                self.assertTrue(config(32, 8).y_block_send)
 
 
 if __name__ == "__main__":
