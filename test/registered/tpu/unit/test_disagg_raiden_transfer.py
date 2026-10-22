@@ -44,7 +44,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.disaggregation.raiden.common import (
+    VALIDATED_RESHARD_LAYOUTS,
     RaidenKVCacheGroups,
+    StateSharding,
     get_raiden_kv_caches,
 )
 from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -61,6 +63,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReq,
     ReshardState,
 )
+from sglang_tpu.disaggregation.transfer_layout import PageSharding
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 
@@ -886,16 +889,19 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
         self.assertNotIn(room, prefill._prefill.send_state_rows)
 
     def test_push_resharding_with_gdn_state_fails_closed(self):
-        """State fan-in is built only for KDA beside MLA latent pages; a GDN
-        model (head-sliced KV pages) refuses push-resharding on both sides."""
+        """State fan-in is validated only beside replicated MLA latent pages; a
+        GDN model (head-sliced KV pages) refuses push-resharding on both sides."""
         prefill, decode = self._state_pair()
+        for m in (prefill, decode):
+            m._state_kv_caches = (torch.zeros(4, 3, 1, 8), torch.zeros(4, 2, 4, 4))
+            m._state_slice_axes = (2, 0)
         infos = self._bootstrap_info(prefill) * 2
-        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
             decode.register_decode_request(
                 7330, [1], [], aux_index=None, bootstrap_infos=infos
             )
         self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
-        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
             prefill._on_reshard_req(
                 ReshardReq(
                     room=7330,
@@ -948,7 +954,7 @@ class TestRaidenStateFanIn(RaidenStateTestCase):
         m._state_kv_caches = (conv, temporal)
         m._state_slice_axes = (2, 0)
         m._state_conv_groups = (_CONV_GROUPS, None)
-        m.kv_args.is_hybrid_mla_backend = True
+        m._full_sharding = PageSharding.REPLICATED
         # MLA latent pages, the same on every attention-TP rank.
         m._kv_caches = [torch.zeros(16, 2, 2, 64, dtype=torch.bfloat16)]
         m.chunked_transfer = True
@@ -1198,12 +1204,13 @@ class TestRaidenStateFanIn(RaidenStateTestCase):
         self.assertEqual(decode._decode.state_uploads, {})
 
     def test_pure_mla_push_resharding_fails_closed(self):
-        """Only the hybrid MLA + KDA pool moves latent pages whole, so a pure
-        MLA decode refuses before asking its sources instead of timing out."""
+        """Replicated latent pages are validated only beside row-sharded state,
+        so a pure MLA decode refuses before asking its sources instead of
+        timing out."""
         sources = [self._prefill(attn_tp_rank=r, attn_tp_size=2) for r in range(2)]
         decode = self._decode(attn_tp_size=1)
-        decode.is_mla_backend = True
-        with self.assertRaisesRegex(NotImplementedError, "pure MLA"):
+        decode._full_sharding = PageSharding.REPLICATED
+        with self.assertRaisesRegex(NotImplementedError, "not validated"):
             self._register(decode, sources, 7409, [4], 1)
         for prefill in sources:
             self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
@@ -1236,6 +1243,158 @@ class TestRaidenStateFanIn(RaidenStateTestCase):
         self.assertNotIn(room, decode._decode.reshard_state_sources)
         sources[0].clear_room(room)
         self.assertNotIn(room, sources[0]._prefill.reshard_state)
+
+
+_HEAD, _REPLICATED = PageSharding.HEAD_SLICED, PageSharding.REPLICATED
+_ROW = StateSharding.ROW_SHARDED
+
+# (full, SWA, state) layouts, whether push-resharding admits each, and the flags
+# set by the TPU pool that builds it, (is_mla_backend,
+# kv_args.is_hybrid_mla_backend), or None when no TPU pool builds it.
+_RESHARD_LAYOUTS = {
+    # TpuFusedMHATokenToKVPool
+    "head": ((_HEAD, None, None), True, (False, False)),
+    # SWAKVPool over two of them
+    "head + head SWA": ((_HEAD, _HEAD, None), True, (False, False)),
+    # TpuFusedMLATokenToKVPool
+    "replicated": ((_REPLICATED, None, None), False, (True, False)),
+    # The upstream MLATokenToKVPool, which declares nothing
+    "unsupported": ((PageSharding.UNSUPPORTED, None, None), False, (True, False)),
+    # HybridLinearKVPool over a fused MHA pool and a TpuMambaPool (GDN)
+    "head + row state": ((_HEAD, None, _ROW), False, (False, False)),
+    # HybridLinearKVPool over a fused MLA pool and a TpuMambaPool (KDA)
+    "replicated + row state": ((_REPLICATED, None, _ROW), True, (False, True)),
+    "replicated + row state + SWA": ((_REPLICATED, _HEAD, _ROW), False, None),
+    "replicated + state that cannot reshard": (
+        (_REPLICATED, None, StateSharding.UNSUPPORTED),
+        False,
+        None,
+    ),
+}
+# Layouts the flag gate let through, now refused before any page moves: a
+# hybrid MLA pool whose mamba pool is not a TpuMambaPool (its state never
+# moved), and an MLA-backed SWAKVPool (head-slice geometry raised on its rank-4
+# latent pages in the listener, so the room timed out).
+_NEWLY_REFUSED_LAYOUTS = {
+    "hybrid MLA without state": ((_REPLICATED, None, None), (False, True)),
+    "MLA-backed SWAKVPool": ((_REPLICATED, _REPLICATED, None), (False, False)),
+}
+
+
+def _flag_gate_refused(flags, state, *, decode: bool) -> bool:
+    """The gate the declared page shardings replaced: the decode refused an MLA
+    pool, and both sides refused state beside anything but a hybrid MLA pool."""
+    is_mla, is_hybrid_mla = flags
+    return (decode and is_mla) or (state is not None and not is_hybrid_mla)
+
+
+class TestRaidenReshardLayoutGate(RaidenStateTestCase):
+    """Push-resharding is admitted by the cache layout the pools declare, and
+    both sides refuse an unvalidated one before any page moves."""
+
+    def test_every_validated_layout_names_its_e2e(self):
+        e2e_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.pardir, "e2e"
+        )
+        for layout, tests in VALIDATED_RESHARD_LAYOUTS.items():
+            for name in tests.split(", "):
+                with self.subTest(layout=layout, test=name):
+                    self.assertTrue(os.path.isfile(os.path.join(e2e_dir, name)))
+
+    def _layout_manager(self, mode, layout, flags, **kw):
+        full, swa, state = layout
+        m = self._manager(mode, **kw)
+        m._full_sharding = full
+        if swa is not None:
+            m._swa_sharding = swa
+            m._swa_engine = _FakeRaidenEngine()
+            m._swa_engine.transfer_address = f"swa-{m.rank_port}"
+        if state is not None:
+            self._with_state(m)
+            m._state_kv_caches = (torch.zeros(4, 3, 1, 8), torch.zeros(4, 2, 4, 4))
+            # Rows can be reassembled only along an axis named for every tensor.
+            m._state_slice_axes = (2, 0) if state is _ROW else ()
+        # Set as the pool would, though they no longer decide anything.
+        m.is_mla_backend, m.kv_args.is_hybrid_mla_backend = flags
+        m._engine.transfer_address = f"full-{m.rank_port}"
+        # Read by update_status; the stubbed common init does not set them.
+        m._deferred_ack_targets = {}
+        m._deferred_ack_poisoned_rooms = set()
+        m._staging_outstanding = collections.defaultdict(int)
+        return m
+
+    def _refused(self, layout, flags, room) -> bool:
+        """Whether a TP-1 decode and its two TP-2 sources refuse to reshard
+        room; both sides must agree."""
+        sources = [
+            self._layout_manager(
+                DisaggregationMode.PREFILL,
+                layout,
+                flags,
+                attn_tp_rank=r,
+                attn_tp_size=2,
+            )
+            for r in range(2)
+        ]
+        decode = self._layout_manager(DisaggregationMode.DECODE, layout, flags)
+        try:
+            decode.register_decode_request(
+                room,
+                [4],
+                [],
+                aux_index=None,
+                bootstrap_infos=[self._bootstrap_info(p)[0] for p in sources],
+            )
+            refused = False
+        except NotImplementedError as e:
+            self.assertIn("not validated", str(e))
+            refused = True
+        for prefill in sources:
+            inbox = self.inboxes[prefill.endpoint]
+            if not refused:
+                prefill._on_reshard_req(inbox.take(MessageTag.RESHARD_REQ))
+                self.assertIn(room, prefill._prefill.reshard_req)
+                continue
+            self.assertEqual(inbox.frames, [])
+            with self.assertRaisesRegex(NotImplementedError, "not validated"):
+                prefill._on_reshard_req(
+                    ReshardReq(
+                        room=room,
+                        decode_ip="127.0.0.1",
+                        decode_port=decode.rank_port,
+                        push_endpoint="tcp://push",
+                        decode_blocks=[4],
+                        dst_attn_tp=1,
+                        decode_swa_blocks=[],
+                        swa_push_endpoint="",
+                    ).to_frames()
+                )
+            self.assertNotIn(room, prefill._prefill.reshard_req)
+        return refused
+
+    def test_refusals_match_the_flag_gate_they_replace(self):
+        for room, (name, (layout, admitted, flags)) in enumerate(
+            _RESHARD_LAYOUTS.items(), 7500
+        ):
+            with self.subTest(layout=name):
+                refused = self._refused(layout, flags or (False, False), room)
+                self.assertEqual(refused, not admitted)
+                if flags is None:
+                    continue
+                self.assertEqual(
+                    refused, _flag_gate_refused(flags, layout[2], decode=True)
+                )
+                # The prefill refused less than the decode; now they match.
+                if _flag_gate_refused(flags, layout[2], decode=False):
+                    self.assertTrue(refused)
+
+    def test_unvalidated_layouts_the_flag_gate_admitted_are_refused(self):
+        for room, (name, (layout, flags)) in enumerate(
+            _NEWLY_REFUSED_LAYOUTS.items(), 7520
+        ):
+            with self.subTest(layout=name):
+                self.assertFalse(_flag_gate_refused(flags, layout[2], decode=True))
+                self.assertTrue(self._refused(layout, flags, room))
 
 
 class TestRaidenStateEngine(RaidenRendezvousTestCase):

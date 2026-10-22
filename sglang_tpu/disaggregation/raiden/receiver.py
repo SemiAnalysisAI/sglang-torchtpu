@@ -207,24 +207,13 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
-            if self.is_mla_backend:
-                # _make_geometry moves latent pages whole only for the hybrid
-                # pool; a pure MLA room would fail in the listener and time out.
+            refusal = self._reshard_refusal()
+            if refusal is not None:
+                # Refused before any source is asked: an unvalidated layout can
+                # fail in a listener and leave the room to time out.
                 raise NotImplementedError(
-                    "Raiden push resharding moves MLA latent pages only for "
-                    "hybrid MLA + KDA models, not pure MLA ones (got "
-                    f"{len(bootstrap_infos)} prefill sources for one decode "
-                    "rank); use equal attention TP on prefill and decode."
-                )
-            if (
-                self._state_engine is not None
-                and not self.kv_args.is_hybrid_mla_backend
-            ):
-                raise NotImplementedError(
-                    "Raiden push resharding moves linear-attention state only "
-                    "for hybrid MLA + KDA models, not GDN (got "
-                    f"{len(bootstrap_infos)} prefill sources for one decode "
-                    "rank); use equal attention TP on prefill and decode."
+                    f"{len(bootstrap_infos)} prefill sources for one decode rank: "
+                    f"{refusal}; use equal attention TP on prefill and decode."
                 )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its

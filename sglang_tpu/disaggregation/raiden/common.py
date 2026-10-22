@@ -1,20 +1,23 @@
 """Shared helpers for the raiden prefill/decode disaggregation backend.
 
 Holds what both sides of the transport need: the package logger, the port and
-chunk-size constants, the peer-endpoint formatter, and the KV-cache grouping
-that turns a device pool into the per-namespace tensor lists raiden registers.
+chunk-size constants, the peer-endpoint formatter, the KV-cache grouping that
+turns a device pool into the per-namespace tensor lists raiden registers, and
+the cache layouts push-resharding is validated for.
 """
 
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVCache
 from sglang.srt.utils.network import NetworkAddress
+from sglang_tpu.disaggregation.transfer_layout import PageSharding
 from sglang_tpu.mamba_pool import TpuMambaPool
 
 # One logger for the whole package, deliberately keeping the name of the module
@@ -72,6 +75,26 @@ class RaidenKVCacheGroups:
     # what a decode at a narrower attention TP reassembles its rows from.
     state_slice_axes: List[int] = field(default_factory=list)
     state_conv_groups: List[Optional[List[int]]] = field(default_factory=list)
+    # How the full and SWA pools shard their pages across attention-TP ranks;
+    # get_raiden_kv_caches sets both from the pools' declarations, and groups
+    # built without them cannot be push-resharded.
+    full_sharding: PageSharding = PageSharding.UNSUPPORTED
+    swa_sharding: PageSharding = PageSharding.UNSUPPORTED
+
+
+def _declared_sharding(pool: Any) -> PageSharding:
+    """The ``raiden_page_sharding`` a pool declares; one that declares none
+    cannot be push-resharded."""
+    declared = getattr(pool, "raiden_page_sharding", None)
+    if not isinstance(declared, str):
+        return PageSharding.UNSUPPORTED
+    try:
+        return PageSharding(declared)
+    except ValueError:
+        raise RuntimeError(
+            f"{type(pool).__name__} declares raiden_page_sharding={declared!r}; "
+            f"expected one of {[sharding.value for sharding in PageSharding]}"
+        ) from None
 
 
 def get_raiden_kv_caches(
@@ -175,4 +198,69 @@ def get_raiden_kv_caches(
         committed_state_row=committed_state_row,
         state_slice_axes=state_slice_axes,
         state_conv_groups=state_conv_groups,
+        # A composite pool's sub-pools declare how their own pages are sharded;
+        # draft tensors move with the target's.
+        full_sharding=_declared_sharding(getattr(pool, "full_kv_pool", pool)),
+        swa_sharding=_declared_sharding(getattr(pool, "swa_kv_pool", pool)),
+    )
+
+
+class StateSharding(str, enum.Enum):
+    """How a request state can be push-resharded, derived from what its pool
+    describes rather than declared."""
+
+    # One row per request, each tensor sharded on a per-row axis the pool names.
+    ROW_SHARDED = "row_sharded"
+    UNSUPPORTED = "unsupported"
+
+
+# Cache layouts push-resharding is validated for, keyed by how the full-attention
+# pages, the sliding-window pages and the request state shard (None for a model
+# without them), each with the e2e that validates it. Any model whose layout
+# matches is admitted; enabling another layout takes an entry here and its e2e.
+# A layout with both sliding-window pages and request state first needs the SWA
+# push to handle a full prefix hit: such a room still asks its sources for the
+# state (register_decode_request), and the SWA push fails a room that has no
+# window pages to move (_run_reshard_swa_push).
+VALIDATED_RESHARD_LAYOUTS: Mapping[
+    Tuple[PageSharding, Optional[PageSharding], Optional[StateSharding]], str
+] = {
+    (PageSharding.HEAD_SLICED, None, None): (
+        "test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py"
+    ),
+    (PageSharding.HEAD_SLICED, PageSharding.HEAD_SLICED, None): (
+        "test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py, "
+        "test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py"
+    ),
+    (PageSharding.REPLICATED, None, StateSharding.ROW_SHARDED): (
+        "test_tpu_kimi_k3_tiny_pd_reshard.py"
+    ),
+}
+
+
+def _describe_layout(
+    full: PageSharding, swa: Optional[PageSharding], state: Optional[StateSharding]
+) -> str:
+    parts = [f"{full.value} KV pages"]
+    if swa is not None:
+        parts.append(f"{swa.value} sliding-window pages")
+    if state is not None:
+        parts.append(f"{state.value} request state")
+    return " + ".join(parts)
+
+
+def reshard_refusal(
+    full: PageSharding, swa: Optional[PageSharding], state: Optional[StateSharding]
+) -> Optional[str]:
+    """Why push-resharding a cache of this layout is refused, or None when the
+    layout is validated. ``swa`` and ``state`` are None when the model has no
+    sliding-window pages or no request state."""
+    if (full, swa, state) in VALIDATED_RESHARD_LAYOUTS:
+        return None
+    validated = ", ".join(
+        _describe_layout(*layout) for layout in VALIDATED_RESHARD_LAYOUTS
+    )
+    return (
+        "Raiden push resharding is not validated for "
+        f"{_describe_layout(full, swa, state)}; validated layouts: {validated}"
     )

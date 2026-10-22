@@ -701,11 +701,10 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        if self._state_engine is not None and not self.kv_args.is_hybrid_mla_backend:
+        refusal = self._reshard_refusal()
+        if refusal is not None:
             raise NotImplementedError(
-                "Raiden push resharding moves linear-attention state only for "
-                "hybrid MLA + KDA models, not GDN; use equal attention TP on "
-                "prefill and decode."
+                f"{refusal}; use equal attention TP on prefill and decode."
             )
         req = ReshardReq.from_frames(msg)
         room = req.room

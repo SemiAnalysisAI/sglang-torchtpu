@@ -6,6 +6,8 @@ TPU P/D path relies on beyond the symmetric state transfer, without a chip:
 
 * the Mamba pool describes how its state tensors are TP-sharded, which a
   decode at a narrower attention TP reassembles its rows from;
+* each KV pool declares how its pages shard across attention TP, which picks
+  the reshard geometry and whether push-resharding is admitted;
 * both pools back up and restore a request for decode retraction;
 * state slots freed while a forward may still write them wait on the KV free
   fence, like KV pages;
@@ -32,18 +34,23 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
 )
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.utils import setup_state_kv_args
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.disaggregation.utils import is_mla_backend, setup_state_kv_args
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
+from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+    ReshardGeometry,
     WholeBlockGeometry,
     assemble_state_fan_in,
     build_receiver_request,
     build_sender_request,
 )
 from sglang_tpu.disaggregation.raiden.serde import ReshardState
+from sglang_tpu.disaggregation.transfer_layout import PageSharding
 from sglang_tpu.kv_free_fence import KVFreeFence
-from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuFusedMLATokenToKVPool
 from sglang_tpu.mamba_pool import AT_SLOT, TpuMambaPool, TpuMambaSlotAllocator
 
 LAYERS = [1, 2, 4]
@@ -86,6 +93,51 @@ def _mla_pool(page_size: int = 16) -> TpuFusedMLATokenToKVPool:
     )
 
 
+def _mha_pool() -> TpuFusedMHATokenToKVPool:
+    return TpuFusedMHATokenToKVPool(
+        size=128,
+        page_size=64,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=128,
+        layer_num=2,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+
+
+def _upstream_mla_pool() -> MLATokenToKVPool:
+    return MLATokenToKVPool(
+        size=64,
+        page_size=16,
+        dtype=torch.bfloat16,
+        kv_lora_rank=128,
+        qk_rope_head_dim=64,
+        layer_num=2,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+
+
+def _hybrid_pool(full_kv_pool, mamba_pool=None) -> HybridLinearKVPool:
+    pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+    pool.start_layer = 0
+    pool.layer_transfer_counter = None
+    pool.full_kv_pool = full_kv_pool
+    pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+    pool.mamba_pool = mamba_pool
+    return pool
+
+
+def _swa_pool(full_kv_pool, swa_kv_pool) -> SWAKVPool:
+    pool = object.__new__(SWAKVPool)
+    pool.start_layer = 0
+    pool.full_kv_pool = full_kv_pool
+    pool.swa_kv_pool = swa_kv_pool
+    pool.layers_mapping = {0: (0, False), 1: (0, True), 2: (1, False), 3: (1, True)}
+    return pool
+
+
 def _fill(tensors) -> None:
     generator = torch.Generator().manual_seed(0)
     for tensor in tensors:
@@ -125,6 +177,107 @@ class TestMambaStateDescription(CustomTestCase):
         self.assertEqual(
             kv_args.state_item_lens, [[t[0].nbytes for t in mamba.get_state()]]
         )
+
+
+class TestRaidenPageSharding(CustomTestCase):
+    """Raiden reads how pages shard from what each pool declares, never from a
+    model flag."""
+
+    def test_pools_declare_how_their_pages_shard(self):
+        head, replicated = PageSharding.HEAD_SLICED, PageSharding.REPLICATED
+        pools = {
+            "fused MHA": (_mha_pool(), head, None),
+            "fused MLA": (_mla_pool(), replicated, None),
+            "upstream MLA": (_upstream_mla_pool(), PageSharding.UNSUPPORTED, None),
+            "hybrid over fused MHA": (_hybrid_pool(_mha_pool()), head, None),
+            "hybrid over fused MLA": (_hybrid_pool(_mla_pool()), replicated, None),
+            "SWA over fused MHA": (_swa_pool(_mha_pool(), _mha_pool()), head, head),
+            "SWA over fused MLA": (
+                _swa_pool(_mla_pool(), _mla_pool()),
+                replicated,
+                replicated,
+            ),
+        }
+        for name, (pool, full, swa) in pools.items():
+            with self.subTest(pool=name):
+                groups = get_raiden_kv_caches(pool)
+                self.assertEqual(groups.full_sharding, full)
+                if swa is not None:
+                    self.assertTrue(groups.swa)
+                    self.assertEqual(groups.swa_sharding, swa)
+                # What is_mla_backend told apart: an MLA pool's pages are never
+                # cut as head slices, and only an MLA pool's are replicated.
+                owner = getattr(pool, "full_kv_pool", pool)
+                self.assertEqual(full != head, is_mla_backend(owner))
+        # A misspelt declaration fails at startup rather than refusing quietly.
+        pool = _mha_pool()
+        pool.raiden_page_sharding = "head-sliced"
+        with self.assertRaisesRegex(RuntimeError, "raiden_page_sharding"):
+            get_raiden_kv_caches(pool)
+
+    def test_the_declaration_picks_the_reshard_gate_and_geometry(self):
+        """set_kv_caches hands what the pools declare to the gate both sides
+        check before a page moves and to the geometry a page moves by."""
+
+        def manager(pool):
+            mgr = object.__new__(RaidenKVManager)
+            mgr.kv_args = SimpleNamespace(total_kv_head_num=4)
+
+            def build_engine():
+                # The engines _build_engine starts, one per non-empty group.
+                mgr._engine = object()
+                if mgr._swa_kv_caches:
+                    mgr._swa_engine = object()
+                if mgr._state_kv_caches:
+                    mgr._state_engine = object()
+                    mgr._state_engine_max_blocks = 1
+
+            mgr._build_engine = build_engine
+            mgr.set_kv_caches(get_raiden_kv_caches(pool))
+            return mgr
+
+        # Whether push-resharding admits each pool's layout (the hybrids carry
+        # Mamba state), and the geometry its pages move by (None: it has none).
+        pools = {
+            "fused MHA": (_mha_pool(), True, ReshardGeometry),
+            "SWA over fused MHA": (
+                _swa_pool(_mha_pool(), _mha_pool()),
+                True,
+                ReshardGeometry,
+            ),
+            "hybrid over fused MLA": (
+                _hybrid_pool(_mla_pool(), _mamba_pool()),
+                True,
+                WholeBlockGeometry,
+            ),
+            "hybrid over fused MHA": (
+                _hybrid_pool(_mha_pool(), _mamba_pool()),
+                False,
+                ReshardGeometry,
+            ),
+            "fused MLA": (_mla_pool(), False, WholeBlockGeometry),
+            "SWA over fused MLA": (
+                _swa_pool(_mla_pool(), _mla_pool()),
+                False,
+                WholeBlockGeometry,
+            ),
+            "upstream MLA": (_upstream_mla_pool(), False, None),
+        }
+        for name, (pool, admitted, geometry) in pools.items():
+            with self.subTest(pool=name):
+                mgr = manager(pool)
+                self.assertEqual(mgr._reshard_refusal() is None, admitted)
+                if geometry is None:
+                    with self.assertRaisesRegex(RuntimeError, "no reshard geometry"):
+                        mgr._make_geometry(4, 2)
+                    continue
+                built = mgr._make_geometry(4, 2)
+                self.assertIsInstance(built, geometry)
+                if geometry is WholeBlockGeometry:
+                    self.assertEqual(built.block_bytes, mgr._kv_caches[0][0].nbytes)
+                if mgr._swa_kv_caches:
+                    # Sliding-window pages move by their own pool's declaration.
+                    self.assertIsInstance(mgr._make_geometry(4, 2, swa=True), geometry)
 
 
 class TestRetractionBackup(CustomTestCase):

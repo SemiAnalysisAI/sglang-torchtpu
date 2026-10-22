@@ -126,6 +126,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # io backend asserts it moves all of the pool's KV state: a pool that keeps
     # quantization scales outside get_fused_kv_buffer must not list it.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # How raiden push-reshards a page between unequal attention TPs (a
+    # transfer_layout.PageSharding value): each rank holds its kv-head slice of
+    # every token. A subclass that changes the page layout must restate this.
+    raiden_page_sharding: str = "head_sliced"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -603,6 +607,11 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     # raiden's page copy is layout-agnostic, and torch_tpu's host pool reads
     # its page shape from get_fused_kv_buffer, so it mirrors this layout too.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
+    # FIXME: "head_sliced" only keeps the push-resharding admission this pool
+    # has always had. raiden's head-slice geometry assumes the fused pool's
+    # token-major page, which this layout is not, and no P/D e2e covers it:
+    # teach the geometry this layout or declare "unsupported".
+    raiden_page_sharding: str = "head_sliced"
 
     @classmethod
     def kv_bytes_per_token_per_layer(
@@ -789,6 +798,10 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # How raiden push-reshards a page between unequal attention TPs: the latent
+    # page has no head axis and is the same on every attention-TP rank, so it
+    # moves whole. A subclass that changes the page layout must restate this.
+    raiden_page_sharding: str = "replicated"
 
     def __init__(
         self,

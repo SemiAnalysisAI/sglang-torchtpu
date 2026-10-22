@@ -60,9 +60,11 @@ from sglang_tpu.disaggregation.raiden.common import (
     STATE_PORT_OFFSET,
     SWA_PORT_OFFSET,
     RaidenKVCacheGroups,
+    StateSharding,
     _tcp_endpoint,
     get_raiden_kv_caches,
     logger,
+    reshard_refusal,
 )
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
@@ -90,6 +92,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     RoomFailed,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang_tpu.disaggregation.transfer_layout import PageSharding
 from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
@@ -147,6 +150,13 @@ class RaidenKVManager(
     _pipeline = None
     _pipeline_enabled = False
     _listener_start_read = False
+    # How the full and SWA pools shard their pages; set_kv_caches takes them
+    # from the pools' declarations.
+    _full_sharding = PageSharding.HEAD_SLICED
+    _swa_sharding = PageSharding.HEAD_SLICED
+    # No sliding-window engine unless set_kv_caches hands over SWA tensors.
+    _swa_engine = None
+    _swa_kv_caches = None
     # GDN state engine: one row per request, built only for linear-attention pools.
     _state_engine: Optional[Any] = None
     _state_kv_caches: Tuple[Any, ...] = ()
@@ -343,7 +353,8 @@ class RaidenKVManager(
     def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
         """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
         the local fused KV tensor (the K+V head-pair granule matches on both
-        sides) and the global kv-head count.
+        sides) and the global kv-head count, or a WholeBlockGeometry when the
+        pool declares its pages replicated across attention-TP ranks.
 
         ``swa`` sizes it from the sliding-window sub-pool instead. Its layers
         carry the same kv-head count as the full pool -- windowing bounds how
@@ -366,15 +377,41 @@ class RaidenKVManager(
                 + " KV tensors to build a reshard geometry from"
             )
         tensor = tensors[0]
-        if not swa and getattr(self.kv_args, "is_hybrid_mla_backend", False):
-            # An MLA latent page is the same on every attention-TP rank, so
-            # it moves whole rather than as a head slice.
+        sharding = self._swa_sharding if swa else self._full_sharding
+        if sharding == PageSharding.REPLICATED:
+            # The page is the same on every attention-TP rank, so it moves
+            # whole rather than as a head slice.
             return WholeBlockGeometry(src_attn_tp, dst_attn_tp, tensor[0].nbytes)
+        if sharding != PageSharding.HEAD_SLICED:
+            raise RuntimeError(
+                f"Raiden has no reshard geometry for {sharding.value} KV pages"
+            )
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
         return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
+
+    def _state_reshard_kind(self) -> Optional[StateSharding]:
+        """How this side's request state can be push-resharded; None without
+        state. A decode assembles a resharded room's state from one row per
+        source, each tensor sliced on the per-row axis the pool names."""
+        if self._state_engine is None:
+            return None
+        n = len(self._state_kv_caches)
+        sliced = n > 0 and len(self._state_slice_axes) == n
+        if sliced and self._state_engine_max_blocks == 1:
+            return StateSharding.ROW_SHARDED
+        return StateSharding.UNSUPPORTED
+
+    def _reshard_refusal(self) -> Optional[str]:
+        """Why this side refuses push-resharding, or None when its cache layout
+        is validated for it."""
+        return reshard_refusal(
+            self._full_sharding,
+            self._swa_sharding if self._swa_engine is not None else None,
+            self._state_reshard_kind(),
+        )
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -388,6 +425,8 @@ class RaidenKVManager(
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        self._full_sharding = kv_caches.full_sharding
+        self._swa_sharding = kv_caches.swa_sharding
         self._state_kv_caches = tuple(kv_caches.state)
         self._committed_state_row = kv_caches.committed_state_row
         self._state_slice_axes = tuple(kv_caches.state_slice_axes)
