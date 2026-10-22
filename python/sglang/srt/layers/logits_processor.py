@@ -1187,7 +1187,9 @@ class LogitsProcessor(nn.Module):
                 )
 
         if bucket_rows and logits.shape[0] != rows:
-            logits = logits[:rows]
+            # torch_tpu folds a row view into each consumer's program;
+            # with a copy, consumers reuse programs built for [rows, vocab] logits.
+            logits = logits[:rows].clone()
         return logits
 
     def _compute_lm_head(
