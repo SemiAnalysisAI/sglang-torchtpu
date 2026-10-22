@@ -139,9 +139,12 @@ Both families serve `--attn-cp-size N --enable-prefill-cp` (`../../cp_forward.py
 The CP target extend all-gathers the FULL-capture hidden rows over the attention
 CP group and puts them back in the batch's token order (`cp_layout.global_rows`),
 so the draft prompt pass reads every row. Draft forwards run as plain TP
-(`draft_cp_context`); decode and verify are not context-parallel. The other
-prefill-CP requirements (`tpu_platform._validate_prefill_context_parallel`) still
-apply, e.g. no DP attention.
+(`draft_cp_context`); decode and verify are not context-parallel. The draft is
+built on attention TP so its heads match its pool; DFlash and DSpark need
+`--speculative-draft-attention-backend pallas_tpu_rpa_v3`, since the CP target's
+batched backend is causal-only. Validated with DFlash on gpt-oss-20b at CP8; EAGLE3
+is not (gpt-oss-120b does not fit at CP8). The other prefill-CP requirements
+(`tpu_platform._validate_prefill_context_parallel`) still apply, e.g. no DP attention.
 
 ## Not supported
 
