@@ -9,6 +9,7 @@ padded decoder outputs back to real request shapes.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import time
@@ -472,8 +473,91 @@ def _restore_fields(forward_batch: Any, saved: dict[str, Any]) -> None:
         setattr(forward_batch, field, value)
 
 
+def input_logprob_rows(forward_batch: Any) -> int:
+    """Rows the LogitsProcessor scores for this batch's input logprobs.
+
+    Each request keeps its rows from the logprob start on, and at least the
+    one it samples from: the count the scheduler's MLP sync gathers as
+    num_tokens_for_logprob.
+    """
+    return sum(
+        max(extend_len - start_len, 1)
+        for extend_len, start_len in zip(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_logprob_start_lens_cpu,
+        )
+    )
+
+
+@contextlib.contextmanager
+def _dp_matched_logits(logits_processor: Any, rows: int):
+    """Compute the LogitsProcessor's logits at ``rows`` rows, in one pass.
+
+    Under DP attention the logits gather of the eager pass (the attention-TP
+    all-gather of the vocab shards) is a program over the whole mesh, so every
+    DP rank has to run it, at one shape. Here the requesting rank pads its
+    rows to the DP-wide count; every other rank runs the same program through
+    _join_dp_input_logprob_gather. Chunking would make the number of gathers
+    depend on the local rows, so the gather runs as a single chunk.
+    """
+    from sglang_tpu.row_pad import pad_rows
+
+    get_logits = logits_processor._get_logits
+
+    def padded_get_logits(hidden_states, lm_head, logits_metadata, *args, **kwargs):
+        local_rows = hidden_states.shape[0]
+        if local_rows > rows:
+            raise RuntimeError(
+                f"input logprob gather of {local_rows} rows exceeds the "
+                f"DP-wide {rows}; the other DP ranks would gather a different "
+                "shape, and the mesh would hang"
+            )
+        # A padded shape can equal the graph's next-token logits buffer, which
+        # this pass must not overwrite.
+        kwargs["use_logits_buffer"] = False
+        logits = get_logits(
+            pad_rows(hidden_states, rows), lm_head, logits_metadata, *args, **kwargs
+        )
+        return logits[:local_rows]
+
+    chunker = logits_processor.input_logprob_processor
+    chunked = chunker.enable_logprobs_chunk
+    logits_processor._get_logits = padded_get_logits
+    chunker.enable_logprobs_chunk = False
+    try:
+        yield
+    finally:
+        del logits_processor._get_logits
+        chunker.enable_logprobs_chunk = chunked
+
+
+def _join_dp_input_logprob_gather(*, forward_batch: Any, model: Any, rows: int) -> None:
+    """Run another DP rank's input-logprob logits gather, at its shape.
+
+    The rank holding the request computes logits for ``rows`` rows and
+    all-gathers them; this runs that same program on zero rows here, so
+    every chip of the mesh executes it. The logits are discarded.
+    """
+    from sglang.srt.layers.dp_attention import (
+        get_dp_device,
+        get_dp_dtype,
+        get_dp_hidden_size,
+    )
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+
+    hidden_states = torch.zeros(
+        (rows, get_dp_hidden_size()), dtype=get_dp_dtype(), device=get_dp_device()
+    )
+    model.logits_processor._get_logits(
+        hidden_states,
+        model.lm_head,
+        LogitsMetadata.from_forward_batch(forward_batch, compute_input_logprobs=False),
+        use_logits_buffer=False,
+    )
+
+
 def _attach_input_logprobs(
-    *, logits_output: Any, forward_batch: Any, model: Any
+    *, logits_output: Any, forward_batch: Any, model: Any, dp_rows: int = 0
 ) -> None:
     """Gather input (prompt) logprobs eagerly from the captured prefill rows.
 
@@ -487,6 +571,9 @@ def _attach_input_logprobs(
     Copies every input_* field the gather produces -- chosen-token logprobs,
     top-k, and logprobs for caller-named token ids. The scheduler indexes each
     directly, so a field left behind is a None index downstream.
+
+    ``dp_rows``, when nonzero, is the DP-wide row count the logits gather runs
+    at (see _dp_matched_logits).
     """
     hidden_states = logits_output.hidden_states
     if hidden_states is None:
@@ -497,10 +584,16 @@ def _attach_input_logprobs(
     logits_processor = model.logits_processor
     previous = logits_processor.compute_input_logprobs
     logits_processor.compute_input_logprobs = True
+    matched = (
+        _dp_matched_logits(logits_processor, dp_rows)
+        if dp_rows
+        else contextlib.nullcontext()
+    )
     try:
-        eager = logits_processor(
-            forward_batch.input_ids, hidden_states, model.lm_head, forward_batch
-        )
+        with matched:
+            eager = logits_processor(
+                forward_batch.input_ids, hidden_states, model.lm_head, forward_batch
+            )
     finally:
         logits_processor.compute_input_logprobs = previous
     if eager.input_token_logprobs is None:
@@ -904,18 +997,18 @@ class CompiledForwardShim:
         parallel = get_parallel()
         # get_attention_dp_size() asserts on live DP state; read the parallel leaves.
         attn_dp_size = parallel.attn_dp_size
-        # _attach_input_logprobs re-runs the LogitsProcessor, whose logits path
-        # enters the attention-TP/DP collectives. Wanting input logprobs is a
-        # property of the local batch, so under DP attention a rank holding
-        # such a request would join a collective its peers never reach and the
-        # worker group would hang.
-        if attn_dp_size > 1:
+        # Under DP attention every DP rank runs the eager gather's logits
+        # collective at the DP-wide row count (_dp_input_logprob_rows). With
+        # the LM head on the attention-TP group that is one all-gather any rank
+        # can join. Without it the hidden rows are gathered across DP groups at
+        # each rank's own count, which the padded DP token counts no longer
+        # carry. (On TPU that layout only exists at attention TP 1.)
+        if attn_dp_size > 1 and not parallel.enable_dp_lm_head:
             return (
-                "input/prompt logprobs are not supported with DP attention "
-                "(attn_dp_size > 1): the eager gather re-enters the logits "
-                "collectives, which only the ranks holding such a request "
-                "would reach. TODO: reduce the request flag across the DP "
-                "group and have every rank run the gather."
+                "input/prompt logprobs with DP attention (attn_dp_size > 1) "
+                "need --enable-dp-lm-head: without it the eager gather "
+                "gathers hidden rows across DP groups at per-rank counts the "
+                "padded batch no longer carries."
             )
         # Non-final pipeline stages return PPProxyTensors, which carries no
         # hidden states for the gather to read.
@@ -927,6 +1020,48 @@ class CompiledForwardShim:
                 "the gather on the last stage only."
             )
         return None
+
+    def _dp_input_logprob_rows(
+        self, forward_batch: Any, wants_input_logprob: bool
+    ) -> int:
+        """Rows the input-logprob logits gather runs at on every DP rank this
+        step, or 0 when no DP rank runs one or the gather has no collective.
+
+        Every input here is the same on every rank -- the env flag, the
+        parallel layout, and the DP-wide max_input_logprob_rows from the
+        scheduler's MLP sync -- so all ranks agree on whether to gather. The
+        local row count is checked against it when the gather runs, on the
+        unpadded batch (_dp_matched_logits).
+        """
+        if (
+            self._draft_worker
+            or not self._prompt_logprob_enabled
+            or get_parallel().attn_dp_size == 1
+            # The requesting rank raises the rejection; nobody gathers.
+            or self._prompt_logprob_rejection(True) is not None
+        ):
+            return 0
+        logits_processor = getattr(
+            self.policy.model_runner.model, "logits_processor", None
+        )
+        if logits_processor is None or not (
+            logits_processor.do_tensor_parallel_all_gather
+        ):
+            return 0
+        rows = forward_batch.max_input_logprob_rows
+        if rows == 0:
+            if wants_input_logprob:
+                raise RuntimeError(
+                    "this DP rank gathers input logprobs, but the DP-wide row "
+                    "count is 0: the scheduler's MLP sync did not carry it (is "
+                    "SGLANG_SCHEDULER_SKIP_ALL_GATHER set?), and a gather the "
+                    "other DP ranks do not join would hang the mesh."
+                )
+            return 0
+        from sglang_tpu.row_pad import row_bucket
+
+        # One eager program per power of two, as _get_logits buckets its rows.
+        return row_bucket(rows)
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Set the serving-time recompilation checker."""
@@ -1073,6 +1208,10 @@ class CompiledForwardShim:
             rejection = self._prompt_logprob_rejection(self._prompt_logprob_enabled)
             if rejection is not None:
                 raise NotImplementedError(rejection)
+        # Read before the pins below: the row count reads the logprob starts.
+        dp_logprob_rows = self._dp_input_logprob_rows(
+            forward_batch, wants_input_logprob
+        )
         saved: dict[str, Any] = {}
         if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
             saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
@@ -1194,7 +1333,9 @@ class CompiledForwardShim:
                 and result.mm_input_embeds is None
             ):
                 result.mm_input_embeds = mm_embeds
-            return self._finish_forward(result, forward_batch, wants_input_logprob)
+            return self._finish_forward(
+                result, forward_batch, wants_input_logprob, dp_logprob_rows
+            )
 
         if isinstance(out, PendingCall):
             return out.then(finish)
@@ -1209,7 +1350,11 @@ class CompiledForwardShim:
         return out
 
     def _finish_forward(
-        self, out: Any, forward_batch: Any, wants_input_logprob: bool = False
+        self,
+        out: Any,
+        forward_batch: Any,
+        wants_input_logprob: bool = False,
+        dp_logprob_rows: int = 0,
     ) -> Any:
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.
@@ -1218,6 +1363,14 @@ class CompiledForwardShim:
                 logits_output=out,
                 forward_batch=forward_batch,
                 model=self.policy.model_runner.model,
+                dp_rows=dp_logprob_rows,
+            )
+        elif dp_logprob_rows:
+            # Another DP rank gathers input logprobs this step.
+            _join_dp_input_logprob_gather(
+                forward_batch=forward_batch,
+                model=self.policy.model_runner.model,
+                rows=dp_logprob_rows,
             )
 
         return out

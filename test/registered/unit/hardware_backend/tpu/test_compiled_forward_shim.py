@@ -40,7 +40,9 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _attach_input_logprobs,
     _dp_attn_apply_bucket_metadata,
     _dp_attn_select_bucket_shape,
+    _dp_matched_logits,
     _extend_batch_cap,
+    _join_dp_input_logprob_gather,
     _matches_default,
     _pad_forward_batch_inputs,
     _pin_fields,
@@ -49,6 +51,7 @@ from sglang_tpu.compilation.compiled_forward_shim import (
     _static_default_kwargs,
     _zero_pad_dim0,
     build_bucketers,
+    input_logprob_rows,
     needs_input_logprob,
     reconcile_tpu_batch_limits,
 )
@@ -1762,11 +1765,18 @@ class TestPromptLogprobRejection(CustomTestCase):
         with get_context().override_server_args():
             self.assertIsNone(CompiledForwardShim._prompt_logprob_rejection(True))
 
-    def test_flag_on_dp_attention_rejects(self):
+    def test_flag_on_dp_attention_needs_the_dp_lm_head(self):
+        # Without it the gather collects hidden rows across DP groups at
+        # per-rank counts the padded batch no longer carries.
         with get_context().override_server_args(tp_size=2, attn_dp_size=2):
             self.assertIn(
-                "DP attention", CompiledForwardShim._prompt_logprob_rejection(True)
+                "--enable-dp-lm-head",
+                CompiledForwardShim._prompt_logprob_rejection(True),
             )
+        with get_context().override_server_args(
+            tp_size=4, attn_dp_size=2, enable_dp_lm_head=True
+        ):
+            self.assertIsNone(CompiledForwardShim._prompt_logprob_rejection(True))
 
     def test_flag_on_pipeline_parallel_rejects(self):
         with get_context().override_server_args(pp_size=2):
@@ -1871,7 +1881,14 @@ class TestShimInputLogprobPath(CustomTestCase):
         # The gate reads the parallel bag per forward; publish a single-rank server.
         self._publish_topology()
 
-    def _publish_topology(self, *, pp_size=1, dp_size=1, enable_dp_attention=False):
+    def _publish_topology(
+        self,
+        *,
+        pp_size=1,
+        dp_size=1,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+    ):
         """Publish the topology the prompt-logprob gate reads, for this test."""
         # Attention DP is declared by width now; the flag alone no longer
         # resolves to a width inside an override.
@@ -1879,13 +1896,16 @@ class TestShimInputLogprobPath(CustomTestCase):
             pp_size=pp_size,
             dp_size=1 if enable_dp_attention else dp_size,
             attn_dp_size=dp_size if enable_dp_attention else 1,
+            tp_size=2 * dp_size if enable_dp_attention else 1,
+            enable_dp_lm_head=enable_dp_lm_head,
         )
         override.install()
         self.addCleanup(override.restore)
 
     @staticmethod
-    def _fb(mode="extend", return_logprob=True, starts=(0, 0)):
+    def _fb(mode="extend", return_logprob=True, starts=(0, 0), dp_rows=0):
         return SimpleNamespace(
+            max_input_logprob_rows=dp_rows,
             is_prefill_only=False,
             mm_input_embeds=None,
             input_embeds=None,
@@ -1913,6 +1933,7 @@ class TestShimInputLogprobPath(CustomTestCase):
         pp_size=1,
         dp_size=1,
         enable_dp_attention=False,
+        enable_dp_lm_head=False,
     ):
         def compiled(input_ids, positions, forward_batch, *a, **kw):
             # Snapshot what the graph actually sees.
@@ -1929,6 +1950,7 @@ class TestShimInputLogprobPath(CustomTestCase):
             pp_size=pp_size,
             dp_size=dp_size,
             enable_dp_attention=enable_dp_attention,
+            enable_dp_lm_head=enable_dp_lm_head,
         )
 
         # Constructed inside the override on purpose: the flag decides which
@@ -2058,17 +2080,80 @@ class TestShimInputLogprobPath(CustomTestCase):
         ):
             self._shim({}, model=_StubModel(), enabled=False)(None, None, self._fb())
 
-    def test_dp_attention_rejects_prompt_logprobs(self):
-        # The eager gather re-runs the LogitsProcessor, whose logits path
-        # enters the attention-TP/DP collectives. Wanting input logprobs is a
-        # property of the local batch, so under DP attention one rank would
-        # join a collective its peers never reach: the worker group hangs
-        # rather than failing. Reject up front instead.
+    def test_dp_attention_without_the_dp_lm_head_rejects_prompt_logprobs(self):
+        # Without --enable-dp-lm-head the gather collects hidden rows across
+        # DP groups at per-rank counts the padded batch no longer carries.
+        # Reject up front rather than gather at the wrong shapes.
         model = _StubModel()
         shim = self._shim({}, model=model, dp_size=2, enable_dp_attention=True)
-        with self.assertRaisesRegex(NotImplementedError, "DP attention"):
+        with self.assertRaisesRegex(NotImplementedError, "--enable-dp-lm-head"):
             shim(None, None, self._fb())
         self.assertEqual(model.calls, 0)
+
+    def _dp_shim(self, model, *, draft=False):
+        shim = self._shim(
+            {},
+            model=model,
+            dp_size=2,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+        )
+        shim._draft_worker = draft
+        return shim
+
+    def test_dp_attention_gathers_at_the_dp_wide_row_count(self):
+        # Every DP rank runs the gather's logits all-gather at one shape: the
+        # requesting rank pads its 8 rows to the bucketed DP-wide 12.
+        model = _GatherStubModel()
+        out = self._dp_shim(model)(None, None, self._fb(dp_rows=12))
+        self.assertIsNotNone(out.input_token_logprobs)
+        self.assertEqual(model.logits_processor.gathered_rows, [16])
+        self.assertEqual(model.logits_processor.returned_rows, [8])
+
+    def test_dp_attention_rank_without_the_request_joins_the_gather(self):
+        model = _GatherStubModel()
+        with _patched_dp_buffer(hidden_size=5):
+            out = self._dp_shim(model)(None, None, self._fb(mode="decode", dp_rows=12))
+        self.assertIsNone(out.input_token_logprobs)
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(model.logits_processor.gathered_rows, [16])
+
+    def test_dp_attention_step_without_input_logprobs_gathers_nothing(self):
+        model = _GatherStubModel()
+        self._dp_shim(model)(None, None, self._fb(mode="decode"))
+        self.assertEqual(model.logits_processor.gathered_rows, [])
+
+    def test_dp_attention_gather_the_sync_did_not_announce_raises(self):
+        # Gathering alone would hang the mesh; fail loudly instead.
+        model = _GatherStubModel()
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_SCHEDULER_SKIP_ALL_GATHER"):
+            self._dp_shim(model)(None, None, self._fb(dp_rows=0))
+        self.assertEqual(model.logits_processor.gathered_rows, [])
+
+    def test_dp_attention_gather_above_the_dp_wide_count_raises(self):
+        # The count is checked on the unpadded batch the gather reads.
+        model = _GatherStubModel()
+        with self.assertRaisesRegex(RuntimeError, "exceeds the DP-wide 4"):
+            self._dp_shim(model)(None, None, self._fb(dp_rows=4))
+        self.assertEqual(model.logits_processor.gathered_rows, [])
+
+    def test_dp_attention_without_a_logits_collective_stays_local(self):
+        # At attention TP 1 the LM head gathers nothing: no rank waits on
+        # another, so the requesting rank gathers alone, unpadded.
+        model = _GatherStubModel(tp_gather=False)
+        self._dp_shim(model)(None, None, self._fb(dp_rows=12))
+        self.assertEqual(model.logits_processor.gathered_rows, [8])
+        model = _GatherStubModel(tp_gather=False)
+        self._dp_shim(model)(None, None, self._fb(mode="decode", dp_rows=12))
+        self.assertEqual(model.logits_processor.gathered_rows, [])
+
+    def test_dp_attention_draft_worker_does_not_join(self):
+        # The target's forward carries the gather; a draft's never does.
+        model = _GatherStubModel()
+        self._dp_shim(model, draft=True)(
+            None, None, self._fb(mode="decode", dp_rows=12)
+        )
+        self.assertEqual(model.logits_processor.gathered_rows, [])
 
     def test_pipeline_parallelism_rejects_prompt_logprobs(self):
         # Non-final PP stages return PPProxyTensors, which carries no hidden
@@ -2094,6 +2179,54 @@ class TestShimInputLogprobPath(CustomTestCase):
         self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
         self.assertFalse(seen["return_logprob"])
         self.assertTrue(fb.return_logprob)
+
+
+class TestDpMatchedInputLogprobGather(CustomTestCase):
+    """Under DP attention the eager gather's logits all-gather runs on every
+    DP rank at one shape."""
+
+    def test_input_logprob_rows_counts_the_sampled_row_of_every_request(self):
+        fb = SimpleNamespace(
+            extend_seq_lens_cpu=[5, 4, 3], extend_logprob_start_lens_cpu=[0, 4, 1]
+        )
+        # 5 prompt rows, the sampled row of a request scoring none, and 2.
+        self.assertEqual(input_logprob_rows(fb), 8)
+
+    def test_logits_are_padded_to_the_shared_rows_and_sliced_back(self):
+        lp = _GatherStubLogitsProcessor()
+        with _dp_matched_logits(lp, 16):
+            logits = lp._get_logits(
+                torch.ones(5, 3), None, None, use_logits_buffer=True
+            )
+            self.assertFalse(lp.input_logprob_processor.enable_logprobs_chunk)
+        self.assertEqual(lp.gathered_rows, [16])
+        self.assertEqual(tuple(logits.shape), (5, 4))
+        # The padded shape could match the graph's next-token logits buffer.
+        self.assertEqual(lp.use_logits_buffer, [False])
+        # Restored: the class method and the chunking setting.
+        self.assertNotIn("_get_logits", vars(lp))
+        self.assertTrue(lp.input_logprob_processor.enable_logprobs_chunk)
+
+    def test_state_is_restored_when_the_gather_raises(self):
+        lp = _GatherStubLogitsProcessor()
+        with self.assertRaisesRegex(RuntimeError, "exceeds the DP-wide 4"):
+            with _dp_matched_logits(lp, 4):
+                lp._get_logits(torch.ones(5, 3), None, None)
+        self.assertEqual(lp.gathered_rows, [])
+        self.assertNotIn("_get_logits", vars(lp))
+        self.assertTrue(lp.input_logprob_processor.enable_logprobs_chunk)
+
+    def test_join_runs_the_gather_on_zero_rows(self):
+        model = _GatherStubModel()
+        with _patched_dp_buffer(hidden_size=7):
+            _join_dp_input_logprob_gather(
+                forward_batch=SimpleNamespace(), model=model, rows=32
+            )
+        lp = model.logits_processor
+        self.assertEqual(lp.gathered_rows, [32])
+        self.assertEqual(lp.use_logits_buffer, [False])
+        self.assertEqual(tuple(lp.last_hidden.shape), (32, 7))
+        self.assertEqual(lp.last_hidden.abs().sum().item(), 0)
 
 
 class TestAttachInputLogprobs(CustomTestCase):
@@ -2295,6 +2428,75 @@ class _StubLogitsProcessor:
             input_token_logprobs=self._input_token_logprobs,
             **self._input_logprob_fields,
         )
+
+
+class _GatherStubLogitsProcessor(_StubLogitsProcessor):
+    """A LogitsProcessor whose input-logprob pass computes its logits through
+    ``_get_logits``, as the real one does, recording the rows it gathers."""
+
+    def __init__(self, input_token_logprobs=None, *, tp_gather=True):
+        super().__init__(input_token_logprobs)
+        self.do_tensor_parallel_all_gather = tp_gather
+        self.input_logprob_processor = SimpleNamespace(enable_logprobs_chunk=True)
+        self.gathered_rows = []
+        self.returned_rows = []
+        self.use_logits_buffer = []
+        self.last_hidden = None
+
+    def _get_logits(
+        self, hidden_states, lm_head, logits_metadata, use_logits_buffer=True
+    ):
+        self.gathered_rows.append(hidden_states.shape[0])
+        self.use_logits_buffer.append(use_logits_buffer)
+        self.last_hidden = hidden_states
+        return torch.zeros(hidden_states.shape[0], 4)
+
+    def __call__(self, input_ids, hidden_states, lm_head, logits_metadata):
+        logits = self._get_logits(
+            hidden_states[: input_logprob_rows(logits_metadata)],
+            lm_head,
+            logits_metadata,
+        )
+        self.returned_rows.append(logits.shape[0])
+        return super().__call__(input_ids, hidden_states, lm_head, logits_metadata)
+
+
+class _GatherStubModel:
+    def __init__(self, *, tp_gather=True):
+        self.logits_processor = _GatherStubLogitsProcessor(
+            _StubModel.LOGPROBS, tp_gather=tp_gather
+        )
+        self.lm_head = object()
+
+    @property
+    def calls(self):
+        return self.logits_processor.calls
+
+
+def _patched_dp_buffer(*, hidden_size):
+    """The DP buffer geometry and a LogitsMetadata the join can build."""
+    from contextlib import ExitStack
+
+    from sglang.srt.layers import dp_attention, logits_processor
+
+    stack = ExitStack()
+    stack.enter_context(
+        patch.object(dp_attention, "get_dp_hidden_size", return_value=hidden_size)
+    )
+    stack.enter_context(
+        patch.object(dp_attention, "get_dp_dtype", return_value=torch.bfloat16)
+    )
+    stack.enter_context(
+        patch.object(dp_attention, "get_dp_device", return_value=torch.device("cpu"))
+    )
+    stack.enter_context(
+        patch.object(
+            logits_processor.LogitsMetadata,
+            "from_forward_batch",
+            return_value=SimpleNamespace(),
+        )
+    )
+    return stack
 
 
 class _StubModel:
