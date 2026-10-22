@@ -320,6 +320,10 @@ class MuseMegakernel(torch.nn.Module):
         if swa_chunk_pages >= sal_chunk_pages:
             swa_chunk_pages = 0
         kv_chunk_tokens = sal_chunk_pages * page_size if kv_sal else 512
+        # a 4096-token ring at 512- and 1024-token chunks; two-stream needs an even group
+        kv_group = max(2, 2048 // kv_chunk_tokens) if kv_sal else 4
+        if rows > _LARGE_STEP_ROWS:
+            kv_group = 2
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -352,8 +356,6 @@ class MuseMegakernel(torch.nn.Module):
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
             # SEQ_ALONG_LANE pages are >= 256 tokens
             chunk_pages=sal_chunk_pages if kv_sal else self.chunk_pages,
-            # a 4096-token ring at 512- and 1024-token chunks; two-stream needs an even group
-            **({"kv_group": max(2, 2048 // (sal_chunk_pages * page_size))} if kv_sal else {}),
             swa_chunk_pages=swa_chunk_pages,
             attn_skip_idle_streams=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
             attn_col_mask=bool(swa_chunk_pages)
@@ -375,10 +377,19 @@ class MuseMegakernel(torch.nn.Module):
             # the dense merge/combine/top-k fit VMEM up to 64 rows and run faster (per-slot
             # merge measured 3.2 vs 0.2 ms per 64-row step)
             row_bounded_temps=rows > _LARGE_STEP_ROWS,
+            packed_pages=_pack_pages(n_page_entries),
             fold_attn_scale=tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get()
             and math.frexp(g.attn_scale)[0] == 0.5,
             # half-height dense tiles: smaller ring slots for the larger steps' VMEM
-            tile_k=512 if rows > _BASE_STEP_MAX_ROWS else 1024,
+            # smaller dense tiles and KV fetch groups for the larger steps' VMEM: 96 rows with
+            # 512-row tiles and 4-chunk groups overflowed by 0.5 MiB
+            tile_k=256
+            if rows > _LARGE_STEP_ROWS
+            else 512
+            if rows > _BASE_STEP_MAX_ROWS
+            else 1024,
+            kv_group=kv_group,
+            vmem_limit_bytes=_vmem_limit(rows),
         )
         # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
         # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
@@ -477,6 +488,10 @@ class MuseMegakernel(torch.nn.Module):
         pool = backend.token_to_kv_pool
         self.check_kv_pools(pool)
         kv = [pool.get_fused_kv_buffer(i) for i in range(self.geo.n_layers)]
+        if _pack_pages(page_indices.shape[0]) and max(k.shape[0] for k in kv) > 0xFFFF:
+            raise NotImplementedError(
+                "packed page tables need fewer than 65536 KV pages"
+            )
         weights = [getattr(self, f"w_{n}") for n in K.WEIGHT_NAMES]
         experts = [getattr(self, f"expert_{i}") for i in range(self.n_expert_refs)]
         hidden, aux = torch.ops.sglang_tpu_pallas.muse_megakernel(
@@ -573,6 +588,25 @@ _LARGE_CHUNK_BUDGET = int(2.5 * 2**20)
 _COMPACT4_MAX_ROWS = 24
 
 
+# Both int32 page tables in SMEM: 16 requests at 1M context (512 KiB) read at SMEM speed, 24
+# (768 KiB) did not (every page lookup ~1 us: 670 ms steps), 32 do not fit (1 MiB).
+_PAGE_TABLES_SMEM_BYTES_MAX = 600 * 1024
+
+
+def _pack_pages(n_page_entries: int) -> bool:
+    forced = tpu_envs.SGLANG_TPU_MK_PACK_PAGE_TABLES.get()
+    if forced is not None:
+        return bool(forced)
+    return n_page_entries * 2 * 4 > _PAGE_TABLES_SMEM_BYTES_MAX
+
+
+def _vmem_limit(rows: int) -> int:
+    mb = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB.get()
+    if mb is None or rows <= _LARGE_STEP_ROWS:
+        return 60 * 2**20
+    return int(mb * 2**20)
+
+
 def _scratch_budget(rows: int, chunk_tokens: int) -> int:
     per_row = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB.get()
     per_row = _LARGE_STEP_BUDGET_PER_ROW if per_row is None else per_row * 1024
@@ -604,6 +638,8 @@ def _build_callable(cfg: K.MKConfig, tp: int):
     kvw = K.kv_write_call(cfg)
 
     def body(*xs):
+        if cfg.packed_pages:
+            xs = (*xs[:2], K.pack_page_table(xs[2]), K.pack_page_table(xs[3]), *xs[4:])
         hid, aux, newkv = mk(*xs)
         pools = kvw(*xs[:4], newkv, *xs[kv0:])
         return (hid, aux, *pools)

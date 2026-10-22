@@ -181,6 +181,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # one owned row at a time, so their temporaries stay [R, He] / [K, He] instead of growing
     # with every row of the step (Mosaic places those values in VMEM). Same arithmetic.
     row_bounded_temps: bool = False
+    # page tables arrive as int32 words holding two 16-bit page ids (even entry low): half the
+    # SMEM. Past ~600 KB of tables every page lookup stops being an SMEM read (24 requests at
+    # 1M context: the 96-row step took 670 ms, the KV write 12 ms).
+    packed_pages: bool = False
     # attention multiplies the bf16 queries by attn_scale once instead of every score; exact
     # because ops only sets it for a power-of-two scale
     fold_attn_scale: bool = False
@@ -886,6 +890,20 @@ class _Coll:
         return pad
 
 
+def _page(tab_ref, ent, packed):
+    """Page id ``ent`` of an SMEM page table, unpacked or two ids per int32 word."""
+    if not packed:
+        return tab_ref[ent]
+    word = tab_ref[ent // 2]
+    return jax.lax.shift_right_logical(word, (ent % 2) * 16) & 0xFFFF
+
+
+def pack_page_table(tab):
+    """int32 ``[2n]`` page ids (< 65536) -> int32 ``[n]`` words, even entry in the low half."""
+    assert tab.shape[0] % 2 == 0
+    return (tab[0::2] & 0xFFFF) | (tab[1::2] << 16)
+
+
 def few_rows(c):
     """Rows a step can have, if few enough for the gather-only collectives (else 1, unused)."""
     n = c.n_req * c.rows_per_req
@@ -1350,7 +1368,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pages.append(_sel(geo.is_global, pf_ref[ent], psw_ref[ent]))
+                pages.append(
+                    _sel(
+                        geo.is_global,
+                        _page(pf_ref, ent, c.packed_pages),
+                        _page(psw_ref, ent, c.packed_pages),
+                    )
+                )
             return pages
 
         def chunk_dst(geo, slot, pi):
@@ -2117,6 +2141,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         def _(j=j, p=p):
                             S["ysend"].at[p // K][pl.ds(p % K, 1), :] = yp[j : j + 1]
 
+                def compact_scoped(nrows):
+                    with _scope(f"ex_c{nrows}"):
+                        compact_expert(nrows)
+
+                def full_scoped():
+                    with _scope("ex_full"):
+                        full_expert()
+
                 if kind == "fp4" and c.compact_rows:
                     cnt = S["ex_cnt"][i]
                     lo = 0
@@ -2124,12 +2156,12 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         if b > c.compact_rows:
                             break
                         pl.when((cnt > lo) & (cnt <= b))(
-                            functools.partial(compact_expert, b)
+                            functools.partial(compact_scoped, b)
                         )
                         lo = b
-                    pl.when(cnt > c.compact_rows)(full_expert)
+                    pl.when(cnt > c.compact_rows)(full_scoped)
                 else:
-                    full_expert()
+                    full_scoped()
                 if c.y_early:
 
                     def send_row(t, carry):
@@ -2420,7 +2452,7 @@ def _kv_write_sal_call(cfg: MKConfig):
                             ent = jnp.minimum(
                                 j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1
                             )
-                            page = tab[ent]
+                            page = _page(tab, ent, cfg.packed_pages)
                             rd = pltpu.make_async_copy(
                                 kv_out[l].at[page], blk, sems.at[0]
                             )
@@ -2486,7 +2518,7 @@ def kv_write_call(cfg: MKConfig):
                 ent = jnp.minimum(
                     (r // q) * cfg.pages_per_seq + p // ps, cfg.n_pages_entries - 1
                 )
-                tok = tab[ent] * ps + p % ps
+                tok = _page(tab, ent, cfg.packed_pages) * ps + p % ps
                 cp = pltpu.make_async_copy(
                     newkv.at[l, pl.ds(r, 1)], flat.at[pl.ds(tok, 1)], sems.at[l * R + r]
                 )

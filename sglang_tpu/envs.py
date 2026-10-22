@@ -104,6 +104,10 @@ class TpuEnvs:
     SGLANG_TPU_MK_TRACE_REGIONS = EnvBool(False)
     # Tuning only: declared-scratch budget cut per row past 64 rows (KiB), for the VMEM sweep.
     SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB = EnvInt(None)
+    # Tuning only: scoped VMEM limit (MiB) for steps past 64 rows (default 60; 64 MiB physical).
+    SGLANG_TPU_MK_LARGE_STEP_VMEM_LIMIT_MB = EnvFloat(None)
+    # Tuning only: force the 16-bit packed page tables on (1) or off (0); unset = by table size.
+    SGLANG_TPU_MK_PACK_PAGE_TABLES = EnvInt(None)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)
