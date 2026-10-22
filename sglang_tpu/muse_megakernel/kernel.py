@@ -141,6 +141,12 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # KV chunks are fetched in groups of kv_group per layer branch-tree walk (each walk has a
     # fixed cost); the ring holds two groups: one being consumed, the next in flight
     kv_group: int = 4
+    # independent online-softmax streams over consecutive chunks, merged at the end
+    attn_streams: int = 2
+    # > 0: every score is exponentiated against this constant instead of a running row max (no
+    # rescale). Exact because q and k are RMS-normalized per head: |score| <= scale_query_by *
+    # head_dim * attn_scale, which validate() requires this to cover with fp8-rounding margin.
+    attn_fixed_max: float = 0.0
     # Pool rows hold every local KV head side by side in one pool_padded_head_dim-lane row
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
@@ -246,6 +252,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             not self.kv_packed
             and self.page_size % LANE == 0
             and self.head_dim % (8 * self.sal_pack) == 0
+        )
+        assert self.attn_streams >= 1 and self.kv_group % self.attn_streams == 0
+        # 1.1: fp8 rounding of the cached K can stretch |k| a few percent past sqrt(head_dim)
+        assert not self.attn_fixed_max or self.attn_fixed_max >= 1.1 * (
+            self.scale_query_by * self.head_dim * self.attn_scale
         )
         return self
 
@@ -1181,10 +1192,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             )
             return p_lo, first_ch, n_ch
 
-        KG, KR = c.kv_group, c.kv_ring
-        if KG % 2:
+        KG, KR, NS = c.kv_group, c.kv_ring, c.attn_streams
+        if KG % NS:
             raise ValueError(
-                "two-stream attention prefetches on even chunks: kv_group must be even"
+                f"{NS}-stream attention prefetches on group starts: kv_group must be a multiple of {NS}"
             )
 
         def chunk_pages_of(j, ci, is_global):
@@ -1300,12 +1311,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 """``v_t``: v is [kv_dim, tokens] (SEQ_ALONG_LANE chunks), else [tokens, dim]."""
                 m, lsum, acc = carry
                 with _scope("softmax"):
-                    m_new = jnp.maximum(m, jnp.max(s_, axis=1, keepdims=True))
-                    corr = jnp.exp(m - m_new)
-                    pexp = jnp.exp(s_ - m_new)
-                    lsum = lsum * corr + jnp.sum(pexp, axis=1, keepdims=True)
+                    if c.attn_fixed_max:  # m stays at its initial value; streams merge with weight 1
+                        m_new, corr = m, None
+                        pexp = jnp.exp(s_ - c.attn_fixed_max)
+                        lsum = lsum + jnp.sum(pexp, axis=1, keepdims=True)
+                    else:
+                        m_new = jnp.maximum(m, jnp.max(s_, axis=1, keepdims=True))
+                        corr = jnp.exp(m - m_new)
+                        pexp = jnp.exp(s_ - m_new)
+                        lsum = lsum * corr + jnp.sum(pexp, axis=1, keepdims=True)
                 with _scope("pv"):
-                    acc = acc[:, : v.shape[0 if v_t else 1]] * corr + jax.lax.dot_general(
+                    acc = acc[:, : v.shape[0 if v_t else 1]]
+                    acc = (acc if corr is None else acc * corr) + jax.lax.dot_general(
                         pexp.astype(jnp.bfloat16),
                         v,
                         (((1,), (1 if v_t else 0,)), ((), ())),
@@ -1410,10 +1427,60 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     online(carry2[1], s_b, v_b, v_t=c.kv_sal),
                 )
 
+            def body_streams(k, carries, clean=False):
+                """NS streams over chunks NS*k .. NS*k+NS-1: every wait before any compute."""
+                i0 = NS * k
+
+                @pl.when(
+                    jnp.logical_and(
+                        jnp.logical_and(i0 % KG == 0, i0 >= KG), i0 + KG < n_ch
+                    )
+                )
+                def _():
+                    issue_range(
+                        l,
+                        j,
+                        first_ch + i0 + KG,
+                        (i0 + KG) % KR,
+                        jnp.minimum(KG, n_ch - i0 - KG),
+                        is_global,
+                    )
+
+                valid = [i0 + s < n_ch for s in range(NS)]
+                with _scope("kv_wait"):
+                    wait_chunk(i0 % KR)
+                    for s in range(1, NS):
+
+                        @pl.when(valid[s])  # a past-the-end stream re-reads the last chunk
+                        def _(s=s):
+                            wait_chunk((i0 + s) % KR)
+
+                out = []
+                for s in range(NS):
+                    i = i0 + s if (clean or s == 0) else jnp.minimum(i0 + s, n_ch - 1)
+                    s_, v = chunk_scores(i, True if s == 0 else valid[s], clean)
+                    out.append(online(carries[s], s_, v, v_t=c.kv_sal))
+                return tuple(out)
+
             # Global-layer chunks before a request's last one lie wholly in the past of every
             # verify row: chunks [0, n_clean) need only the cross-head mask.
             n_clean = jnp.where(is_global, jnp.maximum(n_ch - 1, 0), 0)
-            with _scope("chunk_loop"):
+            if NS != 2:
+                with _scope("chunk_loop"):
+                    n_it, carries = (n_ch + NS - 1) // NS, (init,) * NS
+                    carries = jax.lax.fori_loop(
+                        0, n_clean // NS, functools.partial(body_streams, clean=True), carries
+                    )
+                    carries = jax.lax.fori_loop(n_clean // NS, n_it, body_streams, carries)
+                    m_all = functools.reduce(jnp.maximum, [cr[0] for cr in carries])
+                    ws_ = [jnp.exp(cr[0] - m_all) for cr in carries]
+                    carry = (
+                        m_all,
+                        sum(cr[1] * w for cr, w in zip(carries, ws_)),
+                        sum(cr[2] * w for cr, w in zip(carries, ws_)),
+                    )
+            else:
+              with _scope("chunk_loop"):
                 # Two independent online-softmax streams over even and odd chunks, merged at
                 # the end: two dependency chains per iteration for the scheduler to interleave.
                 # A stream that saw no live key keeps m = NEG and gets weight exp(NEG - m) = 0.
