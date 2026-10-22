@@ -1037,6 +1037,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 cp_rank=self._cp_strategy.cp_rank,
                 device=self.model_runner.device,
             )
+            # A spec target extend stages its token inputs on host (HOST_PADDED).
+            self._upload_host_padded_inputs(forward_batch)
         else:
             real_q, real_b = _pad_forward_batch_inputs(
                 forward_batch,
