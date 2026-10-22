@@ -133,6 +133,10 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_ETP_FUSED_COMBINE = EnvBool(False)
     # Fused-RS: rows issued per iteration of the per-row gather / write DMA loops.
     SGLANG_TPU_FUSED_RS_ROW_LOOP_UNROLL = EnvInt(1)
+    # Fused-RS: output staging buffers a tile's deferred direct writes stay in flight
+    # across (VMEM: slots x tile_m x hidden x 2 B). Measured on the Muse Spark expert-TP
+    # call: 6 slots -1.5% per layer vs 3, 8 slots -2%.
+    SGLANG_TPU_FUSED_RS_STAGING_SLOTS = EnvInt(3)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
