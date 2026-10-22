@@ -138,6 +138,9 @@ Both raiden roles serve every algorithm with the same spec flags.
   stages run `TpuPipelineStageWorker`, which only forwards the target. The
   stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
   and PP runs without overlap, which a prefill-only server allows.
+- DP attention on the decode: the decode ranks pull their own requests' KV, which
+  relieves the PP transfer that bounds a non-DP decode (`pd_singlehost_pp_spec.py`
+  `decode_dp`; it adds `--enable-dp-lm-head`).
   `test_tpu_gpt_oss_120b_pd_singlehost_pp_spec_perf.py` runs PP8 EAGLE3 and DFlash.
 - KV free fence: commit writes draft KV after the accept outputs the result
   copies, so commit and extend return an output of their last KV write as
