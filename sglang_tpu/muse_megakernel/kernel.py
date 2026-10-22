@@ -147,6 +147,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # rescale). Exact because q and k are RMS-normalized per head: |score| <= scale_query_by *
     # head_dim * attn_scale, which validate() requires this to cover with fp8-rounding margin.
     attn_fixed_max: float = 0.0
+    # a stream with no chunk left in its loop iteration skips the chunk (lax.cond) instead of
+    # scoring a re-read chunk fully masked
+    attn_skip_idle_streams: bool = False
     # Pool rows hold every local KV head side by side in one pool_padded_head_dim-lane row
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
@@ -1419,6 +1422,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         wait_chunk(i1 % KR)
 
                 s_a, v_a = chunk_scores(i0, True, clean)
+                if c.attn_skip_idle_streams and not clean:
+                    # a past-the-end stream skips its chunk instead of scoring it fully masked
+                    carry_b = jax.lax.cond(
+                        valid_b,
+                        lambda cr: online(cr, *chunk_scores(i1, True, False), v_t=c.kv_sal),
+                        lambda cr: cr,
+                        carry2[1],
+                    )
+                    return online(carry2[0], s_a, v_a, v_t=c.kv_sal), carry_b
                 s_b, v_b = chunk_scores(
                     i1 if clean else jnp.minimum(i1, n_ch - 1), valid_b, clean
                 )
@@ -1457,6 +1469,18 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
                 out = []
                 for s in range(NS):
+                    if c.attn_skip_idle_streams and not clean and s > 0:
+                        out.append(
+                            jax.lax.cond(
+                                valid[s],
+                                lambda cr, i=i0 + s: online(
+                                    cr, *chunk_scores(i, True, False), v_t=c.kv_sal
+                                ),
+                                lambda cr: cr,
+                                carries[s],
+                            )
+                        )
+                        continue
                     i = i0 + s if (clean or s == 0) else jnp.minimum(i0 + s, n_ch - 1)
                     s_, v = chunk_scores(i, True if s == 0 else valid[s], clean)
                     out.append(online(carries[s], s_, v, v_t=c.kv_sal))
