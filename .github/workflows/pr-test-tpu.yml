@@ -99,8 +99,9 @@ jobs:
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
       # Shared files listed in the TPU debt baseline carry TPU code outside the
-      # paths above. Read the list from the base commit so a PR cannot drop its
-      # own files; a change to the list itself counts too.
+      # paths above, or are patched by a sglang_tpu hook. Read the list from the
+      # base commit so a PR cannot drop its own files; a change to the list
+      # itself counts too.
       - name: Detect changes to shared files that carry TPU code
         id: debt
         uses: actions/github-script@v8
@@ -125,6 +126,7 @@ jobs:
               ...Object.keys(baseline.branches),
               ...Object.keys(baseline.imports),
               ...baseline.modules,
+              ...(baseline.hook_targets ?? []),
             ]);
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner, repo, pull_number: context.issue.number, per_page: 100,
