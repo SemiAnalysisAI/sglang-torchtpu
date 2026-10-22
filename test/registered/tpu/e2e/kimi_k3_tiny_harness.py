@@ -16,8 +16,6 @@ import json
 import os
 import sys
 import tempfile
-import threading
-import time
 
 import requests
 
@@ -86,17 +84,11 @@ MAX_NEW_TOKENS = 24
 TOP_K = 20
 
 
-def prompt_ids(length: int, seed: int) -> list[int]:
-    return [(i * 7919 + seed * 104729) % 50000 + 100 for i in range(length)]
-
-
 # 1300 tokens span three 512-token prefill chunks, so the KDA state the decode
 # receives is the one left after chunked prefill.
 PROMPTS = [
-    prompt_ids(100, 1),
-    prompt_ids(37, 2),
-    prompt_ids(300, 3),
-    prompt_ids(1300, 4),
+    [(i * 7919 + seed * 104729) % 50000 + 100 for i in range(length)]
+    for length, seed in [(100, 1), (37, 2), (300, 3), (1300, 4)]
 ]
 
 
@@ -328,29 +320,13 @@ def read_log(path: str) -> str:
         return f.read()
 
 
-def follow_log(path: str, prefix: str) -> None:
-    """Mirror a server log to stdout as it grows, so the pod log shows it."""
-
-    def run():
-        with open(path, errors="replace") as f:
-            while True:
-                line = f.readline()
-                if line:
-                    sys.stdout.write(f"[{prefix}] {line}")
-                    sys.stdout.flush()
-                else:
-                    time.sleep(0.5)
-
-    threading.Thread(target=run, daemon=True).start()
-
-
 def launch(
     model: str, port: int, args: list[str], log_path: str, env: dict | None = None
 ):
     log = open(log_path, "w")
-    follow_log(log_path, os.path.splitext(os.path.basename(log_path))[0])
     # Bind every interface: the peer engine and the router reach these servers
-    # by pod name (popen_launch_server takes --host from this URL).
+    # by pod name (popen_launch_server takes --host from this URL). It also
+    # copies the server's output to this process's stdout/stderr, the pod log.
     process = popen_launch_server(
         model,
         f"http://0.0.0.0:{port}",
@@ -367,15 +343,3 @@ def assert_no_serving_recompile(test: CustomTestCase, log: str, name: str) -> No
     # Unfrozen recompiles log "Recompiling function"; frozen ones raise
     # "Detected recompile" and fail the request.
     test.assertNotIn("Detected recompile", log, f"{name} recompiled while serving")
-
-
-def wait_healthy(url: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if requests.get(f"{url}/health", timeout=5).status_code == 200:
-                return
-        except requests.RequestException:
-            pass
-        time.sleep(5)
-    raise TimeoutError(f"{url} not healthy after {timeout}s")

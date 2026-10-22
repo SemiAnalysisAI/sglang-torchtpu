@@ -133,13 +133,10 @@ push-resharding moves it as a whole block (`WholeBlockGeometry`): each of the
 receive barrier counts every writer. Push-resharding a pure MLA model raises
 `NotImplementedError` on the decode.
 Decode retraction backup (`--disaggregation-decode-retraction-backup
-cpu_tensor`) copies latent rows by token id and restores whole and partial
-pages with `write_pages_torch`; `TpuMambaPool` copies each slot's committed
-row: the slot row, or after a verify the window row its read offset names.
-The restore writes it into the resumed slot's own row and resets the offset to
-`AT_SLOT`. State slots freed while a forward may still write them are held on
-the KV free fence (`TpuMambaSlotAllocator`), so a received state row cannot be
-overwritten by a finishing request's last step.
+cpu_tensor`) covers both pools (`get_cpu_copy` / `load_cpu_copy` on
+`TpuFusedMLATokenToKVPool` and `TpuMambaPool`). State slots freed while a
+forward may still write them wait on the KV free fence (`TpuMambaSlotAllocator`),
+so a received state row cannot be overwritten by a finishing request's last step.
 
 ## Scope (v1)
 

@@ -85,7 +85,6 @@ def _prefill_manager():
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._swa_engine = None
-    mgr._state_engine = None
     mgr._reshard_slot_rooms = [None]
     mgr._reshard_slot_of = {}
     mgr._aborted = {}

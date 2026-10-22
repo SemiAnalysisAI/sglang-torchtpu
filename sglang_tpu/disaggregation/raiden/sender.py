@@ -860,28 +860,25 @@ class RaidenSenderMixin:
             (indices, torch.stack([tensors[i][row] for i in indices]))
             for indices in by_shape.values()
         ]
-        self._state_copy_executor.submit(
-            self._finish_reshard_state, room, groups, len(tensors)
-        )
+        self._state_copy_executor.submit(self._finish_reshard_state, room, groups)
 
     def _finish_reshard_state(
-        self, room: int, groups: List[Tuple[List[int], Any]], num_tensors: int
+        self, room: int, groups: List[Tuple[List[int], Any]]
     ) -> None:
         """On the state-copy worker: copy the gathered rows to host, then reply."""
         try:
-            rows: List[Any] = [None] * num_tensors
+            rows: List[Any] = [None] * sum(len(indices) for indices, _ in groups)
             for indices, gathered in groups:
                 for i, value in zip(indices, gathered.cpu().numpy(), strict=True):
                     rows[i] = value
         except Exception as exc:
             with self._state_lock:
-                if room in self._aborted:
-                    return
-                self._mark_aborted_locked(room)
-                self._fail_room_locked(
-                    room, f"Raiden reshard: room {room} state copy failed: {exc}"
-                )
-                self.update_status(room, KVPoll.Failed)
+                if room not in self._aborted:
+                    self._mark_aborted_locked(room)
+                    self._fail_room_locked(
+                        room, f"Raiden reshard: room {room} state copy failed: {exc}"
+                    )
+                    self.update_status(room, KVPoll.Failed)
             return
         with self._state_lock:
             if room not in self._prefill.send_blocks or room in self._aborted:

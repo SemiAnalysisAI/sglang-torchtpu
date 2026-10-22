@@ -972,9 +972,7 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     # order (token t at row t // kv_packing, lane t % kv_packing), so a page
     # flattened to [page_size, dim] is indexed by the token's offset in it.
 
-    def _synchronize_device(self) -> None:
-        if torch.device(self.device).type != "cpu":
-            torch.accelerator.synchronize()
+    _synchronize_device = TpuFusedMHATokenToKVPool._synchronize_device
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Copy the latent rows of the tokens ``indices`` out to host.
@@ -995,13 +993,10 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         device_pages = pages.to(self.kv_buffer[0].device)
         self._synchronize_device()
         kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
         for buf in self.kv_buffer[: self.layer_num]:
             held = buf.index_select(0, device_pages).to("cpu")
             rows = held.view(-1, buf.shape[-1]).index_select(0, rows_in_pages)
-            kv_cache_cpu.append(
-                [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
-            )
+            kv_cache_cpu.append(list(rows.split(self.cpu_offloading_chunk_size)))
         self._synchronize_device()
         return kv_cache_cpu
 
@@ -1058,19 +1053,8 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
                 write_pages_torch(part_blocks, pages.view(-1, *page_shape), dst)
         self._synchronize_device()
 
-    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
-        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``."""
-        chunk_size = self.cpu_offloading_chunk_size
-        filtered = []
-        for layer_chunks in kv_cache_cpu:
-            if len(layer_chunks) == 0:
-                filtered.append([])
-                continue
-            rows = torch.cat(layer_chunks, dim=0)[row_mask]
-            filtered.append(
-                [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
-            )
-        return filtered
+    # Same payload as the MHA pool's: per-layer chunks of token-major rows.
+    filter_cpu_copy = TpuFusedMHATokenToKVPool.filter_cpu_copy
 
     def get_mla_kv_buffer(self, *args, **kwargs):
         raise NotImplementedError(

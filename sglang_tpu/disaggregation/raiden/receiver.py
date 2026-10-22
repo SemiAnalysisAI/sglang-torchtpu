@@ -1136,8 +1136,7 @@ class RaidenReceiverMixin:
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
                 if room in self._decode.reshard_meta:
-                    self._failed.add(str(room))
-                    self.record_failure(room, reason)
+                    self._fail_room_locked(room, reason)
             return False
 
         with self._state_lock:

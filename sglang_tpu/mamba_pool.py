@@ -140,12 +140,6 @@ class TpuMambaSlotAllocator(MambaSlotAllocator):
 
     kv_free_fence = None
 
-    def __init__(self, size: int, device: str):
-        from sglang_tpu.kv_free_fence import HeldPages
-
-        self.held_pages = HeldPages()
-        super().__init__(size, device)
-
     def available_size(self) -> int:
         return len(self.free_slots) + self.held_pages.num_pages
 
@@ -159,8 +153,6 @@ class TpuMambaSlotAllocator(MambaSlotAllocator):
         return super()._do_alloc(need_size)
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
         fence = self.kv_free_fence
         tag = None if fence is None else fence.hold_tag(num_pages=free_index.numel())
         if tag is None:

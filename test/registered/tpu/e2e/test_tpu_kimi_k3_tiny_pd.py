@@ -14,6 +14,7 @@ The decode pod (``CI_PD_ROLE=decode``) only serves; the JobSet ends with the
 prefill pod.
 """
 
+import contextlib
 import os
 import socket
 import subprocess
@@ -29,12 +30,12 @@ from kimi_k3_tiny_harness import (
     read_log,
     run_requests,
     token_ranks,
-    wait_healthy,
 )
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, CustomTestCase
+from sglang.utils import wait_for_http_ready
 
 register_tpu_ci(
     est_time=900,
@@ -84,6 +85,16 @@ def _disagg_args(role: str) -> list[str]:
     return args
 
 
+@contextlib.contextmanager
+def _serving(model, port, args, log_path, env=None):
+    process, log = launch(model, port, args, log_path, env)
+    try:
+        yield process
+    finally:
+        kill_process_tree(process.pid, wait_timeout=60)
+        log.close()
+
+
 class TinyPDParity:
     """The P/D-vs-colocated comparison; a variant sets the decode's extra
     server arguments and environment, and may serve the requests its own way
@@ -107,29 +118,25 @@ class TinyPDParity:
         logs = tempfile.mkdtemp(prefix="kimi_k3_pd_logs_")
 
         if role == "decode":
-            process, log = launch(
+            with _serving(
                 model,
                 DECODE_PORT,
                 _disagg_args("decode") + self.decode_args,
                 f"{logs}/decode.log",
                 env=self.decode_env,
-            )
-            try:
+            ) as process:
                 # Serve until the prefill pod finishes and the JobSet ends.
                 process.wait()
-            finally:
-                kill_process_tree(process.pid, wait_timeout=60)
-                log.close()
             return
 
         decode_host = _decode_hostname()
         prefill_log = f"{logs}/prefill.log"
-        process, log = launch(model, PREFILL_PORT, _disagg_args("prefill"), prefill_log)
-        router = None
-        try:
+        with _serving(model, PREFILL_PORT, _disagg_args("prefill"), prefill_log):
             prefill_url = f"http://{_self_hostname()}:{PREFILL_PORT}"
             decode_url = f"http://{decode_host}:{DECODE_PORT}"
-            wait_healthy(decode_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
+            wait_for_http_ready(
+                f"{decode_url}/health", DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            )
             router = subprocess.Popen(
                 [
                     sys.executable,
@@ -148,34 +155,27 @@ class TinyPDParity:
                     str(LB_PORT),
                 ]
             )
-            lb_url = f"http://127.0.0.1:{LB_PORT}"
-            wait_healthy(lb_url, 300)
-            disaggregated = self.serve_requests(lb_url, model)
-        finally:
-            if router is not None:
+            try:
+                lb_url = f"http://127.0.0.1:{LB_PORT}"
+                wait_for_http_ready(f"{lb_url}/health", 300)
+                disaggregated = self.serve_requests(lb_url, model)
+            finally:
                 kill_process_tree(router.pid, wait_timeout=30)
-            kill_process_tree(process.pid, wait_timeout=60)
-            log.close()
         assert_no_serving_recompile(self, read_log(prefill_log), "prefill")
 
         # The colocated reference's own greedy output.
-        process, log = launch(model, PREFILL_PORT, [], f"{logs}/colocated.log")
-        try:
+        with _serving(model, PREFILL_PORT, [], f"{logs}/colocated.log"):
             expected = run_requests(f"http://127.0.0.1:{PREFILL_PORT}", model)
-        finally:
-            kill_process_tree(process.pid, wait_timeout=60)
-            log.close()
         # The rank of each disaggregated token in the reference's distribution
         # at that position, and, for scale, of another prompt's continuation.
         # (A second server: prompt logprobs change the compiled program.)
-        process, log = launch(
+        with _serving(
             model,
             PREFILL_PORT,
             [],
             f"{logs}/reference_logprobs.log",
             env={"SGLANG_TPU_ENABLE_PROMPT_LOGPROB": "1"},
-        )
-        try:
+        ):
             reference = f"http://127.0.0.1:{PREFILL_PORT}"
             ranks = [
                 token_ranks(reference, prompt, tokens)
@@ -185,9 +185,6 @@ class TinyPDParity:
                 token_ranks(reference, prompt, expected["text"][(i + 1) % len(PROMPTS)])
                 for i, prompt in enumerate(PROMPTS)
             ]
-        finally:
-            kill_process_tree(process.pid, wait_timeout=60)
-            log.close()
         self.assertGreater(expected["image"][1], 0)
         for i, (got, want) in enumerate(zip(disaggregated["text"], expected["text"])):
             same = next(

@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from test_tpu_raiden_offload_unit import _Pb2, _plan_blocks
 
 from sglang.srt.configs.mamba_utils import (
     KimiLinearCacheParams,
@@ -31,7 +32,16 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
 )
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.utils import setup_state_kv_args
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu.disaggregation.raiden.reshard_schedule import (
+    WholeBlockGeometry,
+    assemble_state_fan_in,
+    build_receiver_request,
+    build_sender_request,
+)
+from sglang_tpu.disaggregation.raiden.serde import ReshardState
 from sglang_tpu.kv_free_fence import KVFreeFence
 from sglang_tpu.kv_pool import TpuFusedMLATokenToKVPool
 from sglang_tpu.mamba_pool import AT_SLOT, TpuMambaPool, TpuMambaSlotAllocator
@@ -103,9 +113,6 @@ class TestMambaStateDescription(CustomTestCase):
         )
 
     def test_hybrid_pool_registers_one_mamba_component(self):
-        from sglang.srt.disaggregation.utils import setup_state_kv_args
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
         mamba = _mamba_pool()
         pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
         pool.mamba_pool = mamba
@@ -142,8 +149,6 @@ class TestRetractionBackup(CustomTestCase):
         """After a verify the committed state is a row of the request's window.
         The hybrid pool hands the request's pool row down to find it, and the
         restore leaves it in the resumed request's slot row."""
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
         mamba = _mamba_pool(width=2)
         _fill(mamba.get_state())
         before = [t.clone() for t in mamba.get_state()]
@@ -205,24 +210,16 @@ class TestRetractionBackup(CustomTestCase):
         torch.testing.assert_close(torch.cat(filtered[0]), torch.cat(saved[0])[mask])
 
 
-class _Result(SimpleNamespace):
-    copy_done = None
-
-
 class TestFencedStateSlots(CustomTestCase):
     def setUp(self):
-        self.syncs = 0
-
-        def sync():
-            self.syncs += 1
-
-        self.fence = KVFreeFence(sync)
+        self.syncs = []
+        self.fence = KVFreeFence(lambda: self.syncs.append("device"))
         self.slots = TpuMambaSlotAllocator(size=4, device="cpu")
         self.fence.attach(self.slots)
 
     def _in_flight(self):
         self.fence.on_batch_formed()
-        result = _Result()
+        result = SimpleNamespace(copy_done=None)
         self.fence.on_forward_launched(result)
         return result
 
@@ -246,7 +243,7 @@ class TestFencedStateSlots(CustomTestCase):
         self._in_flight()
         self.slots.free(taken[:1])
         got = self.slots.alloc(1)
-        self.assertEqual(self.syncs, 1)
+        self.assertEqual(self.syncs, ["device"])
         self.assertEqual(got.tolist(), taken[:1].tolist())
 
 
@@ -265,10 +262,6 @@ class TestStateFanIn(CustomTestCase):
         ]
 
     def test_assembly_matches_sharding_at_the_decode_tp(self):
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            assemble_state_fan_in,
-        )
-
         rng = np.random.default_rng(0)
         groups = [64, 32, 32]
         conv = rng.standard_normal((K - 1, 1, sum(groups))).astype(np.float32)
@@ -288,17 +281,11 @@ class TestStateFanIn(CustomTestCase):
             np.testing.assert_array_equal(got[1], want_temp[d])
 
     def test_assembly_rejects_groups_that_do_not_cover_the_row(self):
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            assemble_state_fan_in,
-        )
-
         row = np.zeros((3, 1, 10), np.float32)
         with self.assertRaisesRegex(ValueError, "cover"):
             assemble_state_fan_in([[row], [row]], [2], [[16, 8, 8]], 4)
 
     def test_state_message_round_trips_rows(self):
-        from sglang_tpu.disaggregation.raiden.serde import ReshardState
-
         rows = [
             np.arange(12, dtype=np.float32).reshape(3, 1, 4),
             np.arange(8, dtype=np.float32).reshape(2, 2, 2),
@@ -312,20 +299,9 @@ class TestStateFanIn(CustomTestCase):
             ReshardState.from_frames(frames[:-1])
 
     def test_mla_pages_move_whole_from_every_source(self):
-        from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-            WholeBlockGeometry,
-            build_receiver_request,
-            build_sender_request,
-        )
-
-        pb2 = SimpleNamespace(
-            StartTransferRequest=_FakeRequest,
-            MEMORY_TYPE_DRAM=1,
-            MEMORY_TYPE_HBM=2,
-        )
         geom = WholeBlockGeometry(4, 2, block_bytes=4096)
         send = build_sender_request(
-            pb2,
+            _Pb2,
             uuid=1,
             req_id="1",
             peer="p",
@@ -337,21 +313,13 @@ class TestStateFanIn(CustomTestCase):
             live_tokens=[128, 40],
         )
         entries = send.shard_push_schedules[0].entries
+        self.assertEqual(_plan_blocks(send, 0), ([5, 6], [8, 9]))
         self.assertEqual(
-            [
-                (
-                    e.src_block_id,
-                    e.dst_block_id,
-                    e.src_offset_bytes,
-                    e.size_bytes,
-                    e.count,
-                )
-                for e in entries
-            ],
-            [(5, 8, 0, 4096, 1), (6, 9, 0, 4096, 1)],
+            {(e.src_offset_bytes, e.size_bytes, e.count) for e in entries},
+            {(0, 4096, 1)},
         )
         recv = build_receiver_request(
-            pb2,
+            _Pb2,
             uuid=1,
             req_id="1",
             peer="p",
@@ -362,29 +330,6 @@ class TestStateFanIn(CustomTestCase):
             live_tokens=[128, 40],
         )
         self.assertEqual(recv.expected_block_count, 4)
-
-
-class _FakeEntries(list):
-    def add(self):
-        entry = SimpleNamespace()
-        self.append(entry)
-        return entry
-
-
-class _FakeSchedule:
-    def __init__(self):
-        self.entries = _FakeEntries()
-
-
-class _FakeSchedules(dict):
-    def __missing__(self, key):
-        self[key] = _FakeSchedule()
-        return self[key]
-
-
-class _FakeRequest:
-    def __init__(self):
-        self.shard_push_schedules = _FakeSchedules()
 
 
 if __name__ == "__main__":

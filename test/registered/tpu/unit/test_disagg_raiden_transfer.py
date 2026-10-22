@@ -928,12 +928,13 @@ _SLOTS, _K, _D, _HEADS = 4, 4, 8, 4
 _CONV_GROUPS = [64, 32, 32]
 
 
-class TestRaidenStateFanIn(RaidenRendezvousTestCase):
+class TestRaidenStateFanIn(RaidenStateTestCase):
     """Decode attention TP < prefill TP: every source sends its committed state
     row ahead of its RESHARD_BLOCKS, the decode assembles its wider row, and
     the replicated MLA latent pages move whole."""
 
     def _with_state(self, m, *, tp, seed=0, checkpoint_width=1):
+        super()._with_state(m)
         generator = torch.Generator().manual_seed(seed)
         # TpuMambaPool's layout: the slot rows, then with speculation one verify
         # window of checkpoint_width rows per request. A transfer uses slot rows.
@@ -944,14 +945,9 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         )
         temporal = torch.randn(rows, _HEADS // tp, _D, _D, generator=generator)
         m._engine.transfer_address = f"full-{m.rank_port}"
-        m._state_engine = _FakeRaidenEngine()
-        m._state_engine_max_blocks = 1
         m._state_kv_caches = (conv, temporal)
         m._state_slice_axes = (2, 0)
         m._state_conv_groups = (_CONV_GROUPS, None)
-        m._committed_state_row = lambda slot: slot
-        m.state_raiden_endpoint = f"raiden-state://127.0.0.1:{m.rank_port}"
-        m.kv_args.state_types = [StateType.MAMBA]
         m.kv_args.is_hybrid_mla_backend = True
         # MLA latent pages, the same on every attention-TP rank.
         m._kv_caches = [torch.zeros(16, 2, 2, 64, dtype=torch.bfloat16)]
@@ -982,6 +978,13 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
             ),
         )
 
+    def _fan_in_room(self, room, local_blocks=(4,)):
+        """Both sources and a TP-1 decode that asked them for room (slot 1)."""
+        sources = self._sources()
+        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
+        self._register(decode, sources, room, list(local_blocks), 1)
+        return sources, decode
+
     @staticmethod
     def _drain_state_copies(prefill):
         # One worker, first in first out: a no-op runs after every queued copy.
@@ -1004,6 +1007,20 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         prefill.finalize_send(room, aux_index=None)
         prefill.stage_reshard_state(room)
 
+    def _send_all(self, decode, sources, room, blocks=(1,)):
+        """Source r sends slot r + 1; the decode takes each source's state rows,
+        then its block list, in wire order."""
+        for r, prefill in enumerate(sources):
+            self._send(prefill, room, prefill_slot=r + 1, blocks=blocks)
+        for prefill in sources:
+            frames = self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+            state = ReshardState.from_frames(frames)
+            self.assertEqual((state.room, state.src_rank), (room, prefill._local_rank))
+            decode._on_reshard_state(frames)
+            decode._on_reshard_blocks(
+                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+            )
+
     def test_decode_assembles_its_row_from_both_sources(self):
         sources = self._sources()
         decode = self._with_state(
@@ -1013,15 +1030,7 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         room, slot = 7401, 2
 
         self._register(decode, sources, room, [4, 9], slot)
-        for r, prefill in enumerate(sources):
-            self._send(prefill, room, prefill_slot=r + 1)
-        for _ in sources:
-            decode._on_reshard_state(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
-            )
-            decode._on_reshard_blocks(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
-            )
+        self._send_all(decode, sources, room, blocks=(1, 2))
 
         # The full plan moves whole MLA pages from every source.
         ((plan_args, plan_kwargs),) = decode._engine.plans
@@ -1071,38 +1080,13 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
             # The verify windows after the slot rows stay untouched.
             torch.testing.assert_close(got[_SLOTS:], old[_SLOTS:])
 
-    def test_state_rows_precede_the_blocks_on_the_wire(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
-        room = 7402
-        self._register(decode, sources, room, [4], 1)
-        self._send(sources[0], room, prefill_slot=3, blocks=(1,))
-
-        state = ReshardState.from_frames(
-            self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
-        )
-        self.assertEqual((state.room, state.src_rank), (room, sources[0]._local_rank))
-        np.testing.assert_array_equal(
-            state.rows[1], sources[0]._state_kv_caches[1][3].numpy()
-        )
-        self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
-
     def test_a_reshard_without_a_state_row_fails_the_room(self):
-        (prefill, _) = self._sources()
-        decode = self._decode(attn_tp_size=1)
         room = 7403
+        sources, _ = self._fan_in_room(room)
+        prefill = sources[0]
         prefill.request_status[room] = KVPoll.Transferring
         prefill._on_reshard_req(
-            ReshardReq(
-                room=room,
-                decode_ip=decode.local_ip,
-                decode_port=decode.rank_port,
-                push_endpoint="tcp://push",
-                decode_blocks=[4],
-                dst_attn_tp=1,
-                decode_swa_blocks=[],
-                swa_push_endpoint="",
-            ).to_frames()
+            self.inboxes[prefill.endpoint].take(MessageTag.RESHARD_REQ)
         )
         prefill.append_send_blocks(room, [1])
         prefill.finalize_send(room, aux_index=None)
@@ -1134,10 +1118,8 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         self.assertNotIn(room, prefill._prefill.reshard_state)
 
     def test_a_late_reshard_req_is_staged_by_poll_then_replied(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
         room = 7406
-        self._register(decode, sources, room, [4], 1)
+        sources, decode = self._fan_in_room(room)
         prefill = sources[0]
         self._finish_last_chunk(prefill, room, prefill_slot=3)
         # Nothing asked to reshard yet, so nothing was gathered.
@@ -1159,10 +1141,8 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
 
     def test_the_host_copy_runs_on_the_state_copy_worker(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
         room = 7407
-        self._register(decode, sources, room, [4], 1)
+        sources, decode = self._fan_in_room(room)
         prefill = sources[0]
         queued = []
         worker = SimpleNamespace(submit=lambda fn, *args: queued.append((fn, args)))
@@ -1186,11 +1166,8 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
 
     def test_missing_source_rows_fail_the_room(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
         room = 7405
-        decode.request_status[room] = KVPoll.WaitingForInput
-        self._register(decode, sources, room, [4], 1)
+        sources, decode = self._fan_in_room(room)
         for r, prefill in enumerate(sources):
             self._send(prefill, room, prefill_slot=r + 1, blocks=(1,))
         # The first source's rows are lost; both block lists arrive.
@@ -1211,21 +1188,10 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
     def test_conv_rows_without_sub_block_widths_fail_the_room(self):
         """Without its q | k | v widths a conv row cannot be split per
         sub-block; whole rows side by side would be the wrong layout."""
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
-        decode._state_conv_groups = (None, None)
         room = 7408
-        decode.request_status[room] = KVPoll.WaitingForInput
-        self._register(decode, sources, room, [4], 1)
-        for r, prefill in enumerate(sources):
-            self._send(prefill, room, prefill_slot=r + 1, blocks=(1,))
-        for _ in sources:
-            decode._on_reshard_state(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
-            )
-            decode._on_reshard_blocks(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
-            )
+        sources, decode = self._fan_in_room(room)
+        decode._state_conv_groups = (None, None)
+        self._send_all(decode, sources, room)
         self.assertTrue(decode.is_failed(room))
         self.assertIn("conv sub-block widths", decode.failure_records[room])
         self.assertEqual(decode._engine.plans, [])
@@ -1238,31 +1204,15 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         decode = self._decode(attn_tp_size=1)
         decode.is_mla_backend = True
         with self.assertRaisesRegex(NotImplementedError, "pure MLA"):
-            decode.register_decode_request(
-                7409,
-                [4],
-                [],
-                aux_index=None,
-                bootstrap_infos=[self._bootstrap_info(p)[0] for p in sources],
-            )
+            self._register(decode, sources, 7409, [4], 1)
         for prefill in sources:
             self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
 
     def test_full_prefix_hit_still_moves_state(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
         room = 7406
-        self._register(decode, sources, room, [], 1)
+        sources, decode = self._fan_in_room(room, local_blocks=())
         self.assertNotIn(str(room), decode._completed_recv)
-        for r, prefill in enumerate(sources):
-            self._send(prefill, room, prefill_slot=r + 1, blocks=(1,))
-        for _ in sources:
-            decode._on_reshard_state(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
-            )
-            decode._on_reshard_blocks(
-                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
-            )
+        self._send_all(decode, sources, room)
         # No page plan: the READY asks for no pages.
         self.assertEqual(decode._engine.plans, [])
         for prefill in sources:
@@ -1275,10 +1225,8 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         self.assertTrue(decode.is_recv_done(room))
 
     def test_clearing_a_room_drops_its_state_rows(self):
-        sources = self._sources()
-        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
         room = 7407
-        self._register(decode, sources, room, [4], 1)
+        sources, decode = self._fan_in_room(room)
         self._send(sources[0], room, prefill_slot=1, blocks=(1,))
         decode._on_reshard_state(
             self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)

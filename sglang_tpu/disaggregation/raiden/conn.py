@@ -152,8 +152,6 @@ class RaidenKVManager(
     _state_kv_caches: Tuple[Any, ...] = ()
     _state_engine_max_blocks = 0
     _committed_state_row: Optional[Callable[[int], int]] = None
-    # Per state tensor: its TP-sharded axis and conv sub-block widths, for
-    # assembling a resharded room's rows.
     _state_slice_axes: Tuple[int, ...] = ()
     _state_conv_groups: Tuple[Optional[List[int]], ...] = ()
     state_raiden_endpoint: Optional[str] = None
@@ -356,6 +354,7 @@ class RaidenKVManager(
         """
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
+            WholeBlockGeometry,
             head_pair_bytes,
         )
 
@@ -370,10 +369,6 @@ class RaidenKVManager(
         if not swa and getattr(self.kv_args, "is_hybrid_mla_backend", False):
             # An MLA latent page is the same on every attention-TP rank, so
             # it moves whole rather than as a head slice.
-            from sglang_tpu.disaggregation.raiden.reshard_schedule import (
-                WholeBlockGeometry,
-            )
-
             return WholeBlockGeometry(src_attn_tp, dst_attn_tp, tensor[0].nbytes)
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
