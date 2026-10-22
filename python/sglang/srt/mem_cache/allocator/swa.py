@@ -4,13 +4,18 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_npu, is_tpu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import ceil_div, get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)
@@ -224,16 +229,66 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        self._evict_to_free_tokens(tree_cache, num_tokens, num_tokens)
+
+    def _evict_to_free_tokens(self, tree_cache, full_tokens: int, swa_tokens: int):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        full_shortfall = max(0, num_tokens - self.full_available_size())
-        swa_shortfall = max(0, num_tokens - self.swa_available_size())
+        full_shortfall = max(0, full_tokens - self.full_available_size())
+        swa_shortfall = max(0, swa_tokens - self.swa_available_size())
         if full_shortfall or swa_shortfall:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
             )
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        """Both sides at their own page. ``num_tokens`` is the batch's count of
+        new full-side pages; with one page for both sides it is the SWA side's
+        count too. With a finer SWA page the SWA side is recounted from the
+        requests' allocation lengths (the lengths the decode allocation uses),
+        since a step can open an SWA page without opening a full page."""
+        swa_tokens = self._swa_tokens_next_decode(num_tokens, requests, spec_algorithm)
+        self._evict_to_free_tokens(tree_cache, num_tokens, swa_tokens)
+        if self.full_available_size() < num_tokens:
+            return False
+        return self._swa_req_ring or self.swa_available_size() >= swa_tokens
+
+    def _swa_tokens_next_decode(self, num_tokens: int, requests, spec_algorithm) -> int:
+        if (
+            requests is None
+            or self._swa_req_ring
+            or self.swa_page_size == self.page_size
+        ):
+            return num_tokens
+        if spec_algorithm is not None and spec_algorithm.is_some():
+            # ScheduleBatch._new_tokens_required_next_decode_spec_v2's reserve.
+            reserve = get_alloc_reserve_per_decode() + int(
+                self._req_to_token_pool is not None
+                and self._req_to_token_pool.host_resident
+                and not get_schedule().disable_overlap_schedule
+                and not spec_algorithm.is_dflash_family()
+            )
+            cur_lens, nxt_lens, _ = page_aligned_decode_alloc_lens(
+                requests, reserve=reserve, page_size=self.page_size
+            )
+        else:
+            cur_lens = [req.kv.kv_committed_len for req in requests]
+            nxt_lens = [cur + 1 for cur in cur_lens]
+        ps = self.swa_page_size
+        new_pages = sum(
+            ceil_div(nxt, ps) - ceil_div(cur, ps)
+            for cur, nxt in zip(cur_lens, nxt_lens)
+        )
+        return new_pages * ps
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -861,6 +916,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         assert isinstance(kvcache, BaseSWAKVPool)
 
         self.page_size = page_size
+        self.swa_page_size = page_size  # one side, one page
         self.dtype = dtype
         self.device = device
         self.need_sort = need_sort

@@ -176,6 +176,98 @@ class TestSwaPageSize(CustomTestCase):
         self.assertEqual(alloc.swa_attn_allocator.num_pages, 5)
         self.assertEqual(alloc.full_attn_allocator.num_pages, 4)
 
+    def _req(self, committed, allocated=None):
+        allocated = committed if allocated is None else allocated
+        return SimpleNamespace(
+            kv=SimpleNamespace(kv_committed_len=committed, kv_allocated_len=allocated)
+        )
+
+    def _running_and_room(self, alloc, room_len):
+        """The decode node's mixed state: one running request whose allocation
+        is aligned to the full page, and one preallocated room (a transferred
+        request on its first decode steps, allocated through the SWA-tail
+        prealloc) whose length is not; the room's tail takes every SWA page
+        that is left while the full side keeps free pages."""
+        running = self._extend(alloc, 0, 2 * FULL_PS, -1).to(torch.int64)
+        tail = alloc.swa_available_size()
+        self.assertLessEqual(tail, room_len)
+        room = alloc.alloc_extend_swa_tail(
+            prefix_lens=_t([0]),
+            prefix_lens_cpu=_t([0]),
+            seq_lens=_t([room_len]),
+            seq_lens_cpu=_t([room_len]),
+            last_loc=_t([-1]),
+            extend_num_tokens=room_len,
+            swa_tail_len=tail,
+        ).to(torch.int64)
+        self.assertEqual(alloc.swa_available_size(), 0)
+        self.assertGreater(alloc.full_available_size(), 2 * FULL_PS)
+        return running, room
+
+    def test_decode_capacity_sees_the_swa_page_a_plain_decode_opens(self):
+        """Room at 72 = 4.5 full pages, on an SWA page boundary: the batch
+        counts no full page for the next token, which opens an SWA page."""
+        alloc = self._make()
+        running, room = self._running_and_room(alloc, room_len=9 * PS)
+        reqs = [self._req(2 * FULL_PS - 1, allocated=2 * FULL_PS), self._req(9 * PS)]
+        self.assertFalse(
+            alloc.check_decode_capacity(
+                num_tokens=0, tree_cache=None, requests=reqs, spec_algorithm=None
+            )
+        )
+        # The step's allocation agrees with the gate.
+        self.assertIsNone(
+            alloc.alloc_decode(_t([9 * PS + 1]), _t([9 * PS + 1]), room[-1:])
+        )
+        # One SWA page back (the running request moves on) and the step fits.
+        alloc.free_segment(running[:PS], start_pos=0)
+        self.assertTrue(
+            alloc.check_decode_capacity(
+                num_tokens=0, tree_cache=None, requests=reqs, spec_algorithm=None
+            )
+        )
+
+    def test_decode_capacity_sees_the_swa_page_a_spec_step_opens(self):
+        """Room at 67: the speculative reserve rounds the allocation up to 80,
+        inside full page 64..79 (no full page for the batch to count), while
+        SWA page 72..79 is still unopened."""
+        alloc = self._make()
+        room_len = 4 * FULL_PS + 3
+        running, room = self._running_and_room(alloc, room_len=room_len)
+        reqs = [self._req(2 * FULL_PS - 2, allocated=2 * FULL_PS), self._req(room_len)]
+        spec = SimpleNamespace(
+            is_some=lambda: True, is_none=lambda: False, is_dflash_family=lambda: False
+        )
+        with (
+            patch.object(swa_module, "get_alloc_reserve_per_decode", lambda: 2),
+            patch.object(
+                swa_module,
+                "get_schedule",
+                lambda: SimpleNamespace(disable_overlap_schedule=True),
+            ),
+        ):
+            # Full: ceil16(80) - ceil16(67) = 0 pages; SWA: ceil8(80) - ceil8(67) = 1.
+            self.assertFalse(
+                alloc.check_decode_capacity(
+                    num_tokens=0, tree_cache=None, requests=reqs, spec_algorithm=spec
+                )
+            )
+            self.assertIsNone(self._extend(alloc, room_len, 5 * FULL_PS, int(room[-1])))
+            # A room already on the full-page grid needs both sides equally.
+            self.assertTrue(
+                alloc.check_decode_capacity(
+                    num_tokens=0,
+                    tree_cache=None,
+                    requests=[
+                        reqs[0],
+                        self._req(5 * FULL_PS - 4, allocated=5 * FULL_PS),
+                    ],
+                    spec_algorithm=spec,
+                )
+            )
+        # Without request context the gate keeps today's single count.
+        self.assertTrue(alloc.check_decode_capacity(num_tokens=0, tree_cache=None))
+
     def test_default_single_page_unchanged(self):
         alloc = self._make(swa_page_size=None)
         self.assertEqual(alloc.swa_page_size, FULL_PS)
