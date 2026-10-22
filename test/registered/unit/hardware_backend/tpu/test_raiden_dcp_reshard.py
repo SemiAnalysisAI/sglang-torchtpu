@@ -1,13 +1,18 @@
 """Raiden transfer into a decode-context-parallel (DCP) decode.
 
 The decode keeps the prefill's attention TP and splits each request's
-full-attention pages across its DCP group by page interleave: logical page
-``l`` is DCP rank ``l % dcp_size``'s local page ``l // dcp_size``, and each
-rank stores its group's kv heads for the pages it holds. Decode rank ``u``
-therefore takes its pages from prefill ranks ``u // dcp_size * dcp_size ..``
-(a ``src_tp -> src_tp // dcp_size`` fan-in of their heads) and its
-sliding-window pages, one head per rank over every page, from prefill rank
-``u`` alone.
+full-attention pages across its DCP group by page interleave. Its page table
+is global with logical pages of ``dcp_size`` physical pages: position ``p``
+belongs to rank ``(p // page) % dcp_size`` at local position ``(p // (dcp_size
+* page)) * page + p % page``, so the prefill's physical page ``k`` of a request
+lands whole on decode rank ``k % dcp_size`` at that rank's local page ``k //
+dcp_size`` of the logical page, and each rank stores its group's kv heads for
+the pages it holds. On the 512-granular logical page ids the decode lists for
+the transfer (``l = loc // page``) that is owner ``l % dcp_size`` and local
+page ``l // dcp_size``. Decode rank ``u`` therefore takes its pages from
+prefill ranks ``u // dcp_size * dcp_size ..`` (a ``src_tp -> src_tp //
+dcp_size`` fan-in of their heads) and its sliding-window pages, one head per
+rank over every page, from prefill rank ``u`` alone.
 
 These tests drive real ``RaidenKVManager`` pairs over an in-process loopback
 with the native engine faked (as ``test_disagg_raiden_transfer`` does), and
@@ -372,21 +377,30 @@ class TestPagePlacement(unittest.TestCase):
         self.assertEqual(rs.dcp_page_split([4, 7, 10], 2, 0), ([0, 2], [2, 5]))
         self.assertEqual(rs.dcp_page_split([4, 7, 10], 2, 1), ([1], [3]))
 
+    def test_consecutive_position_pages_alternate_ranks(self):
+        # A request's position pages 0..4 sit in logical (1024-position)
+        # pages 5, 9, 2: 512-page ids 2j, 2j + 1, so the ranks take alternate
+        # prefill pages into the same local page ids, and an odd page count
+        # leaves the lone last page on rank 0.
+        pages = [10, 11, 18, 19, 4]
+        self.assertEqual(rs.dcp_page_split(pages, 2, 0), ([0, 2, 4], [5, 9, 2]))
+        self.assertEqual(rs.dcp_page_split(pages, 2, 1), ([1, 3], [5, 9]))
+
     def test_dcp_size_one_is_the_identity(self):
         self.assertEqual(rs.dcp_page_split([3, 9, 4], 1, 0), ([0, 1, 2], [3, 9, 4]))
         self.assertEqual(rs.dcp_page_split([], 2, 1), ([], []))
 
     def test_retraction_backup_sees_sequential_local_pages(self):
-        # A rank's local rows of a page-interleaved request (PageInterleave-
-        # Placement): of a 5-page request at page 4, rank 0 holds logical
-        # pages 0, 2, 4 as its local pages 0, 1, 2 and rank 1 holds pages
-        # 1, 3 as local pages 0, 1 -- page-aligned and whole, so the raiden
-        # backup stages them (the pages need not be adjacent, only the rows
-        # within them).
+        # Position p of a request belongs to rank (p // page) % 2 at local
+        # position (p // (2 * page)) * page + p % page. Of a 5-page request at
+        # page 4, rank 0 holds position pages 0, 2, 4 as its local pages 0,
+        # 1, 2 and rank 1 holds pages 1, 3 as local pages 0, 1: page-aligned
+        # and whole, so the raiden retraction backup stages them (the pages
+        # need not be adjacent, only the rows within them).
         ps, n = 4, 2
-        loc = torch.arange(5 * ps)
-        owner = (loc % (n * ps)) // ps
-        local = (loc // (n * ps)) * ps + loc % ps
+        pos = torch.arange(5 * ps)
+        owner = (pos // ps) % n
+        local = (pos // (n * ps)) * ps + pos % ps
         rows = local[owner == 0]
         self.assertEqual(rows.tolist(), list(range(12)))
         self.assertEqual(sequential_page_runs(rows, ps), ([0, 1, 2], 0, 12))
@@ -464,9 +478,10 @@ class TestDcpRankMapping(RaidenDcpTestCase):
 
 class TestDcpReshardHandshake(RaidenDcpTestCase):
     ROOM = 61
-    # Six logical pages in token order: owners 1 0 0 1 1 0 with local ids
-    # 5, 3, 4, 7, 11, 6.
-    DECODE_PAGES = [11, 6, 8, 15, 23, 12]
+    # The request's six position pages sit in the decode's logical
+    # (1024-position) pages 5, 9, 2, listed as 512-page ids 2j, 2j + 1: ranks
+    # 0 1 0 1 0 1 own them, at local pages 5 5 9 9 2 2.
+    DECODE_PAGES = [10, 11, 18, 19, 4, 5]
     PREFILL_PAGES = [30, 31, 32, 33, 34, 35]
     SWA_PAGES = [50, 51]
 
@@ -508,7 +523,7 @@ class TestDcpReshardHandshake(RaidenDcpTestCase):
         prefills, decodes = self._pair_transfer(
             self.ROOM, self.PREFILL_PAGES, self.DECODE_PAGES, self.SWA_PAGES
         )
-        expected = {0: ([1, 2, 5], [3, 4, 6]), 1: ([0, 3, 4], [5, 7, 11])}
+        expected = {0: ([0, 2, 4], [5, 9, 2]), 1: ([1, 3, 5], [5, 9, 2])}
         for decode in decodes:
             dcp_rank = decode.dcp_rank
             positions, local = expected[dcp_rank]
@@ -543,7 +558,7 @@ class TestDcpReshardHandshake(RaidenDcpTestCase):
             self.assertEqual(set(peers), {0, 1})
             self.assertEqual(
                 prefill._prefill.reshard_ready_pages[self.ROOM],
-                {0: [1, 2, 5], 1: [0, 3, 4]},
+                {0: [0, 2, 4], 1: [1, 3, 5]},
             )
 
     def test_sender_plans_mirror_the_receiver_plans(self):
@@ -565,6 +580,63 @@ class TestDcpReshardHandshake(RaidenDcpTestCase):
                 entries = receiver.shard_push_schedules[prefill.attn_tp_rank].entries
                 self.assertEqual(src, [e.src_block_id for e in entries])
                 self.assertEqual(dst, [e.dst_block_id for e in entries])
+
+    def test_odd_page_count_and_prefix_tail_pair_by_position(self):
+        """A lone last page goes to one rank only; a decode that already holds
+        a prefix pairs the prefill's list from the tail, so the positions in
+        READY are the prefill's, not the decode's."""
+        cases = [
+            # five pages: rank 0 takes 0, 2, 4 and rank 1 takes 1, 3
+            (
+                self.PREFILL_PAGES[:5],
+                self.DECODE_PAGES[:5],
+                0,
+                {0: [0, 2, 4], 1: [1, 3]},
+            ),
+            # prefix hit: the decode holds the last four of six prefill pages
+            (self.PREFILL_PAGES, self.DECODE_PAGES[2:], 2, {0: [2, 4], 1: [3, 5]}),
+        ]
+        for prefill_pages, decode_pages, base, positions in cases:
+            with self.subTest(pages=len(decode_pages), base=base):
+                self.setUp()
+                prefills, decodes = self._pair_transfer(
+                    self.ROOM, prefill_pages, decode_pages, self.SWA_PAGES
+                )
+                for prefill in prefills:
+                    self.assertEqual(
+                        prefill._prefill.reshard_ready_pages[self.ROOM], positions
+                    )
+                for decode in decodes:
+                    plan = decode._engine.plans[
+                        decode._decode.reshard_meta[self.ROOM]["uuid"]
+                    ]
+                    owned = positions[decode.dcp_rank]
+                    for sender in (2, 3):
+                        entries = plan.shard_push_schedules[sender].entries
+                        self.assertEqual(
+                            [e.src_block_id for e in entries],
+                            [prefill_pages[pg] for pg in owned],
+                        )
+                        self.assertEqual(
+                            [e.dst_block_id for e in entries],
+                            [decode_pages[pg - base] // DCP for pg in owned],
+                        )
+                    # The prefill pushed exactly those pages to this rank.
+                    for prefill in prefills:
+                        pushed = [
+                            (src, dst)
+                            for _, peer, src, dst, layer in prefill._engine.pushes
+                            if peer == decode._engine.transfer_address and layer == 0
+                        ]
+                        self.assertEqual(
+                            pushed,
+                            [
+                                (
+                                    [prefill_pages[pg] for pg in owned],
+                                    [decode_pages[pg - base] // DCP for pg in owned],
+                                )
+                            ],
+                        )
 
     def test_pushed_bytes_assemble_each_ranks_pages(self):
         prefills, decodes = self._pair_transfer(
