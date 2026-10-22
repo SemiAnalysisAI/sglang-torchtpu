@@ -168,6 +168,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # transposed to [kv_dim, tokens]; kv_write_call merges new token columns into their pages.
     kv_sal: bool = False
     kv_sal_fp8: bool = False
+    # fp8 SEQ_ALONG_LANE chunks reach the MXU as fp8 (exact bf16 x fp8 products): 1 = K only,
+    # 2 = K and V; 0 widens the whole page block to bf16 on the VPU first
+    sal_fp8_dot: int = 0
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
@@ -1449,11 +1452,15 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                                 .bitcast(jnp.uint32)
                                 .reshape(c.sal_words, ps)[...]
                             )
-                            x = pltpu.bitcast(w, c.kv_dtype).astype(jnp.bfloat16)
+                            x8 = pltpu.bitcast(w, c.kv_dtype)
+                            fp8_k = c.kv_sal_fp8 and c.sal_fp8_dot >= 1
+                            fp8_v = c.kv_sal_fp8 and c.sal_fp8_dot >= 2
+                            xb = None if (fp8_k and fp8_v) else x8.astype(jnp.bfloat16)
+                            xk, xv = (x8 if fp8_k else xb), (x8 if fp8_v else xb)
                             kts.append(
                                 jnp.concatenate(
                                     [
-                                        x[2 * h * hd : (2 * h + 1) * hd]
+                                        xk[2 * h * hd : (2 * h + 1) * hd]
                                         for h in range(hkv)
                                     ],
                                     axis=0,
@@ -1462,7 +1469,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             vts.append(
                                 jnp.concatenate(
                                     [
-                                        x[(2 * h + 1) * hd : (2 * h + 2) * hd]
+                                        xv[(2 * h + 1) * hd : (2 * h + 2) * hd]
                                         for h in range(hkv)
                                     ],
                                     axis=0,

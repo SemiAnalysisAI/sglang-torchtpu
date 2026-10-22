@@ -95,6 +95,10 @@ class TpuEnvs:
     # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
     # soon as the row's last expert is done (MKConfig.y_early).
     SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
+    # Megakernel attention on fp8 SEQ_ALONG_LANE pools: feed K (and V) to the MXU as fp8
+    # instead of widening each chunk to bf16 on the VPU first. 0 = off, 1 = K only, 2 = K and V
+    # (exact; measured at 32 rows / 100K context: 1 is -1.8%, 2 is +1% slower than 0).
+    SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
     # Profiling only: name megakernel regions in xprof; needs libtpu's
     # --xla_enable_custom_call_region_trace=true and slows fine-grained regions.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvBool(False)
