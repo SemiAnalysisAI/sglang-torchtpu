@@ -308,6 +308,13 @@ class MuseMegakernel(torch.nn.Module):
         sal_chunk_pages = max(
             1, tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.get() // page_size
         )
+        swa_chunk_pages = (
+            tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.get() // page_size
+            if kv_sal
+            else 0
+        )
+        if swa_chunk_pages >= sal_chunk_pages:
+            swa_chunk_pages = 0
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -342,6 +349,10 @@ class MuseMegakernel(torch.nn.Module):
             chunk_pages=sal_chunk_pages if kv_sal else self.chunk_pages,
             # a 4096-token ring at 512- and 1024-token chunks; two-stream needs an even group
             **({"kv_group": max(2, 2048 // (sal_chunk_pages * page_size))} if kv_sal else {}),
+            swa_chunk_pages=swa_chunk_pages,
+            attn_skip_idle_streams=tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_SKIP_IDLE.get(),
+            attn_col_mask=bool(swa_chunk_pages)
+            and tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_COL_MASK.get(),
             attn_fixed_max=(
                 # 1.125: margin over validate()'s fp8-rounding factor of 1.1
                 1.125 * g.scale_query_by * g.head_dim * g.attn_scale

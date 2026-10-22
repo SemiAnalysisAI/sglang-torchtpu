@@ -33,6 +33,7 @@ all-gather.
 import contextlib
 import functools
 import math
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -150,6 +151,13 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # a stream with no chunk left in its loop iteration skips the chunk (lax.cond) instead of
     # scoring a re-read chunk fully masked
     attn_skip_idle_streams: bool = False
+    # SEQ_ALONG_LANE only. > 0: SWA layers fetch chunks of this many pages (a divisor of
+    # chunk_pages) into sub-slots of the same ring, and the attention body is specialized per
+    # layer type. A window spans a few short chunks; only full-attention layers gain from long ones.
+    swa_chunk_pages: int = 0
+    # With swa_chunk_pages: a full-attention layer's last chunk masks by key column only instead
+    # of by [rows, keys] (same values; a row mask over a long chunk is costly).
+    attn_col_mask: bool = False
     # Pool rows hold every local KV head side by side in one pool_padded_head_dim-lane row
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
@@ -228,6 +236,11 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         return 2 * self.kv_group
 
     @property
+    def swa_kv_group(self):
+        """SWA chunks per prefetch group: half the ring counted in SWA sub-slots."""
+        return self.kv_group * (self.chunk_pages // (self.swa_chunk_pages or self.chunk_pages))
+
+    @property
     def rows_per_dev(self):
         return self.rows // self.tp
 
@@ -257,6 +270,12 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             and self.head_dim % (8 * self.sal_pack) == 0
         )
         assert self.attn_streams >= 1 and self.kv_group % self.attn_streams == 0
+        assert not self.swa_chunk_pages or (
+            self.kv_sal
+            and self.chunk_pages % self.swa_chunk_pages == 0
+            and self.swa_kv_group % self.attn_streams == 0
+        )
+        assert not self.attn_col_mask or self.swa_chunk_pages
         # 1.1: fp8 rounding of the cached K can stretch |k| a few percent past sqrt(head_dim)
         assert not self.attn_fixed_max or self.attn_fixed_max >= 1.1 * (
             self.scale_query_by * self.head_dim * self.attn_scale
@@ -352,12 +371,49 @@ def _branch(idx, fns, lo=0):
     )
 
 
-def _dispatch(idx, refs, fn):
-    """Run ``fn(ref)`` on ``refs[idx]``; a traced index goes through ``_branch``."""
+def _dispatch(idx, refs, fn, only=None):
+    """Run ``fn(ref)`` on ``refs[idx]``; a traced index goes through ``_branch``. ``only``: the
+    sorted indices ``idx`` can take, so the tree has one leaf per index rather than per ref."""
     if isinstance(idx, int):
         fn(refs[idx])
         return
-    _branch(idx, [functools.partial(fn, r) for r in refs])
+    if only is None:
+        _branch(idx, [functools.partial(fn, r) for r in refs])
+        return
+
+    def tree(keys):
+        if len(keys) == 1:
+            fn(refs[keys[0]])
+            return
+        mid = len(keys) // 2
+        jax.lax.cond(idx < keys[mid], lambda: tree(keys[:mid]), lambda: tree(keys[mid:]))
+
+    tree(tuple(only))
+
+
+class _AttnGeom(NamedTuple):
+    """Chunk geometry of one attention body: ``cp`` pages per chunk, ``kr`` ring slots fetched in
+    groups of ``kg``. ``is_global`` is a Python bool when the body is specialized per layer
+    type, else the layer's traced flag."""
+
+    cp: int
+    kg: int
+    kr: int
+    is_global: Any
+
+
+def _sel(flag, a, b):
+    """``where(flag, a, b)``, resolved at trace time for a Python-bool flag."""
+    if isinstance(flag, bool):
+        return a if flag else b
+    return jnp.where(flag, a, b)
+
+
+def _in_window(is_global, cond):
+    """``is_global or cond``; None when every key is in range."""
+    if isinstance(is_global, bool):
+        return None if is_global else cond
+    return jnp.logical_or(is_global, cond)
 
 
 def _dequant_fp4(words, scale):
@@ -1084,7 +1140,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
         # ------------------------------------------------------------ attention
         def attention(l, x_bf, use_rope, is_global, nxt, sm):
-            kv_prologue(l, 0, is_global)
+            per_geom(is_global, lambda geo: kv_prologue(geo, l, 0))
             with _scope("qkvg_mv"):
                 qkvg = ws.mv(x_bf, l, "wqkvg", nxt, sm=sm)
             qd, kd = c.q_dim, c.kv_dim
@@ -1162,11 +1218,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             with _scope("attn_core"):
                 n_req_live = jnp.minimum((n_live + q - 1) // q, c.n_req)
 
-                def req_loop(j, carry):
-                    request_attention_body(l, j, is_global)
-                    return carry
+                def requests(geo):
+                    def req_loop(j, carry):
+                        request_attention_body(geo, l, j)
+                        return carry
 
-                jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+                    jax.lax.fori_loop(0, n_req_live, req_loop, 0)
+
+                per_geom(is_global, requests)
                 kv_out_cp.wait()
             attn = S["attn_buf"][...]
             attn = (
@@ -1182,15 +1241,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             with _scope("o_allreduce"):
                 return allreduce(o)
 
-        def req_geom(j, is_global):
+        def req_geom(geo, j):
             """First cache chunk and chunk count of request j (cached keys: [first_tok, p_lo))."""
+            cpt_g = geo.cp * ps
             r0 = j * q
             p_lo = pos_ref[r0]
-            first_tok = jnp.where(is_global, 0, jnp.maximum(p_lo - c.window + 1, 0))
-            first_ch = first_tok // cpt
+            first_tok = _sel(geo.is_global, 0, jnp.maximum(p_lo - c.window + 1, 0))
+            first_ch = first_tok // cpt_g
             n_ch = jnp.where(
                 jnp.logical_and(r0 < n_live, p_lo > 0),
-                (p_lo - 1) // cpt - first_ch + 1,
+                (p_lo - 1) // cpt_g - first_ch + 1,
                 0,
             )
             return p_lo, first_ch, n_ch
@@ -1200,56 +1260,82 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             raise ValueError(
                 f"{NS}-stream attention prefetches on group starts: kv_group must be a multiple of {NS}"
             )
+        geo_global = _AttnGeom(c.chunk_pages, KG, KR, True)
+        if c.swa_chunk_pages:
+            geo_swa = _AttnGeom(
+                c.swa_chunk_pages, c.swa_kv_group, 2 * c.swa_kv_group, False
+            )
 
-        def chunk_pages_of(j, ci, is_global):
+        def per_geom(is_global, fn):
+            """``fn(geometry)`` for a layer: one shared body, or with swa_chunk_pages a body per
+            layer type."""
+            if not c.swa_chunk_pages:
+                fn(_AttnGeom(c.chunk_pages, KG, KR, is_global))
+            elif isinstance(is_global, bool):
+                fn(geo_global if is_global else geo_swa)
+            else:
+                pl.when(is_global)(lambda: fn(geo_global))
+                pl.when(jnp.logical_not(is_global))(lambda: fn(geo_swa))
+
+        def ring_at(geo, slot, pi):
+            """Ring entry and page of page ``pi`` of chunk slot ``slot``: a shorter chunk is a
+            sub-slot of consecutive pages of an entry."""
+            f = c.chunk_pages // geo.cp
+            if f == 1:
+                return slot, pi
+            return slot // f, (slot % f) * geo.cp + pi
+
+        def chunk_pages_of(geo, j, ci):
             pages = []
-            for pi in range(c.chunk_pages):
-                pg_no = ci * c.chunk_pages + pi
+            for pi in range(geo.cp):
+                pg_no = ci * geo.cp + pi
                 ent = jnp.minimum(
                     j * c.pages_per_seq + jnp.minimum(pg_no, c.pages_per_seq - 1),
                     c.n_pages_entries - 1,
                 )
-                pages.append(jnp.where(is_global, pf_ref[ent], psw_ref[ent]))
+                pages.append(_sel(geo.is_global, pf_ref[ent], psw_ref[ent]))
             return pages
 
-        def chunk_dst(slot, pi):
+        def chunk_dst(geo, slot, pi):
             # SEQ_ALONG_LANE: a whole page block; fused: the page's token rows
             if c.kv_sal:
-                return S["kv_chunk"].at[slot, pi]
+                return S["kv_chunk"].at[ring_at(geo, slot, pi)]
             return S["kv_chunk"].at[slot, pl.ds(pi * ps, ps)]
 
-        def issue_range(l, j, ci0, slot0, n, is_global):
+        def chunk_sem(geo, slot, pi):
+            return S["kv_chunk_sems"].at[ring_at(geo, slot, pi)]
+
+        def issue_range(geo, l, j, ci0, slot0, n):
             """Chunks ``ci0 .. ci0+n`` of request j into ring slots ``slot0 ..``: ONE layer
             branch-tree walk whose leaf is a small runtime loop, so the 62
             leaves stay small (unrolled per-chunk code in every leaf bloats the kernel)."""
 
             def leaf(ref):
                 def one(u, carry):
-                    slot = (slot0 + u) % KR
-                    for pi, page in enumerate(chunk_pages_of(j, ci0 + u, is_global)):
+                    slot = (slot0 + u) % geo.kr
+                    for pi, page in enumerate(chunk_pages_of(geo, j, ci0 + u)):
                         pltpu.make_async_copy(
-                            ref.at[page],
-                            chunk_dst(slot, pi),
-                            S["kv_chunk_sems"].at[slot, pi],
+                            ref.at[page], chunk_dst(geo, slot, pi), chunk_sem(geo, slot, pi)
                         ).start()
                     return carry
 
                 jax.lax.fori_loop(0, n, one, 0)
 
-            _dispatch(l, KV, leaf)
+            only = None
+            if isinstance(geo.is_global, bool) and c.swa_chunk_pages:
+                only = [x for x in range(c.n_layers) if (x in gl) == geo.is_global]
+            _dispatch(l, KV, leaf, only)
 
-        def wait_chunk(slot):
-            for pi in range(c.chunk_pages):
+        def wait_chunk(geo, slot):
+            for pi in range(geo.cp):
                 pltpu.make_async_copy(
-                    KV[0].at[0],
-                    chunk_dst(slot, pi),
-                    S["kv_chunk_sems"].at[slot, pi],
+                    KV[0].at[0], chunk_dst(geo, slot, pi), chunk_sem(geo, slot, pi)
                 ).wait()
 
-        def kv_prologue(l, j, is_global):
+        def kv_prologue(geo, l, j):
             # the request's first two groups of chunks
-            _, first_ch, n_ch = req_geom(j, is_global)
-            issue_range(l, j, first_ch, 0, jnp.minimum(n_ch, KR), is_global)
+            _, first_ch, n_ch = req_geom(geo, j)
+            issue_range(geo, l, j, first_ch, 0, jnp.minimum(n_ch, geo.kr))
 
         def rows_at(ref, r0, n):
             """``n`` rows from a dynamic start: one-row accesses, as a multi-row dynamic sublane
@@ -1260,16 +1346,17 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 else ref[pl.ds(r0, 1), :]
             )
 
-        def request_attention_body(l, j, is_global):
+        def request_attention_body(geo, l, j):
             """Both local KV heads in one MXU op per step: the query rows of all heads are
             stacked ``[hkv*q*g, .]`` (rows ``(h, t, gi)``). Padded pools: scored against the
             chunk's interleaved key rows ``(token, h)``, scores of the other head masked. Packed
             pools (kv_packed): a token's one row holds every head side by side and a query row
             carries its q in its head's lanes, zeros elsewhere, so the op scores only same-head
             pairs: one key row per token and no head mask."""
+            is_global, KG, KR, cpt = geo.is_global, geo.kg, geo.kr, geo.cp * ps
             r0 = pl.multiple_of(j * q, q)
             qg = q * g
-            p_lo, first_ch, n_ch = req_geom(j, is_global)
+            p_lo, first_ch, n_ch = req_geom(geo, j)
             qrows = rows_at(S["qn_s"], r0, q)  # [q, q_dim]
 
             def qrow(h, t, gi):
@@ -1298,7 +1385,7 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             @pl.when(j > 0)  # request 0's chunks were requested before the qkv matvec
             def _():
-                kv_prologue(l, j, is_global)
+                kv_prologue(geo, l, j)
 
             init = (
                 jnp.full((hkv * qg, 1), NEG, jnp.float32),
@@ -1341,10 +1428,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 with _scope("kv_unpack"):
                     if c.kv_sal:  # page block -> rows slot * hd + dim, tokens on lanes
                         kts, vts = [], []
-                        for pi in range(c.chunk_pages):
+                        for pi in range(geo.cp):
                             w = (
                                 S["kv_chunk"]
-                                .at[slot, pi]
+                                .at[ring_at(geo, slot, pi)]
                                 .bitcast(jnp.uint32)
                                 .reshape(c.sal_words, ps)[...]
                             )
@@ -1374,10 +1461,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 live = None if c.packed_attn else colhead == rowhead
                 if not clean:
                     keypos = coltok + ci * cpt
-                    pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
-                    pos_live = pos_live & jnp.logical_or(
-                        is_global, rowpos - keypos < c.window
-                    )
+                    if c.attn_col_mask and is_global is True:
+                        # a cached key (before p_lo) precedes every verify row: [1, cpt] mask
+                        pos_live = (keypos < p_lo) & valid
+                    else:
+                        pos_live = (keypos < p_lo) & (keypos <= rowpos) & valid
+                        in_win = _in_window(is_global, rowpos - keypos < c.window)
+                        if in_win is not None:
+                            pos_live = pos_live & in_win
                     live = pos_live if live is None else live & pos_live
                 with _scope("qk"):
                     s_ = (
@@ -1404,22 +1495,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 )
                 def _():
                     issue_range(
+                        geo,
                         l,
                         j,
                         first_ch + i0 + KG,
                         (i0 + KG) % KR,
                         jnp.minimum(KG, n_ch - i0 - KG),
-                        is_global,
                     )
 
                 with _scope("kv_wait"):
-                    wait_chunk(i0 % KR)
+                    wait_chunk(geo, i0 % KR)
 
                     @pl.when(
                         valid_b
                     )  # an odd tail re-reads chunk i0, already waited for
                     def _():
-                        wait_chunk(i1 % KR)
+                        wait_chunk(geo, i1 % KR)
 
                 s_a, v_a = chunk_scores(i0, True, clean)
                 if c.attn_skip_idle_streams and not clean:
@@ -1450,22 +1541,22 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 )
                 def _():
                     issue_range(
+                        geo,
                         l,
                         j,
                         first_ch + i0 + KG,
                         (i0 + KG) % KR,
                         jnp.minimum(KG, n_ch - i0 - KG),
-                        is_global,
                     )
 
                 valid = [i0 + s < n_ch for s in range(NS)]
                 with _scope("kv_wait"):
-                    wait_chunk(i0 % KR)
+                    wait_chunk(geo, i0 % KR)
                     for s in range(1, NS):
 
                         @pl.when(valid[s])  # a past-the-end stream re-reads the last chunk
                         def _(s=s):
-                            wait_chunk((i0 + s) % KR)
+                            wait_chunk(geo, (i0 + s) % KR)
 
                 out = []
                 for s in range(NS):
@@ -1488,13 +1579,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
 
             # Global-layer chunks before a request's last one lie wholly in the past of every
             # verify row: chunks [0, n_clean) need only the cross-head mask.
-            n_clean = jnp.where(is_global, jnp.maximum(n_ch - 1, 0), 0)
+            n_clean = _sel(is_global, jnp.maximum(n_ch - 1, 0), 0)
             if NS != 2:
                 with _scope("chunk_loop"):
                     n_it, carries = (n_ch + NS - 1) // NS, (init,) * NS
-                    carries = jax.lax.fori_loop(
-                        0, n_clean // NS, functools.partial(body_streams, clean=True), carries
-                    )
+                    if not isinstance(n_clean, int):  # SWA-only bodies have no clean chunks
+                        carries = jax.lax.fori_loop(
+                            0, n_clean // NS, functools.partial(body_streams, clean=True), carries
+                        )
                     carries = jax.lax.fori_loop(n_clean // NS, n_it, body_streams, carries)
                     m_all = functools.reduce(jnp.maximum, [cr[0] for cr in carries])
                     ws_ = [jnp.exp(cr[0] - m_all) for cr in carries]
@@ -1509,12 +1601,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 # the end: two dependency chains per iteration for the scheduler to interleave.
                 # A stream that saw no live key keeps m = NEG and gets weight exp(NEG - m) = 0.
                 n_pairs, carry2 = (n_ch + 1) // 2, (init, init)
-                carry2 = jax.lax.fori_loop(
-                    0,
-                    n_clean // 2,
-                    functools.partial(body_two_stream, clean=True),
-                    carry2,
-                )
+                if not isinstance(n_clean, int):  # SWA-only bodies have no clean chunks
+                    carry2 = jax.lax.fori_loop(
+                        0,
+                        n_clean // 2,
+                        functools.partial(body_two_stream, clean=True),
+                        carry2,
+                    )
                 (m_a, l_a, acc_a), (m_b, l_b, acc_b) = jax.lax.fori_loop(
                     n_clean // 2, n_pairs, body_two_stream, carry2
                 )
@@ -1566,7 +1659,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             for t in range(q):
                 newpos = jnp.where(nt == t, pos_ref[r0 + t], newpos)
             live_new = head_ok & (newpos <= rowpos)
-            live_new = live_new & jnp.logical_or(is_global, rowpos - newpos < c.window)
+            in_win = _in_window(is_global, rowpos - newpos < c.window)
+            if in_win is not None:
+                live_new = live_new & in_win
             s_ = (
                 jax.lax.dot_general(
                     q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32

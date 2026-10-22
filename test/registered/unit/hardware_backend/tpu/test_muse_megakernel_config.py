@@ -106,6 +106,17 @@ class TestMuseMegakernelConfig(CustomTestCase):
             K.scratch_vmem_bytes(tuned),
             ops._SCRATCH_VMEM_BUDGET - ops._SAL_VMEM_HEADROOM,
         )
+        # SWA layers' short chunks are sub-slots of the full-attention ring: same VMEM, no overrun
+        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.override(
+            2048
+        ), tpu_envs.SGLANG_TPU_MUSE_MK_SAL_SWA_CHUNK_TOKENS.override(512):
+            split = cfg()
+        self.assertEqual((split.chunk_pages, split.swa_chunk_pages), (8, 2))
+        self.assertEqual(
+            2 * split.swa_kv_group * split.swa_chunk_pages,
+            split.kv_ring * split.chunk_pages,
+        )
+        self.assertEqual(split.swa_kv_group % split.attn_streams, 0)
 
     def test_48_row_shapes_fit_the_scratch_budget(self):
         # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
