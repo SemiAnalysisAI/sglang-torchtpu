@@ -5,9 +5,12 @@ Under DP attention every rank runs the MoE layers together, so every rank must
 run the same compiled program each step. When one group prefills an image, the
 other groups take the input_embeds path too (``is_tpu_mm_extend_in_batch``),
 and the vision tower runs collective-free on the group that owns the image.
-Requests go in four at a time, an image request after every second text
-prefix, so one group prefills an image while the other prefills or decodes
-text.
+A decode batch that runs as one-token extends while the other group extends
+keeps that group's program even when it holds an image request, whose image
+is already embedded. Requests go in four at a time, an image request after
+every second text prefix, so one group prefills an image while the other
+prefills or decodes text, and image requests decode beside the other group's
+text prefills.
 
 The reference is the same checkpoint (kimi_k3_tiny_harness.py) at TP4 without
 DP attention. Greedy continuations of this random model part ways within a

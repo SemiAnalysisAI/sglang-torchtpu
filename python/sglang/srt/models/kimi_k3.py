@@ -4221,7 +4221,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
             or forward_batch.forward_mode.is_target_verify()
             or (
                 self.text_prefill_in_language_model
-                and not forward_batch.contains_mm_inputs()
+                # A decode batch that DP attention runs as one-token extends
+                # (a peer is extending) still carries its image requests'
+                # inputs but embeds no image. It must take its peers' program:
+                # TPU ranks on different programs deadlock.
+                and not (
+                    forward_batch.contains_mm_inputs()
+                    and forward_batch._original_forward_mode is None
+                )
                 # A DP peer's image step puts every rank on the input_embeds path.
                 and not forward_batch.is_tpu_mm_extend_in_batch
             )
