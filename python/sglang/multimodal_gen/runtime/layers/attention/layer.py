@@ -1512,6 +1512,18 @@ class USPAttention(nn.Module):
 
         return out
 
+    def supports_tail_pad_meta(self, batch_size: int) -> bool:
+        """Whether tail-pad metadata alone (no mask) is served under the
+        current parallel layout; the masked path's ring branch raises for it
+        otherwise. A caller that cannot honour the padding attends to the pad
+        keys instead, as without the metadata."""
+        if get_ring_parallel_world_size() == 1:
+            return True
+        # The ring branches of forward's masked path.
+        return (self.backend == AttentionBackendEnum.FA and batch_size == 1) or (
+            not self.causal and self.attn_impl.supports_ring_resume()
+        )
+
     def _forward_ring_tail_pad(
         self,
         q: torch.Tensor,
@@ -1643,14 +1655,14 @@ class USPAttention(nn.Module):
             pad_start = attn_mask_meta.get("pad_start", attn_mask_meta.get("gap_start"))
             pad_end = attn_mask_meta.get("pad_end", attn_mask_meta.get("gap_end"))
             if pad_start is not None and pad_end == k.shape[1]:
-                # Tail padding only: mask the keys past the global real length,
-                # a span every rank holds, so every rank runs the same program
-                # (spmd-safe compiled regions need that) and no mask is
-                # gathered. Pad query rows keep their values; the caller trims
-                # them after the final gather.
-                key_mask = torch.arange(k.shape[1], device=q.device) < pad_start
-                return self._kv_gather_masked_sdpa(
-                    q, k, v, key_mask.expand(q.shape[0], -1)
+                # Tail padding only: attend over the global real-key prefix
+                # with the selected backend. Every rank slices the same span,
+                # so every rank runs the same program (spmd-safe compiled
+                # regions need that) and no mask is built or gathered. Pad
+                # query rows keep their values; the caller trims them after
+                # the final gather.
+                return self.attn_impl.forward(
+                    q, k[:, :pad_start], v[:, :pad_start], ctx_attn_metadata
                 )
 
         explicit_mask = attn_mask is not None

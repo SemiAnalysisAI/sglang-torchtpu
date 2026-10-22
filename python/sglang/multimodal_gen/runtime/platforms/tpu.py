@@ -216,7 +216,16 @@ class TpuPlatform(Platform):
         # scratch, so only regions. The ranks must run identical programs: the
         # fused collectives otherwise hang or exchange the wrong data.
         import torch.compiler.config as compiler_config
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
+
+        try:
+            from torch_tpu._internal.distributed.spmd_util import spmd_safe
+        except ImportError:
+            # A private API: without it, regions keep split collectives.
+            logger.warning_once(
+                "torch_tpu has no spmd_safe; regional-compile programs keep "
+                "their collectives split."
+            )
+            return None
 
         # The region annotation is not part of the compile cache key; keep
         # persisted executables of the two region policies apart.

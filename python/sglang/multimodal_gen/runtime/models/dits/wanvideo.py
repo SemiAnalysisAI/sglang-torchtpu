@@ -742,12 +742,14 @@ class WanTransformerBlock(nn.Module):
             attn_mask_meta is not None
             and isinstance(self.attn1, USPAttention)
             and not self.attn1.backend.is_sparse
+            and self.attn1.supports_tail_pad_meta(query.shape[0])
         ):
             # Keys past the sequence-parallel tail pad are not real tokens.
             attn_output = self.attn1(query, key, value, attn_mask_meta=attn_mask_meta)
         else:
-            # Sparse attention (SLA, USP sparse backends) cannot drop the pad
-            # keys without a dense fallback; it attends to them, as before.
+            # Sparse attention (SLA, USP sparse backends), and ring layouts
+            # whose kernel cannot skip the pad keys (e.g. sage_attn, or FA at
+            # batch > 1), attend to them, as before.
             attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)

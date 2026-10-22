@@ -155,7 +155,7 @@ class TestUSPAttentionKVGather(unittest.TestCase):
 
         torch.testing.assert_close(out, expected)
 
-    def test_tail_pad_meta_masks_keys_by_the_global_span_on_every_rank(self):
+    def test_tail_pad_meta_attends_the_global_real_prefix_on_every_rank(self):
         class _RankInvariantMeta(dict):
             # The span is the same on every rank; the per-rank pad count is not
             # and must not reach the program (spmd-safe compiled regions).
@@ -175,16 +175,34 @@ class TestUSPAttentionKVGather(unittest.TestCase):
         # Pad keys that would dominate the softmax if they were not masked.
         full_k[:, real:] = 1e2
         full_v[:, real:] = 1e4
+        impl_forward = self.attn.attn_impl.forward
+        kv_lengths = []
+
+        def recording_forward(q, k, v, ctx):
+            kv_lengths.append((k.shape[1], v.shape[1]))
+            return impl_forward(q, k, v, ctx)
+
         for rank in range(world):
             with self.subTest(rank=rank):
+                kv_lengths.clear()
                 q = torch.randn(2, local_len, self.heads, self.head_dim)
                 meta = _RankInvariantMeta(
                     pad_start=real,
                     pad_end=local_len * world,
                     local_pad=(local_len * world - real) if rank == world - 1 else 0,
                 )
-                # Two gathers (K and V) and no third for a mask.
-                out = self._run(q, q, q, [full_k, full_v], attn_mask_meta=meta)
+                # Two gathers (K and V) and no third for a mask; the selected
+                # impl attends the real-key prefix, without masked SDPA.
+                with (
+                    patch.object(self.attn.attn_impl, "forward", recording_forward),
+                    patch.object(
+                        USPAttention,
+                        "_kv_gather_masked_sdpa",
+                        side_effect=AssertionError("masked SDPA"),
+                    ),
+                ):
+                    out = self._run(q, q, q, [full_k, full_v], attn_mask_meta=meta)
+                self.assertEqual(kv_lengths, [(real, real)])
                 expected = _reference_attention(
                     q, full_k[:, :real], full_v[:, :real], self.attn.softmax_scale
                 )
