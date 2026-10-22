@@ -1097,6 +1097,12 @@ class TestInstallExtendCap(_PolicyTestCase):
             self.assertTrue(policy.install())
 
         self.assertEqual(compile_mock.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["options"] == {"serializable": False}
+                for call in compile_mock.call_args_list
+            )
+        )
         self.assertIs(model.model.forward, compiled_backbone)
         self.assertIs(logits_processor.forward, compiled_logits)
         self.assertIs(policy.compiled_forward_shim.fn, original_outer)

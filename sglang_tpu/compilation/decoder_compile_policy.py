@@ -683,12 +683,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         if split_draft:
             logits_fn = self.owner.logits_processor.forward
-            compiled_logits = torch.compile(
-                torch.no_grad()(logits_fn),
-                backend=self.backend or current_platform.get_compile_backend(),
-                fullgraph=self.fullgraph,
-                dynamic=self.dynamic,
-            )
+            compiled_logits = self._compile(logits_fn)
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
         max_t = max_extend_tokens(
@@ -790,7 +785,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         # The bundle Compiler installs its own guard filter for restorable guards.
-        options = None if use_bundle else _guard_filter_options(server_args)
+        # Native caching does not need an additional in-memory AOT export.
+        options = (
+            None
+            if use_bundle
+            else {"serializable": False, **(_guard_filter_options(server_args) or {})}
+        )
         return compiler(
             torch.no_grad()(fn),
             backend=self.backend or current_platform.get_compile_backend(),

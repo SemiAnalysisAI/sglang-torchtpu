@@ -213,9 +213,21 @@ class TestViTTpuCompileRunner(unittest.TestCase):
                 server_args=SimpleNamespace(tpu_compile_tracer="direct")
             )
         )
-        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            patch.object(
+                vit_runner.torch, "compile", wraps=torch.compile
+            ) as compile_fn,
+        ):
             compiled = policy._compile_method(lambda x: x, use_bundle=False)
         self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
+        self.assertEqual(
+            compile_fn.call_args.kwargs["options"], {"serializable": False}
+        )
+
+        with patch.object(vit_runner.torch_compile_bundle, "Compiler") as bundle:
+            policy._compile_method(lambda x: x, use_bundle=True)
+        self.assertNotIn("options", bundle.call_args.kwargs)
 
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")

@@ -231,7 +231,13 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         == torch.distributed.get_world_size()
                     ),
                 )
-        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        # Keep AOT export only for explicit bundles; native TorchTPU caches
+        # persist the executable without retaining a second export in RAM.
+        compiler = (
+            torch_compile_bundle.Compiler
+            if use_bundle
+            else partial(torch.compile, options={"serializable": False})
+        )
         return compiler(
             torch.no_grad()(method),
             backend=self.backend,

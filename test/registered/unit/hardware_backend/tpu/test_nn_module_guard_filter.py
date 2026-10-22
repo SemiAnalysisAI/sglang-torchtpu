@@ -78,14 +78,19 @@ class TestDecoderCompileUsesFilter(CustomTestCase):
             dcp.DecoderTpuCompilePolicy._compile(policy, lambda x: x)
         return compile_mock, bundle_mock
 
-    def test_options_only_when_enabled(self):
+    def test_serialization_option_preserves_guard_filter_selection(self):
         compile_mock, _ = self._compile(_server_args())
-        self.assertNotIn("options", compile_mock.call_args.kwargs)
+        self.assertEqual(
+            compile_mock.call_args.kwargs["options"], {"serializable": False}
+        )
         with tpu_envs.SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER.override(True):
             compile_mock, _ = self._compile(_server_args())
         self.assertEqual(
             compile_mock.call_args.kwargs["options"],
-            {"guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe},
+            {
+                "serializable": False,
+                "guard_filter_fn": torch.compiler.skip_guard_on_all_nn_modules_unsafe,
+            },
         )
 
     def test_bundle_keeps_its_own_filter(self):
