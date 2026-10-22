@@ -4,9 +4,11 @@ These tests mock torch_tpu so they can run on any machine without TPU hardware.
 """
 
 import builtins
+import importlib
 import os
 import sys
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -423,8 +425,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(attention_backend="pallas_tpu_mla")
         self._apply(args)
         self.assertEqual(self._resolved(args, "kv_cache_dtype"), "auto")
-        # The MLA kernel's tuned blocks are keyed on 128-token pages.
-        self.assertEqual(self._resolved(args, "page_size"), 128)
+        self.assertEqual(self._resolved(args, "page_size"), 64)
 
     def test_sparse_mla_backend_defaults_kv_cache_to_fp8(self):
         # Its kernels read an FP8 cache and nothing else, so "auto" cannot be
@@ -776,12 +777,40 @@ class TestModelServingArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "decode-enable-radix-cache"):
             self._apply(args)
 
-    def test_state_dtype_other_than_float32_is_refused(self):
+    def test_state_dtype_other_than_float32_is_served_as_float32(self):
         self._apply(self._args(mamba_ssm_dtype="float32"))
-        with self.assertRaisesRegex(ValueError, "mamba-ssm-dtype bfloat16"):
-            self._apply(self._args(mamba_ssm_dtype="bfloat16"))
+        args = self._args(mamba_ssm_dtype="bfloat16")
+        with self.assertLogs("sglang_tpu.tpu_platform", "WARNING") as logs:
+            self._apply(args)
+        self.assertIn("ignoring --mamba-ssm-dtype bfloat16", "\n".join(logs.output))
+        self.assertEqual(self._resolved(args, "mamba_ssm_dtype"), "float32")
         # Irrelevant without linear-attention state.
-        self._apply(self._args(mamba_ssm_dtype="bfloat16"), state=False)
+        args = self._args(mamba_ssm_dtype="bfloat16")
+        self._apply(args, state=False)
+        self.assertEqual(self._resolved(args, "mamba_ssm_dtype"), "bfloat16")
+
+    def test_kimi_k3_recipes_are_accepted(self):
+        """The Kimi-K3 recipes, and the cookbook commands rendered from them,
+        pass --mamba-ssm-dtype bfloat16; no argument-time check may refuse them."""
+        root = str(Path(__file__).resolve().parents[5])
+        for name in ("server", "server_mk", "dspark", "dspark_mk"):
+            with self.subTest(recipe=name):
+                with patch.object(sys, "path", [root, *sys.path]):
+                    config = importlib.import_module(
+                        f"benchmark.tpu.recipe.configs.kimi_k3.{name}"
+                    ).CONFIG
+                # launch_server omits a None or False flag;
+                # the stubbed model config stands in for model_path.
+                server_args = {
+                    key: value
+                    for key, value in config["server_args"].items()
+                    if value is not None and value is not False and key != "model_path"
+                }
+                with patch.dict(os.environ, config["runtime_env"]):
+                    self._apply(
+                        self._args(**server_args),
+                        context_len=server_args["context_length"],
+                    )
 
     def test_mla_needs_the_raiden_transfer_backend(self):
         for mode in ("prefill", "decode"):
@@ -842,17 +871,13 @@ class TestModelServingArgs(CustomTestCase):
             arch="KimiK3LinearForCausalLM",
         )
 
-    def test_mla_defaults_to_128_token_pages(self):
-        args = self._args(attention_backend="pallas_tpu_mla")
-        self._apply(args)
-        self.assertEqual(self._resolved(args, "page_size"), 128)
-
     def test_a_page_table_that_cannot_fit_in_smem_is_refused(self):
         # 262144-token context at 128-token pages: 2049 pages per sequence, so
         # at most 127 sequences fit the 1 MiB budget.
         def args(max_bs):
             return self._args(
                 attention_backend="pallas_tpu_mla",
+                page_size=128,
                 enable_torch_compile=True,
                 torch_compile_max_bs=max_bs,
             )

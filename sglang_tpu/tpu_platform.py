@@ -73,10 +73,6 @@ def _sync_weight_stream(weights):
 # each KV fetch into many tiny DMAs, which is fine for GPU kernels and wasteful
 # here.
 _DEFAULT_PAGE_SIZE = 64
-# The MLA kernel's tuned block sizes are keyed on the page size, and most of
-# them, every Kimi-K3 row included, on 128-token pages; a page the table has no
-# row for falls back to untuned blocks.
-_MLA_DEFAULT_PAGE_SIZE = 128
 # Attention backends whose kernels take the shared RPA page table as an SMEM
 # scalar-prefetch operand (see attention_pallas_rpa_base).
 _RPA_PAGE_TABLE_BACKENDS = (
@@ -436,8 +432,6 @@ def _apply_page_size_default(server_args) -> None:
     floor = spec.min_page_size if spec is not None else None
     if cfg.page_size is None:
         default = max(_DEFAULT_PAGE_SIZE, floor or 0)
-        if cfg.attention_backend == "pallas_tpu_mla":
-            default = _MLA_DEFAULT_PAGE_SIZE
         declare_resolution(
             server_args, "tpu.apply_server_args_defaults", page_size=default
         )
@@ -566,9 +560,15 @@ def _resolve_model_serving_args(server_args, platform) -> None:
         # TpuMambaPool keeps conv and recurrent state in float32 whatever the
         # flag says, and sizes the pool for it.
         if cfg.mamba_ssm_dtype not in (None, "float32"):
-            raise ValueError(
+            logger.warning(
                 "TPU keeps linear-attention (GDN / KDA) state in float32; "
-                f"--mamba-ssm-dtype {cfg.mamba_ssm_dtype} is not supported."
+                "ignoring --mamba-ssm-dtype %s.",
+                cfg.mamba_ssm_dtype,
+            )
+            declare_resolution(
+                server_args,
+                "tpu.apply_server_args_defaults",
+                mamba_ssm_dtype="float32",
             )
         # The scheduler refuses the tree only after the load, when the pool
         # and the Mamba strategy are already sized for prefix checkpoints.
