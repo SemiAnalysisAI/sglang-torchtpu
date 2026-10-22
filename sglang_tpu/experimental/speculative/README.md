@@ -133,6 +133,16 @@ Startup checks:
 Known gap: DFlash with HiCache under DP attention passes GSM8K, but the KV
 offload probe sees one verify forward fewer on a host reload than on a device hit.
 
+## Prefill context parallelism
+
+Both families serve `--attn-cp-size N --enable-prefill-cp` (`../../cp_forward.py`).
+The CP target extend all-gathers the FULL-capture hidden rows over the attention
+CP group and puts them back in the batch's token order (`cp_layout.global_rows`),
+so the draft prompt pass reads every row. Draft forwards run as plain TP
+(`draft_cp_context`); decode and verify are not context-parallel. The other
+prefill-CP requirements (`tpu_platform._validate_prefill_context_parallel`) still
+apply, e.g. no DP attention.
+
 ## Not supported
 
 Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
