@@ -75,6 +75,38 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     )
                     self.assertEqual(cfg.stream_depth, cfg.ring_slots - 1)
 
+    def test_sal_attention_flags(self):
+        # The cc=1 verify step on fp8 SEQ_ALONG_LANE pages, with and without the flags.
+        from sglang_tpu.envs import envs as tpu_envs
+
+        def cfg():
+            return ops.MuseMegakernel.config(
+                _megakernel(),
+                rows=8,
+                q=8,
+                n_req=1,
+                n_page_entries=4097,
+                page_size=256,
+                capture=(1, 16, 30, 44, 59),
+                kv_sal=True,
+                kv_sal_fp8=True,
+            ).validate()
+
+        default = cfg()
+        self.assertEqual((default.chunk_pages, default.kv_group), (2, 4))
+        self.assertEqual(default.attn_fixed_max, 0.0)
+        with tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.override(
+            1024
+        ), tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX.override(True):
+            tuned = cfg()
+        self.assertEqual((tuned.chunk_pages, tuned.kv_group), (4, 2))
+        bound = _GEOMETRY.scale_query_by * _GEOMETRY.head_dim * _GEOMETRY.attn_scale
+        self.assertGreaterEqual(tuned.attn_fixed_max, 1.1 * bound)
+        self.assertLessEqual(
+            K.scratch_vmem_bytes(tuned),
+            ops._SCRATCH_VMEM_BUDGET - ops._SAL_VMEM_HEADROOM,
+        )
+
     def test_48_row_shapes_fit_the_scratch_budget(self):
         # SGLANG_TPU_MUSE_MK_MAX_ROWS=48: 12 requests x 4 verify tokens and 6 x 8, on the
         # packed bf16 pool and on fp8 SEQ_ALONG_LANE pages (which keep extra headroom).

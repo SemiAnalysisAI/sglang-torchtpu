@@ -305,6 +305,9 @@ class MuseMegakernel(torch.nn.Module):
         kv_sal_fp8: bool = False,
     ) -> K.MKConfig:
         g = self.geo
+        sal_chunk_pages = max(
+            1, tpu_envs.SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS.get() // page_size
+        )
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -335,8 +338,16 @@ class MuseMegakernel(torch.nn.Module):
             n_req=n_req,
             capture_layers=capture,
             compact_rows=4 if rows <= _COMPACT4_MAX_ROWS else 8,
-            # SEQ_ALONG_LANE pages are >= 256 tokens: keep 512-token chunks
-            chunk_pages=max(1, 512 // page_size) if kv_sal else self.chunk_pages,
+            # SEQ_ALONG_LANE pages are >= 256 tokens
+            chunk_pages=sal_chunk_pages if kv_sal else self.chunk_pages,
+            # a 4096-token ring at 512- and 1024-token chunks; two-stream needs an even group
+            **({"kv_group": max(2, 2048 // (sal_chunk_pages * page_size))} if kv_sal else {}),
+            attn_fixed_max=(
+                # 1.125: margin over validate()'s fp8-rounding factor of 1.1
+                1.125 * g.scale_query_by * g.head_dim * g.attn_scale
+                if tpu_envs.SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX.get()
+                else 0.0
+            ),
             kv_packed=self.kv_packed and not kv_sal,
             kv_sal=kv_sal,
             kv_sal_fp8=kv_sal_fp8,

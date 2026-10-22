@@ -68,6 +68,12 @@ class TpuEnvs:
     # TP size); larger steps run the native decoder. 48 fits at tp8; 64 overflows the
     # kernel's DMA semaphore memory at compile time.
     SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
+    # Megakernel attention over SEQ_ALONG_LANE pools: tokens per KV chunk, a multiple of the page.
+    # Larger chunks shorten the per-chunk softmax chain at long context.
+    SGLANG_TPU_MUSE_MK_SAL_CHUNK_TOKENS = EnvInt(512)
+    # Megakernel attention exponentiates against a fixed max (MKConfig.attn_fixed_max) instead
+    # of a running row max; exact for Muse's per-head RMS-normalized q and k.
+    SGLANG_TPU_MUSE_MK_ATTN_FIXED_MAX = EnvBool(False)
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
