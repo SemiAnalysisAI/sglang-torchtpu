@@ -983,7 +983,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "hidden_states": zeros((num_tokens, hidden_size)),
             "residual": zeros((num_tokens, hidden_size)),
         }
-        # Serving hands the Eagle3 capture slots on with the activations, so
+        # Serving hands the aux capture slots on with the activations, so
         # trace them too or the graph signature differs from the real one.
         num_aux = num_relayed_aux_slots(
             self.model_runner.spec_aux_config, self.model_runner.model

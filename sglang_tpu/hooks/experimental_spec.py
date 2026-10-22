@@ -20,7 +20,7 @@ import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang_tpu.experimental import (
     experimental_spec_enabled,
@@ -36,9 +36,12 @@ def initialize_host_batch(result, *args, **kwargs):
     # Every batch of a process a TpuSpecWorker serves is host padded, whatever the algorithm.
     padder = get_host_batch_padder()
     if padder is not None:
-        if not result.enable_overlap:
+        # Only decode relays through FutureMap; a PD prefill (PP runs it
+        # without overlap) never decodes.
+        if not result.enable_overlap and get_disagg().disaggregation_mode != "prefill":
             raise ValueError(
-                "The experimental TPU spec worker requires overlap scheduling"
+                "The experimental TPU spec worker requires overlap scheduling "
+                "outside --disaggregation-mode prefill"
             )
         result.host_pad_bs = padder
     return result
@@ -64,6 +67,11 @@ def sampling_from_batch(
     )
 
 
+def _relays_rows(batch) -> bool:
+    """Whether FutureMap owns batch's rows; a non-overlap PD prefill keeps core's."""
+    return uses_host_batch(batch) and batch.enable_overlap
+
+
 def _rebuild_relay_rows(batch):
     assert batch.enable_overlap and not batch.spec_algorithm.is_none()
     assert batch.input_ids is None
@@ -76,21 +84,21 @@ def _rebuild_relay_rows(batch):
 
 
 def filter_model_inputs(original, batch, keep_indices, keep_indices_device):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, keep_indices, keep_indices_device)
     _rebuild_relay_rows(batch)
 
 
 def merge_model_inputs(original, batch, other):
     assert uses_host_batch(batch) == uses_host_batch(other)
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, other)
     assert other.input_ids is None
     _rebuild_relay_rows(batch)
 
 
 def filter_spec_input(original, batch, keep_indices, keep_indices_device):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, keep_indices, keep_indices_device)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 
@@ -103,7 +111,7 @@ def filter_spec_input(original, batch, keep_indices, keep_indices_device):
 
 
 def merge_spec_input(original, batch, other):
-    if not uses_host_batch(batch):
+    if not _relays_rows(batch):
         return original(batch, other)
     from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
 

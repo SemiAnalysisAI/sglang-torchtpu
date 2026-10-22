@@ -31,6 +31,7 @@ from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftI
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
+    initialize_host_batch,
     kimi_spec_defaults,
 )
 
@@ -123,14 +124,14 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
             stack.callback(restore)
 
-    def batch(self, rows, spec_algorithm=SpeculativeAlgorithm.DSPARK):
+    def batch(self, rows, spec_algorithm=SpeculativeAlgorithm.DSPARK, overlap=True):
         batch = ScheduleBatch.init_new(
             [_req(0.1 * (i + 1)) for i in range(len(rows))],
             SimpleNamespace(device="cpu"),
             None,
             None,
             SimpleNamespace(is_encoder_decoder=False, vocab_size=32),
-            enable_overlap=True,
+            enable_overlap=overlap,
             spec_algorithm=spec_algorithm,
         )
         batch.req_pool_indices_cpu = torch.tensor(rows)
@@ -176,6 +177,23 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(len(forwarded), 5)
         self.assertIsNone(forwarded.penalizer_orchestrator)
         self.assertEqual(forwarded.on_device().temperatures.shape, (8, 1))
+
+    def test_pd_prefill_without_overlap_filters_core_rows(self):
+        """A PP PD prefill filters its chunked extend batch without overlap; FutureMap
+        owns no rows there, so the filter must keep core's rows and the seed's."""
+        with patch(
+            "sglang_tpu.hooks.experimental_spec.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ):
+            batch = self.batch([2, 5, 8], overlap=False)
+        batch.spec_info = HostPaddedBlockDraftInput(
+            bonus_tokens=torch.tensor([7, 8, 9]), new_seq_lens=batch.seq_lens
+        )
+        batch.filter_batch(keep_indices=[0, 2])
+        self.assertEqual(batch.req_pool_indices.tolist(), [2, 8])
+        self.assertEqual(batch.seq_lens.tolist(), [10, 12])
+        self.assertEqual(batch.spec_info.bonus_tokens.tolist(), [7, 9])
+        self.assertEqual(batch.spec_info.new_seq_lens.tolist(), [10, 12])
 
     def test_host_padding_follows_the_worker_not_the_algorithm(self):
         """Without a TpuSpecWorker (no registered padder) batches keep core's rows;
@@ -419,7 +437,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         core_batch = SimpleNamespace(spec_algorithm=mtp, spec_info=draft_input)
         core_prepare = lambda batch: prepared.append("core")  # noqa: E731
         core_fence = lambda algo, *, copies_draft_tail: True  # noqa: E731
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+        last_stage = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=True))
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            patch("sglang_tpu.hooks.spec_worker.get_parallel", return_value=last_stage),
+        ):
             self.assertFalse(is_experimental_spec_worker(SpeculativeAlgorithm.EAGLE3))
             self.assertIs(
                 select_experimental_spec_worker(None, mtp, None), TpuChainSpecWorker
@@ -463,6 +485,55 @@ class TestExperimentalSpecHooks(CustomTestCase):
             ):
                 self.assertTrue(spec_need_hidden_states(lambda: True))
         self.assertEqual(prepared, [batch, "core"])
+
+    def test_pp_stages_before_the_last_get_no_draft(self):
+        """Under PP only the last stage hosts the draft; an earlier stage building one
+        would bind the target embedding or lm_head its stage does not hold."""
+        from sglang_tpu.experimental.speculative.pipeline_stage_worker import (
+            TpuPipelineStageWorker,
+        )
+        from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+
+        earlier_stage = SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=False))
+        algorithms = (
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        )
+        with patch(
+            "sglang_tpu.hooks.spec_worker.get_parallel", return_value=earlier_stage
+        ):
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+                for algorithm in algorithms:
+                    self.assertIs(
+                        select_experimental_spec_worker(None, algorithm, None),
+                        TpuPipelineStageWorker,
+                    )
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(False):
+                for algorithm in algorithms:
+                    self.assertIsNone(
+                        select_experimental_spec_worker(None, algorithm, None)
+                    )
+
+    def test_only_a_pd_prefill_host_pads_without_overlap(self):
+        """PP runs a PD prefill without overlap; decode relays through FutureMap,
+        so a non-overlap decode must still refuse host padding."""
+        batch = SimpleNamespace(enable_overlap=False)
+        with patch("sglang_tpu.experimental._host_batch_padder", _pad):
+            for mode, allowed in (
+                ("prefill", True),
+                ("decode", False),
+                ("null", False),
+            ):
+                with patch(
+                    "sglang_tpu.hooks.experimental_spec.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ):
+                    if allowed:
+                        self.assertIs(initialize_host_batch(batch).host_pad_bs, _pad)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "overlap"):
+                            initialize_host_batch(SimpleNamespace(enable_overlap=False))
 
     def test_kimi_spec_defaults_yield_only_to_experimental_dspark(self):
         def original(server_args):
@@ -788,6 +859,86 @@ class TestExperimentalSpecHooks(CustomTestCase):
         self.assertEqual(hidden.shape, (4, 2))
         self.assertEqual(carry[3].tolist(), [1.0, 1.0])
         self.assertEqual(carry[0].tolist(), [0.0, 0.0])
+
+    def _retraction_worker(self, draft_pool, *, mode="decode", backup="cpu_tensor"):
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._draft_worker = SimpleNamespace(
+            draft_runners=(SimpleNamespace(token_to_kv_pool=draft_pool),)
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode=mode, disaggregation_decode_retraction_backup=backup
+        )
+        get_disagg = patch(
+            "sglang_tpu.experimental.speculative.base_spec_worker.get_disagg",
+            return_value=disagg,
+        )
+        return worker, get_disagg
+
+    def test_cpu_retraction_restores_draft_kv_at_resumed_slots(self):
+        """A PD decode request retracted with a CPU backup must resume with its
+        own draft KV, not whatever its newly allocated slots hold."""
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        draft_pool = MHATokenToKVPool(
+            size=16,
+            page_size=1,
+            dtype=torch.float32,
+            head_num=1,
+            head_dim=2,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        old_slots, new_slots = torch.tensor([3, 4, 5]), torch.tensor([9, 10, 11])
+        draft_pool.k_buffer[0][old_slots] = 7.0
+        draft_pool.v_buffer[0][old_slots] = 8.0
+        req_to_token = torch.zeros((4, 8), dtype=torch.int64)
+        req_to_token[1, :3] = old_slots
+        req_to_token[2, :3] = new_slots
+        req = object.__new__(Req)
+        req.origin_input_ids = [1, 2, 3]
+        req.output_ids = [4]
+        req.kv = SimpleNamespace(req_pool_idx=1, mamba_pool_idx=None, holds_mamba=False)
+        target_allocator = MagicMock()
+        target_allocator.get_kvcache.return_value.cpu_copy_carries_mamba = True
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+
+        worker, get_disagg = self._retraction_worker(draft_pool)
+        with get_disagg:
+            draft_kv_pools = worker.retraction_draft_kv_pools
+        req.offload_kv_cache(
+            req_to_token_pool, target_allocator, draft_kv_pools=draft_kv_pools
+        )
+        # Resume lands on another req pool row whose slots held other KV.
+        req.kv.req_pool_idx = 2
+        draft_pool.k_buffer[0][new_slots] = -1.0
+        draft_pool.v_buffer[0][new_slots] = -1.0
+        req.load_kv_cache(req_to_token_pool, target_allocator)
+        self.assertTrue(bool((draft_pool.k_buffer[0][new_slots] == 7.0).all()))
+        self.assertTrue(bool((draft_pool.v_buffer[0][new_slots] == 8.0).all()))
+
+    def test_unbackable_draft_pool_refuses_cpu_retraction_at_startup(self):
+        """A draft pool without a CPU copy must fail when the scheduler reads the
+        pools at startup, not resume requests over stale draft KV."""
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        mla_pool = object.__new__(MLATokenToKVPool)
+        worker, get_disagg = self._retraction_worker(mla_pool)
+        with get_disagg, self.assertRaisesRegex(NotImplementedError, "draft KV"):
+            worker.retraction_draft_kv_pools
+        # No CPU backup is taken off a decode server or with another backend.
+        for mode, backup in (("prefill", "cpu_tensor"), ("decode", "none")):
+            worker, get_disagg = self._retraction_worker(
+                mla_pool, mode=mode, backup=backup
+            )
+            with get_disagg:
+                self.assertEqual(worker.retraction_draft_kv_pools, (mla_pool,))
 
     def test_per_batch_checks_refuse_only_unsupported_requests(self):
         """Filtered sampling needs the sort-free filter (the sort-based target

@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
 
 
 class TpuDraftWorker(ABC):
@@ -55,7 +55,9 @@ class TpuDraftWorker(ABC):
     @contextlib.contextmanager
     def draft_context(self) -> Iterator[None]:
         """The scopes every draft-model phase runs under, as EAGLEWorkerV2 enters them."""
+        # Under PP the one-layer draft lives on the last stage only, as if PP were off.
         with (
+            draft_pp_context(),
             draft_tp_context(self._owns_attention),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
