@@ -703,6 +703,168 @@ class TestExperimentalSpecHooks(CustomTestCase):
         with self.assertRaises(_Stop):
             init(dp_attention=True)
 
+    def test_idle_dp_rank_mirrors_the_whole_step(self):
+        """An idle DP rank runs the active step's forwards and syncs in order (the
+        greedy draft, verify, commit) on all-padding rows; a skipped one leaves
+        its peers hanging in the collective."""
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.experimental.speculative.spec_types import (
+            DraftResult,
+            SpecState,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        calls = []
+        drafts = torch.zeros((4, 2), dtype=torch.int64)
+
+        def draft(batch, bucket, rows, verify_input):
+            calls.append(("draft", bucket.temperatures, bucket.live_mask.any().item()))
+            return DraftResult(
+                draft_tokens=drafts, draft_logits=None, num_verify_drafts=None
+            )
+
+        worker.draft = draft
+        worker._forward_idle_verify = lambda **kwargs: (
+            calls.append(("verify", kwargs["verify_tokens"].shape)) or "out"
+        )
+        worker.commit = lambda *args: calls.append(
+            ("commit", args[4], args[5].accept_lens.tolist())
+        )
+        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
+        zeros = torch.zeros((4,), dtype=torch.int64)
+        state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
+        worker._forward_idle_step(batch=None, state=state, rows=None, verify_input=None)
+        self.assertEqual(
+            calls,
+            [
+                ("draft", None, False),
+                # Flat [pbs * (gamma + 1)] verify rows.
+                ("verify", torch.Size([12])),
+                ("commit", "out", [0, 0, 0, 0]),
+            ],
+        )
+
+    def test_target_token_sync_has_one_shape_on_every_dp_rank(self):
+        """Every DP rank must issue extend's target-token sync at one shape; an idle
+        rank (no rows) syncing a different shape than its peers hangs them."""
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        synced = []
+        worker._tp_sync = SimpleNamespace(
+            sync=lambda site, values: synced.append(tuple(values.shape)) or values
+        )
+        worker._compile_policy = lambda: SimpleNamespace(_extend_compile_cap=lambda: 8)
+        tokens = torch.tensor([5, 6, 7])
+        worker._dp_attention = True
+        self.assertEqual(worker.sync_target_tokens(tokens).tolist(), [5, 6, 7])
+        self.assertEqual(worker.sync_target_tokens(tokens[:0]).tolist(), [])
+        self.assertEqual(synced, [(8,), (8,)])
+        worker._dp_attention = False
+        self.assertIs(worker.sync_target_tokens(tokens), tokens)
+
+    def test_idle_draft_prefill_runs_the_peers_token_bucket(self):
+        """An idle DP rank's draft prefill pads to the token bucket its peers run;
+        the synced live counts would pick other attention collectives and hang."""
+        from sglang_tpu.experimental.speculative import chain_spec_worker
+        from sglang_tpu.experimental.speculative.chain_spec_worker import (
+            TpuChainSpecWorker,
+        )
+
+        worker = object.__new__(TpuChainSpecWorker)
+        worker.device = "cpu"
+        forwarded = []
+        worker._draft_runner = SimpleNamespace(forward=forwarded.append)
+        worker._chain_draft_worker = SimpleNamespace(draft_context=ExitStack)
+        idle_batch = SimpleNamespace(global_num_tokens_cpu=[780, 0])
+        target_hidden = torch.zeros((8192, 4))
+        with patch.object(
+            chain_spec_worker.ForwardBatch, "init_new", return_value=idle_batch
+        ):
+            worker._forward_idle_draft_prefill(None, target_hidden=target_hidden)
+        (forward_batch,) = forwarded
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [8192, 8192])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [8192, 8192])
+        # Core's DP unpadding of the relabeled idle rank reads this backup.
+        self.assertEqual(tuple(forward_batch.hidden_states_backup.shape), (0, 4))
+
+    def test_dp_attention_rejects_a_draft_head_sharded_over_full_tp(self):
+        """A draft sharing a target head sharded over the full TP group drafts from one
+        shard inside its attention-TP group: acceptance collapses with no error. A
+        head sharded over the draft's own group (built in its scope) is fine."""
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from sglang_tpu.experimental.speculative.base_spec_worker import (
+            _check_draft_lm_head_group,
+        )
+
+        def head(*, use_attn_tp_group, tp_size):
+            lm_head = object.__new__(VocabParallelEmbedding)
+            lm_head.__dict__.update(
+                enable_tp=True, use_attn_tp_group=use_attn_tp_group, tp_size=tp_size
+            )
+            return lm_head
+
+        def check(lm_head, attn_tp_size):
+            _check_draft_lm_head_group(
+                SimpleNamespace(lm_head=lm_head), attn_tp_size=attn_tp_size
+            )
+
+        for attn_tp_size in (1, 4):
+            with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                check(head(use_attn_tp_group=False, tp_size=8), attn_tp_size)
+        # Target head under --enable-dp-lm-head; a draft head built in the draft's
+        # scope, where the narrowed group reports use_attn_tp_group False.
+        check(head(use_attn_tp_group=True, tp_size=4), 4)
+        check(head(use_attn_tp_group=False, tp_size=4), 4)
+        check(head(use_attn_tp_group=False, tp_size=1), 1)
+        check(None, 4)
+
+    def test_block_dp_attention_drafts_greedy(self):
+        """Under DP attention the block draft never samples: peers and idle ranks
+        must issue the same draft sync, and sampled requests take target-only accept."""
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        greedy = torch.ones((4, 2), dtype=torch.int64)
+        worker._forward_draft_block = lambda **kwargs: (None, greedy)
+        worker._sync_greedy_drafts = lambda tokens: tokens
+        worker._sample_draft_block = lambda *args: ("sampled", "logits")
+        worker._all_drafts = {4: None}
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
+            live_mask=None,
+            temperatures=torch.ones(4),
+            top_ks=torch.ones(4),
+        )
+        results = {}
+        for sampled in (True, False):
+            worker._sampled_drafts = sampled
+            results[sampled] = worker.draft(None, bucket, None, None)
+        self.assertEqual(results[True].draft_tokens, "sampled")
+        self.assertIs(results[False].draft_tokens, greedy)
+        self.assertIsNone(results[False].draft_logits)
+
+    def test_tpu_opts_experimental_spec_into_dp_attention(self):
+        """Core rejects DFLASH with DP attention unless the platform opts in; every
+        experimental worker serves DP attention, core's DFlash worker does not."""
+        from sglang_tpu.tpu_platform import TpuSRTPlatform
+
+        platform = TpuSRTPlatform()
+        for enabled in (True, False):
+            with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled):
+                for algorithm in ("DFLASH", "DSPARK", "EAGLE3", "NEXTN"):
+                    with self.subTest(algorithm=algorithm, enabled=enabled):
+                        self.assertEqual(
+                            platform.supports_speculative_dp_attention(algorithm),
+                            enabled,
+                        )
+
     def test_pd_seeds_reach_decode_as_host_padded_inputs(self):
         """A PD decode server's prebuilt batch must carry the experimental input
         type (decode prep and filter/merge reject core's), built on host: core's

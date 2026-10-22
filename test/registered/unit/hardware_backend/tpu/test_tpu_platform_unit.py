@@ -517,6 +517,33 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         )
         self._apply(args)
 
+    def test_shared_head_experimental_drafts_need_dp_lm_head_at_attn_tp_1(self):
+        """At attention TP 1 the target head shards over the full TP group, but these
+        drafts share it inside the attention-TP group: they would draft from one shard."""
+        from sglang_tpu.envs import envs as tpu_envs
+
+        for algorithm, enabled, error in (
+            ("DFLASH", True, True),
+            ("NEXTN", True, True),
+            ("EAGLE3", True, False),
+            ("DFLASH", False, False),
+        ):
+            args = self._args(
+                tp_size=8,
+                attn_dp_size=8,
+                enable_dp_lm_head=False,
+                speculative_algorithm=algorithm,
+            )
+            with (
+                self.subTest(algorithm=algorithm, enabled=enabled),
+                tpu_envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(enabled),
+            ):
+                if error:
+                    with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                        self._apply(args)
+                else:
+                    self._apply(args)
+
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)
         platform = TpuSRTPlatform()
