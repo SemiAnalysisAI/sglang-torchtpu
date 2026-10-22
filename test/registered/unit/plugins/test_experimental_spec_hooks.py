@@ -796,7 +796,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
 
     def test_dp_attention_rejects_a_draft_head_sharded_over_full_tp(self):
         """A draft sharing a target head sharded over the full TP group drafts from one
-        shard inside its attention-TP group: acceptance collapses with no error."""
+        shard inside its attention-TP group: acceptance collapses with no error. A
+        head sharded over the draft's own group (built in its scope) is fine."""
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
         from sglang_tpu.experimental.speculative.base_spec_worker import (
             _check_draft_lm_head_group,
@@ -809,16 +810,20 @@ class TestExperimentalSpecHooks(CustomTestCase):
             )
             return lm_head
 
-        with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+        def check(lm_head, attn_tp_size):
             _check_draft_lm_head_group(
-                SimpleNamespace(lm_head=head(use_attn_tp_group=False, tp_size=8))
+                SimpleNamespace(lm_head=lm_head), attn_tp_size=attn_tp_size
             )
-        for lm_head in (
-            head(use_attn_tp_group=True, tp_size=4),
-            head(use_attn_tp_group=False, tp_size=1),
-            None,
-        ):
-            _check_draft_lm_head_group(SimpleNamespace(lm_head=lm_head))
+
+        for attn_tp_size in (1, 4):
+            with self.assertRaisesRegex(ValueError, "--enable-dp-lm-head"):
+                check(head(use_attn_tp_group=False, tp_size=8), attn_tp_size)
+        # Target head under --enable-dp-lm-head; a draft head built in the draft's
+        # scope, where the narrowed group reports use_attn_tp_group False.
+        check(head(use_attn_tp_group=True, tp_size=4), 4)
+        check(head(use_attn_tp_group=False, tp_size=4), 4)
+        check(head(use_attn_tp_group=False, tp_size=1), 1)
+        check(None, 4)
 
     def test_block_dp_attention_drafts_greedy(self):
         """Under DP attention the block draft never samples: peers and idle ranks

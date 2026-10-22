@@ -122,18 +122,19 @@ _SAMPLING_WARMUP_VARIANTS = [{"greedy": True}] + [
 ]
 
 
-def _check_draft_lm_head_group(draft_model: nn.Module) -> None:
-    """Reject a draft head sharded over the full TP group under DP attention.
+def _check_draft_lm_head_group(draft_model: nn.Module, *, attn_tp_size: int) -> None:
+    """Reject a draft head sharded over another group than the draft runs in.
 
-    The draft runs in the attention-TP group, so a shared target head sharded
-    over the full TP group (no --enable-dp-lm-head) would draft from one shard.
+    Under DP attention the draft runs in the attention-TP group. A head built in
+    the draft's scope, or a target head under --enable-dp-lm-head, shards over
+    that group; a shared target head sharded over the full TP group would draft
+    from one shard.
     """
     lm_head = draft_model.lm_head
     if (
         isinstance(lm_head, VocabParallelEmbedding)
         and lm_head.enable_tp
-        and not lm_head.use_attn_tp_group
-        and lm_head.tp_size > 1
+        and lm_head.tp_size != attn_tp_size
     ):
         raise ValueError(
             "Under DP attention the draft shares a target lm_head sharded over the "
@@ -205,7 +206,9 @@ class TpuSpecWorker(BaseSpecWorker):
                 "under DP attention."
             )
         if self._dp_attention:
-            _check_draft_lm_head_group(draft_worker.model_runner.model)
+            _check_draft_lm_head_group(
+                draft_worker.model_runner.model, attn_tp_size=parallel.attn_tp_size
+            )
         self._target_has_linear_attn = (
             mambaish_config(target_worker.model_runner.model_config) is not None
         )
