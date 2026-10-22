@@ -1038,6 +1038,83 @@ class TestDcpReshardHandshake(RaidenDcpTestCase):
                 )
                 self.assertTrue(prefill.is_send_done(self.ROOM))
 
+    def test_closing_plans_wait_for_host_staging(self):
+        """A rank seats a room's closing plan through the staging admission
+        like a pull: a room that does not fit waits (no plan, no READY), is
+        seated on a later poll once an earlier room settles, in arrival
+        order, and a cleared waiter gives up its place in line."""
+        prefills = [self._prefill(0), self._prefill(1)]
+        decodes = [self._decode(0), self._decode(1)]
+        decode = decodes[1]
+        # Each rank's share of a six-page room is three pages: two rooms do
+        # not fit a four-page pool together.
+        for d in decodes:
+            d._pulling = StagingAdmission(4, 256)
+        rooms = {
+            61: (self.PREFILL_PAGES, self.DECODE_PAGES, self.SWA_PAGES),
+            62: ([36, 37, 38, 39, 40, 41], [20, 21, 22, 23, 6, 7], [52, 53]),
+            63: ([42, 43, 44, 45, 46, 47], [24, 25, 26, 27, 8, 9], [54, 55]),
+        }
+
+        ready = {p.endpoint: [] for p in prefills}
+
+        def drain_ready():
+            for p in prefills:
+                frames = self.inboxes[p.endpoint].take_all(MessageTag.RESHARD_READY)
+                ready[p.endpoint] += [ReshardReady.from_frames(f).room for f in frames]
+
+        def ready_rooms(prefill):
+            drain_ready()
+            rooms, ready[prefill.endpoint] = sorted(ready[prefill.endpoint]), []
+            return rooms
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            for room, (prefill_pages, decode_pages, swa_pages) in rooms.items():
+                for d in decodes:
+                    d.register_decode_request(
+                        room, decode_pages, swa_pages, None, self._infos(prefills)
+                    )
+                drain_ready()  # the previous room's READYs precede these asks
+                for p in prefills:
+                    for _ in decodes:
+                        p._on_reshard_req(
+                            self.inboxes[p.endpoint].take(MessageTag.RESHARD_REQ)
+                        )
+                    p.append_send_blocks(room, prefill_pages, swa_block_ids=[90, 91])
+                    p.finalize_send(room, None)
+                for d in decodes:
+                    for _ in prefills:
+                        d._on_reshard_blocks(
+                            self.inboxes[d.endpoint].take(MessageTag.RESHARD_BLOCKS)
+                        )
+            # Room 61 is seated on both ranks (one READY per rank per source);
+            # 62 holds the line and 63 waits behind it.
+            self.assertEqual(ready_rooms(prefills[0]), [61, 61])
+            self.assertEqual(sorted(decode._reshard_plans), [61])
+            self.assertEqual(decode._decode.reshard_waiting, {62, 63})
+            self.assertEqual(decode._pulling.waiting, "62#dcp1")
+            self.assertFalse(decode.maybe_start_pull(63))
+            self.assertEqual(sorted(decode._reshard_plans), [61])
+            # 61 settles on this rank: 63 is still behind 62, which the next
+            # poll seats and tells the sources about.
+            decode._engine._stats = ([], ["61#dcp1"], [])
+            decode._swa_engine._stats = ([], ["swa:61"], [])
+            decode._drain_engine()
+            self.assertNotIn("61#dcp1", decode._pulling)
+            decode.maybe_start_pull(63)
+            self.assertEqual(sorted(decode._reshard_plans), [61])
+            decode.maybe_start_pull(62)
+            self.assertEqual(sorted(decode._reshard_plans), [61, 62])
+            self.assertEqual(ready_rooms(prefills[0]), [62])
+            self.assertIn("62#dcp1", decode._pulling)
+            self.assertEqual(decode._decode.reshard_waiting, {63})
+            # 63 now holds the line; clearing it frees the line.
+            decode.maybe_start_pull(63)
+            self.assertEqual(decode._pulling.waiting, "63#dcp1")
+            decode.clear_room(63)
+            self.assertIsNone(decode._pulling.waiting)
+            self.assertEqual(decode._decode.reshard_waiting, set())
+
     def test_prefill_refuses_a_dcp_decode_of_another_attention_tp(self):
         prefill = self._prefill(0)
         decode = self._decode(1)

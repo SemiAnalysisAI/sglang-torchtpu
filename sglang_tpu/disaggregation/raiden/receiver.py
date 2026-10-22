@@ -273,19 +273,20 @@ class RaidenReceiverMixin:
     def _paired_swa_read(self, key: str) -> Optional[str]:
         """The sliding-window read issued alongside the read ``key``, if any.
 
-        A whole-room read and the closing read of a chunked transfer carry the
-        sliding-window pages on the second engine; earlier chunks do not.
+        A whole-room read, the closing read of a chunked transfer and a
+        decode-context-parallel rank's closing push carry the sliding-window
+        pages on the second engine; earlier chunks do not.
         """
-        if self._swa_engine is None or "#" in key:
+        if self._swa_engine is None or ("#" in key and "#dcp" not in key):
             return None
-        return self._swa_req_id(int(key))
+        return self._swa_req_id(self._room_of(key))
 
     def _paired_state_read(self, key: str) -> Optional[str]:
         """The GDN state read issued alongside the read key, if any; it rides
         on the same reads as the sliding-window one."""
-        if self._state_engine is None or "#" in key:
+        if self._state_engine is None or ("#" in key and "#dcp" not in key):
             return None
-        return self._state_req_id(int(key))
+        return self._state_req_id(self._room_of(key))
 
     def _paired_reads(self, key: str) -> List[str]:
         return [
@@ -443,6 +444,12 @@ class RaidenReceiverMixin:
         Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        with self._state_lock:
+            waiting = room in self._decode.reshard_waiting
+        if waiting:
+            # A resharded room whose closing plan found no host staging asks
+            # for its seat again on every poll, in line with the pulls.
+            self._register_receiver_and_signal(room)
         if self._pipeline is not None:
             return self._pipeline.maybe_start_pull(room)
         if self.chunked_transfer:
@@ -1022,9 +1029,8 @@ class RaidenReceiverMixin:
             ):
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
-            self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
-                prefill_swa_blocks
-            )
+            swa_sources = self._decode.reshard_swa_sources.setdefault(room, {})
+            swa_sources[src_rank] = prefill_swa_blocks
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}
@@ -1251,24 +1257,99 @@ class RaidenReceiverMixin:
         return True
 
     def _register_receiver_and_signal(self, room: int) -> None:
+        from sglang_tpu.disaggregation.raiden.reshard_schedule import dcp_page_split
+
+        with self._state_lock:
+            if room in self._decode.reshard_registered:
+                return
+            meta = self._decode.reshard_meta.get(room)
+            if meta is None:
+                return  # cleared before its plan was placed
+            local_blocks = list(meta["local_blocks"])
+            local_swa_blocks = list(meta.get("local_swa_blocks") or [])
+            dcp_size, dcp_rank = meta["dcp_size"], meta["dcp_rank"]
+            closing_id = self._reshard_closing_id(room, dcp_size, dcp_rank)
+            admission = self._pulling
+            if admission is not None:
+                # The closing plan stages this rank's share of the pages, and
+                # the window, on the host like a pull does, so it takes its
+                # seat through the same admission under the id the engine
+                # settles it by: a room that does not fit waits its turn and
+                # asks again on every poll instead of failing to register.
+                n_full = len(dcp_page_split(local_blocks, dcp_size, dcp_rank)[1])
+                cost = self._staging_cost(n_full, self._full_engine_max_blocks)
+                swa_cost = 0
+                if self._swa_engine is not None and local_swa_blocks:
+                    swa_cost = self._staging_cost(
+                        len(local_swa_blocks), self._swa_engine_max_blocks
+                    )
+                if cost > admission.capacity or (
+                    swa_cost > 0
+                    and (
+                        admission.swa_capacity is None
+                        or swa_cost > admission.swa_capacity
+                    )
+                ):
+                    reason = (
+                        f"Raiden reshard receive failed: room {room} needs "
+                        f"{n_full} pages and {len(local_swa_blocks)} window pages "
+                        "of host staging, more than this rank's pools seat "
+                        f"({admission.capacity} and {admission.swa_capacity}). "
+                        "Raise SGLANG_RAIDEN_MAX_BLOCKS or "
+                        "SGLANG_RAIDEN_SWA_MAX_BLOCKS if this request size is "
+                        "expected."
+                    )
+                    self._fail_room_locked(room, reason)
+                    logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                    return
+                if not admission.admit(closing_id, cost, swa_cost):
+                    self._decode.reshard_waiting.add(room)
+                    return
+                self._decode.reshard_waiting.discard(room)
+            self._decode.reshard_registered.add(room)
+            src_attn_tp = meta["src_attn_tp"]
+            ready_endpoints = list(meta["ready_endpoints"])
+            sources_map = dict(self._decode.reshard_sources[room])
+            swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
+        if not self._place_reshard_plan(
+            room,
+            meta,
+            closing_id,
+            local_blocks,
+            local_swa_blocks,
+            src_attn_tp,
+            ready_endpoints,
+            sources_map,
+            swa_sources_map,
+        ):
+            # No plan of the room holds staging (nothing left to receive, or
+            # the registration failed): hand the seat back now. A registered
+            # plan's completion releases it.
+            with self._state_lock:
+                if admission is not None:
+                    admission.release(closing_id)
+                self._pulling_cleared.discard(closing_id)
+
+    def _place_reshard_plan(
+        self,
+        room: int,
+        meta: dict,
+        closing_id: str,
+        local_blocks: List[int],
+        local_swa_blocks: List[int],
+        src_attn_tp: int,
+        ready_endpoints: List[str],
+        sources_map: Dict[int, List[int]],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> bool:
+        """Registers the room's window and closing receive plans and sends the
+        READY; True when a registered plan now holds host staging."""
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang_tpu.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
             dcp_page_split,
         )
-
-        with self._state_lock:
-            if room in self._decode.reshard_registered:
-                return
-            self._decode.reshard_registered.add(room)
-            meta = self._decode.reshard_meta[room]
-            local_blocks = list(meta["local_blocks"])
-            local_swa_blocks = list(meta.get("local_swa_blocks") or [])
-            src_attn_tp = meta["src_attn_tp"]
-            ready_endpoints = list(meta["ready_endpoints"])
-            sources_map = dict(self._decode.reshard_sources[room])
-            swa_sources_map = dict(self._decode.reshard_swa_sources.get(room, {}))
 
         # Arm the sliding-window receive before the READY goes out: the READY is
         # what tells every source to push, and its closing push carries the SWA
@@ -1277,11 +1358,10 @@ class RaidenReceiverMixin:
         if not self._register_reshard_swa_receiver(
             room, meta, local_swa_blocks, swa_sources_map
         ):
-            return
+            return False
 
         geom = self._make_geometry(src_attn_tp, meta["dst_attn_tp"])
         dcp_size, dcp_rank = meta["dcp_size"], meta["dcp_rank"]
-        closing_id = self._reshard_closing_id(room, dcp_size, dcp_rank)
         uuid = meta["uuid"]
         n = len(local_blocks)
         if self.chunked_transfer:
@@ -1302,7 +1382,7 @@ class RaidenReceiverMixin:
             missing = [missing[i] for i in owned]
             with self._state_lock:
                 if room not in self._decode.reshard_meta:
-                    return  # cleared while the complement was computed
+                    return False  # cleared while the complement was computed
                 # The closing read is owed from the moment the room can look
                 # complete: it is recorded before _final_seen so completion
                 # can never be inferred while its registration is pending.
@@ -1315,7 +1395,7 @@ class RaidenReceiverMixin:
                         room=room, dcp_rank=dcp_rank, uuid=uuid
                     ).to_frames()
                     self._send_multipart_locked(endpoint, payload)
-                return
+                return False
             sources = [
                 (p_rank, [sources_map[p_rank][pg] for pg in missing])
                 for p_rank in sorted(sources_map)
@@ -1367,7 +1447,7 @@ class RaidenReceiverMixin:
             dcp_rank=dcp_rank,
             uuid=uuid,
         ).to_frames()
-        self._publish_reshard_plan(
+        return self._publish_reshard_plan(
             room,
             closing_id,
             uuid,

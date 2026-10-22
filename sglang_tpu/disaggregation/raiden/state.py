@@ -119,3 +119,5 @@ class DecodeState:
     reshard_swa_sources: Dict[int, Dict[int, List[int]]] = field(default_factory=dict)
     reshard_meta: Dict[int, dict] = field(default_factory=dict)
     reshard_registered: Set[int] = field(default_factory=set)
+    # Rooms whose closing plan found no host staging; they ask again on poll.
+    reshard_waiting: Set[int] = field(default_factory=set)

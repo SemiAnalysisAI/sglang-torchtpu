@@ -1374,6 +1374,7 @@ class RaidenKVManager(
                 for table in (
                     self._decode.final_seen,
                     self._decode.reshard_registered,
+                    self._decode.reshard_waiting,
                 ):
                     table.discard(room)
             if clear_failure_record:
