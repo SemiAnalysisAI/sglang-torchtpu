@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -544,6 +545,39 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
                 )
+
+    def test_seq_along_lane_softmax_variants(self):
+        """exp2 softmax and ones-in-V row sums match the reference on the fp8
+        SEQ_ALONG_LANE prefill path they are meant for, with and without a window."""
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        variants = (
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_EXP2_SOFTMAX": "1", "SGLANG_TPU_RPA_ONES_V": "1"},
+            {"SGLANG_TPU_RPA_ONES_V": "1", "SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK": "1"},
+        )
+        for env in variants:
+            for sliding_window in (None, 128):
+                with (
+                    self.subTest(env=env, sliding_window=sliding_window),
+                    unittest.mock.patch.dict(os.environ, env),
+                ):
+                    # The wrapper reads the flags while tracing; drop cached traces.
+                    jax.clear_caches()
+                    self.assertTrue(all(getattr(tpu_envs, name).get() for name in env))
+                    self._check(
+                        seqs=self.EXTEND_SEQS,
+                        padded_tokens=self.EXTEND_TOKENS,
+                        kv_dtype_name="float8_e4m3fn",
+                        k_scale=1.0,
+                        v_scale=1.0,
+                        sliding_window=sliding_window,
+                        seq_along_lane=True,
+                    )
+        jax.clear_caches()
 
 
 if __name__ == "__main__":

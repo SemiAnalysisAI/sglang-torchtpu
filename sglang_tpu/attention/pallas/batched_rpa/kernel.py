@@ -171,6 +171,11 @@ def calculate_and_store_out(
             )
         if cfgs.model.has_attention_sink:
             batch_l = add_attention_sink(batch_l, batch_m, sink_ref)
+        if cfgs.serve.ones_v:
+            # l rode along in the accumulator lanes above the head.
+            h = cfgs.aligned_kv_head_dim
+            batch_l = batch_acc[..., h : 2 * h]
+            batch_acc = batch_acc[..., :h]
         if cfgs.serve.cache_only:
             # A row that attended no key keeps l == 0 and outputs 0.
             batch_l = jnp.where(batch_l == 0, jnp.ones_like(batch_l), batch_l)
@@ -381,6 +386,16 @@ def rpa_body(
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
+    if cfgs.serve.ones_v:
+        # [B, KV, H, S] -> [B, KV, lanes, S]: the PV matmul then returns
+        # sum(p) in the lanes above the head, for free on an MXU that pads H.
+        assert cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        ones_rows = cfgs.acc_width - v.shape[-2]
+        assert ones_rows > 0, v.shape
+        v = jnp.concatenate(
+            [v, jnp.ones((*v.shape[:-2], ones_rows, v.shape[-1]), v.dtype)],
+            axis=-2,
+        )
 
     # Step 3: Perform compute, then step 4: write back outputs.
     fast_tiles = (
@@ -389,11 +404,12 @@ def rpa_body(
         and kv_len_left is None
         and global_q_k_gap is None
     )
+    # exp2 folds sm_scale * log2e into q, which is not a power of two: bf16 q rounds.
     fold_sm_scale = (
         fast_tiles
         and cfgs.serve.scale_q is None
         and math.frexp(cfgs.model.sm_scale)[0] == 0.5
-    )
+    ) or (cfgs.serve.exp2_softmax and cfgs.serve.scale_q is None)
 
     def compute_and_store(apply_mask: bool):
         m_val = m_scratch_ref[...]
@@ -430,7 +446,8 @@ def rpa_body(
                 )
             )
             m_scratch_ref[:, q_slice] = m_next
-            l_scratch_ref[:, q_slice] = l_next[-1]
+            if not cfgs.serve.ones_v:
+                l_scratch_ref[:, q_slice] = l_next[-1]
             l_new_list.append(l_next)
             m_new_list.append(m_lanes)
 

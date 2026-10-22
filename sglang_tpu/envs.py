@@ -146,6 +146,15 @@ class TpuEnvs:
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Batched RPA prefill softmax (the per-score vector chain, not the MXU, sets the
+    # time): exp2 with log2e folded into the q scale, one VALU op per score fewer.
+    # Off with an attention sink or an LSE output, which would see base-2 m and l;
+    # the folded scale rounds q in bf16, so the output is not bit-identical.
+    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
+    # Row sums from the PV matmul: V tiles get ones rows in the lanes head_dim 64
+    # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
+    # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
+    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

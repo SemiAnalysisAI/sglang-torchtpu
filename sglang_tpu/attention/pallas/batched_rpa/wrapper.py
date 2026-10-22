@@ -703,6 +703,20 @@ def ragged_paged_attention(
         return_lse=return_lse,
         cp_group_size=cp_group_size,
         skip_full_tile_mask=tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK.get(),
+        # Base-2 m and l would reach the soft cap, the sink term and the LSE.
+        exp2_softmax=(
+            tpu_envs.SGLANG_TPU_RPA_EXP2_SOFTMAX.get()
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+        ),
+        ones_v=(
+            tpu_envs.SGLANG_TPU_RPA_ONES_V.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and attention_sink is None
+            and not return_lse
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
