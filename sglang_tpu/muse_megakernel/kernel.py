@@ -171,6 +171,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
+    # attention multiplies the bf16 queries by attn_scale once instead of every score; exact
+    # because ops only sets it for a power-of-two scale
+    fold_attn_scale: bool = False
     vmem_limit_bytes: int = 60 * 2**20
 
     @property
@@ -228,7 +231,12 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     def kv_block(self):
         # one page block (SEQ_ALONG_LANE) or one token's row (fused) of a layer's pool
         if self.kv_sal:
-            return (2 * self.kv_heads, self.head_dim // self.sal_pack, self.sal_pack, self.page_size)
+            return (
+                2 * self.kv_heads,
+                self.head_dim // self.sal_pack,
+                self.sal_pack,
+                self.page_size,
+            )
         return (self.pool_kv_heads, 2, self.pool_padded_head_dim)
 
     @property
@@ -804,7 +812,9 @@ class _Coll:
 
         @pl.when(my_live)
         def _():
-            pad[self.me] = send_ref[pl.ds(pl.multiple_of(self.me * rows_per, rows_per), rows_per)]
+            pad[self.me] = send_ref[
+                pl.ds(pl.multiple_of(self.me * rows_per, rows_per), rows_per)
+            ]
 
         for r in range(self.tp * rows_per):
             owner, cp = self.row_copy(kind, send_ref, r, rows_per)
@@ -1159,7 +1169,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             vb = vv.astype(c.kv_dtype).astype(jnp.bfloat16)
             # ---- this step's K/V rows go out to newkv (scattered into the pools by kv_write_call);
             # attention reads them from VMEM, the cache only for positions before them.
-            if c.kv_sal:  # [slot * words + word, row]: an identity matmul transposes exactly
+            if (
+                c.kv_sal
+            ):  # [slot * words + word, row]: an identity matmul transposes exactly
                 eye = (
                     jax.lax.broadcasted_iota(jnp.int32, (hd, hd), 0)
                     == jax.lax.broadcasted_iota(jnp.int32, (hd, hd), 1)
@@ -1377,6 +1389,8 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 ],
                 axis=0,
             ).astype(jnp.bfloat16)  # [hkv*qg, hd or pd]
+            if c.fold_attn_scale:
+                q2 = q2 * jnp.asarray(c.attn_scale, jnp.bfloat16)
             rowpos = jnp.concatenate(
                 [jnp.broadcast_to(pos_ref[r0 + t], (g, 1)) for t in range(q)] * hkv,
                 axis=0,
@@ -1438,12 +1452,19 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             x = pltpu.bitcast(w, c.kv_dtype).astype(jnp.bfloat16)
                             kts.append(
                                 jnp.concatenate(
-                                    [x[2 * h * hd : (2 * h + 1) * hd] for h in range(hkv)], axis=0
+                                    [
+                                        x[2 * h * hd : (2 * h + 1) * hd]
+                                        for h in range(hkv)
+                                    ],
+                                    axis=0,
                                 )
                             )
                             vts.append(
                                 jnp.concatenate(
-                                    [x[(2 * h + 1) * hd : (2 * h + 2) * hd] for h in range(hkv)],
+                                    [
+                                        x[(2 * h + 1) * hd : (2 * h + 2) * hd]
+                                        for h in range(hkv)
+                                    ],
                                     axis=0,
                                 )
                             )
@@ -1456,7 +1477,9 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             .bitcast(jnp.uint32)
                             .reshape(cpt * ph, pd)[...]
                         )  # rows (token, h)
-                        kk = pltpu.bitcast((u & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
+                        kk = pltpu.bitcast(
+                            (u & 0xFFFF).astype(jnp.uint16), jnp.bfloat16
+                        )
                         vk = pltpu.bitcast((u >> 16).astype(jnp.uint16), jnp.bfloat16)
                 live = None if c.packed_attn else colhead == rowhead
                 if not clean:
@@ -1471,15 +1494,14 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                             pos_live = pos_live & in_win
                     live = pos_live if live is None else live & pos_live
                 with _scope("qk"):
-                    s_ = (
-                        jax.lax.dot_general(
-                            q2,
-                            kk if c.kv_sal else kk[:, :kdim],
-                            (((1,), (0 if c.kv_sal else 1,)), ((), ())),
-                            preferred_element_type=jnp.float32,
-                        )
-                        * c.attn_scale
+                    s_ = jax.lax.dot_general(
+                        q2,
+                        kk if c.kv_sal else kk[:, :kdim],
+                        (((1,), (0 if c.kv_sal else 1,)), ((), ())),
+                        preferred_element_type=jnp.float32,
                     )
+                    if not c.fold_attn_scale:
+                        s_ = s_ * c.attn_scale
                 return (s_ if live is None else jnp.where(live, s_, NEG)), vk
 
             def body_two_stream(k, carry2, clean=False):
@@ -1662,12 +1684,11 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
             in_win = _in_window(is_global, rowpos - newpos < c.window)
             if in_win is not None:
                 live_new = live_new & in_win
-            s_ = (
-                jax.lax.dot_general(
-                    q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-                )
-                * c.attn_scale
+            s_ = jax.lax.dot_general(
+                q2, kn, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )
+            if not c.fold_attn_scale:
+                s_ = s_ * c.attn_scale
             _, lsum, acc = online(carry, jnp.where(live_new, s_, NEG), vn)
             res = acc / jnp.maximum(lsum, 1e-30)  # [hkv*qg, hd or pd]
             lanes = (
@@ -2238,7 +2259,9 @@ def megakernel_call(cfg: MKConfig, axis: str = "model"):
         out_shape = [
             jax.ShapeDtypeStruct((cfg.rows, cfg.hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((cfg.rows, aux_w), jnp.bfloat16),
-            jax.ShapeDtypeStruct(newkv_shape(cfg), jnp.uint32 if cfg.kv_sal else jnp.bfloat16),
+            jax.ShapeDtypeStruct(
+                newkv_shape(cfg), jnp.uint32 if cfg.kv_sal else jnp.bfloat16
+            ),
         ]
         # The pools are read-only here. With any remote DMA in the kernel XLA treats the call
         # as a collective and copies every aliased operand: the in-place write is kv_write_call.
@@ -2298,7 +2321,9 @@ def _kv_write_sal_call(cfg: MKConfig):
                                 j * cfg.pages_per_seq + pg_no, cfg.n_pages_entries - 1
                             )
                             page = tab[ent]
-                            rd = pltpu.make_async_copy(kv_out[l].at[page], blk, sems.at[0])
+                            rd = pltpu.make_async_copy(
+                                kv_out[l].at[page], blk, sems.at[0]
+                            )
                             rd.start()
                             rd.wait()
                             words = blk.bitcast(jnp.uint32).reshape(nw, ps)
@@ -2307,10 +2332,14 @@ def _kv_write_sal_call(cfg: MKConfig):
                             for t in range(q):
                                 r = j * q + t
                                 p = pos_ref[r]
-                                hit = (lane == p % ps) & (p // ps == pg_no) & (r < n_live)
+                                hit = (
+                                    (lane == p % ps) & (p // ps == pg_no) & (r < n_live)
+                                )
                                 w = jnp.where(hit, nv[:, r : r + 1], w)
                             words[...] = w
-                            wr = pltpu.make_async_copy(blk, kv_out[l].at[page], sems.at[1])
+                            wr = pltpu.make_async_copy(
+                                blk, kv_out[l].at[page], sems.at[1]
+                            )
                             wr.start()
                             wr.wait()
 

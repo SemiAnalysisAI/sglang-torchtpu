@@ -13,6 +13,7 @@ place).
 """
 
 import logging
+import math
 
 import jax
 import msgspec
@@ -368,6 +369,8 @@ class MuseMegakernel(torch.nn.Module):
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound
             y_early=tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16,
+            fold_attn_scale=tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get()
+            and math.frexp(g.attn_scale)[0] == 0.5,
         )
         # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
         # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
