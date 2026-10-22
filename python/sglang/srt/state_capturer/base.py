@@ -119,6 +119,11 @@ class TopkCaptureOutput:
 
 
 class BaseTopkCapturer:
+    # Set by a platform before a forward that must not capture. That forward
+    # writes nothing, reports its rows as -1 (unknown), and clears the flag.
+    # A class default so instances built without __init__ (tests) have it too.
+    skip_capture: bool = False
+
     def __init__(
         self,
         num_tokens: int,
@@ -146,9 +151,6 @@ class BaseTopkCapturer:
             device,
             name=name,
         )
-        # Set by a platform before a forward that must not capture. That forward
-        # writes nothing, reports its rows as -1 (unknown), and clears the flag.
-        self.skip_capture = False
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         if self.skip_capture:
