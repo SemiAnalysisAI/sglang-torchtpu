@@ -2,7 +2,7 @@
 
 Every algorithm is written as draft -> verify -> commit over static, bucketed
 shapes. Enable it with `SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`. It requires
-overlap scheduling. For an example launch config, see
+overlap scheduling (except on a P/D prefill). For an example launch config, see
 `benchmark/tpu/recipe/configs/qwen3_8_27b/mtp_gate.py`.
 
 Two rules:
@@ -116,7 +116,8 @@ policy mixin, and routes all three.
 
 ## Not supported
 
-Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP and mixed prefill/decode DP steps. Neither family supports DP
+Draft trees (MTP and EAGLE3 need `--speculative-eagle-topk 1`), PP outside a P/D
+prefill and mixed prefill/decode DP steps. Neither family supports DP
 attention, and the chain family (MTP) does not support a draft sliding window.
 Each raises at startup.
 
@@ -131,6 +132,11 @@ Both raiden roles serve every algorithm with the same spec flags.
 - Hybrid GDN targets: raiden moves each request's committed GDN state row on a
   third engine next to the KV, and the decode seed resets the slot's
   checkpoint read offset.
+- PP prefill: only the last stage hosts the draft (`TpuSpecWorker`); earlier
+  stages run `TpuPipelineStageWorker`, which only forwards the target. The
+  stages relay the EAGLE3 / DFlash aux captures to the last one (`../../pp_wave.py`),
+  and PP runs without overlap, which a prefill-only server allows.
+  `test_tpu_gpt_oss_120b_pd_singlehost_pp_spec_perf.py` runs PP8 EAGLE3 and DFlash.
 - KV free fence: commit writes draft KV after the accept outputs the result
   copies, so commit and extend return an output of their last KV write as
   `kv_fence_tail` (MTP's draft hidden, EAGLE3's seed token, the block KV
