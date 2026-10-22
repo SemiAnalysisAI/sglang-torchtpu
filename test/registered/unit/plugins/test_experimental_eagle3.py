@@ -81,7 +81,15 @@ def _unfiltered(rows: int) -> dict[str, torch.Tensor]:
 
 class TestExperimentalEagle3(CustomTestCase):
     def test_flag_routes_eagle3_and_leaves_other_algorithms_alone(self):
-        with envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True):
+        with (
+            envs.SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER.override(True),
+            patch(
+                "sglang_tpu.hooks.spec_worker.get_parallel",
+                return_value=SimpleNamespace(
+                    pp_group=SimpleNamespace(is_last_rank=True)
+                ),
+            ),
+        ):
             self.assertIs(
                 select_experimental_spec_worker(
                     None, SpeculativeAlgorithm.EAGLE3, None

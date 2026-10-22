@@ -1442,12 +1442,11 @@ class SchedulerPPMixin:
                 dsa_topk_indices=draft_state.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
-            )
+        elif batch.spec_algorithm.is_dflash_family():
+            # DFlash (PP prefill on TPU) seeds only the bonus token, like DSpark.
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
-            next_draft_input = make_next_draft_input(
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )

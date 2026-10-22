@@ -29,6 +29,7 @@ from sglang_tpu.hooks.glm_flash_megakernel import (
     drop_freed_glm_flash_megakernel_request,
     route_glm_flash_megakernel,
 )
+from sglang_tpu.hooks.hicache_swa_metrics import hook_specs as hicache_swa_metrics_hooks
 from sglang_tpu.hooks.host_padding import hook_specs as host_padding_hooks
 from sglang_tpu.hooks.k3_megakernel import (
     attach_k3_megakernel,
@@ -61,6 +62,7 @@ from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.static_fp8 import bind_kimi_k3_static_fp8
+from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
@@ -250,6 +252,10 @@ HOOKS: list[tuple] = [
 ]
 
 HOOKS.extend(host_padding_hooks())
+
+HOOKS.extend(hicache_swa_metrics_hooks())
+
+HOOKS.extend(swa_miss_metrics_hooks())
 
 HOOKS.extend(hook_specs())
 

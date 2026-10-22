@@ -43,8 +43,6 @@ on:
           - feature-validation
           - perf
           - mh
-          - pd-mh-qwen3-480b-kvoff-reshard
-          - pd-mh-qwen3-vl-8b-spec
           - pd-sh-kimi-k3-tiny
           - pd-sh-kimi-k3-tiny-reshard
           - pd-sh-kimi-k3-tiny-retract
