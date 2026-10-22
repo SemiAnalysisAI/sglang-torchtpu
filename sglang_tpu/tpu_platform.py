@@ -1050,11 +1050,13 @@ class TpuSRTPlatform(SRTPlatform):
             hybrid_kda_config,
         )
 
-        # Both backends hand the shared fused kernel the snapshot plan
-        # (track_indices / track_end), which writes reusable checkpoints.
-        return (
-            hybrid_gdn_config(model_config) is not None
-            or hybrid_kda_config(model_config) is not None
+        # Both backends hand the fused kernel the snapshot plan (track_indices /
+        # track_end). Of the KDA hybrids only Kimi-K3 is validated; its text-only
+        # entry is not in _MAMBA_RADIX_CACHE_ARCHS, so nothing would validate it.
+        return hybrid_gdn_config(model_config) is not None or (
+            hybrid_kda_config(model_config) is not None
+            and model_config.hf_config.architectures[0]
+            == "KimiK3ForConditionalGeneration"
         )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
@@ -1080,6 +1082,16 @@ class TpuSRTPlatform(SRTPlatform):
                     "Use device-resident, uncompressed Mamba states."
                 )
         if hf_config is not None:
+            from sglang.srt.configs.model_config import uses_kda_attention
+
+            # Prefix hits on the checkpoints a KDA speculative verify writes
+            # have not been validated.
+            if uses_kda_attention(hf_config) and view.speculative_algorithm is not None:
+                raise ValueError(
+                    "TPU KDA prefix caching does not support speculative decoding "
+                    f"(--speculative-algorithm {view.speculative_algorithm}). "
+                    "Use --disable-radix-cache or remove --speculative-algorithm."
+                )
             text_config = getattr(hf_config, "text_config", hf_config)
             assert getattr(text_config, "mamba_chunk_size", 64) == 64, (
                 "TPU GDN prefix caching requires mamba_chunk_size=64."
