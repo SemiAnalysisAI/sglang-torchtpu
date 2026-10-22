@@ -426,7 +426,7 @@ class TestCpEmbeddingAndLogits(CustomTestCase):
 
     def test_full_capture_returns_every_row_in_global_order(self):
         """FULL capture (a spec target extend) stores the packed aux rows of the
-        whole batch in global order; the processor itself captures nothing."""
+        whole batch in global order, not the processor's reduced rows."""
         original = MagicMock(return_value=SimpleNamespace(hidden_states=None))
         processor = SimpleNamespace(forward=original, compute_input_logprobs=False)
         wrapper = install_cp_logits_forward(processor)
@@ -464,7 +464,6 @@ class TestCpEmbeddingAndLogits(CustomTestCase):
         ):
             out = wrapper("ids", hidden, "head", SimpleNamespace(), aux)
         args = original.call_args.args
-        self.assertEqual(args[3].capture_hidden_mode, CaptureHiddenMode.NULL)
         self.assertEqual(args[4:], (None, None))
         packed_rows = [[5.0, 7.0], [6.0, 8.0], [10.0, 10.0], [11.0, 11.0]]
         expected = [packed_rows[i] for i in (2, 0, 3, 1)]

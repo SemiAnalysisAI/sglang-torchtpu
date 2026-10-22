@@ -24,7 +24,7 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.logits_processor import LogitsMetadata
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.cp_layout import (
@@ -398,14 +398,13 @@ class TpuCpLogitsForward:
                 hidden_states_before_norm,
             )
         # FULL capture (a spec draft reads every prompt row): gather the rows the
-        # processor would store, in global token order, and skip its own capture.
+        # processor would store, in global token order, over its reduced-row capture.
         if hidden_states_before_norm is not None:
             captured = hidden_states_before_norm
         elif aux_hidden_states is not None:
             captured = pack_aux_hidden_states(aux_hidden_states)
         else:
             captured = hidden_states
-        metadata.capture_hidden_mode = CaptureHiddenMode.NULL
         output = self._forward(input_ids, rows, lm_head, metadata, None, None)
         output.hidden_states = cp_global_token_rows(
             captured, global_rows=attn_metadata.cp_global_rows, group=group
