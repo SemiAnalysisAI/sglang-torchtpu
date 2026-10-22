@@ -95,6 +95,9 @@ class TpuEnvs:
     # Megakernel MoE: send each row's expert outputs to their reduce-scatter owner as
     # soon as the row's last expert is done (MKConfig.y_early).
     SGLANG_TPU_MK_Y_EARLY = EnvBool(False)
+    # Profiling only: name megakernel regions in xprof; needs libtpu's
+    # --xla_enable_custom_call_region_trace=true and slows fine-grained regions.
+    SGLANG_TPU_MK_TRACE_REGIONS = EnvBool(False)
     # Raiden HiCache transfers move each run of pages that is consecutive on both the
     # device and the host as one segment instead of one segment per page.
     SGLANG_TPU_RAIDEN_COALESCE_PAGES = EnvBool(False)

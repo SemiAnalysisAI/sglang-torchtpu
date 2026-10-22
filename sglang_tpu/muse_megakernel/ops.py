@@ -29,6 +29,9 @@ from sglang_tpu.kv_pool import (
 )
 from sglang_tpu.muse_megakernel import kernel as K
 
+# Profiling only: in-kernel region names for xprof (kernel.py's _TRACE).
+K._TRACE = tpu_envs.SGLANG_TPU_MK_TRACE_REGIONS.get()
+
 logger = logging.getLogger(__name__)
 
 _OP_NS = "sglang_tpu_pallas"
