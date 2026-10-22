@@ -17,6 +17,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_utils import draft_pp_context, draft_tp_context
+from sglang_tpu.cp_strategy import draft_cp_context
 
 
 class TpuDraftWorker(ABC):
@@ -59,6 +60,7 @@ class TpuDraftWorker(ABC):
         with (
             draft_pp_context(),
             draft_tp_context(self._owns_attention),
+            draft_cp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):

@@ -32,7 +32,22 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
         return []
 
     def _precompile_extend(self) -> list[PendingCall]:
-        return []
+        # Prompts under prefill CP run the context-parallel program at FULL capture;
+        # warmed here, before precompile checks the family. Empty without CP.
+        pending = []
+        for num_tokens, bs in self._extend_cp_compile_cases():
+            for spec_info in (None, self.make_null_spec_info()):
+                warmup = self._run_one(
+                    num_tokens=num_tokens,
+                    bs=bs,
+                    mode=ForwardMode.EXTEND,
+                    variant="cp",
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    spec_info=spec_info,
+                )
+                if warmup is not None:
+                    pending.append(warmup)
+        return pending
 
     def make_null_spec_info(self) -> DFlashVerifyInput:
         return make_draft_block_spec_info(
