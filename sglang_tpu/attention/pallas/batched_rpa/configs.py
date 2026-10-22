@@ -93,6 +93,9 @@ class ServingConfigs:
     # q scale; row sums from ones rows appended to V (l rides in the accumulator).
     exp2_softmax: bool = False
     ones_v: bool = False
+    # Prefill tiles with transposed scores and fp8 q (see transposed.py);
+    # env-gated in the wrapper, applied where `use_transposed` holds.
+    transposed: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -385,6 +388,47 @@ class RpaConfigs:
     @property
     def acc_width(self) -> int:
         return pltpu.get_tpu_info().num_lanes
+
+    @property
+    def use_transposed(self) -> bool:
+        # One sequence per tile, compute blocks of whole lane vregs, the head
+        # inside half a vreg so O^T pads to one lane tile at the store.
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        return (
+            self.serve.transposed
+            and self.mode != RpaCase.DECODE
+            and self.batch_size == 1
+            and self.bq_sz > 1
+            and self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and (self.bq_c_sz * self.aligned_num_q_heads_per_kv_head) % num_lanes == 0
+            and self.aligned_kv_head_dim * 2 <= num_lanes
+        )
+
+    @property
+    def mt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
+            1,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def acct_scratch_shape(self):
+        # O^T rows, then one bf16 sublane tile of row sums (ones rows in V^T).
+        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        return (
+            self.model.num_kv_heads,
+            self.aligned_kv_head_dim + 2 * num_sublanes,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
+
+    @property
+    def qt_scratch_shape(self):
+        return (
+            self.model.num_kv_heads,
+            self.aligned_kv_head_dim,
+            self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
+        )
 
     @property
     def max_schedule_size_multiplier(self) -> int:

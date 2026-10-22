@@ -717,6 +717,17 @@ def ragged_paged_attention(
             and attention_sink is None
             and not return_lse
         ),
+        transposed=(
+            tpu_envs.SGLANG_TPU_RPA_TRANSPOSED.get()
+            and kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            and head_dim <= 64
+            and q_scale is None
+            and soft_cap is None
+            and attention_sink is None
+            and not return_lse
+            and not cache_only
+            and cp_group_size is None
+        ),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(

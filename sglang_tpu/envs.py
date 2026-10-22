@@ -155,6 +155,10 @@ class TpuEnvs:
     # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
     # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
     SGLANG_TPU_RPA_ONES_V = EnvBool(False)
+    # Prefill attention tiles with transposed scores (keys along sublanes) and
+    # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
+    # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
+    SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
