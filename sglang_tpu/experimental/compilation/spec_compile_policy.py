@@ -49,6 +49,13 @@ class TpuSpecDecodeCompilePolicyMixin(DFlashSpecDecodeCompilePolicyMixin):
                     pending.append(warmup)
         return pending
 
+    def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
+        # A CP extend writes only slots > 0 (padding is slot 0); the spec seed's
+        # one repeated slot would make every row its own write run.
+        if forward_batch.attn_cp_metadata is not None:
+            return
+        super()._seed_dummy_req_to_token(forward_batch)
+
     def make_null_spec_info(self) -> DFlashVerifyInput:
         return make_draft_block_spec_info(
             draft_token_num=self.draft_token_num, device=self.model_runner.device
