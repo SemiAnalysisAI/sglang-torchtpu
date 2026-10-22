@@ -141,6 +141,26 @@ class TestMuseMegakernelConfig(CustomTestCase):
                     self.assertLessEqual(K.scratch_vmem_bytes(cfg), budget)
                     self.assertEqual(cfg.compact_rows, 8)
 
+    def test_raised_row_cap_shapes_fit_the_scratch_budget(self):
+        # SGLANG_TPU_MUSE_MK_MAX_ROWS: 12, 16 and 24 requests of a 4-token DFlash verify block on the
+        # SEQ_ALONG_LANE fp8 pools the AgentX recipe serves.
+        for n_req in (12, 16, 24):
+            with self.subTest(n_req=n_req):
+                cfg = ops.MuseMegakernel.config(
+                    _megakernel(kv_packed=False),
+                    rows=4 * n_req,
+                    q=4,
+                    n_req=n_req,
+                    n_page_entries=n_req * 2048,
+                    page_size=256,
+                    capture=(1, 16, 30, 44, 59),
+                    kv_sal=True,
+                    kv_sal_fp8=True,
+                ).validate()
+                self.assertLessEqual(
+                    K.scratch_vmem_bytes(cfg), ops._SCRATCH_VMEM_BUDGET
+                )
+
     def test_tp16_shapes_keep_a_deep_weight_ring(self):
         # tp16's dense weights split into 26 tiles, whose only ring divisor is 2; the
         # tiling must split tiles until a ring of at least MIN_RING_SLOTS divides them.

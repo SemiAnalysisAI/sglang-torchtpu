@@ -65,8 +65,8 @@ class TpuEnvs:
     # steps, with fp8 dense weight copies and an fp8 weight-only LM head.
     SGLANG_TPU_MUSE_MEGAKERNEL = EnvBool(False)
     # Largest megakernel step in rows (running requests x verify tokens, padded to the
-    # TP size); larger steps run the native decoder. 48 fits at tp8; 64 overflows the
-    # kernel's DMA semaphore memory at compile time.
+    # TP size); larger steps run the native decoder. Steps above 32 rows use the
+    # large-step paths (ops._BASE_STEP_MAX_ROWS).
     SGLANG_TPU_MUSE_MK_MAX_ROWS = EnvInt(32)
     # Megakernel attention over SEQ_ALONG_LANE pools: tokens per KV chunk, a multiple of the page.
     # Larger chunks shorten the per-chunk softmax chain at long context.
@@ -102,6 +102,8 @@ class TpuEnvs:
     # Profiling only: name megakernel regions in xprof; needs libtpu's
     # --xla_enable_custom_call_region_trace=true and slows fine-grained regions.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvBool(False)
+    # Tuning only: declared-scratch budget cut per row past 64 rows (KiB), for the VMEM sweep.
+    SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB = EnvInt(None)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
     SGLANG_TPU_MK_FOLD_ATTN_SCALE = EnvBool(False)

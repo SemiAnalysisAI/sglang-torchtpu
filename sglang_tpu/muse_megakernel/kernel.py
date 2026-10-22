@@ -174,6 +174,13 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # each row's expert outputs leave for their reduce-scatter owner as soon as the row's last
     # expert is done, overlapping y_rs with the rest of the expert loop
     y_early: bool = False
+    # xfull holds the bf16 expert inputs as packed bf16 pairs instead of f32 (exact: the
+    # values are bf16): half its VMEM, for the larger steps.
+    xfull_packed: bool = False
+    # The busy-expert output merge runs one top-k slot at a time and the post-expert combine
+    # one owned row at a time, so their temporaries stay [R, He] / [K, He] instead of growing
+    # with every row of the step (Mosaic places those values in VMEM). Same arithmetic.
+    row_bounded_temps: bool = False
     # attention multiplies the bf16 queries by attn_scale once instead of every score; exact
     # because ops only sets it for a power-of-two scale
     fold_attn_scale: bool = False
@@ -320,25 +327,48 @@ def _rope_roll(x, n_heads, d, cos_x, sin_x):
     return xv * c + jnp.where(even, -1.0, 1.0) * partner * s
 
 
-def _topk_by_rank(scores, k, n_live, rank_ref):
+def _topk_by_rank(scores, k, n_live, rank_ref, score_ref=None):
     """Top-k by rank: ``rank[r, e]`` = number of experts beating ``e`` (higher score, ties to
     the lower id), so pick ``j`` is the expert of rank ``j`` -- the same picks as ``k`` argmax
     rounds, from one ``[E, E]`` comparison per live row instead of a dependent chain. Rows past
     ``n_live`` keep stale ranks."""
     R, E = scores.shape
-    s_t = scores.T  # [E, R]: e' on sublanes
     lower = jax.lax.broadcasted_iota(jnp.int32, (E, E), 0) < jax.lax.broadcasted_iota(
         jnp.int32, (E, E), 1
     )
-    for r in range(R):
+    if score_ref is None:
+        s_t = scores.T  # [E, R]: e' on sublanes
+        for r in range(R):
 
-        @pl.when(r < n_live)
-        def _(r=r):
-            col, row = s_t[:, r : r + 1], scores[r : r + 1, :]
-            beats = (col > row) | ((col == row) & lower)
-            rank_ref[r : r + 1, :] = jnp.sum(
-                beats.astype(jnp.int32), axis=0, keepdims=True
-            )
+            @pl.when(r < n_live)
+            def _(r=r):
+                col, row = s_t[:, r : r + 1], scores[r : r + 1, :]
+                beats = (col > row) | ((col == row) & lower)
+                rank_ref[r : r + 1, :] = jnp.sum(
+                    beats.astype(jnp.int32), axis=0, keepdims=True
+                )
+    else:
+        # The same comparisons over 8-row blocks in a loop: one block's [E, E] temporaries live
+        # at a time instead of one set per unrolled row (they grew VMEM ~0.3 MiB per row).
+        score_ref[...] = scores
+
+        def block(b, carry):
+            r0 = pl.multiple_of(b * 8, 8)
+            rows8 = score_ref[pl.ds(r0, 8), :]  # [8, E]
+            cols8 = rows8.T  # [E, 8]
+            for i in range(8):
+
+                @pl.when(r0 + i < n_live)
+                def _(i=i):
+                    col, row = cols8[:, i : i + 1], rows8[i : i + 1, :]
+                    beats = (col > row) | ((col == row) & lower)
+                    rank_ref[pl.ds(r0 + i, 1), :] = jnp.sum(
+                        beats.astype(jnp.int32), axis=0, keepdims=True
+                    )
+
+            return carry
+
+        jax.lax.fori_loop(0, (n_live + 7) // 8, block, 0)
 
     rank = rank_ref[...]
     idx = jax.lax.broadcasted_iota(jnp.int32, (R, E), 1)
@@ -935,8 +965,20 @@ def scratch_plan(cfg: MKConfig):
         ("ex_pos", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("perm", pltpu.SMEM((R * K + 8,), jnp.int32)),
         ("ex_of", pltpu.SMEM((c.n_experts_padded,), jnp.int32)),
-        ("xfull", pltpu.VMEM((R, He), jnp.float32)),
+        (
+            "xfull",
+            pltpu.VMEM((R, He // 2), jnp.uint32)
+            if c.xfull_packed
+            else pltpu.VMEM((R, He), jnp.float32),
+        ),
         ("rank", pltpu.VMEM((R, c.n_experts_padded), jnp.int32)),
+        # row_bounded_temps: router scores, read 8 rows at a time by the top-k
+        (
+            "topk_s",
+            pltpu.VMEM(
+                (R if c.row_bounded_temps else 8, c.n_experts_padded), jnp.float32
+            ),
+        ),
         ("ids_v", pltpu.VMEM((R, LANE), jnp.int32)),
         ("ids_s", pltpu.SMEM((R, LANE), jnp.int32)),
         ("ids_sem", pltpu.SemaphoreType.DMA((1,))),
@@ -1808,7 +1850,13 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 sc = jax.nn.sigmoid(logits)
                 # padded lanes carry a -1e30 bias, so they are never selected
                 bias = sm[SMALL["expert_bias"] : SMALL["expert_bias"] + 1, :Ep]
-                ids_list, picks = _topk_by_rank(sc + bias, K, n_live, S["rank"])
+                ids_list, picks = _topk_by_rank(
+                    sc + bias,
+                    K,
+                    n_live,
+                    S["rank"],
+                    S["topk_s"] if c.row_bounded_temps else None,
+                )
                 wsel = jnp.concatenate(
                     [
                         jnp.sum(jnp.where(p, sc, 0.0), axis=1, keepdims=True)
@@ -1969,7 +2017,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 # every live (row, slot) gets exactly one expert output, written bf16-packed;
                 # rows past n_live stay zero
                 S["ysend"][...] = jnp.zeros((R, K, He // 2), jnp.uint32)
-                S["xfull"][...] = x_full.astype(jnp.float32)
+                if c.xfull_packed:
+                    S["xfull"][...] = _pack_bf16x2(x_full.astype(jnp.float32))
+                else:
+                    S["xfull"][...] = x_full.astype(jnp.float32)
 
             def ebody(i, carry):
                 slot = i % nslot
@@ -2027,9 +2078,16 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                         y = y * S["gs_s"][1, e]
                     # slot space: row r, slot k gets y[r] where ids[r, k] == e
                     with _scope("ex_accum"):
-                        S["ysend"][...] = jnp.where(
-                            ids3 == e, _pack_bf16x2(y)[:, None, :], S["ysend"][...]
-                        )
+                        if c.row_bounded_temps:
+                            yp = _pack_bf16x2(y)
+                            for k in range(K):
+                                S["ysend"][:, k, :] = jnp.where(
+                                    ids_list[k] == e, yp, S["ysend"][:, k, :]
+                                )
+                        else:
+                            S["ysend"][...] = jnp.where(
+                                ids3 == e, _pack_bf16x2(y)[:, None, :], S["ysend"][...]
+                            )
 
                 def compact_expert(nrows):
                     # one variant per row bucket: the expanded input and the scale work scale
@@ -2038,9 +2096,10 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                     pairs = [
                         S["perm"][off + jnp.minimum(j, cnt - 1)] for j in range(nrows)
                     ]
-                    xc = jnp.concatenate(
-                        [S["xfull"][pl.ds(p // K, 1), :] for p in pairs], axis=0
-                    ).astype(jnp.bfloat16)
+                    xrows = [S["xfull"][pl.ds(p // K, 1), :] for p in pairs]
+                    if c.xfull_packed:
+                        xrows = [_unpack_bf16x2(x) for x in xrows]
+                    xc = jnp.concatenate(xrows, axis=0).astype(jnp.bfloat16)
                     gu = _fp4_blockdiag_dot(
                         xc, W13.at[slot], S["w13s"].at[slot], He, 2 * Il, c.blockdiag_kc
                     )
@@ -2097,30 +2156,64 @@ def build_kernel(cfg: MKConfig, axis: str = "model"):
                 else:
                     pad = coll.reduce_scatter_rows("y", S["ysend"], Rc, n_live)
             with _scope("combine"):
-                ysum = _unpack_bf16x2(pad[0])
-                for d in range(1, c.tp):
-                    ysum = ysum + _unpack_bf16x2(pad[d])  # [Rc, K, He]
-                # rows past n_live received nothing: keep them finite
-                ysum = (
-                    jnp.where(me * Rc < n_live, ysum, 0.0)
-                    .astype(jnp.bfloat16)
-                    .astype(jnp.float32)
-                )
-                pw = sm[SMALL["post_expert_w"] : SMALL["post_expert_w"] + 1, :He]
-                ysc = ysum * pw[None]
-                nrm = jax.lax.rsqrt(
-                    jnp.mean(jnp.square(ysc), axis=-1, keepdims=True) + c.post_eps
-                )
-                ynorm = (ysc * nrm).astype(jnp.bfloat16).astype(jnp.float32)
-                # this device's rows' routing weights
-                r0 = pl.multiple_of(me * Rc, Rc) if c.tp > 1 else 0
-                wk = jnp.concatenate(
-                    [wsel[:, k : k + 1][:, :, None] for k in range(K)], axis=1
-                )  # [R, K, 1]
-                S["wk_s"][...] = jnp.broadcast_to(wk, (R, K, LANE))
-                wmine = S["wk_s"][pl.ds(r0, Rc), :, 0:1]  # [Rc, K, 1]
-                u = jnp.sum(ynorm * wmine, axis=1)  # [Rc, He]
-                S["u_send"][...] = _pack_bf16x2(u)
+                if c.row_bounded_temps:
+                    # one owned row at a time: the same per-(row, slot) norm and weighted sum
+                    pw = sm[SMALL["post_expert_w"] : SMALL["post_expert_w"] + 1, :He]
+                    r0 = pl.multiple_of(me * Rc, Rc) if c.tp > 1 else 0
+                    wk = jnp.concatenate(
+                        [wsel[:, k : k + 1][:, :, None] for k in range(K)], axis=1
+                    )  # [R, K, 1]
+                    S["wk_s"][...] = jnp.broadcast_to(wk, (R, K, LANE))
+                    mine_live = me * Rc < n_live
+
+                    def combine_row(r, carry):
+                        ysum = _unpack_bf16x2(pad[0, pl.ds(r, 1)])
+                        for d in range(1, c.tp):
+                            ysum = ysum + _unpack_bf16x2(
+                                pad[d, pl.ds(r, 1)]
+                            )  # [1, K, He]
+                        ysum = (
+                            jnp.where(mine_live, ysum, 0.0)
+                            .astype(jnp.bfloat16)
+                            .astype(jnp.float32)
+                        )
+                        ysc = ysum * pw[None]
+                        nrm = jax.lax.rsqrt(
+                            jnp.mean(jnp.square(ysc), axis=-1, keepdims=True)
+                            + c.post_eps
+                        )
+                        ynorm = (ysc * nrm).astype(jnp.bfloat16).astype(jnp.float32)
+                        wrow = S["wk_s"][pl.ds(r0 + r, 1), :, 0:1]  # [1, K, 1]
+                        u = jnp.sum(ynorm * wrow, axis=1)  # [1, He]
+                        S["u_send"][pl.ds(r, 1), :] = _pack_bf16x2(u)
+                        return carry
+
+                    jax.lax.fori_loop(0, Rc, combine_row, 0)
+                else:
+                    ysum = _unpack_bf16x2(pad[0])
+                    for d in range(1, c.tp):
+                        ysum = ysum + _unpack_bf16x2(pad[d])  # [Rc, K, He]
+                    # rows past n_live received nothing: keep them finite
+                    ysum = (
+                        jnp.where(me * Rc < n_live, ysum, 0.0)
+                        .astype(jnp.bfloat16)
+                        .astype(jnp.float32)
+                    )
+                    pw = sm[SMALL["post_expert_w"] : SMALL["post_expert_w"] + 1, :He]
+                    ysc = ysum * pw[None]
+                    nrm = jax.lax.rsqrt(
+                        jnp.mean(jnp.square(ysc), axis=-1, keepdims=True) + c.post_eps
+                    )
+                    ynorm = (ysc * nrm).astype(jnp.bfloat16).astype(jnp.float32)
+                    # this device's rows' routing weights
+                    r0 = pl.multiple_of(me * Rc, Rc) if c.tp > 1 else 0
+                    wk = jnp.concatenate(
+                        [wsel[:, k : k + 1][:, :, None] for k in range(K)], axis=1
+                    )  # [R, K, 1]
+                    S["wk_s"][...] = jnp.broadcast_to(wk, (R, K, LANE))
+                    wmine = S["wk_s"][pl.ds(r0, Rc), :, 0:1]  # [Rc, K, 1]
+                    u = jnp.sum(ynorm * wmine, axis=1)  # [Rc, He]
+                    S["u_send"][...] = _pack_bf16x2(u)
             with _scope("u_ag"):
                 padu = coll.all_gather(
                     "u", S["u_send"], me, live=lambda m: m * Rc < n_live

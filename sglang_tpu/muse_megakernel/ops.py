@@ -319,6 +319,7 @@ class MuseMegakernel(torch.nn.Module):
         )
         if swa_chunk_pages >= sal_chunk_pages:
             swa_chunk_pages = 0
+        kv_chunk_tokens = sal_chunk_pages * page_size if kv_sal else 512
         cfg = K.MKConfig(
             hidden=g.hidden,
             head_dim=g.head_dim,
@@ -370,18 +371,26 @@ class MuseMegakernel(torch.nn.Module):
             scale_fp8=self.scale_fp8,
             # measured a loss at 32 rows, where the expert loop is compute-bound
             y_early=tpu_envs.SGLANG_TPU_MK_Y_EARLY.get() and rows <= 16,
+            xfull_packed=rows > _BASE_STEP_MAX_ROWS,
+            row_bounded_temps=rows > _BASE_STEP_MAX_ROWS,
             fold_attn_scale=tpu_envs.SGLANG_TPU_MK_FOLD_ATTN_SCALE.get()
             and math.frexp(g.attn_scale)[0] == 0.5,
+            # half-height dense tiles: smaller ring slots for the larger steps' VMEM
+            tile_k=512 if rows > _BASE_STEP_MAX_ROWS else 1024,
         )
         # Deepest expert prefetch, then largest dense ring (2.25 MiB slots), whose declared
         # scratch leaves VMEM headroom for Mosaic temporaries; rows-scaled scratch grows ~0.24 MiB/row.
         for depth, cap in _DEPTH_RING_PREFERENCE:
+            if rows > _BASE_STEP_MAX_ROWS and cap > 4:
+                # half-height tiles double the tile count, so a deep ring of them fills the
+                # VMEM those steps' temporaries need: 64 rows with a 10-slot ring overflowed
+                continue
             cand = msgspec.structs.replace(cfg, expert_depth=depth)
             slots = K.fit_ring_slots(cand, cap=cap)
             cand = msgspec.structs.replace(
                 cand, ring_slots=slots, stream_depth=slots - 1
             )
-            if K.scratch_vmem_bytes(cand) <= _SCRATCH_VMEM_BUDGET - (
+            if K.scratch_vmem_bytes(cand) <= _scratch_budget(rows, kv_chunk_tokens) - (
                 # the page-block unpack's temporaries; measured 1.2 MiB over at 32 rows
                 _SAL_VMEM_HEADROOM if kv_sal else 0
             ):
@@ -546,10 +555,31 @@ def _register_op() -> None:
 # 60 MiB limit at 48.7 MiB (~11.5 MiB of temporaries).
 _SCRATCH_VMEM_BUDGET = 48 * 2**20
 _SAL_VMEM_HEADROOM = 2 * 2**20
-_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4))
+_DEPTH_RING_PREFERENCE = ((3, K.MAX_RING_SLOTS), (3, 4), (1, 4), (1, 2))
+# Past 64 rows Mosaic's own temporaries grow ~0.1 MiB per row: 96 rows of 4 overflowed the
+# 64 MiB VMEM by 2.5 MiB at 41.5 MiB declared (39.5 + SAL headroom), so the declared budget
+# shrinks with rows.
+_LARGE_STEP_ROWS = 64
+# Steps of at most this many rows compile the original program; larger ones
+# (SGLANG_TPU_MUSE_MK_MAX_ROWS > 32) keep the expert inputs as packed bf16 pairs, use
+# half-height dense weight tiles, a ring of at most 4 slots and row-bounded temporaries.
+_BASE_STEP_MAX_ROWS = 32
+_LARGE_STEP_BUDGET_PER_ROW = int(0.3 * 2**20)
+_LARGE_CHUNK_BUDGET = int(2.5 * 2**20)
 # Measured device step (real geometry, random routing): the 8-row block-diag variant is
 # slower than the 4-row one at 8-24 rows and faster only at 48.
 _COMPACT4_MAX_ROWS = 24
+
+
+def _scratch_budget(rows: int, chunk_tokens: int) -> int:
+    per_row = tpu_envs.SGLANG_TPU_MK_LARGE_STEP_BUDGET_PER_ROW_KB.get()
+    per_row = _LARGE_STEP_BUDGET_PER_ROW if per_row is None else per_row * 1024
+    budget = _SCRATCH_VMEM_BUDGET - max(0, rows - _LARGE_STEP_ROWS) * per_row
+    if rows > _BASE_STEP_MAX_ROWS:
+        # Larger KV chunks grow the chunk unpack and score temporaries: 64 rows with 1024-token
+        # chunks overflowed by 1.2 MiB at 40.2 MiB declared.
+        budget -= max(0, chunk_tokens // 512 - 1) * _LARGE_CHUNK_BUDGET
+    return budget
 
 
 def _round_up(n: int, m: int) -> int:
