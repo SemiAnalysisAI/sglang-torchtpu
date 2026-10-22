@@ -153,15 +153,9 @@ class TpuMambaSlotAllocator(MambaSlotAllocator):
         fence = self.kv_free_fence
         short = need_size - len(self.free_slots)
         if fence is not None and 0 < short <= self.held_pages.num_pages:
-            if fence.in_forward_write_target:
-                # Device compute runs in launch order, so this forward writes last.
-                self.free_slots = torch.cat(
-                    (self.held_pages.borrow(short), self.free_slots)
-                )
-            else:
-                # Other allocations may be DMA targets; wait for the forwards
-                # that may still write the held slots, which releases them.
-                fence.wait_for_in_flight()
+            # Slots may be DMA targets; wait for the forwards that may still
+            # write the held slots, which releases them.
+            fence.wait_for_in_flight()
         return super()._do_alloc(need_size)
 
     def free(self, free_index: torch.Tensor):
@@ -619,16 +613,6 @@ class TpuMambaPool(MambaPool):
         """Per-row axis each state tensor is TP-sharded on, in the order of
         get_state (conv channels, then recurrent heads)."""
         return [axis for _, _, axis, _ in self._iter_transfer_state_entries()]
-
-    def get_state_conv_shard_groups(self) -> List[Optional[List[int]]]:
-        """Full widths of the sub-blocks (q | k | v) each conv tensor's channel
-        axis concatenates, each TP-sharded on its own; None for recurrent
-        tensors and when the model gives no decomposition."""
-        groups = self.conv_shard_groups
-        return [
-            list(groups) if kind == "conv" and groups is not None else None
-            for kind, _, _, _ in self._iter_transfer_state_entries()
-        ]
 
     def committed_row(self, slot: int) -> int:
         """State row a P/D transfer reads or writes for slot.

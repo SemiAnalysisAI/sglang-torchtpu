@@ -8,8 +8,9 @@ its state row from two prefill ranks' rows, and takes the replicated MLA
 latent pages whole through the reshard push. Colocated servers at different TP
 already part ways within a few greedy tokens of this random model, so the
 first token must match the colocated reference and each of the first five
-decoded tokens must rank in its top four (a decode whose KDA state is dropped
-ranks outside its top 20).
+decoded tokens must rank in its top four. How a decode with dropped KDA state
+ranks is not measured. The image request only checks that it is served. Each
+run prints the checked ranks of every request, which shows MAX_RANK's margin.
 """
 
 import unittest
@@ -40,11 +41,15 @@ class TestKimiK3TinyPDReshard(TinyPDParity, CustomTestCase):
     def check_outputs(self, disaggregated, expected, ranks) -> None:
         """A decode at another TP sums in another order, and even colocated
         servers at TP4 and TP2 part ways within a few greedy tokens of this
-        random-weight model, so exact equality is not the test. A decode that
-        resumed from wrong KDA state or MLA pages produces tokens the
-        reference ranks nowhere near the top at the first positions (another
-        prompt's continuation ranks outside its top 20 there), so each of the
-        first decoded tokens must rank in the reference's top few."""
+        random-weight model, so exact equality is not the test. Each of the
+        first decoded tokens must instead rank in the reference's top few. The
+        run prints, for scale, the ranks of another prompt's continuation;
+        a decode resumed from wrong KDA state or MLA pages was not measured."""
+        for i, rank in enumerate(ranks):
+            print(
+                f"request {i}: ranks of the first {CHECKED_TOKENS} decoded tokens "
+                f"{rank[:CHECKED_TOKENS]} (MAX_RANK {MAX_RANK})"
+            )
         for i, (got, want, rank) in enumerate(
             zip(disaggregated["text"], expected["text"], ranks)
         ):
@@ -53,6 +58,7 @@ class TestKimiK3TinyPDReshard(TinyPDParity, CustomTestCase):
                 # colocated computation.
                 self.assertEqual(got[0], want[0])
                 self.assertLessEqual(max(rank[:CHECKED_TOKENS]), MAX_RANK, rank)
+        # Only that it is served: a reply, and the prompt's image token count.
         image, image_tokens = disaggregated["image"]
         self.assertTrue(image)
         self.assertEqual(image_tokens, expected["image"][1])

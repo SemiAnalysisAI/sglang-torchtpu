@@ -249,15 +249,6 @@ class TestFencedStateSlots(CustomTestCase):
         self.assertEqual(self.syncs, 1)
         self.assertEqual(got.tolist(), taken[:1].tolist())
 
-    def test_forward_allocation_borrows_without_a_sync(self):
-        taken = self.slots.alloc(4)
-        self._in_flight()
-        self.slots.free(taken[:1])
-        with self.fence.forward_write_target():
-            got = self.slots.alloc(1)
-        self.assertEqual(self.syncs, 0)
-        self.assertEqual(got.tolist(), taken[:1].tolist())
-
 
 class TestStateFanIn(CustomTestCase):
     """Decode TP < prefill TP: each decode rank assembles its state slot from

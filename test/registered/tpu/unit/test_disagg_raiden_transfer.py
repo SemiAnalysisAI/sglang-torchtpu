@@ -198,6 +198,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
             m.kv_args = args
             m.server_args = server_args
             m.disaggregation_mode = disaggregation_mode
+            m.is_mla_backend = is_mla
             m.attn_tp_size = attn_tp_size
             m.attn_tp_rank = attn_tp_rank
             m.attn_dp_rank = 0
@@ -234,6 +235,7 @@ class RaidenRendezvousTestCase(CustomTestCase):
             sliding_window_size=None,
             engine_rank=attn_tp_rank,
             state_types=[],
+            is_hybrid_mla_backend=False,
         )
         server_args = SimpleNamespace(context_length=1024)
 
@@ -882,6 +884,30 @@ class TestRaidenStateTransfer(RaidenStateTestCase):
         prefill.clear_room(room)
         self.assertNotIn(room, prefill._prefill.send_state_rows)
 
+    def test_push_resharding_with_gdn_state_fails_closed(self):
+        """State fan-in is built only for KDA beside MLA latent pages; a GDN
+        model (head-sliced KV pages) refuses push-resharding on both sides."""
+        prefill, decode = self._state_pair()
+        infos = self._bootstrap_info(prefill) * 2
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            decode.register_decode_request(
+                7330, [1], [], aux_index=None, bootstrap_infos=infos
+            )
+        self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
+        with self.assertRaisesRegex(NotImplementedError, "GDN"):
+            prefill._on_reshard_req(
+                ReshardReq(
+                    room=7330,
+                    decode_ip="127.0.0.1",
+                    decode_port=decode.rank_port,
+                    push_endpoint="tcp://push",
+                    decode_blocks=[1],
+                    dst_attn_tp=1,
+                    decode_swa_blocks=[],
+                    swa_push_endpoint="",
+                ).to_frames()
+            )
+
     def test_pipeline_transfer_with_state_fails_closed(self):
         decode = self._decode()
         decode._pipeline_enabled = True
@@ -908,7 +934,10 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
 
     def _with_state(self, m, *, tp, seed=0, checkpoint_width=1):
         generator = torch.Generator().manual_seed(seed)
-        rows = _SLOTS * checkpoint_width
+        # TpuMambaPool's layout: the slot rows, then with speculation one verify
+        # window of checkpoint_width rows per request. A transfer uses slot rows.
+        windows = _SLOTS * checkpoint_width if checkpoint_width > 1 else 0
+        rows = _SLOTS + windows
         conv = torch.randn(
             rows, _K - 1, 1, sum(_CONV_GROUPS) // tp, generator=generator
         )
@@ -919,7 +948,7 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         m._state_kv_caches = (conv, temporal)
         m._state_slice_axes = (2, 0)
         m._state_conv_groups = (_CONV_GROUPS, None)
-        m._committed_state_row = lambda slot: slot * checkpoint_width
+        m._committed_state_row = lambda slot: slot
         m.state_raiden_endpoint = f"raiden-state://127.0.0.1:{m.rank_port}"
         m.kv_args.state_types = [StateType.MAMBA]
         m.kv_args.is_hybrid_mla_backend = True
@@ -1024,9 +1053,11 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         )
         torch.testing.assert_close(conv[row], want_conv)
         torch.testing.assert_close(temporal[row], want_temporal)
-        others = [i for i in range(conv.shape[0]) if i != row]
+        other_slots = [i for i in range(_SLOTS) if i != row]
         for got, old in zip(decode._state_kv_caches, before):
-            torch.testing.assert_close(got[others], old[others])
+            torch.testing.assert_close(got[other_slots], old[other_slots])
+            # The verify windows after the slot rows stay untouched.
+            torch.testing.assert_close(got[_SLOTS:], old[_SLOTS:])
 
     def test_state_rows_precede_the_blocks_on_the_wire(self):
         sources = self._sources()
@@ -1096,6 +1127,46 @@ class TestRaidenStateFanIn(RaidenRendezvousTestCase):
         self.assertTrue(decode.is_failed(room))
         self.assertIn("state rows from source ranks", decode.failure_records[room])
         self.assertEqual(decode._engine.plans, [])
+
+    def test_conv_rows_without_sub_block_widths_fail_the_room(self):
+        """Without its q | k | v widths a conv row cannot be split per
+        sub-block; whole rows side by side would be the wrong layout."""
+        sources = self._sources()
+        decode = self._with_state(self._decode(attn_tp_size=1), tp=1)
+        decode._state_conv_groups = (None, None)
+        room = 7408
+        decode.request_status[room] = KVPoll.WaitingForInput
+        self._register(decode, sources, room, [4], 1)
+        for r, prefill in enumerate(sources):
+            self._send(prefill, room, prefill_slot=r + 1, blocks=(1,))
+        for _ in sources:
+            decode._on_reshard_state(
+                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_STATE)
+            )
+            decode._on_reshard_blocks(
+                self.inboxes[decode.endpoint].take(MessageTag.RESHARD_BLOCKS)
+            )
+        self.assertTrue(decode.is_failed(room))
+        self.assertIn("conv sub-block widths", decode.failure_records[room])
+        self.assertEqual(decode._engine.plans, [])
+        self.assertEqual(decode._decode.state_uploads, {})
+
+    def test_pure_mla_push_resharding_fails_closed(self):
+        """Only the hybrid MLA + KDA pool moves latent pages whole, so a pure
+        MLA decode refuses before asking its sources instead of timing out."""
+        sources = [self._prefill(attn_tp_rank=r, attn_tp_size=2) for r in range(2)]
+        decode = self._decode(attn_tp_size=1)
+        decode.is_mla_backend = True
+        with self.assertRaisesRegex(NotImplementedError, "pure MLA"):
+            decode.register_decode_request(
+                7409,
+                [4],
+                [],
+                aux_index=None,
+                bootstrap_infos=[self._bootstrap_info(p)[0] for p in sources],
+            )
+        for prefill in sources:
+            self.assertEqual(self.inboxes[prefill.endpoint].frames, [])
 
     def test_full_prefix_hit_still_moves_state(self):
         sources = self._sources()

@@ -1019,6 +1019,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
         mgr.attn_tp_rank = 0
+        mgr.is_mla_backend = False
         mgr._prefill = None
         mgr._decode = DecodeState()
         mgr._timeout_s = 120.0

@@ -701,6 +701,12 @@ class RaidenSenderMixin:
                 self._completed_send.add(self._swa_req_id(room))
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
+        if self._state_engine is not None and not self.kv_args.is_hybrid_mla_backend:
+            raise NotImplementedError(
+                "Raiden push resharding moves linear-attention state only for "
+                "hybrid MLA + KDA models, not GDN; use equal attention TP on "
+                "prefill and decode."
+            )
         req = ReshardReq.from_frames(msg)
         room = req.room
         decode_ip = req.decode_ip
@@ -827,8 +833,20 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._prefill.decode_addr or room in self._aborted:
                 return
+        import torch
+
         row = int(state_rows[0])
-        rows = [tensor[row].cpu().numpy() for tensor in self._state_kv_caches]
+        tensors = self._state_kv_caches
+        # One device gather and one host copy per state shape (the conv and
+        # the recurrent tensors), not one blocking copy per layer's tensor.
+        by_shape = {}
+        for i, tensor in enumerate(tensors):
+            by_shape.setdefault((tuple(tensor.shape[1:]), tensor.dtype), []).append(i)
+        rows: List[Any] = [None] * len(tensors)
+        for indices in by_shape.values():
+            host = torch.stack([tensors[i][row] for i in indices]).cpu().numpy()
+            for i, value in zip(indices, host, strict=True):
+                rows[i] = value
         with self._state_lock:
             if room in self._prefill.send_blocks and room not in self._aborted:
                 self._prefill.reshard_state[room] = rows

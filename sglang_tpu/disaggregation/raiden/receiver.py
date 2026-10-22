@@ -207,6 +207,25 @@ class RaidenReceiverMixin:
             )
             return
         if len(bootstrap_infos) != 1:
+            if self.is_mla_backend:
+                # _make_geometry moves latent pages whole only for the hybrid
+                # pool; a pure MLA room would fail in the listener and time out.
+                raise NotImplementedError(
+                    "Raiden push resharding moves MLA latent pages only for "
+                    "hybrid MLA + KDA models, not pure MLA ones (got "
+                    f"{len(bootstrap_infos)} prefill sources for one decode "
+                    "rank); use equal attention TP on prefill and decode."
+                )
+            if (
+                self._state_engine is not None
+                and not self.kv_args.is_hybrid_mla_backend
+            ):
+                raise NotImplementedError(
+                    "Raiden push resharding moves linear-attention state only "
+                    "for hybrid MLA + KDA models, not GDN (got "
+                    f"{len(bootstrap_infos)} prefill sources for one decode "
+                    "rank); use equal attention TP on prefill and decode."
+                )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
             # head-slice strided into the wider decode block. The plan stages
@@ -1126,6 +1145,10 @@ class RaidenReceiverMixin:
             sources = dict(self._decode.reshard_state_sources.get(room, {}))
         if meta is None:
             return False
+        if not any(self._state_conv_groups):
+            # Whole conv rows side by side would order channels by source, not
+            # by q | k | v sub-block; the pool gives all conv tensors widths or none.
+            return fail("has no conv sub-block widths to split the sources' rows by")
         src_attn_tp = meta["src_attn_tp"]
         local_rows = meta["local_state_rows"]
         need = set(meta["source_ranks"])
