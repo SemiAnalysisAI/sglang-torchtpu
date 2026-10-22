@@ -86,9 +86,15 @@ def _disagg_args(role: str) -> list[str]:
 
 class TinyPDParity:
     """The P/D-vs-colocated comparison; a variant sets the decode's extra
-    server arguments (a mixin, so importing it adds no test)."""
+    server arguments and environment, and may serve the requests its own way
+    (a mixin, so importing it adds no test)."""
 
     decode_args: list[str] = []
+    decode_env: dict[str, str] = {}
+
+    def serve_requests(self, base_url: str, model: str) -> dict:
+        """The requests the disaggregated deployment serves."""
+        return run_requests(base_url, model)
 
     def test_disaggregated_output_matches_colocated(self):
         role = os.environ.get("CI_PD_ROLE")
@@ -106,6 +112,7 @@ class TinyPDParity:
                 DECODE_PORT,
                 _disagg_args("decode") + self.decode_args,
                 f"{logs}/decode.log",
+                env=self.decode_env,
             )
             try:
                 # Serve until the prefill pod finishes and the JobSet ends.
@@ -143,7 +150,7 @@ class TinyPDParity:
             )
             lb_url = f"http://127.0.0.1:{LB_PORT}"
             wait_healthy(lb_url, 300)
-            disaggregated = run_requests(lb_url, model)
+            disaggregated = self.serve_requests(lb_url, model)
         finally:
             if router is not None:
                 kill_process_tree(router.pid, wait_timeout=30)

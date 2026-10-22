@@ -47,6 +47,7 @@ on:
           - pd-mh-qwen3-vl-8b-spec
           - pd-sh-kimi-k3-tiny
           - pd-sh-kimi-k3-tiny-reshard
+          - pd-sh-kimi-k3-tiny-retract
           - pd-sh-qwen3-vl-30b
           - sh
       test_filter:
