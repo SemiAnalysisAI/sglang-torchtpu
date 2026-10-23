@@ -787,7 +787,7 @@ GLM_5_3_FLASH = {
     "config_module": "recipe/configs/glm_5_3_flash/accuracy.py",
     # The model card's sampling; the template always thinks, with no toggle.
     "sampling": {
-        "max_tokens": 131072,
+        "max_tokens": 290000,
         "num_threads": 32,
         "temperature": 1.0,
         "top_p": 0.95,

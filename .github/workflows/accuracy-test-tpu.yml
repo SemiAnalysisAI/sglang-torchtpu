@@ -255,8 +255,8 @@ jobs:
       run_name: accuracy-glm-5-3-flash-aime
       nightly: true
       weights_pvc: model-weights
-      # 36 min bring-up plus 42 min of eval measured in CI.
-      timeout_per_file: 7200
+      # 36 min bring-up; eval took 42 min at a 128k budget, the 290k tail is longer.
+      timeout_per_file: 10800
     permissions:
       contents: read
       id-token: write

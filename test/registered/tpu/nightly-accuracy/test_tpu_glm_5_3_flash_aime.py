@@ -7,7 +7,7 @@ from sglang.test.tpu import GLM_5_3_FLASH, make_model_config, make_runner
 from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
 
 register_tpu_ci(
-    est_time=7200,
+    est_time=10800,
     suite="nightly-tpu-accuracy-glm-5-3-flash-aime",
     nightly=True,
     labels=["singlehost", "glm-5.3-flash", "accuracy"],
@@ -18,7 +18,8 @@ CONFIG_MODULE = GLM_5_3_FLASH["config_module"]
 GATE = {
     "dataset": "aime26",
     "label": "aime26",
-    "baseline": 0.942,  # measured on TPU
+    # 0.942 measured on TPU at a 128k budget; re-measure at 290k.
+    "baseline": 0.942,
     "atol": 0.12,
     "runner": make_runner(GLM_5_3_FLASH, "aime26", n_repeats=4),
 }

@@ -10,8 +10,8 @@ from copy import deepcopy
 from benchmark.tpu.recipe.configs.glm_5_3_flash.server import CONFIG as BASE_CONFIG
 
 CONCURRENCY = 32
-# 128k thinking budget + prompt; at 60k, 5 of 30 AIME26 answers truncated.
-CONTEXT_LENGTH = 131072 + 2048
+# 290k thinking budget + prompt; at 128k, 3.3% of AIME26 samples truncated.
+CONTEXT_LENGTH = 300000
 MAX_RUNNING = CONCURRENCY + 2
 
 CONFIG = deepcopy(BASE_CONFIG)
