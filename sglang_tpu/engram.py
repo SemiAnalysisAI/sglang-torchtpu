@@ -22,6 +22,28 @@ _INVALID_SCALE = 255
 _FP8_BLOCK_SIZE = 32
 
 
+def signed_sqrt(dot, clamp_value):
+    """FP32 signed square root, including the sign of negative zero."""
+    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
+    # Integer comparison reads the sign bit; a floating comparison loses -0.
+    return torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
+
+
+def engram_gate(x, kv, q_weight, k_weight, eps, clamp_value):
+    """Core Engram gate with a bitcast/select form of FP32 copysign."""
+    hc_mult, dim = x.shape[-2:]
+    key, value = kv.split([hc_mult * dim, dim], dim=-1)
+    key = key.float().unflatten(-1, (hc_mult, dim))
+    weight = q_weight.float() * k_weight.float()
+    h = x.float()
+    rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
+        key.square().mean(-1) + eps
+    )
+    dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
+    gate = torch.sigmoid(signed_sqrt(dot, clamp_value))
+    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+
+
 @dataclass(frozen=True)
 class HostEngramInputs:
     # Current token first, then predecessors. Negative positions are padding.

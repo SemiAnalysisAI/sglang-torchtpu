@@ -5,14 +5,68 @@ The scorer, selector and bounded overlap schedule come from EPIC bdb38700.
 This adapter supplies SGLang request rows and one candidate publication contract.
 """
 
+from collections.abc import Callable
+from typing import Any
+
+import jax
 import jax.numpy as jnp
 from jax import lax
 
+from sglang_tpu.dsv4.streamindex_topk import config
+from sglang_tpu.kernels.index_selection.pipeline import pipeline_score_topk
 from sglang_tpu.kernels.index_selection.prefill_scores import prefill_index_scores
 from sglang_tpu.kernels.index_selection.streaming_topk import streaming_topk
 
-from .cache_rows import split_halves
-from .indexer import pipeline_score_topk_bounded
+from .cache import split_halves
+
+
+# Adapted scheduling helper from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/deepseek_v41/indexer.py
+# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+def pipeline_score_topk_bounded(
+    num_tiles: int,
+    prepare: Callable[[jax.Array], Any],
+    score: Callable[[Any, int | None], jax.Array],
+    select: Callable[[jax.Array, jax.Array, int | None], Any],
+    write: Callable[[jax.Array, Any, Any], Any],
+    output: Any,
+) -> Any:
+    """Bound score lifetime and pair next-tile scoring with current selection.
+
+    Callbacks accept an optional scheduling group after their data arguments.
+    Each pair gets a program-unique group so the compiler keeps TensorCore
+    scoring between SparseCore selection start and completion.
+    """
+    if num_tiles < 1:
+        raise ValueError("The score/top-k pipeline requires at least one tile")
+    if num_tiles > 16:
+        return pipeline_score_topk(num_tiles, prepare, score, select, write, output)
+
+    group_base = (
+        config.reserve_scheduling_group_ids(num_tiles - 1) if num_tiles > 1 else 0
+    )
+    # Gate current scores and next preparation on the previous selection
+    # so unrolling does not extend every score buffer's lifetime.
+    with jax.named_scope("DSV41ScoreTopKBoundedPipeline"):
+        current = score(prepare(jnp.int32(0)), None)
+        previous = None
+        for tile in range(num_tiles - 1):
+            prepared = prepare(jnp.int32(tile + 1))
+            if previous is not None:
+                previous, current, prepared = lax.optimization_barrier(
+                    (previous, current, prepared)
+                )
+                output = write(jnp.int32(tile - 1), previous, output)
+            group = group_base + tile
+            following = score(prepared, group)
+            previous = select(jnp.int32(tile), current, group)
+            current = following
+        if previous is not None:
+            previous, current = lax.optimization_barrier((previous, current))
+            output = write(jnp.int32(num_tiles - 2), previous, output)
+        last = jnp.int32(num_tiles - 1)
+        return write(last, select(last, current, None), output)
 
 
 def select_scores(

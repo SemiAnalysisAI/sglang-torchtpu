@@ -32,9 +32,13 @@ from sglang.srt.models.deepseek_v4 import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
-from sglang_tpu.dsv41.mhc import ShiftedCarry, ShiftedMhc, pack_layer_weights
+from sglang_tpu.dsv41.mhc import (
+    ShiftedCarry,
+    ShiftedMhc,
+    hc_combine,
+    pack_layer_weights,
+)
 from sglang_tpu.dsv41.moe import DSV41MoE
-from sglang_tpu.dsv41.ops import hc_combine
 
 
 class DSV41Attention(MqaAttentionBase):

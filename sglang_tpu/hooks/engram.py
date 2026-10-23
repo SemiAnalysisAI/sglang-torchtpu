@@ -132,7 +132,7 @@ def embedding_forward(
 
 
 def gate_forward(original, x, kv, q_weight, k_weight, eps, clamp_value):
-    from sglang_tpu.dsv41.ops import engram_gate
+    from sglang_tpu.engram import engram_gate
 
     return engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
 

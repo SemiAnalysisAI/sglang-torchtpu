@@ -2,14 +2,87 @@
 """V4.1 source ownership and CSA2 attention on SGLang request/page metadata."""
 
 import torch
+import torch.nn.functional as F
 
 from sglang_tpu.dsv4.dsv4_attention_backend import (
     DSV4TPUAttnBackend,
     apply_tpu_dsv4_rope,
 )
-from sglang_tpu.dsv41.cache_ops import publish_source, register_cache_ops
-from sglang_tpu.dsv41.custom_ops import register_ops
-from sglang_tpu.dsv41.ops import compressor_project, pair_compress, round_index_fp8
+from sglang_tpu.dsv41.custom_ops import (
+    publish_source,
+    register_cache_ops,
+    register_ops,
+)
+
+
+def pair_compress(kv, score, req, positions, valid, state, ring_size):
+    """Pair adjacent positions, including an even token from the previous chunk.
+
+    Read the old ring before writing this chunk. Only its last ``ring_size`` rows
+    per request may write live slots; discarded and padded rows use the spare row.
+    The returned value is meaningful only at odd, valid positions.
+    """
+    dim = kv.shape[-1]
+    previous = req * ring_size + (positions - 1) % ring_size
+    previous = torch.where(valid & (positions > 0), previous, state.shape[0] - 1)
+    carried = state[previous]
+    in_batch = torch.cat(
+        [
+            valid.new_zeros(1),
+            valid[1:]
+            & valid[:-1]
+            & (req[1:] == req[:-1])
+            & (positions[1:] == positions[:-1] + 1),
+        ]
+    )
+    previous_kv = torch.where(in_batch[:, None], torch.roll(kv, 1, 0), carried[:, :dim])
+    previous_score = torch.where(
+        in_batch[:, None], torch.roll(score, 1, 0), carried[:, dim:]
+    )
+    # A missing partner must not create NaNs in unused even/padding rows.
+    previous_score = torch.where(
+        (valid & (positions % 2 == 1))[:, None], previous_score, score
+    )
+    weights = torch.stack([previous_score, score], 1).softmax(1)
+    pooled = (torch.stack([previous_kv, kv], 1) * weights).sum(1)
+
+    keep = valid
+    if kv.shape[0] > ring_size:
+        keep = torch.cat(
+            [
+                valid[:-ring_size]
+                & ((req[:-ring_size] != req[ring_size:]) | ~valid[ring_size:]),
+                valid[-ring_size:],
+            ]
+        )
+    slots = torch.where(
+        keep, req * ring_size + positions % ring_size, state.shape[0] - 1
+    )
+    state.index_copy_(0, slots.to(torch.int64), torch.cat([kv, score], -1))
+    state[-1, :dim] = 0
+    state[-1, dim:] = float("-inf")
+    return pooled
+
+
+def compressor_project(compressor, x):
+    # Both C1 and C2 keep their checkpoint projection weights in FP32.
+    kv = F.linear(x.float(), compressor.wkv.weight)
+    if compressor.compress_ratio == 1:
+        return kv, None
+    return kv, F.linear(x.float(), compressor.wgate.weight)
+
+
+def round_index_fp8(values):
+    """Round each D128 head to E4M3 with a power-of-two scale, then store BF16.
+
+    Matches EPIC v2/ops.py: the BF16 index pool contains these rounded values;
+    its physical halfplane packing does not perform another quantization.
+    """
+    x = values.float()
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    rounded = (x / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return (rounded.float() * scale).to(torch.bfloat16)
 
 
 class DSV41TPUAttnBackend(DSV4TPUAttnBackend):

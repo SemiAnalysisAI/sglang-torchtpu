@@ -24,7 +24,7 @@ def cache_bytes(result, configurator):
 def hc_combine(original, x_flat, pre, hc, out_dtype):
     if x_flat.device.type != "tpu":
         return original(x_flat, pre, hc, out_dtype)
-    from sglang_tpu.dsv41.ops import hc_combine as combine
+    from sglang_tpu.dsv41.mhc import hc_combine as combine
 
     return combine(x_flat, pre, hc, out_dtype)
 

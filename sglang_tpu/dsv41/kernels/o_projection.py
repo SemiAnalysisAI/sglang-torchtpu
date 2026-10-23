@@ -22,12 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels.rope import (
-    LANE,
-    CosSinRef,
-    _cos_sin_lanes,
-    _rotate_gptj,
-)
+LANE = 128
 
 FP8_E4M3_MAX = 448.0
 
@@ -44,124 +39,47 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _cos_sin_body(
-    cos_sin_ref: jax.Ref,
-    out_ref: jax.Ref,
-    *,
-    rotary_dim: int,
-    inverse: bool,
-    out_dtype: jnp.dtype,
-) -> None:
-    """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    out_ref[...] = jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
+# RoPE lane helpers adapted from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/kernels/deepseek_v4/rope.py
+# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
+def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
+    """``out[b..., i] = operand[b..., indices[i]]`` over the last axis.
 
-
-def _cos_sin_kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
-    # HBM input
-    cos_sin_cache_hbm_ref: jax.Ref,
-    # HBM output
-    out_hbm_ref: jax.Ref,
-    *,
-    num_tiles: int,
-    tile_n: int,
-    rotary_dim: int,
-    inverse: bool,
-    cos_sin_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
-) -> None:
-    cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    out_spec = pl.BlockSpec(
-        block_shape=(tile_n, 2 * LANE),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    # The per-token row gather; one buffer of lookahead hides its DMAs.
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
-
-    pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _cos_sin_body,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            out_dtype=out_dtype,
-        ),
-        grid=(num_tiles,),
-        in_specs=[cos_sin_spec],
-        out_specs=[out_spec],
-    )
-    allocations = (
-        cos_sin_alloc,
-        pltpu.BufferedRef.output(out_spec, out_dtype, buffer_count=2),
-    )
-
-    @pl.with_scoped(allocations=allocations)
-    def _run(allocations):
-        pipeline(
-            (cos_sin_cache_hbm_ref, positions_ref),
-            out_hbm_ref,
-            allocations=allocations,
-        )
-
-    _run()
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=("inverse", "out_dtype", "name"),
-)
-def gather_cos_sin(
-    positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
-    *,
-    inverse: bool = False,
-    out_dtype: jnp.dtype = jnp.float32,
-    name: str = "gather_cos_sin",
-) -> jax.Array:
-    """Builds ``wo_a_projection``'s ``[T, 2 * LANE]`` cos/sin table.
-
-    Gathers ``cos_sin_cache[positions]`` based on the token positions, expands
-    each row to ``[2 * LANE]``
+    The leading axes come along as batch dimensions. ``indices`` is a constant
+    1-D array.
     """
-    assert positions.ndim == 1
-    assert cos_sin_cache.ndim == 2
+    rank = operand.ndim
+    lanes = indices.shape[0]
+    coords = jnp.broadcast_to(indices, (*operand.shape[:-1], lanes))[..., None]
+    batching = tuple(range(rank - 1))
+    dimension_numbers = jax.lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(rank - 1,),
+        start_index_map=(rank - 1,),
+        operand_batching_dims=batching,
+        start_indices_batching_dims=batching,
+    )
+    return jax.lax.gather(
+        operand,
+        coords,
+        dimension_numbers=dimension_numbers,
+        slice_sizes=(1,) * rank,
+        unique_indices=False,
+        mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
 
-    num_tokens = positions.shape[0]
-    rotary_dim = cos_sin_cache.shape[1]
-    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
 
-    tile_n = _largest_divisor(num_tokens, cap=128)
+def _rotate_gptj(x: jax.Array) -> jax.Array:
+    """The reference's ``rotated``: ``[-x1, x0, -x3, x2, ...]`` along the lanes.
 
-    return pl.pallas_call(
-        functools.partial(
-            _cos_sin_kernel,
-            num_tiles=num_tokens // tile_n,
-            tile_n=tile_n,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            cos_sin_dtype=cos_sin_cache.dtype,
-            out_dtype=out_dtype,
-        ),
-        out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
-        name=name,
-    )(positions, cos_sin_cache)
+    ``np.stack([-x[..., 1::2], x[..., 0::2]], -1).reshape(...)`` says, lane by
+    lane, "take the partner lane ``i ^ 1``, negated on the even ones" -- a
+    constant-index lane shuffle and a sign, no reshape. Lane parity may be read
+    for channel parity because ``LANE - rotary_dim`` is even.
+    """
+    lane = jnp.arange(LANE)
+    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+    return _lane_gather(x, lane ^ 1) * sign
 
 
 def _rope_heads(x: jax.Array, cos_sin: jax.Array, *, head_dim: int) -> jax.Array:
@@ -334,53 +252,3 @@ def wo_a_projection(
         ),
         name=name,
     )(x, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "head_dim",
-        "inverse",
-        "tile_t",
-        "tile_r",
-        "sub_t",
-        "quantize_activations",
-        "name",
-    ),
-)
-def fused_reverse_rope_wo_a_projection(
-    x: jax.Array,  # [T, G * H, head_dim] bf16
-    positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
-    wo_a: jax.Array,  # [D, G * R] fp8
-    wo_a_scale: jax.Array,  # [G * R] float32
-    *,
-    head_dim: int,
-    inverse: bool = True,
-    tile_t: int | None = None,
-    tile_r: int | None = None,
-    sub_t: int | None = None,
-    quantize_activations: bool = True,
-    name: str = "wo_a_projection",
-) -> jax.Array:
-    """``The RoPE-fused ``wo_a_projection``."""
-    assert x.ndim == 3
-    assert x.shape[2] == head_dim
-
-    cos_sin = gather_cos_sin(
-        positions,
-        cos_sin_cache,
-        inverse=inverse,
-        name=f"{name}_gather_cos_sin",
-    )
-    return wo_a_projection(
-        x,
-        wo_a,
-        wo_a_scale,
-        cos_sin,
-        tile_t=tile_t,
-        tile_r=tile_r,
-        sub_t=sub_t,
-        quantize_activations=quantize_activations,
-        name=name,
-    )

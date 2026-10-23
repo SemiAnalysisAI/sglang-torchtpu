@@ -1,4 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+# FP4 fallback adapted from vllm-project/vllm-torchtpu (Apache-2.0).
+# Source: src/vllm_torchtpu/layers/core/fused_moe_gmm.py
+# Revision: bdb38700dd25959c029c7d77f00cee91ccd3a0bc
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Load-time MXFP4 block-32 to EPIC block-512 preparation.
 
 Quantization uses the imported EPIC E2M1 cast, including ties to even.
@@ -33,11 +49,29 @@ def _quantizer():
     import jax
     import jax.numpy as jnp
 
-    from sglang_tpu.dsv41.kernels.fp4_quant import quantize_to_native_fp4_kmajor
+    def quantize_to_native_fp4_kmajor(
+        w: jax.Array, block: int
+    ) -> tuple[jax.Array, jax.Array]:
+        """Quantize K-major float weight to E2M1 with per-block FP32 scales."""
+        size_k = w.shape[-2]
+        num_blocks = size_k // block
+        blocked = w.astype(jnp.float32).reshape(
+            *w.shape[:-2], num_blocks, block, w.shape[-1]
+        )
+        fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
+        abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
+        scale = abs_max / fp4_max
+        scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
+        quantized = jnp.clip(blocked * scale_inv, -fp4_max, fp4_max).astype(
+            jnp.float4_e2m1fn
+        )
+        quantized = quantized.reshape(*w.shape[:-2], size_k, w.shape[-1])
+        scale = scale.astype(jnp.float32)
+        return quantized, scale
 
     @jax.jit
     def quantize(values):
-        quantized, scales = quantize_to_native_fp4_kmajor(values, 512, pack=False)
+        quantized, scales = quantize_to_native_fp4_kmajor(values, 512)
         # Torch native FP4 packs the final N dimension, unlike the old GMM
         # uint8 transport which packs K. The kernel sees unpacked [E,K,N].
         packed = jax.lax.bitcast_convert_type(

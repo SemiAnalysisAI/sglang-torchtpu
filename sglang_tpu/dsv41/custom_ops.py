@@ -8,16 +8,14 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from sglang_tpu.dsv41.kernels.csa2 import csa2
-from sglang_tpu.dsv41.kernels.csa2_metadata import (
+from sglang_tpu.dsv41.kernels.cache import (
     prepare_main_records,
     prepare_swa_metadata,
+    swa_word_pages,
 )
-from sglang_tpu.dsv41.kernels.csa2_pipeline import csa2_pipeline
+from sglang_tpu.dsv41.kernels.csa2 import csa2, csa2_gather_chunk_size, csa2_pipeline
 from sglang_tpu.dsv41.kernels.o_projection import wo_a_projection
-from sglang_tpu.dsv41.kernels.paged_swa import swa_word_pages
 from sglang_tpu.dsv41.kernels.selection import index_selection
-from sglang_tpu.dsv41.kernels.tuned_block_sizes import csa2_gather_chunk_size
 
 
 def inverse_rope(cos_sin, positions):
@@ -258,3 +256,77 @@ def register_ops():
         op.register_fake(fake)
         ops.append(op)
     return AttentionOps(*ops)
+
+
+class CacheOps(NamedTuple):
+    compressed: object
+    index: object
+    swa: object
+
+
+@cache
+def register_cache_ops():
+    import jax
+
+    from sglang_tpu.dsv41.kernels.cache import (
+        publish_csa2_kv,
+        scatter_index_keys,
+        write_swa_word_pool,
+    )
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    def compressed(
+        words: jax.Array,
+        scales: jax.Array,
+        records: jax.Array,
+        values: jax.Array,
+        after: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        words, scales, _ = jax.lax.optimization_barrier((words, scales, after))
+        return publish_csa2_kv(words, scales, records, values)
+
+    def index(
+        words: jax.Array,
+        records: jax.Array,
+        values: jax.Array,
+        after: jax.Array,
+    ) -> jax.Array:
+        words, _ = jax.lax.optimization_barrier((words, after))
+        return scatter_index_keys(words, records, values)
+
+    def swa(
+        words: jax.Array,
+        records: jax.Array,
+        values: jax.Array,
+        page_size: int,
+    ) -> jax.Array:
+        return write_swa_word_pool(words, records, values, page_size=page_size)
+
+    compressed_op = cpu_export_jax_op(
+        "sglang_tpu_pallas::dsv41_publish_compressed",
+        compressed,
+        donate_argnums=(0, 1),
+    )
+    compressed_op.register_fake(
+        lambda words, scales, *_: (torch.empty_like(words), torch.empty_like(scales))
+    )
+    index_op = cpu_export_jax_op(
+        "sglang_tpu_pallas::dsv41_publish_index", index, donate_argnums=(0,)
+    )
+    index_op.register_fake(lambda words, *_: torch.empty_like(words))
+    swa_op = cpu_export_jax_op(
+        "sglang_tpu_pallas::dsv41_publish_swa", swa, donate_argnums=(0,)
+    )
+    swa_op.register_fake(lambda words, *_: torch.empty_like(words))
+    return CacheOps(compressed_op, index_op, swa_op)
+
+
+def publish_source(ops, pool, layer_id, records, latent, key, after):
+    """Preserve pool tensor identity and serialize reuse after its last gather."""
+    words = pool.low_ratio_cache(layer_id)
+    scales = pool.low_ratio_scales(layer_id)
+    new_words, new_scales = ops.compressed(words, scales, records, latent, after)
+    words.copy_(new_words)
+    scales.copy_(new_scales)
+    index = pool.low_ratio_cache(layer_id, index=True)
+    index.copy_(ops.index(index, records, key, after))

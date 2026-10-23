@@ -12,6 +12,15 @@ import torch
 import torch.nn.functional as F
 
 
+def hc_combine(x_flat, pre, hc, out_dtype):
+    """Unfused mHC combine; the model still owns shifted-pre ordering."""
+    return (
+        (x_flat.unflatten(-1, (hc, -1)).float() * pre.unsqueeze(-1))
+        .sum(-2)
+        .to(out_dtype)
+    )
+
+
 class ShiftedCarry(NamedTuple):
     """An uncommitted sublayer result and the four inputs to its next boundary."""
 
