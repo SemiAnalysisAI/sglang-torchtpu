@@ -11,7 +11,6 @@ class DSV41CompilePolicy(DecoderTpuCompilePolicy):
         model = self.owner.model
         compile_graph = super()._compile
         model.segments = tuple(compile_graph(segment) for segment in model.segments)
-        model.finish = compile_graph(model.finish)
         self.owner.logits_processor.forward = compile_graph(
             self.owner.logits_processor.forward
         )

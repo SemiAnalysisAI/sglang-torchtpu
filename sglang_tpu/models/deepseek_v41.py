@@ -23,8 +23,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM as CoreCausalLM
 from sglang.srt.models.deepseek_v4 import (
-    DeepseekV4ForCausalLM as CoreCausalLM,
     MqaAttentionBase,
     get_attn_backend,
     get_attn_tp_context,
@@ -206,7 +206,10 @@ class DSV41Model(nn.Module):
             residual = embedded[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
         for layer in self.layers[start:stop]:
             carry = layer(residual, carry, input_ids, positions, forward_batch)
-        return carry
+        # No host Engram boundary follows the final layer. Keep its mHC commit,
+        # combine and norm in this same device graph instead of compiling a
+        # separate tail for every prefill/decode shape.
+        return self.finish(carry) if stop == self.end_layer else carry
 
     def finish(self, carry):
         residual = self.layers[-1].ffn_mhc.commit(carry)
@@ -236,7 +239,7 @@ class DSV41Model(nn.Module):
             # Submit this segment before host lookup for the next Engram layer.
             # Its output tensors carry the device dependency into that segment.
             synchronize(list(carry), wait=False)
-        return self.finish(carry)
+        return carry
 
 
 class DeepseekV4ForCausalLM(CoreCausalLM):
