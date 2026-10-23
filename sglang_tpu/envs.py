@@ -142,6 +142,9 @@ class TpuEnvs:
     # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
     # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
     SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Expert-TP fused-RS: the two cores of a chip sum their partial rows on chip
+    # before the direct write, halving the off-chip bytes.
+    SGLANG_TPU_FUSED_RS_ETP_PAIR_REDUCE = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
