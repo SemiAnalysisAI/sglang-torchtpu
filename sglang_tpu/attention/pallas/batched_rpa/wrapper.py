@@ -314,6 +314,15 @@ def calculate_block_sizes(
         # Account for batch size.
         total_bytes *= batch_size
 
+        # The m, l and acc carries: f32 scratch per KV head and (token, q head)
+        # row, a lane tile wide, shared by the batch. The transposed tile (one
+        # sequence per tile) keeps them as rows of lanes instead.
+        carry_rows = model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+        carry_width = 3 * num_lanes
+        if serve_cfgs.transposed and batch_size == 1:
+            carry_width = aligned_head_dim // 2 + 3 * tpu_info.num_sublanes
+        total_bytes += carry_rows * carry_width * 4
+
         return total_bytes
 
     def calculate_compute_buffer_time(

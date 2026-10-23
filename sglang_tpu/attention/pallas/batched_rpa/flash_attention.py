@@ -171,7 +171,8 @@ def flash_attention_qk_softmax(
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape))
+    # m is an f32 carry; the scores and p stay in the output dtype.
+    p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
     if kv_len_left is not None:
         # A row with no key in range keeps l == 0 rather than weighting masked
         # keys by exp(mask_value - mask_value).

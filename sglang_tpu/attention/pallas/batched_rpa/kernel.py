@@ -567,10 +567,12 @@ def _full_tile(step, schedule_ref, processed_q_len, processed_kv_len, cfgs):
 
 def _carry_scratch_shapes(cfgs: configs.RpaConfigs):
     if not cfgs.use_transposed:
+        # f32 carries: in bf16 the running sum l stops growing once it exceeds
+        # ~256x a tile's row sum (40% error at 300K keys).
         return (
-            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=cfgs.serve.dtype_out),  # m
-            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=cfgs.serve.dtype_out),  # l
-            pltpu.VMEM(cfgs.acc_scratch_shape, dtype=cfgs.serve.dtype_out),  # acc
+            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=jnp.float32),  # m
+            pltpu.VMEM(cfgs.lm_scratch_shape, dtype=jnp.float32),  # l
+            pltpu.VMEM(cfgs.acc_scratch_shape, dtype=jnp.float32),  # acc
         )
     num_lanes = pltpu.get_tpu_info().num_lanes
     return (
