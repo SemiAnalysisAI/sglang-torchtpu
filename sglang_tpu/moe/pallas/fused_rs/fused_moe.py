@@ -21,6 +21,7 @@ before the post-kernel top-k weighted reduction.
 """
 
 import functools
+import logging
 
 import jax
 from jax import numpy as jnp
@@ -47,6 +48,8 @@ from sglang_tpu.moe.pallas.gmm_v2 import recover_quant_block_size
 
 EXPERT = "model"
 MLP_DATA = "data"
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # SMEM safety guard
@@ -167,6 +170,7 @@ def moe_gmm_local_rs_nodedup(
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
+    pair_reduce: bool = False,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -330,6 +334,7 @@ def moe_gmm_local_rs_nodedup(
         skip_out_zero=expert_tp
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
+        pair_reduce=pair_reduce,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -343,6 +348,8 @@ def moe_gmm_local_rs_nodedup(
             topk_weights, my_id * chunk_size, chunk_size, axis=0
         )
     )
+    # One partial per core, or per chip when its two cores summed on chip.
+    num_partials = ep_size // 2 if pair_reduce else ep_size
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if (
         expert_tp
@@ -358,13 +365,13 @@ def moe_gmm_local_rs_nodedup(
             local_topk_weights,
             chunk_size=chunk_size,
             topk=topk,
-            ep_size=ep_size,
+            ep_size=num_partials,
             eps=1e-8,
         )
     if expert_tp and out_buf.ndim == 3:
         # Split rows only: the ep sum reads the kernel's tiled layout in place.
         out_3d = (
-            out_buf.reshape(chunk_size, topk, ep_size, *out_buf.shape[1:])
+            out_buf.reshape(chunk_size, topk, num_partials, *out_buf.shape[1:])
             .astype(jnp.float32)
             .sum(axis=2)
             .astype(out_buf.dtype)
@@ -372,7 +379,7 @@ def moe_gmm_local_rs_nodedup(
         )
     elif expert_tp:
         out_3d = (
-            out_buf.reshape(chunk_size, topk, ep_size, hidden_size)
+            out_buf.reshape(chunk_size, topk, num_partials, hidden_size)
             .astype(jnp.float32)
             .sum(axis=2)
             .astype(out_buf.dtype)
@@ -416,6 +423,51 @@ _MOE_GMM_LOCAL_RS = moe_gmm_local_rs_nodedup
 # ============================================================================
 # shard_map-wrapped EP driver
 # ============================================================================
+
+
+# Pair reduction trades a per-tile sibling exchange for half the off-chip bytes. On
+# one tpu7x host (expert TP 8, Muse shapes) it measured +7% at 2048 tokens per call,
+# -9% at 4096 and -18% at 8192.
+_PAIR_REDUCE_MIN_TOKENS = 4096
+
+
+_PAIR_REDUCE_LOGGED: set[tuple[int, bool]] = set()
+
+
+def _log_pair_reduce_once(mesh: Mesh, num_tokens: int, enabled: bool) -> None:
+    """Log, once per traced token count, whether the pair path was taken and why."""
+    if (num_tokens, enabled) in _PAIR_REDUCE_LOGGED:
+        return
+    _PAIR_REDUCE_LOGGED.add((num_tokens, enabled))
+    devices = list(mesh.devices.reshape(-1))
+    logger.info(
+        "fused-RS expert TP pair_reduce=%s at %d tokens (min %d); mesh device ids %s, "
+        "coords %s",
+        enabled,
+        num_tokens,
+        _PAIR_REDUCE_MIN_TOKENS,
+        [getattr(d, "id", None) for d in devices],
+        [getattr(d, "coords", None) for d in devices],
+    )
+
+
+def _mesh_pairs_share_chip(mesh: Mesh) -> bool:
+    """Whether mesh positions (2i, 2i + 1) are the two TensorCores of one chip.
+
+    Real JAX devices carry coords; torch_tpu's rank-aligned mesh carries only
+    global device ids, which number a chip's cores 2c and 2c + 1.
+    """
+    devices = list(mesh.devices.reshape(-1))
+    if len(devices) < 4 or len(devices) % 2:
+        return False
+    for a, b in zip(devices[0::2], devices[1::2]):
+        coords_a, coords_b = getattr(a, "coords", None), getattr(b, "coords", None)
+        if coords_a is not None and coords_b is not None:
+            if tuple(coords_a) != tuple(coords_b):
+                return False
+        elif a.id % 2 or b.id != a.id + 1:
+            return False
+    return True
 
 
 def expert_parallel_gmm_rs(
@@ -487,6 +539,15 @@ def expert_parallel_gmm_rs(
     w1_gs_spec = None if w1_global_scale is None else weight_p_spec
     w2_gs_spec = None if w2_global_scale is None else weight_p_spec
 
+    pair_reduce = (
+        expert_tp
+        and not fp8_direct_write
+        and hidden_states.shape[0] >= _PAIR_REDUCE_MIN_TOKENS
+        and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_REDUCE.get()
+        and _mesh_pairs_share_chip(mesh)
+    )
+    if expert_tp and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_REDUCE.get():
+        _log_pair_reduce_once(mesh, hidden_states.shape[0], pair_reduce)
     _has_pn_rs = post_expert_norm_weight is not None
     _pnw_rs = (
         post_expert_norm_weight
@@ -504,6 +565,7 @@ def expert_parallel_gmm_rs(
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
             expert_tp=expert_tp,
+            pair_reduce=pair_reduce,
         ),
         mesh=mesh,
         in_specs=(

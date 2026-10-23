@@ -163,6 +163,9 @@ class TpuEnvs:
     # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
     # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
     SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    # Expert-TP fused-RS: the two cores of a chip sum their partial rows on chip
+    # before the direct write, halving the off-chip bytes.
+    SGLANG_TPU_FUSED_RS_ETP_PAIR_REDUCE = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
