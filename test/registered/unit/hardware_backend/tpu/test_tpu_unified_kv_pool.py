@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang_tpu.allocator_tpu import host_return_allocators
+from sglang_tpu.kv_free_fence import KVFreeFence
 from sglang_tpu.unified_kv_pool import (
     TpuUnifiedSWAKVPool,
+    TpuUnifiedSWATokenToKVPoolAllocator,
     merge_swa_kv_heads,
     num_full_groups,
     num_shared_kv_buffers,
@@ -239,6 +243,333 @@ class TestTpuUnifiedSWAKVPoolStorage(unittest.TestCase):
             self.assertTrue(
                 torch.all(pool.get_state()[i % 4][phys_page] == float(100 + i)).item()
             )
+
+
+class TestTpuUnifiedLogicalToPhysicalAllocator(unittest.TestCase):
+    """Tests for PR 2: Zero-fragmentation logical-to-physical allocation, reclamation, and eviction."""
+
+    def _make_gemma4_pool_and_allocator(self, size: int = 80, page_size: int = 4):
+        pool = TpuUnifiedSWAKVPool(
+            size=size,
+            size_swa=size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=512,
+            swa_head_num=2,
+            swa_head_dim=256,
+            swa_attention_layer_ids=[0, 1, 2, 3, 4],
+            full_attention_layer_ids=[5],
+            device="cpu",
+        )
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=True,
+        )
+        return pool, allocator
+
+    def test_equal_ratio_alloc_extend_decode_and_free(self):
+        page_size = 4
+        pool = TpuUnifiedSWAKVPool(
+            size=32,
+            size_swa=32,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[1],
+            device="cpu",
+        )
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=32,
+            size_swa=32,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=True,
+        )
+        self.assertEqual(allocator.full_available_size(), 32)
+        self.assertEqual(allocator.swa_available_size(), 32)
+        self.assertEqual(allocator.max_extend_tokens(), 16)
+
+        prefix_lens = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([4], dtype=torch.int64)
+        last_loc = torch.tensor([-1], dtype=torch.int64)
+        full_idx = allocator.alloc_extend(
+            prefix_lens, prefix_lens, seq_lens, seq_lens, last_loc, 4
+        )
+        self.assertIsNotNone(full_idx)
+        swa_idx = allocator.translate_loc_from_full_to_swa(full_idx)
+        self.assertFalse(
+            torch.equal(full_idx // page_size, swa_idx // page_size),
+            "Full and SWA pages must occupy distinct physical pages in the shared buffer.",
+        )
+
+        # Decode crossing page boundary (seq_len = 5 -> needs 1 new page each).
+        dec_seq_lens = torch.tensor([5], dtype=torch.int64)
+        dec_last_loc = full_idx[-1:]
+        dec_idx = allocator.alloc_decode(dec_seq_lens, dec_seq_lens, dec_last_loc)
+        self.assertIsNotNone(dec_idx)
+        dec_swa_idx = allocator.translate_loc_from_full_to_swa(dec_idx)
+        self.assertTrue(int(dec_swa_idx.item()) > 0)
+
+        # Free all tokens and verify full page restoration.
+        all_full = torch.cat([full_idx, dec_idx])
+        allocator.free(all_full)
+        self.assertEqual(allocator.full_available_size(), 32)
+        self.assertEqual(allocator.swa_available_size(), 32)
+
+    def test_zero_fragmentation_scattered_free_pages(self):
+        # 10 usable physical pages (pages 1..10), page_size=4, M=5 SWA groups.
+        pool, allocator = self._make_gemma4_pool_and_allocator(size=40, page_size=4)
+        store = allocator._page_store
+        self.assertEqual(store.num_free_pages(), 10)
+        self.assertEqual(allocator.full_available_size(), 40)
+        self.assertEqual(allocator.swa_available_size(), 8)
+
+        # Allocate all 10 physical pages individually as Full Attention pages.
+        fa_pages = [allocator.full_attn_allocator.alloc(4) for _ in range(10)]
+        self.assertEqual(store.num_free_pages(), 0)
+
+        # Free pages at indices 1, 2, 3, 4, 6, 7, 8, 9 (leaving pages 1 and 6 occupied by FA).
+        # No 5 contiguous physical pages exist anywhere in HBM, yet 8 free pages exist!
+        for idx in (1, 2, 3, 4, 6, 7, 8, 9):
+            allocator.full_attn_allocator.free(fa_pages[idx])
+        self.assertEqual(store.num_free_pages(), 8)
+        self.assertEqual(allocator.full_available_size(), 32)
+        self.assertEqual(allocator.swa_available_size(), 4)
+
+        # SWA allocation of 1 logical page (4 tokens = 5 physical pages) succeeds with zero fragmentation!
+        swa_tokens = allocator.swa_attn_allocator.alloc(4)
+        self.assertIsNotNone(swa_tokens)
+        primary_page = int(swa_tokens[0].item()) // 4
+        companion_pages = pool.swa_group_pages[:, primary_page].tolist()
+        all_swa_phys_pages = [primary_page] + companion_pages
+        self.assertEqual(len(set(all_swa_phys_pages)), 5)
+        for p in all_swa_phys_pages:
+            self.assertNotIn(p, (1, 6))
+            self.assertFalse(bool(store.page_is_free[p].item()))
+
+        # Exactly 3 physical pages remain free for Full Attention.
+        self.assertEqual(store.num_free_pages(), 3)
+        self.assertEqual(allocator.full_available_size(), 12)
+        self.assertEqual(allocator.swa_available_size(), 0)
+
+        # Release the SWA logical page and remaining FA pages -> all 10 pages are free again.
+        allocator.swa_attn_allocator.free(swa_tokens)
+        allocator.full_attn_allocator.free(fa_pages[0])
+        allocator.full_attn_allocator.free(fa_pages[5])
+        self.assertEqual(store.num_free_pages(), 10)
+        self.assertTrue(bool(store.page_is_free[1:11].all()))
+
+    def test_can_reserve_eviction_and_leak_conservation(self):
+        _, allocator = self._make_gemma4_pool_and_allocator(size=80, page_size=4)
+        # Empty pool: 20 physical pages. 2 SWA pages (10 phys) + 10 FA pages (10 phys) fits.
+        self.assertTrue(allocator.can_reserve(40, 8, empty_pool=True))
+        self.assertFalse(allocator.can_reserve(44, 8, empty_pool=True))
+
+        # Fill all 20 physical pages with 20 FA pages (80 tokens, swa_tail_len=0).
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([80], dtype=torch.int64)
+        last_loc = torch.tensor([-1], dtype=torch.int64)
+        full_all = allocator.alloc_extend_swa_tail(
+            prefix, prefix, seq, seq, last_loc, extend_num_tokens=80, swa_tail_len=0
+        )
+        self.assertEqual(allocator.full_available_size(), 0)
+        self.assertEqual(allocator.swa_available_size(), 0)
+
+        # Check PoolStatsObserver conservation identity when all 80 FA tokens are in radix cache.
+        (full_cap, full_avail), (swa_cap, swa_avail) = (
+            allocator.swa_capacity_and_available(full_capacity=80, swa_capacity=80)
+        )
+        self.assertEqual(full_cap - (full_avail + 80), 0)
+        self.assertEqual(swa_cap - (swa_avail + 0), 0)
+
+        # Fake tree_cache that frees chunks from full_all when evict() is called.
+        remaining = [full_all]
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = True
+        tree_cache.full_evictable_size.side_effect = lambda: int(remaining[0].numel())
+        tree_cache.swa_evictable_size.return_value = 0
+
+        def _fake_evict(params):
+            n = min(int(params.num_tokens), int(remaining[0].numel()))
+            n = ((n + 3) // 4) * 4
+            to_free, remaining[0] = remaining[0][:n], remaining[0][n:]
+            allocator.free_full(to_free)
+
+        tree_cache.evict.side_effect = _fake_evict
+        tree_cache.evict_for_alloc.side_effect = _fake_evict
+
+        # Reclaim room for 4 FA tokens (1 page) + 4 SWA tokens (5 pages) -> needs exactly 6 pages (24 FA tokens)!
+        err = allocator.reclaim_for_prealloc(tree_cache, full_tokens=4, swa_tokens=4)
+        self.assertIsNone(err)
+        self.assertTrue(allocator.new_pages_available(1, 1))
+        self.assertEqual(int(remaining[0].numel()), 80 - 24)
+        allocator.free_full(remaining[0])
+
+    def test_kv_free_fence_and_host_return_allocators(self):
+        _, allocator = self._make_gemma4_pool_and_allocator(size=24, page_size=4)
+        self.assertEqual(
+            host_return_allocators(allocator),
+            [allocator.full_attn_allocator, allocator.swa_attn_allocator],
+        )
+
+        fence = KVFreeFence(synchronize_device=lambda: None)
+        fence.attach(allocator.full_attn_allocator)
+        fence.attach(allocator.swa_attn_allocator)
+
+        # Allocate 1 SWA logical page (5 phys pages) and 1 FA page (1 phys page) = all 6 pages.
+        swa_tokens = allocator.swa_attn_allocator.alloc(4)
+        fa_tokens = allocator.full_attn_allocator.alloc(4)
+        self.assertEqual(allocator._page_store.unheld_free_pages(), 0)
+
+        # Form a batch and launch a fake forward so freed pages are held.
+        fence.on_batch_formed()
+        result = MagicMock(copy_done=None)
+        fence.on_forward_launched(result)
+
+        allocator.swa_attn_allocator.free(swa_tokens)
+        allocator.full_attn_allocator.free(fa_tokens)
+        # SWA releases 5 physical pages (primary + 4 companions), FA releases 1 -> 6 held pages.
+        self.assertEqual(allocator._page_store.held_pages.num_pages, 6)
+        self.assertEqual(allocator._page_store.unheld_free_pages(), 0)
+
+        # Complete forward -> all 6 physical pages are unheld and free again.
+        fence.on_forward_done(result)
+        self.assertEqual(allocator._page_store.unheld_free_pages(), 6)
+
+    def test_gcd_multi_full_and_swa_groups_allocator(self):
+        # 8 Full layers, 20 SWA layers -> gcd = 4 buffers, M_full = 2, M_swa = 5.
+        # Pool has 14 physical pages (size=56, page_size=4).
+        # 1 joint (Full + SWA) logical page takes M_full + M_swa = 2 + 5 = 7 physical pages.
+        page_size = 4
+        pool = TpuUnifiedSWAKVPool(
+            size=56,
+            size_swa=56,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=list(range(8, 28)),
+            full_attention_layer_ids=list(range(8)),
+            device="cpu",
+        )
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=56,
+            size_swa=56,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=True,
+        )
+        self.assertEqual(allocator._full_groups, 2)
+        self.assertEqual(allocator._swa_groups, 5)
+        self.assertEqual(allocator.full_available_size(), 28)  # 14 // 2 * 4
+        self.assertEqual(allocator.swa_available_size(), 8)  # 14 // 5 * 4
+        self.assertEqual(allocator.max_extend_tokens(), 8)  # 14 // (2 + 5) * 4
+
+        fa_tokens = allocator.full_attn_allocator.alloc(4)
+        swa_tokens = allocator.swa_attn_allocator.alloc(4)
+        self.assertIsNotNone(fa_tokens)
+        self.assertIsNotNone(swa_tokens)
+        fa_primary = int(fa_tokens[0].item()) // 4
+        swa_primary = int(swa_tokens[0].item()) // 4
+        fa_all = [fa_primary] + pool.full_group_pages[:, fa_primary].tolist()
+        swa_all = [swa_primary] + pool.swa_group_pages[:, swa_primary].tolist()
+        self.assertEqual(len(fa_all), 2)
+        self.assertEqual(len(swa_all), 5)
+        self.assertEqual(len(set(fa_all + swa_all)), 7)
+        self.assertEqual(allocator._page_store.num_free_pages(), 7)
+
+        allocator.full_attn_allocator.free(fa_tokens)
+        allocator.swa_attn_allocator.free(swa_tokens)
+        self.assertEqual(allocator._page_store.num_free_pages(), 14)
+
+    def test_unified_kv_eviction_policies(self):
+        from sglang.srt.environ import envs
+
+        # 8 Full layers, 20 SWA layers -> G = 4, M_full = 2, M_swa = 5.
+        # Pool size = 56 tokens (page_size = 4 -> 14 physical pages).
+        # Static full share = 16 tokens (4 Full pages -> 4 * 2 = 8 physical pages),
+        # so SWA share = 14 - 8 = 6 physical pages.
+        page_size = 4
+        pool = TpuUnifiedSWAKVPool(
+            size=56,
+            size_swa=56,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=list(range(8, 28)),
+            full_attention_layer_ids=list(range(8)),
+            device="cpu",
+        )
+        # With default SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1, policy is full_first:
+        default_alloc = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=56,
+            size_swa=56,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=True,
+            static_full_tokens=16,
+        )
+        self.assertEqual(default_alloc._eviction_policy, "full_first")
+
+        # With SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=0, policy is compact:
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(False):
+            allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+                size=56,
+                size_swa=56,
+                page_size=page_size,
+                dtype=torch.bfloat16,
+                device="cpu",
+                kvcache=pool,
+                need_sort=True,
+                static_full_tokens=16,
+            )
+        self.assertEqual(allocator._eviction_policy, "compact")
+        self.assertEqual(allocator._full_share, 8)
+        self.assertEqual(allocator._swa_share, 6)
+
+        # Allocate all 14 physical pages as 7 Full logical pages (28 tokens):
+        # Full holds 14 physical pages (> _full_share=8), SWA holds 0 (< _swa_share=6).
+        fa_all = allocator.full_attn_allocator.alloc(28)
+        self.assertEqual(allocator._free_page_count(), 0)
+
+        calls = []
+        remaining = [fa_all]
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = True
+
+        def _on_evict(params):
+            calls.append((params.num_tokens, params.swa_num_tokens))
+            n = min(int(params.num_tokens), int(remaining[0].numel()))
+            n = ((n + 3) // 4) * 4
+            if n > 0:
+                to_free, remaining[0] = remaining[0][:n], remaining[0][n:]
+                allocator.full_attn_allocator.free(to_free)
+
+        tree_cache.evict.side_effect = _on_evict
+        tree_cache.evict_for_alloc.side_effect = _on_evict
+
+        # Under static_shadow / compact, since Full overshoots its static share (14 > 8)
+        # while SWA is under its share (0 + 5 <= 6), only Full is evicted!
+        ok = allocator.evict_to_free_tokens(tree_cache, 4, swa_num_tokens=4)
+        self.assertTrue(ok)
+        # Need M_full + M_swa = 2 + 5 = 7 physical pages -> ceil(7 / 2) = 4 Full pages = 16 tokens:
+        self.assertEqual(calls[0], (16, 0))
+        allocator.full_attn_allocator.free(remaining[0])
 
 
 if __name__ == "__main__":

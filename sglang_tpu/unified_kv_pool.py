@@ -28,9 +28,16 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.runtime_context import get_disagg
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
+from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kv_free_fence import HeldPages
 from sglang_tpu.kv_pool import (
     GB,
     TpuFusedMHATokenToKVPool,
@@ -40,6 +47,8 @@ from sglang_tpu.kv_pool import (
 from sglang_tpu.unified_kv_heads import merge_swa_kv_heads, split_swa_output
 
 logger = logging.getLogger(__name__)
+
+_EVICTION_POLICIES = ("full_first", "swa_first", "static_shadow", "compact")
 
 
 def num_shared_kv_buffers(num_full_layers: int, num_swa_layers: int) -> int:
@@ -537,3 +546,627 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
     def get_state_buf_infos(self):
         """SWA shares the physical buffers already returned by ``get_contiguous_buf_infos``."""
         return [], [], []
+
+
+class _SharedPageStore:
+    """Shared CPU physical page pool (1 .. num_pages) drawn from by Full and SWA with zero fragmentation."""
+
+    def __init__(self):
+        self.free_pages: Optional[torch.Tensor] = None
+        self.page_is_free: Optional[torch.Tensor] = None
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
+        self.held_pages = HeldPages()
+
+    def unheld_free_pages(self) -> int:
+        return (
+            0 if self.free_pages is None else len(self.free_pages)
+        ) + self.num_staged_pages
+
+    def num_free_pages(self) -> int:
+        return self.unheld_free_pages() + self.held_pages.num_pages
+
+
+class _SharedPagesAllocator(TpuPagedTokenToKVPoolAllocator):
+    """One side (Full or SWA) of the zero-fragmentation Logical-to-Physical unified allocator.
+
+    Both sides share a single flat ``free_pages`` list in ``_SharedPageStore``.
+    - Full Attention claims 1 physical page ID per logical page.
+    - SWA claims 1 primary physical page ID ``p`` (for Group 0) plus ``M - 1``
+      arbitrary companion physical page IDs (for Groups ``1 .. M - 1``), recorded
+      in ``group_pages[:, p]`` and released together when ``p`` is freed.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_store: _SharedPageStore,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+        group_pages: Optional[torch.Tensor] = None,
+    ):
+        self._page_store = page_store
+        self.allocated_pages = 0
+        self._group_pages = group_pages
+        self._pages_per_id = 1 if group_pages is None else group_pages.shape[0] + 1
+        self._free_pages_before_take: Optional[torch.Tensor] = None
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache,
+            need_sort=need_sort,
+        )
+
+    @property
+    def free_pages(self) -> Optional[torch.Tensor]:
+        return self._page_store.free_pages
+
+    @free_pages.setter
+    def free_pages(self, value: Optional[torch.Tensor]) -> None:
+        self._page_store.free_pages = value
+
+    @property
+    def staged_pages(self) -> list[torch.Tensor]:
+        return self._page_store.staged_pages
+
+    @staged_pages.setter
+    def staged_pages(self, value: list[torch.Tensor]) -> None:
+        self._page_store.staged_pages = value
+
+    @property
+    def num_staged_pages(self) -> int:
+        return self._page_store.num_staged_pages
+
+    @num_staged_pages.setter
+    def num_staged_pages(self, value: int) -> None:
+        self._page_store.num_staged_pages = value
+
+    @property
+    def held_pages(self) -> HeldPages:
+        return self._page_store.held_pages
+
+    @held_pages.setter
+    def held_pages(self, value: HeldPages) -> None:
+        self._page_store.held_pages = value
+
+    @property
+    def page_is_free(self) -> Optional[torch.Tensor]:
+        return self._page_store.page_is_free
+
+    @page_is_free.setter
+    def page_is_free(self, value: Optional[torch.Tensor]) -> None:
+        self._page_store.page_is_free = value
+
+    def available_size(self) -> int:
+        return (
+            self._page_store.num_free_pages() // self._pages_per_id
+        ) * self.page_size
+
+    def allocated_count(self) -> int:
+        return (self.allocated_pages // self._pages_per_id) * self.page_size
+
+    def alloc(self, need_size: int):
+        return self._count_taken_pages(super().alloc, need_size)
+
+    def alloc_extend(self, *args, **kwargs):
+        return self._count_taken_pages(super().alloc_extend, *args, **kwargs)
+
+    def alloc_decode(self, *args, **kwargs):
+        return self._count_taken_pages(super().alloc_decode, *args, **kwargs)
+
+    def _count_taken_pages(self, take, *args, **kwargs):
+        free_before = self._page_store.num_free_pages()
+        out = take(*args, **kwargs)
+        if self._group_pages is not None:
+            self._take_group_pages()
+        self.allocated_pages += free_before - self._page_store.num_free_pages()
+        return out
+
+    def _ensure_free_pages(self, num_pages: int) -> bool:
+        if self._group_pages is None:
+            return super()._ensure_free_pages(num_pages)
+        ok = super()._ensure_free_pages(num_pages * self._pages_per_id)
+        self._free_pages_before_take = self.free_pages if ok else None
+        return ok
+
+    def _take_group_pages(self) -> None:
+        before = self._free_pages_before_take
+        self._free_pages_before_take = None
+        if before is None:
+            return
+        num_taken = len(before) - len(self.free_pages)
+        if num_taken == 0:
+            return
+        num_extra = self._group_pages.shape[0] * num_taken
+        extra = self.free_pages[:num_extra]
+        self._mark_handed_out(extra)
+        self._group_pages[:, before[:num_taken].long()] = extra.view(-1, num_taken)
+        self.free_pages = self.free_pages[num_extra:]
+
+    def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
+        page_ids = tuple(
+            ids[ids > 0]
+            for ids in (
+                p.reshape(-1).to(device="cpu", dtype=torch.int32) for p in page_ids
+            )
+        )
+        if self._group_pages is not None and page_ids:
+            ids = torch.cat([p.to(torch.int64) for p in page_ids])
+            if ids.numel() > 0:
+                page_ids = (*page_ids, self._group_pages[:, ids].reshape(-1))
+        total_released = sum(ids.numel() for ids in page_ids)
+        if total_released == 0:
+            return
+        self.allocated_pages -= total_released
+        super()._release_page_ids(*page_ids)
+
+    def clear(self) -> None:
+        super().clear()
+        self.allocated_pages = 0
+
+
+class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Logical-to-Physical Unified KV allocator for Full + SWA attention on TPU.
+
+    Both Full and SWA allocate from a single shared physical page list
+    (``_SharedPageStore``). A Full logical page consumes ``M_full = num_full_groups``
+    arbitrary physical page IDs (recorded in ``kvcache.full_group_pages``);
+    an SWA logical page consumes ``M_swa = num_swa_groups`` arbitrary physical page
+    IDs (recorded in ``kvcache.swa_group_pages``), eliminating both external and
+    internal fragmentation.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: Optional[int] = None,
+        *,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: TpuUnifiedSWAKVPool,
+        need_sort: bool,
+        req_to_token_pool=None,
+        static_full_tokens: Optional[int] = None,
+    ):
+        del size_swa
+        if page_size <= 1:
+            raise ValueError(
+                f"TpuUnifiedSWATokenToKVPoolAllocator requires page_size > 1, got {page_size}."
+            )
+        assert isinstance(kvcache, TpuUnifiedSWAKVPool)
+        self._page_store = _SharedPageStore()
+        self._full_groups = getattr(kvcache, "num_full_groups", 1)
+        self._swa_groups = getattr(kvcache, "num_swa_groups", 1)
+        self.need_sort = need_sort
+        self._kvcache = kvcache
+        self._req_to_token_pool = req_to_token_pool
+        super().__init__(
+            size=size,
+            size_swa=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache,
+            need_sort=need_sort,
+            req_to_token_pool=req_to_token_pool,
+        )
+        assert not self._swa_req_ring
+        self._eviction_policy, self._full_share, self._swa_share = self._eviction_setup(
+            kvcache, size // page_size, static_full_tokens
+        )
+        self._compact_retain_tokens = (
+            tpu_envs.SGLANG_TPU_UNIFIED_KV_COMPACT_RETAIN_TOKENS.get()
+        )
+        self.full_attn_allocator = _SharedPagesAllocator(
+            page_store=self._page_store,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache.full_kv_pool,
+            need_sort=need_sort,
+            group_pages=kvcache.full_group_pages if self._full_groups > 1 else None,
+        )
+        self.swa_attn_allocator = _SharedPagesAllocator(
+            page_store=self._page_store,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache.swa_kv_pool,
+            need_sort=need_sort,
+            group_pages=kvcache.swa_group_pages if self._swa_groups > 1 else None,
+        )
+        self.clear()
+
+    def _eviction_setup(
+        self,
+        kvcache: TpuUnifiedSWAKVPool,
+        total_pages: int,
+        static_full_tokens: Optional[int],
+    ) -> Tuple[str, int, int]:
+        """Resolve ``SGLANG_TPU_UNIFIED_KV_EVICTION`` and each side's static share
+        in physical page IDs."""
+        policy = tpu_envs.SGLANG_TPU_UNIFIED_KV_EVICTION.get()
+        if policy not in _EVICTION_POLICIES:
+            raise ValueError(
+                f"SGLANG_TPU_UNIFIED_KV_EVICTION={policy!r}; expected one of "
+                f"{', '.join(_EVICTION_POLICIES)}"
+            )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            policy = "full_first"
+        if static_full_tokens is None:
+            if policy not in ("full_first", "swa_first"):
+                policy = "full_first"
+            return policy, total_pages, 0
+        full_pages = static_full_tokens // self.page_size
+        full_share = full_pages * self._full_groups
+        # Because G = gcd(B, S), total_pages * G == full_pages * B + swa_pages * S,
+        # so swa_pages * M_swa == total_pages - full_pages * M_full.
+        swa_share = max(0, total_pages - full_share)
+        logger.info(
+            "Unified KV eviction under pressure: %s (static shares: %d full, "
+            "%d SWA page ids)",
+            policy,
+            full_share,
+            swa_share,
+        )
+        return policy, full_share, swa_share
+
+    def clear(self) -> None:
+        self.swa_attn_allocator.clear()
+        self.full_attn_allocator.clear()
+        self.full_to_swa_index_mapping[:-1].fill_(0)
+        self.free_group = None
+        self.swa_free_group = []
+        self.swa_page_ids_group = []
+
+    def _total_pages(self) -> int:
+        return self.size_full // self.page_size
+
+    def _free_page_count(self) -> int:
+        return self._page_store.num_free_pages()
+
+    def _page_ids_needed(self, num_full_pages: int, num_swa_pages: int) -> int:
+        return self._full_groups * num_full_pages + self._swa_groups * num_swa_pages
+
+    def max_extend_tokens(self) -> int:
+        """Maximum joint Full + SWA tokens allocatable in one extend without eviction."""
+        return (
+            self._free_page_count() // (self._full_groups + self._swa_groups)
+        ) * self.page_size
+
+    def available_size(self) -> int:
+        return self.max_extend_tokens()
+
+    def full_available_size(self) -> int:
+        return (self._free_page_count() // self._full_groups) * self.page_size
+
+    def swa_available_size(self) -> int:
+        return (self._free_page_count() // self._swa_groups) * self.page_size
+
+    def _conserve_full_available_size(self) -> int:
+        return self._size_full - self.full_attn_allocator.allocated_count()
+
+    def _conserve_swa_available_size(self) -> int:
+        return self._size_swa - self.swa_attn_allocator.allocated_count()
+
+    def conserve_full_available_size(self) -> int:
+        return self._conserve_full_available_size()
+
+    def conserve_swa_available_size(self) -> int:
+        return self._conserve_swa_available_size()
+
+    @property
+    def current_full_capacity(self) -> int:
+        return self.full_available_size() + self.full_attn_allocator.allocated_count()
+
+    @property
+    def current_swa_capacity(self) -> int:
+        return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        del full_capacity, swa_capacity
+        return (
+            (self.current_full_capacity, self.full_available_size()),
+            (self.current_swa_capacity, self.swa_available_size()),
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
+
+        return SharedSWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
+        if min(num_full_pages, num_swa_pages) < 0:
+            return False
+        return (
+            self._page_ids_needed(num_full_pages, num_swa_pages)
+            <= self._free_page_count()
+        )
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        out_indices_cpu: Optional[torch.Tensor] = None,
+    ):
+        num_new_pages = int((seq_lens_cpu % self.page_size == 1).sum())
+        if not self.new_pages_available(num_new_pages, num_new_pages):
+            return None
+        return super().alloc_decode(
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            out_indices_cpu=out_indices_cpu,
+        )
+
+    def reclaim_plan(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+    ) -> Optional[Tuple[int, int]]:
+        if full_tokens < 0 or swa_tokens < 0:
+            return None
+        page_size = self.page_size
+        full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
+        swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
+        need_pages = self._page_ids_needed(full_pages, swa_pages)
+
+        if empty_pool:
+            return (0, 0) if need_pages <= self._total_pages() else None
+
+        free_pages = self._free_page_count()
+        if need_pages <= free_pages:
+            return (0, 0)
+
+        short_pages = need_pages - free_pages
+        m_full = self._full_groups
+        m_swa = self._swa_groups
+        max_full_pages = min(
+            self.full_attn_allocator.allocated_pages // m_full,
+            max(0, int(full_evictable_tokens)) // page_size,
+        )
+        max_swa_pages = min(
+            self.swa_attn_allocator.allocated_pages // m_swa,
+            max(0, int(swa_evictable_tokens)) // page_size,
+        )
+        if self._page_ids_needed(max_full_pages, max_swa_pages) < short_pages:
+            return None
+
+        # Prefer evicting Full prefix pages first, then SWA pages if needed.
+        full_reclaim_pages = min(max_full_pages, _cdiv(short_pages, m_full))
+        rem_short = short_pages - full_reclaim_pages * m_full
+        swa_reclaim_pages = _cdiv(rem_short, m_swa) if rem_short > 0 else 0
+        return (
+            full_reclaim_pages * page_size,
+            swa_reclaim_pages * page_size,
+        )
+
+    def can_reserve(
+        self,
+        full_tokens: int | float,
+        swa_tokens: int | float,
+        *,
+        full_evictable_tokens: int = 0,
+        swa_evictable_tokens: int = 0,
+        empty_pool: bool = False,
+        require_token_slack: bool = False,
+    ) -> bool:
+        if full_tokens < 0 or swa_tokens < 0:
+            return False
+        if require_token_slack and (
+            full_tokens >= self.size_full or swa_tokens >= self.size_swa
+        ):
+            return False
+        return (
+            self.reclaim_plan(
+                full_tokens,
+                swa_tokens,
+                full_evictable_tokens=full_evictable_tokens,
+                swa_evictable_tokens=swa_evictable_tokens,
+                empty_pool=empty_pool,
+            )
+            is not None
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        del token_capacity
+        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+
+        def fits(candidate: int) -> bool:
+            return self.can_reserve(
+                input_tokens + candidate + self.page_size,
+                estimate_swa_kv_tokens(
+                    input_tokens,
+                    candidate,
+                    sliding_window_size=sliding_window_size,
+                    page_size=self.page_size,
+                    allocation_limit=chunk_size,
+                ),
+                empty_pool=True,
+                require_token_slack=True,
+            )
+
+        if not fits(0):
+            return None
+        if fits(max_new_tokens):
+            return max_new_tokens
+        lo, hi = 0, max_new_tokens
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _evict_shortfall(self, tree_cache, full_pages: int, swa_pages: int) -> None:
+        need_pages = self._page_ids_needed(full_pages, swa_pages)
+        if need_pages <= self._free_page_count():
+            return
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        page_size = self.page_size
+        m_full = self._full_groups
+        m_swa = self._swa_groups
+        if self._eviction_policy == "full_first":
+            short = need_pages - self._free_page_count()
+            tree_cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=_cdiv(short, m_full) * page_size,
+                    swa_num_tokens=_cdiv(short, m_swa) * page_size,
+                )
+            )
+            return
+        if self._eviction_policy == "swa_first":
+            if (
+                isinstance(tree_cache, UnifiedRadixCache)
+                and get_disagg().disaggregation_mode != "decode"
+            ):
+                tree_cache.evict_unmatchable_device_leaves(
+                    lambda: self._free_page_count() >= need_pages
+                )
+            for with_full in (False, True):
+                short = need_pages - self._free_page_count()
+                if short <= 0:
+                    return
+                tree_cache.evict_for_alloc(
+                    EvictParams(
+                        num_tokens=_cdiv(short, m_full) * page_size if with_full else 0,
+                        swa_num_tokens=_cdiv(short, m_swa) * page_size,
+                    )
+                )
+            return
+
+        def shortfall() -> int:
+            return need_pages - self._free_page_count()
+
+        def done() -> bool:
+            return shortfall() <= 0
+
+        def overshoots() -> Tuple[int, int]:
+            return (
+                self.full_attn_allocator.allocated_pages
+                + m_full * full_pages
+                - self._full_share,
+                self.swa_attn_allocator.allocated_pages
+                + m_swa * swa_pages
+                - self._swa_share,
+            )
+
+        def evict(full_ids: int, swa_ids: int) -> None:
+            full_tokens = _cdiv(max(full_ids, 0), m_full) * page_size
+            swa_tokens = _cdiv(max(swa_ids, 0), m_swa) * page_size
+            if full_tokens and swa_tokens:
+                tree_cache.evict(
+                    EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens)
+                )
+            elif full_tokens or swa_tokens:
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=full_tokens, swa_num_tokens=swa_tokens)
+                )
+
+        compact = (
+            self._eviction_policy == "compact"
+            and isinstance(tree_cache, UnifiedRadixCache)
+            and get_disagg().disaggregation_mode != "decode"
+        )
+        if compact:
+            tree_cache.evict_unmatchable_device_leaves(done)
+        over_full, over_swa = overshoots()
+        if compact and over_swa > 0 and not done():
+            evict(min(over_full, shortfall()), 0)
+            tree_cache.compact_swa(self._compact_retain_tokens, done)
+            over_full, over_swa = 0, overshoots()[1]
+        if not done():
+            evict(min(over_full, shortfall()), min(over_swa, shortfall()))
+        full_held, swa_held = (
+            self.full_attn_allocator.allocated_pages + m_full * full_pages,
+            self.swa_attn_allocator.allocated_pages + m_swa * swa_pages,
+        )
+        swa_nearer = swa_held * self._full_share > full_held * self._swa_share
+        for kind_is_swa in (swa_nearer, not swa_nearer):
+            if done():
+                return
+            if kind_is_swa and compact:
+                tree_cache.compact_swa(self._compact_retain_tokens, done)
+                if done():
+                    return
+            if kind_is_swa:
+                evict(0, shortfall())
+            else:
+                evict(shortfall(), 0)
+
+    def evict_to_free_tokens(
+        self, tree_cache, num_tokens: int, *, swa_num_tokens: Optional[int] = None
+    ) -> bool | None:
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
+            return None
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        need_full_pages = _cdiv(max(0, int(num_tokens)), self.page_size)
+        need_swa_pages = _cdiv(max(0, int(required_swa)), self.page_size)
+        if hasattr(tree_cache, "evict_for_alloc"):
+            self._evict_shortfall(tree_cache, need_full_pages, need_swa_pages)
+        else:
+            plan = self.reclaim_plan(
+                num_tokens,
+                required_swa,
+                full_evictable_tokens=tree_cache.full_evictable_size(),
+                swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            )
+            if plan is None:
+                return False
+            full_reclaim, swa_reclaim = plan
+            if full_reclaim or swa_reclaim:
+                tree_cache.evict(
+                    EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
+                )
+        return self.new_pages_available(need_full_pages, need_swa_pages)
+
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        ready = self.evict_to_free_tokens(
+            tree_cache, full_tokens, swa_num_tokens=swa_tokens
+        )
+        if ready is None:
+            need_full_pages = _cdiv(max(0, int(full_tokens)), self.page_size)
+            need_swa_pages = _cdiv(max(0, int(swa_tokens)), self.page_size)
+            ready = self.new_pages_available(need_full_pages, need_swa_pages)
+        if ready:
+            return None
+        return (
+            "Unified FULL/SWA reclamation insufficient: "
+            f"needed=({full_tokens}, {swa_tokens})"
+        )
+
+    def debug_print(self) -> str:
+        return (
+            f"#free-pages: {self._free_page_count()}, "
+            f"#full-pages: {self.full_attn_allocator.allocated_pages}, "
+            f"#swa-pages: {self.swa_attn_allocator.allocated_pages}, "
+        )
+
