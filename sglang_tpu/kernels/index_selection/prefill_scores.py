@@ -18,47 +18,12 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
-from . import tuned_block_sizes
 from .key_layout import DIM, ROW_WORDS, SLOTS
 
-
-def supports_chunked_prefill(
-    q: jax.Array,
-    pool: jax.Array | tuple[jax.Array, jax.Array],
-    page_records: int | None,
-) -> bool:
-    """Packed-cache prefill with complete resident-query tiles."""
-    banks = pool if isinstance(pool, tuple) else (pool,)
-    return (
-        q.ndim == 3
-        and q.shape[0] >= tuned_block_sizes.QUERY_TILE
-        and q.shape[0] % tuned_block_sizes.QUERY_TILE == 0
-        and q.shape[1:] == (32, DIM)
-        and q.dtype == jnp.bfloat16
-        and page_records is not None
-        and 0 < page_records <= tuned_block_sizes.KEY_TILE
-        and page_records % 16 == 0
-        and tuned_block_sizes.KEY_TILE % page_records == 0
-        and all(
-            b.dtype == jnp.int32
-            and b.ndim == 2
-            and b.shape[1] == ROW_WORDS
-            and b.shape[0] % (page_records // SLOTS) == 0
-            for b in banks
-        )
-    )
-
-
-def context_buckets(capacity: int) -> tuple[int, ...]:
-    """Power-of-two score widths, capped at the page-aligned capacity."""
-    tile = tuned_block_sizes.KEY_TILE
-    capacity = pl.cdiv(capacity, tile) * tile
-    widths = []
-    width = tile
-    while width < capacity:
-        widths.append(width)
-        width *= 2
-    return (*widths, capacity)
+# At Bq=128, a 32K-key FP32 output window occupies 16 MiB. Mosaic double
+# buffers grid-window outputs, so long contexts need 32 MiB plus scorer
+# scratch. A single <=64K window retains the original single-buffer layout.
+SCORE_WINDOW = 32768
 
 
 def _block_max(values, lanes, block_size):
@@ -363,8 +328,8 @@ def prefill_index_scores(
     # logical HBM columns before the full-row SparseCore selector runs.
     window = (
         width
-        if width <= 2 * tuned_block_sizes.SCORE_WINDOW
-        else math.gcd(width, max(key_tile, tuned_block_sizes.SCORE_WINDOW))
+        if width <= 2 * SCORE_WINDOW
+        else math.gcd(width, max(key_tile, SCORE_WINDOW))
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     result = pl.pallas_call(
