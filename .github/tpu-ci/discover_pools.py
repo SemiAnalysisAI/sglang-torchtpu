@@ -251,6 +251,11 @@ def main():
                 f"({type(e).__name__}: {e}) {detail.strip()[:300]}"
             )
             log("⚠️  Kueue will not admit onto those pools until this is fixed.")
+            print(
+                f"::warning title=TPU pool not registered with Kueue::{' '.join(new)} "
+                "(see kueue-ci-rbac.yaml)",
+                file=sys.stderr,
+            )
 
     # Union collapses to `found` once every pool carries ci-tpu-lane -- see the TODO above.
     print(" ".join(sorted(set(static) | set(found))))

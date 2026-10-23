@@ -275,6 +275,7 @@ _TODO._
 | `.github/tpu-ci/topology.yaml` | `(lane, host count)` → slice `{topology, pool, queue}` (detection source of truth) |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Strategic-merge patch dropping the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
+| `.github/tpu-ci/kueue-ci-rbac.yaml` | Lets `tpu-ci@` patch the CI ClusterQueues and create flavors, so the two scripts below can keep Kueue current |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
 | `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips (and the 1-host cohort's reserve split); refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
@@ -379,7 +380,8 @@ both labels set, needs no edit to `topology.yaml` or `kueue-tpu.yaml`.
   controller** (the e2-medium default-pool is CPU-saturated by GKE daemons).
 - Artifact Registry: `us-central1-docker.pkg.dev/YOUR_PROJECT/YOUR_REPOSITORY`.
 - Service account `tpu-ci@YOUR_PROJECT.iam.gserviceaccount.com` with
-  `container.developer`, `artifactregistry.writer`, `logging.logWriter`.
+  `container.developer`, `artifactregistry.writer`, `logging.logWriter`, plus the
+  cluster-scoped Kueue grant in `kueue-ci-rbac.yaml`.
 - WIF pool `github` + provider `github-oidc`, scoped to `sgl-project/sglang-torchtpu`,
   bound to `tpu-ci` via `workloadIdentityUser`.
 - Namespace `tpu-ci`; KSA `weights-loader` granted `storage.objectViewer` on
@@ -462,13 +464,21 @@ error anywhere. With only `jobset` enabled, that mistake cannot reach them.
 
 Then confirm nothing unexpected was caught: `kubectl get workloads -A`.
 
-**3. Apply the quotas.**
+**3. Apply the quotas, and let CI keep them current.**
 
 ```bash
 kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
 kubectl get clusterqueues -o wide        # ACTIVE=True on all five
 kubectl -n tpu-ci get localqueues
+kubectl apply -f .github/tpu-ci/kueue-ci-rbac.yaml
+kubectl auth can-i patch clusterqueues/tpu-prgate-1h \
+  --as=tpu-ci@sglang-torchtpu.iam.gserviceaccount.com   # yes
 ```
+
+Without `kueue-ci-rbac.yaml` the CI service account can read the queues but not patch them,
+so `reconcile_quota.py` and `discover_pools.py --sync` log a `::warning::` on every job and
+the quotas stay whatever was last applied by hand -- wrong as soon as a pool is resized,
+added or deleted.
 
 `ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
 resolve, even if it can never admit anything — so also check that a real workload reaches

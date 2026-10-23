@@ -236,7 +236,9 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001 -- stale quota must not block the test
+        # An annotation, not just a log line: a missing grant must show on the run page.
         print(
-            f"⚠️  quota reconcile skipped ({type(e).__name__}: {e}); "
-            "proceeding with existing quota"
+            f"::warning title=TPU quota reconcile skipped::{type(e).__name__}: "
+            f"{' '.join(str(e).split())[:400]}; "
+            "proceeding with existing quota (see kueue-ci-rbac.yaml)"
         )
