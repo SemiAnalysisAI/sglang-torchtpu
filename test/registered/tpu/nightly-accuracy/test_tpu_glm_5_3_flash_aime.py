@@ -43,6 +43,8 @@ class TestGlm53FlashAIME(AccuracyTestCase):
     config_module = CONFIG_MODULE
     model_path = "/weights/GLM-5.3-Flash"
     tag = "glm-5-3-flash-aime-e2e"
+    # Weight load alone measured 1113 s in CI, then 9 decode + 4 prefill graphs compile.
+    health_timeout = 3600
 
     @classmethod
     def build_model_config(cls):
