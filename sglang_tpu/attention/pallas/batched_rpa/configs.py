@@ -85,6 +85,12 @@ class ServingConfigs:
     skip_kv_write: bool = False
     return_lse: bool = False
     cp_group_size: int | None = None
+    # Keep the running max, sum and accumulator in f32 (SGLANG_TPU_RPA_F32_STATS).
+    f32_stats: bool = False
+
+    @property
+    def stats_dtype(self) -> jnp.dtype:
+        return jnp.float32 if self.f32_stats else self.dtype_out
 
     @property
     def pages_per_seq(self) -> int:

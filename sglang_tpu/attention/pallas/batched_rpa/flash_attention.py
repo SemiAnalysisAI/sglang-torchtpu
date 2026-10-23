@@ -147,12 +147,12 @@ def flash_attention_qk_softmax(
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape).astype(qk.dtype))
     if kv_len_left is not None:
         # A row with no key in range keeps l == 0 rather than weighting masked
         # keys by exp(mask_value - mask_value).
         p = jnp.where(jnp.stack(masks, axis=0), p, 0)
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.stats_dtype)
 
     l_next_list = []
     for b_idx in range(cfgs.block.batch_size):
@@ -193,7 +193,7 @@ def flash_attention_pv(
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
-    pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
+    pv = pv.astype(cfgs.serve.stats_dtype).reshape(b, k_heads, tq, h_size)
 
     if cfgs.serve.scale_v is not None:
         pv *= cfgs.serve.scale_v

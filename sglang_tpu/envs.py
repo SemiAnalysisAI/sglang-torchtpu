@@ -130,6 +130,10 @@ class TpuEnvs:
     # Fused KV pool stores a rank's heads side by side in one 128-lane row when they
     # fit exactly (e.g. 2 x head_dim 64): half the bytes of a zero-padded row per head.
     SGLANG_TPU_KV_PACK_HEADS = EnvBool(False)
+    # Batched RPA: keep the online-softmax running max, sum and output accumulator in
+    # f32 instead of the output dtype. With bf16 they drift as the context grows (about
+    # 10% relative error at 900k tokens, 2% with this); the scores stay in the output dtype.
+    SGLANG_TPU_RPA_F32_STATS = EnvBool(False)
 
     # PD disaggregation (raiden)
     # TCP connections per rank pair for raiden KV reads and resharding pushes,

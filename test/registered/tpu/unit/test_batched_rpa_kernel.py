@@ -252,8 +252,11 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
         share_pages=False,
         prefill_block_sizes=None,
         seed=0,
+        tolerance=None,
     ):
         """Runs one batch of ``(prefix_len, q_len)`` sequences and checks it.
+
+        Returns each sequence's relative RMS error against the reference.
 
         ``share_pages`` points every row at one page row whose cache already
         holds each row's new K/V, the layout context-parallel prefill uses.
@@ -400,7 +403,9 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
             f" sink_effect={sink_effect:.3f}"
         )
         for i, diff in enumerate(diffs):
-            self.assertLess(diff, self.TOLERANCE, f"sequence {i} {seqs[i]}")
+            self.assertLess(
+                diff, tolerance or self.TOLERANCE, f"sequence {i} {seqs[i]}"
+            )
 
         updated = _kv_cache_from_kernel(
             updated_cache, 2 * num_kv_heads, head_dim, kv_layout
@@ -410,6 +415,7 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
             # Token-major writeback moves only the new tokens' rows.
             free_slots[:] = False
         np.testing.assert_array_equal(updated[~free_slots], expected_cache[~free_slots])
+        return rel_errors
 
     def test_packed_extend_every_sequence(self):
         for use_sink in (False, True):
@@ -544,6 +550,52 @@ class TestBatchedRpaKernelPackedBatches(unittest.TestCase):
                     sliding_window=sliding_window,
                     seq_along_lane=seq_along_lane,
                 )
+
+
+@unittest.skipIf(not _has_jax_tpu(), "Requires JAX with a TPU device")
+class TestBatchedRpaKernelPackedBatchesF32Stats(TestBatchedRpaKernelPackedBatches):
+    """The packed-batch cases again with SGLANG_TPU_RPA_F32_STATS=1.
+
+    The flag is read when the kernel is traced, so each change of it clears the
+    jit caches.
+    """
+
+    def _set_f32_stats(self, value):
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        tpu_envs.SGLANG_TPU_RPA_F32_STATS.set(value)
+        jax.clear_caches()
+
+    def setUp(self):
+        self._set_f32_stats(True)
+
+    def tearDown(self):
+        import jax
+
+        from sglang_tpu.envs import envs as tpu_envs
+
+        tpu_envs.SGLANG_TPU_RPA_F32_STATS.clear()
+        jax.clear_caches()
+
+    def test_long_prefix_error_does_not_grow(self):
+        """A 512-token extend over a 64k prefix (256 KV blocks): with the running
+        max, sum and accumulator in bf16 the rounding compounds across blocks;
+        in f32 the error stays at the bf16-score level of a short prefix."""
+        long_seqs = ((65536, 512),)
+        short_seqs = ((1024, 512),)
+        f32_long = self._check(seqs=long_seqs, padded_tokens=1024)[0]
+        f32_short = self._check(seqs=short_seqs, padded_tokens=1024)[0]
+        self._set_f32_stats(False)
+        # The bf16 statistics are what this flag fixes; only their error is compared.
+        bf16_long = self._check(seqs=long_seqs, padded_tokens=1024, tolerance=1.0)[0]
+        print(
+            f"{self.id()} rel_rms f32_long={f32_long:.4f}"
+            f" f32_short={f32_short:.4f} bf16_long={bf16_long:.4f}"
+        )
+        self.assertLess(f32_long, bf16_long)
+        self.assertLess(f32_long, 2 * f32_short)
 
 
 if __name__ == "__main__":

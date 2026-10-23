@@ -176,7 +176,7 @@ def calculate_and_store_out(
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
-            cfgs.serve.dtype_out == jnp.float32
+            cfgs.serve.stats_dtype == jnp.float32
             or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
         ):
             result = lax.div(batch_acc, batch_l)
@@ -664,15 +664,15 @@ def rpa_kernel(
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.stats_dtype,
                 ),  # m
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.stats_dtype,
                 ),  # l
                 pltpu.VMEM(
                     cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.stats_dtype,
                 ),  # acc
             ),
             lse_stage=(

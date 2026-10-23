@@ -44,6 +44,7 @@ from sglang_tpu.attention.pallas.batched_rpa import (
     schedule,
     utils,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 
 def prepare_inputs(
@@ -312,6 +313,17 @@ def calculate_block_sizes(
 
         # Account for batch size.
         total_bytes *= batch_size
+
+        if serve_cfgs.f32_stats:
+            # The m, l and acc scratch are not counted above; at the output dtype
+            # they fit the 20% headroom. f32 stats widen them past it (8 KV heads
+            # at bq 768 compiled to 70 MiB), so count the widening.
+            stats_rows = (
+                model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
+            )
+            total_bytes += (
+                stats_rows * (2 * num_lanes + aligned_head_dim) * (4 - out_bytes)
+            )
 
         return total_bytes
 
@@ -701,6 +713,7 @@ def ragged_paged_attention(
         skip_kv_write=skip_kv_write,
         return_lse=return_lse,
         cp_group_size=cp_group_size,
+        f32_stats=tpu_envs.SGLANG_TPU_RPA_F32_STATS.get(),
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
