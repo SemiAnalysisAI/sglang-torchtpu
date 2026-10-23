@@ -1191,8 +1191,11 @@ class TpuSRTPlatform(SRTPlatform):
         if get_memory().hicache_io_backend == "raiden":
             from sglang_tpu.kv_pool_host import (
                 TpuRaidenHostKVCache,
+                TpuRaidenUnifiedHostKVCache,
             )
 
+            if getattr(device_pool, "parent_pool", None) is not None:
+                return TpuRaidenUnifiedHostKVCache
             return TpuRaidenHostKVCache
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):

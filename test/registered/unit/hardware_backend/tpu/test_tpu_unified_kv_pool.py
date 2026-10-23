@@ -884,5 +884,271 @@ class TestTpuUnifiedPoolWiring(unittest.TestCase):
         subprocess.run([sys.executable, "-c", code], check=True)
 
 
+class TestTpuUnifiedRaidenHostOffload(unittest.TestCase):
+    """Tests for PR 4: unified Raiden host KV cache offload and shared host eviction."""
+
+    def test_raiden_unified_host_pool_shares_state_and_expands_swa_pages(self):
+        from unittest.mock import patch
+
+        from sglang_tpu.kv_pool_host import TpuRaidenUnifiedHostKVCache
+
+        pool = TpuUnifiedSWAKVPool(
+            size=40,
+            size_swa=40,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=512,
+            swa_head_num=2,
+            swa_head_dim=256,
+            swa_attention_layer_ids=[0, 1, 2, 3, 4],
+            full_attention_layer_ids=[5],
+            device="cpu",
+        )
+        with (
+            patch(
+                "sglang_tpu.kv_pool_host.host_memory_budget_bytes",
+                return_value=10 * 1024**3,
+            ),
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer") as mock_transfer_cls,
+        ):
+            full_host = TpuRaidenUnifiedHostKVCache(
+                pool.full_kv_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=4,
+                layout="page_first",
+                pool_label="full",
+            )
+            swa_host = TpuRaidenUnifiedHostKVCache(
+                pool.swa_kv_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=4,
+                layout="page_first",
+                pool_label="swa",
+            )
+            mock_transfer_cls.assert_called_once()
+
+        self.assertIs(full_host._state, swa_host._state)
+        self.assertIs(full_host.transfer, swa_host.transfer)
+        self.assertEqual(full_host.available_size(), 80)  # 20 pages * 4
+        self.assertEqual(swa_host.available_size(), 16)  # (20 // 5) * 4
+
+        # Allocate 1 SWA logical page on host (takes 5 physical host pages: 1 + [2, 3, 4, 5]).
+        swa_host_idx = swa_host.alloc(4)
+        self.assertEqual(swa_host_idx.tolist(), [4, 5, 6, 7])
+        self.assertEqual(
+            swa_host._state.swa_group_pages[:, 1].tolist(),
+            [2, 3, 4, 5],
+        )
+        self.assertEqual(full_host.available_size(), 60)  # 15 pages * 4
+
+        # Allocate 1 FA logical page on host (takes 1 physical host page: 6).
+        fa_host_idx = full_host.alloc(4)
+        self.assertEqual(fa_host_idx.tolist(), [24, 25, 26, 27])
+        self.assertEqual(full_host.available_size(), 56)  # 14 pages * 4
+
+        # SWA backup transfers all 5 physical device pages -> all 5 physical host pages.
+        pool.swa_group_pages[:, 3] = torch.tensor([9, 7, 2, 10], dtype=torch.int32)
+        dev_swa_idx = torch.tensor([12, 13, 14, 15], dtype=torch.int64)
+        swa_host.backup_from_device_all_layer(
+            pool.swa_kv_pool, swa_host_idx, dev_swa_idx, "raiden"
+        )
+        swa_host.transfer.backup.assert_called_once_with(
+            [3, 9, 7, 2, 10],
+            [1, 2, 3, 4, 5],
+        )
+
+        # FA load transfers 1 physical page per logical page.
+        dev_fa_idx = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
+        full_host.load_all_layer(pool.full_kv_pool, fa_host_idx, dev_fa_idx)
+        full_host.transfer.load.assert_called_once_with([6], [2])
+
+        swa_host.free(swa_host_idx)
+        full_host.free(fa_host_idx)
+        self.assertEqual(full_host.available_size(), 80)
+        self.assertEqual(swa_host.available_size(), 16)
+
+    def test_raiden_unified_host_pool_expands_both_full_and_swa_groups_when_gcd(self):
+        from unittest.mock import patch
+
+        from sglang_tpu.kv_pool_host import TpuRaidenUnifiedHostKVCache
+
+        # 8 Full layers, 20 SWA layers -> gcd = 4 buffers, M_full = 2, M_swa = 5.
+        pool = TpuUnifiedSWAKVPool(
+            size=40,
+            size_swa=40,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=list(range(8, 28)),
+            full_attention_layer_ids=list(range(8)),
+            device="cpu",
+        )
+        with (
+            patch(
+                "sglang_tpu.kv_pool_host.host_memory_budget_bytes",
+                return_value=10 * 1024**3,
+            ),
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer"),
+        ):
+            full_host = TpuRaidenUnifiedHostKVCache(
+                pool.full_kv_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=4,
+                layout="page_first",
+                pool_label="full",
+            )
+            swa_host = TpuRaidenUnifiedHostKVCache(
+                pool.swa_kv_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=4,
+                layout="page_first",
+                pool_label="swa",
+            )
+
+        self.assertEqual(full_host._m, 2)
+        self.assertEqual(swa_host._m, 5)
+        self.assertEqual(full_host.available_size(), 40)  # 20 pages // 2 * 4
+        self.assertEqual(swa_host.available_size(), 16)  # 20 pages // 5 * 4
+
+        fa_host_idx = full_host.alloc(4)  # primary page 1, companion page 2
+        self.assertEqual(fa_host_idx.tolist(), [4, 5, 6, 7])
+        self.assertEqual(full_host._state.full_group_pages[:, 1].tolist(), [2])
+
+        pool.full_group_pages[:, 3] = torch.tensor([8], dtype=torch.int32)
+        dev_fa_idx = torch.tensor([12, 13, 14, 15], dtype=torch.int64)
+        full_host.backup_from_device_all_layer(
+            pool.full_kv_pool, fa_host_idx, dev_fa_idx, "raiden"
+        )
+        full_host.transfer.backup.assert_called_once_with([3, 8], [1, 2])
+        full_host.free(fa_host_idx)
+        self.assertEqual(full_host.available_size(), 40)
+
+    def test_shared_raiden_host_pool_eviction_falls_back_to_full_when_swa_empty(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_hybrid_swa_group,
+        )
+
+        # 8 Full layers, 20 SWA layers -> G=4, M_full=2, M_swa=5.
+        # Host ratio = 1.0 -> 10 physical host pages (size=40, page_size=4).
+        pool = TpuUnifiedSWAKVPool(
+            size=40,
+            size_swa=40,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=128,
+            swa_attention_layer_ids=list(range(8, 28)),
+            full_attention_layer_ids=list(range(8)),
+            device="cpu",
+        )
+        allocator = TpuUnifiedSWATokenToKVPoolAllocator(
+            size=40,
+            size_swa=40,
+            page_size=4,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=True,
+        )
+        mem_mock = MagicMock(
+            hicache_io_backend="raiden",
+            hicache_ratio=1.0,
+            hicache_size=0,
+            hicache_mem_layout="page_first",
+            hicache_storage_backend=None,
+            enable_unified_memory=False,
+        )
+        parallel_mock = MagicMock(dcp_enabled=False)
+
+        full_host_allocs: list[torch.Tensor] = []
+        swa_evict_calls: list[int] = []
+        full_evict_calls: list[int] = []
+
+        def _host_swa_evict(n: int) -> int:
+            swa_evict_calls.append(n)
+            # Simulate 0 SWA host entries in the tree (all host pages held by Full-only prefix nodes):
+            return 0
+
+        def _host_full_evict(n: int) -> int:
+            full_evict_calls.append(n)
+            pages_to_free = (n + 3) // 4
+            freed = 0
+            while pages_to_free > 0 and full_host_allocs:
+                chunk = full_host_allocs.pop(0)
+                full_entry.host_pool.free(chunk)
+                pages_to_free -= 1
+                freed += 4
+            return freed
+
+        with (
+            patch(
+                "sglang_tpu.kv_pool_host.host_memory_budget_bytes",
+                return_value=10 * 1024**3,
+            ),
+            patch("sglang_tpu.raiden_transfer.RaidenKVTransfer"),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=mem_mock,
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_parallel",
+                return_value=parallel_mock,
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler._get_allocator_type",
+                return_value="default",
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_memory",
+                return_value=mem_mock,
+            ),
+        ):
+            group = build_hybrid_swa_group(
+                page_size=4,
+                full_kv_pool=pool.full_kv_pool,
+                swa_kv_pool=pool.swa_kv_pool,
+                full_layer_mapping={i: i for i in range(8)},
+                swa_layer_mapping={8 + j: j for j in range(20)},
+                use_mla=False,
+                host_full_evict_fn=_host_full_evict,
+                host_swa_evict_fn=_host_swa_evict,
+                swa_attn_allocator=allocator.swa_attn_allocator,
+            )
+
+        full_entry = group.entry_map[PoolName.KV]
+        swa_entry = group.entry_map[PoolName.SWA]
+        self.assertIsNotNone(full_entry.host_evict_fn)
+        self.assertIsNotNone(swa_entry.host_evict_fn)
+
+        # Fill all 10 physical host pages with 5 Full logical pages (each taking M_full=2 physical pages).
+        for _ in range(5):
+            idx = full_entry.host_pool.alloc(4)
+            self.assertIsNotNone(idx)
+            full_host_allocs.append(idx)
+        self.assertEqual(len(full_entry.host_pool._state.free_pages), 0)
+        self.assertEqual(swa_entry.host_pool.available_size(), 0)
+
+        # Now SWA backup needs 4 tokens (1 SWA logical page = M_swa=5 physical host pages).
+        # Even though there are 0 SWA host entries to evict, swa_entry.host_evict_fn(4)
+        # falls back to evicting ceil(5 / 2) = 3 Full logical pages (12 Full tokens = 6 physical pages)
+        # so the subsequent SWA host alloc(4) succeeds instead of permanently wedging!
+        swa_entry.host_evict_fn(4)
+        self.assertEqual(swa_evict_calls, [4])
+        self.assertEqual(full_evict_calls, [12])
+        swa_idx = swa_entry.host_pool.alloc(4)
+        self.assertIsNotNone(swa_idx)
+        self.assertEqual(len(full_entry.host_pool._state.free_pages), 1)
+
+
+
 if __name__ == "__main__":
     unittest.main()

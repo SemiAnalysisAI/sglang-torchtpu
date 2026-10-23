@@ -290,9 +290,11 @@ class _SharedBufferView(TpuFusedMHATokenToKVPool):
         allocation_label: str,
         layer_groups: Optional[List[int]] = None,
         group_pages: Optional[torch.Tensor] = None,
+        parent_pool: Optional[TpuUnifiedSWAKVPool] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        self.parent_pool = parent_pool
         layer_num = len(shared_buffers)
         KVCache.__init__(
             self,
@@ -559,6 +561,7 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
         )
         backing_buffers = self._backing_pool.kv_buffer
 
+        self._shared_raiden_state = None
         full_shared_buffers = [
             backing_buffers[i % self.num_shared_buffers]
             for i in range(self.full_layer_nums)
@@ -579,6 +582,7 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="Full",
             layer_groups=full_layer_groups,
             group_pages=self.full_group_pages if self.num_full_groups > 1 else None,
+            parent_pool=self,
         )
         swa_shared_buffers = [
             backing_buffers[j % self.num_shared_buffers]
@@ -600,6 +604,7 @@ class TpuUnifiedSWAKVPool(SWAKVPool):
             allocation_label="SWA",
             layer_groups=swa_layer_groups,
             group_pages=self.swa_group_pages if self.num_swa_groups > 1 else None,
+            parent_pool=self,
         )
         # HiCache sizes host memory from these weights; both views alias the
         # shared backing buffers, so they are counted once.
