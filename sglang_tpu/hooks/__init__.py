@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.plugins.hook_registry import HookType
+from sglang_tpu.hooks import dsv41, engram
 from sglang_tpu.hooks.attn_residual import (
     aggregate,
     aggregate_fused_add,
@@ -215,6 +216,9 @@ HOOKS: list[tuple] = [
 HOOKS.extend(host_padding_hooks())
 
 HOOKS.extend(hook_specs())
+
+HOOKS.extend(engram.hook_specs())
+HOOKS.extend(dsv41.hook_specs())
 
 _registered = False
 
