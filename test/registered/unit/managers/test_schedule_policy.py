@@ -260,6 +260,32 @@ class TestShortestPrefillFirst(CustomTestCase):
             )
         )
 
+    def test_chunk_share_skips_long_waiters_under_other_policies(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 300000)
+        waiting = [self.make_req("cold", 200000), self.make_req("turn", 1500)]
+        with envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.override(1024):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256
+                ),
+                2560,
+            )
+            self.assertTrue(self.policy.fits_shared_chunk(waiting[1], 1792))
+            self.assertFalse(self.policy.fits_shared_chunk(waiting[0], 1792))
+
+    def test_chunk_share_keeps_minimum_continuation_tokens(self):
+        self.policy.policy = CacheAwarePolicy.LPM
+        continuation = self.make_req("continuation", 300000)
+        waiting = [self.make_req("a", 2000), self.make_req("b", 2000)]
+        with envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.override(1024):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256
+                ),
+                2048,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

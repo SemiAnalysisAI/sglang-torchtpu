@@ -1349,6 +1349,9 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        self.prefill_chunk_share_min_tokens = (
+            envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.get()
+        )
         # DP attention keeps the interval in lockstep across ranks, whose running
         # batches differ, so only non-DP schedulers may skip it locally.
         self.prefill_decode_interval_skip_idle = (
@@ -4356,6 +4359,13 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if (
+                self.chunked_req is not None
+                and self.prefill_chunk_share_min_tokens
+                and not self.policy.fits_shared_chunk(req, adder.rem_chunk_tokens or 0)
+            ):
+                # A long prompt waits for its own turn instead of ending the scan.
+                continue
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)

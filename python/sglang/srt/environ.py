@@ -615,6 +615,10 @@ class Envs:
     # shortest-prefill-first: a request queued longer than this many seconds goes
     # ahead of shorter prefills, oldest first; 0 disables aging.
     SGLANG_SCHEDULE_SPF_MAX_WAIT_S = EnvFloat(0.0)
+    # While a long prompt is mid-prefill, waiting requests whose uncached prefill fits
+    # share each prefill batch with it under any schedule policy; the long prompt keeps at
+    # least this many tokens per batch. 0 disables (only shortest-prefill-first shares).
+    SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS = EnvInt(0)
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # Window for the token-weighted recent cache-hit rate used to estimate

@@ -330,9 +330,13 @@ class SchedulePolicy:
         # set it in _compute_prefix_matches; do the same full match for
         # cache-agnostic policies when the radix supports it, so the load
         # snapshot has it. Skip on decode (never prefills).
+        # Chunk sharing needs each waiting request's uncached length under any policy.
         if (
             not isinstance(policy, CacheAwarePolicy)
-            and self.tree_cache.supports_fast_match_prefix()
+            and (
+                self.tree_cache.supports_fast_match_prefix()
+                or envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.get()
+            )
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
@@ -522,26 +526,37 @@ class SchedulePolicy:
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        share_min = envs.SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS.get()
+        spf = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            not (spf or share_min)
             or budget < 2 * page_size
-            or _spf_aged(chunked_req, time.perf_counter())
+            or (spf and _spf_aged(chunked_req, time.perf_counter()))
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - len(
             chunked_req.prefix_indices
         )
+        # Shortest-prefill-first sorts the queue, so its first long request ends the scan;
+        # chunk sharing keeps the queue order and skips long requests instead.
+        keep = page_size if spf else max(page_size, share_min)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
-                break
+            if work >= remaining or reserved + charge > budget - keep:
+                if spf:
+                    break
+                continue
             reserved += charge
         if not reserved:
             return None
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
+
+    def fits_shared_chunk(self, req: Req, rem_tokens: int) -> bool:
+        """Whether a waiting request fits beside a mid-prefill one under chunk sharing."""
+        return self._shortest_prefill_work(req) <= rem_tokens
 
     @staticmethod
     def _sort_by_longest_prefix(
