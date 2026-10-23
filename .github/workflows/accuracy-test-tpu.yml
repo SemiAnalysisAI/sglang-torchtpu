@@ -255,8 +255,8 @@ jobs:
       run_name: accuracy-glm-5-3-flash-aime
       nightly: true
       weights_pvc: model-weights
-      # Four passes at a 128k thinking budget; not yet measured in CI.
-      timeout_per_file: 10800
+      # 36 min bring-up plus 42 min of eval measured in CI.
+      timeout_per_file: 7200
     permissions:
       contents: read
       id-token: write
