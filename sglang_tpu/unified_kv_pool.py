@@ -34,7 +34,13 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.model_executor.pool_configurator import (
+    HybridSWAPoolConfigurator,
+    MemoryPoolConfig,
+    MemoryPoolConfigurator,
+    SWAChunkCapPoolConfigurator,
+)
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.kv_free_fence import HeldPages
@@ -129,6 +135,121 @@ def resolve_unified_page_shape(
         f"but got full={full_page_shape} (heads={head_num}, dim={head_dim}) vs "
         f"swa={swa_page_shape} (heads={swa_head_num}, dim={swa_head_dim})."
     )
+
+
+def _unsupported_reason(kvc) -> Optional[str]:
+    """Return a human-readable reason why ``kvc`` cannot use the TPU unified KV pool,
+    or ``None`` when supported."""
+    if not getattr(kvc, "is_hybrid_swa", False):
+        return "--enable-unified-memory on TPU requires a hybrid SWA model."
+    if getattr(kvc, "use_mla_backend", False):
+        return "--enable-unified-memory on TPU does not support MLA models."
+    if getattr(kvc, "is_hybrid_gdn", False) or getattr(kvc, "has_mamba_state", False):
+        return (
+            "--enable-unified-memory on TPU does not support hybrid "
+            "linear-attention or Mamba models."
+        )
+    spec_algo = getattr(kvc, "spec_algorithm", None)
+    if getattr(kvc, "is_draft_worker", False) or (
+        spec_algo is not None and not spec_algo.is_none()
+    ):
+        return "--enable-unified-memory on TPU does not support speculative decoding."
+    parallel = get_parallel()
+    if getattr(parallel, "pp_size", 1) > 1 or getattr(kvc, "pp_size", 1) > 1:
+        return "--enable-unified-memory on TPU does not support pipeline parallelism."
+    if getattr(parallel, "attn_cp_size", 1) > 1:
+        return (
+            "--enable-unified-memory on TPU does not support prefill context "
+            "parallelism."
+        )
+    if getattr(kvc, "dcp_enabled", False) or getattr(parallel, "attn_dcp_size", 1) > 1:
+        return (
+            "--enable-unified-memory on TPU does not support decode context "
+            "parallelism."
+        )
+    disagg_mode = getattr(get_disagg(), "disaggregation_mode", "null")
+    if disagg_mode != "null":
+        return (
+            "--enable-unified-memory on TPU does not support PD disaggregation "
+            f"(disaggregation_mode={disagg_mode!r})."
+        )
+    mem = get_memory()
+    if (
+        getattr(mem, "enable_hierarchical_cache", False)
+        and getattr(mem, "hicache_io_backend", None) != "raiden"
+    ):
+        return (
+            "--enable-unified-memory on TPU with --enable-hierarchical-cache "
+            f"requires --hicache-io-backend raiden, got {getattr(mem, 'hicache_io_backend', None)!r}."
+        )
+    if getattr(mem, "enable_unified_cache_external_linker", False):
+        return (
+            "--enable-unified-memory on TPU does not support "
+            "--enable-unified-cache-external-linker."
+        )
+    pool_cls = getattr(kvc, "token_to_kv_pool_class", None)
+    if pool_cls is not None and not getattr(pool_cls, "supports_unified_kv_pool", False):
+        return (
+            "--enable-unified-memory on TPU requires a fused MHA KV pool, "
+            f"got {pool_cls.__name__}."
+        )
+    if getattr(kvc, "kv_cache_dtype_str", None) == "mxint8":
+        return "--enable-unified-memory on TPU does not support mxint8 KV cache."
+    if getattr(kvc, "pool_page_size", 0) <= 1:
+        return (
+            "--enable-unified-memory on TPU requires page_size > 1, "
+            f"got {getattr(kvc, 'pool_page_size', None)}."
+        )
+    if (
+        getattr(kvc, "custom_mem_pool_head_num", None) is not None
+        or getattr(kvc, "custom_mem_pool_head_dim", None) is not None
+    ):
+        return "--enable-unified-memory on TPU does not support custom pool head shapes."
+    n_full = len(kvc.layer_info.full_attention_layer_ids)
+    n_swa = len(kvc.layer_info.swa_attention_layer_ids)
+    if n_full <= 0 or n_swa <= 0:
+        return (
+            "--enable-unified-memory on TPU requires a hybrid model with both "
+            f"full ({n_full}) and SWA ({n_swa}) layers."
+        )
+    tp_size = getattr(parallel, "attn_tp_size", 1)
+    mc = kvc.model_config
+    head_num = mc.get_num_kv_heads(tp_size)
+    head_dim = mc.head_dim
+    v_head_dim = getattr(mc, "v_head_dim", None) or head_dim
+    swa_head_num = mc.get_swa_num_kv_heads(tp_size)
+    swa_head_dim = getattr(mc, "swa_head_dim", None) or head_dim
+    swa_v_head_dim = getattr(mc, "swa_v_head_dim", None) or swa_head_dim
+    try:
+        resolve_unified_page_shape(
+            page_size=kvc.pool_page_size,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            store_dtype=kvc.kv_cache_dtype,
+        )
+    except (ValueError, NotImplementedError) as exc:
+        return str(exc)
+    return None
+
+
+def _raise_if_unsupported(kvc) -> None:
+    reason = _unsupported_reason(kvc)
+    if reason is not None:
+        if "mxint8" in reason or "v_head_dim" in reason:
+            raise NotImplementedError(reason)
+        raise ValueError(reason)
+
+
+def unified_kv_pool_enabled(kvc) -> bool:
+    """Return True if ``--enable-unified-memory`` is active and validate ``kvc``."""
+    if not get_memory().tpu_unified_kv_pool:
+        return False
+    _raise_if_unsupported(kvc)
+    return True
 
 
 @functools.cache
@@ -1168,5 +1289,120 @@ class TpuUnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             f"#free-pages: {self._free_page_count()}, "
             f"#full-pages: {self.full_attn_allocator.allocated_pages}, "
             f"#swa-pages: {self.swa_attn_allocator.allocated_pages}, "
+        )
+
+
+class _SharedPagesRatioSplit(HybridSWAPoolConfigurator):
+    """Prices SWA tokens at the shared physical buffer's row byte width and
+    reserves page 0 across the ``G = gcd(B, S)`` shared buffers."""
+
+    def __init__(self, kvc, num_shared_buffers: int):
+        self._num_shared_buffers = num_shared_buffers
+        super().__init__(kvc)
+        if self._swa_per_token != self._full_per_token:
+            self._swa_per_token = self._full_per_token
+            self._recompute_cell_size()
+
+    def _dummy_page_bytes(self, page_size: int) -> int:
+        return page_size * self._full_per_token * self._num_shared_buffers
+
+    @staticmethod
+    def validate_swa_pool_size(
+        swa_tokens: int, sliding_window_size: Optional[int], page_size: int
+    ) -> None:
+        # Validated against the combined unified pool capacity in TpuUnifiedSWAPoolConfigurator._unify.
+        pass
+
+
+class _UnifiedChunkCapPoolConfigurator(SWAChunkCapPoolConfigurator):
+    """Chunk-capped SWA split priced at the shared physical buffer's row byte width."""
+
+    def __init__(self, kvc, num_shared_buffers: int):
+        self._num_shared_buffers = num_shared_buffers
+        super().__init__(kvc)
+        if self._swa_per_token != self._full_per_token:
+            self._swa_per_token = self._full_per_token
+            self._recompute_cell_size()
+
+    def _dummy_page_bytes(self, page_size: int) -> int:
+        return page_size * self._full_per_token * self._num_shared_buffers
+
+
+class TpuUnifiedSWAPoolConfigurator(MemoryPoolConfigurator):
+    """Sizes the Logical-to-Physical unified Full+SWA KV pool from ``num_shared_buffers = gcd(B, S)``.
+
+    First computes the static Full/SWA token split ``(full_tokens, swa_tokens)``
+    that fits the memory budget, then converts it into the shared physical pool's
+    page-ID token capacity ``shared_tokens = full_tokens * M_full + swa_tokens * M_swa``
+    while keeping ``max_total_num_tokens = full_tokens`` as the full-attention
+    token budget (and static eviction reference share).
+    """
+
+    def __init__(self, kvc):
+        _raise_if_unsupported(kvc)
+        self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
+        self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
+        self._sliding_window_size = kvc.sliding_window_size
+        self._num_shared_buffers = num_shared_kv_buffers(
+            self._full_layers_num, self._swa_layers_num
+        )
+        self._num_full_groups = num_full_groups(
+            self._full_layers_num, self._swa_layers_num
+        )
+        self._num_swa_groups = num_swa_groups(
+            self._full_layers_num, self._swa_layers_num
+        )
+        self._split = (
+            _UnifiedChunkCapPoolConfigurator(kvc, self._num_shared_buffers)
+            if SWAChunkCapPoolConfigurator.is_applicable(kvc)
+            else _SharedPagesRatioSplit(kvc, self._num_shared_buffers)
+        )
+        self._page_bytes = (
+            kvc.pool_page_size * self._split._full_per_token * self._num_shared_buffers
+        )
+        self._reserved_bytes = self._page_bytes
+        self._align_pages = 8
+
+    def _unify(self, cfg: MemoryPoolConfig, page_size: int) -> MemoryPoolConfig:
+        full_tokens = cfg.full_max_total_num_tokens or 0
+        swa_tokens = cfg.swa_max_total_num_tokens or 0
+        raw_shared_tokens = (
+            full_tokens * self._num_full_groups + swa_tokens * self._num_swa_groups
+        )
+        align_tokens = self._align_pages * page_size
+        shared_tokens = (raw_shared_tokens // align_tokens) * align_tokens
+        if self._sliding_window_size is not None:
+            min_tokens = (self._num_full_groups + self._num_swa_groups) * (
+                self._sliding_window_size + page_size
+            )
+            if shared_tokens <= min_tokens:
+                raise ValueError(
+                    f"Unified KV pool ({shared_tokens} page-id tokens) cannot hold "
+                    f"even one request: need > {min_tokens} tokens "
+                    f"(({self._num_full_groups} + {self._num_swa_groups}) * "
+                    f"(sliding_window_size {self._sliding_window_size} + "
+                    f"page_size {page_size}))."
+                )
+        return MemoryPoolConfig(
+            max_total_num_tokens=full_tokens,
+            full_max_total_num_tokens=shared_tokens,
+            swa_max_total_num_tokens=shared_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._unify(
+            self._split.calculate_pool_sizes(available_bytes, page_size), page_size
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._unify(
+            self._split.calculate_pool_sizes_from_max_tokens(
+                max_total_num_tokens, page_size
+            ),
+            page_size,
         )
 

@@ -11,14 +11,17 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.allocator_tpu import host_return_allocators
 from sglang_tpu.kv_free_fence import KVFreeFence
+from sglang_tpu.tpu_platform import TpuSRTPlatform, _resolve_unified_kv_pool
 from sglang_tpu.unified_kv_pool import (
     TpuUnifiedSWAKVPool,
+    TpuUnifiedSWAPoolConfigurator,
     TpuUnifiedSWATokenToKVPoolAllocator,
     merge_swa_kv_heads,
     num_full_groups,
     num_shared_kv_buffers,
     num_swa_groups,
     split_swa_output,
+    unified_kv_pool_enabled,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -570,6 +573,315 @@ class TestTpuUnifiedLogicalToPhysicalAllocator(unittest.TestCase):
         # Need M_full + M_swa = 2 + 5 = 7 physical pages -> ceil(7 / 2) = 4 Full pages = 16 tokens:
         self.assertEqual(calls[0], (16, 0))
         allocator.full_attn_allocator.free(remaining[0])
+
+
+class TestTpuUnifiedPoolWiring(unittest.TestCase):
+    """Tests for PR 3: flag resolution, feature blocking, configurator sizing (bf16 & fp8), and RPA wiring."""
+
+    def _make_kvc(
+        self,
+        dtype: torch.dtype = torch.bfloat16,
+        dtype_str: str = "bfloat16",
+        full_ids: list[int] | None = None,
+        swa_ids: list[int] | None = None,
+        page_size: int = 64,
+    ):
+        from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        if full_ids is None:
+            full_ids = list(range(10))
+        if swa_ids is None:
+            swa_ids = list(range(10, 60))
+        kvc = MagicMock()
+        kvc.is_hybrid_swa = True
+        kvc.use_mla_backend = False
+        kvc.is_hybrid_gdn = False
+        kvc.has_mamba_state = False
+        kvc.is_draft_worker = False
+        kvc.spec_algorithm.is_none.return_value = True
+        kvc.spec_algorithm.is_eagle.return_value = False
+        kvc.spec_algorithm.is_standalone.return_value = False
+        kvc.spec_algorithm.is_dflash_family.return_value = False
+        kvc.dcp_enabled = False
+        kvc.pp_size = 1
+        kvc.token_to_kv_pool_class = TpuFusedMHATokenToKVPool
+        kvc.custom_mem_pool_head_num = None
+        kvc.custom_mem_pool_head_dim = None
+        kvc.kv_cache_dtype = dtype
+        kvc.kv_cache_dtype_str = dtype_str
+        kvc.pool_page_size = page_size
+        kvc.page_size = page_size
+        kvc.sliding_window_size = 1024
+        kvc.attn_dp_size = 1
+        kvc.layer_info.full_attention_layer_ids = full_ids
+        kvc.layer_info.swa_attention_layer_ids = swa_ids
+        kvc.model_config.attention_arch = None
+        kvc.model_config.get_num_kv_heads.return_value = 1
+        kvc.model_config.head_dim = 512
+        kvc.model_config.v_head_dim = 512
+        kvc.model_config.get_swa_num_kv_heads.return_value = 2
+        kvc.model_config.swa_head_dim = 256
+        kvc.model_config.swa_v_head_dim = 256
+        return kvc
+
+    def test_resolve_unified_kv_pool_flag_and_validation(self):
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy",
+            enable_unified_memory=True,
+            attention_backend="pallas_tpu_rpa_v3",
+        )
+        _resolve_unified_kv_pool(args)
+        view = resolving_view(args)
+        self.assertFalse(view.enable_unified_memory)
+        self.assertTrue(view.tpu_unified_kv_pool)
+
+        invalid_kwargs_list = [
+            {"attention_backend": "pallas_tpu_flash"},
+            {"pp_size": 2},
+            {"dcp_size": 2},
+            {"attn_cp_size": 2},
+            {"enable_prefill_cp": True},
+            {"disaggregation_mode": "prefill"},
+            {"speculative_algorithm": "EAGLE3"},
+            {"enable_hierarchical_cache": True, "hicache_io_backend": "direct"},
+            {"enable_unified_cache_external_linker": True},
+            {"page_size": 1},
+        ]
+        for bad_kwargs in invalid_kwargs_list:
+            with self.subTest(bad_kwargs=bad_kwargs):
+                bad_args = ServerArgs(
+                    model_path="dummy",
+                    enable_unified_memory=True,
+                    attention_backend=bad_kwargs.get(
+                        "attention_backend", "pallas_tpu_rpa_batched"
+                    ),
+                    **{
+                        k: v
+                        for k, v in bad_kwargs.items()
+                        if k != "attention_backend"
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    _resolve_unified_kv_pool(bad_args)
+
+    def test_unified_kv_pool_enabled_feature_blocks(self):
+        from unittest.mock import patch
+
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        parallel_ok = MagicMock(
+            attn_tp_size=8, attn_dcp_size=1, pp_size=1, attn_cp_size=1
+        )
+        disagg_ok = MagicMock(disaggregation_mode="null")
+        mem_on = MagicMock(
+            tpu_unified_kv_pool=True,
+            enable_hierarchical_cache=False,
+            hicache_io_backend="raiden",
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            disable_radix_cache=False,
+        )
+        mem_off = MagicMock(tpu_unified_kv_pool=False)
+
+        with patch("sglang_tpu.unified_kv_pool.get_memory", return_value=mem_off):
+            self.assertFalse(unified_kv_pool_enabled(self._make_kvc()))
+
+        with (
+            patch("sglang_tpu.unified_kv_pool.get_memory", return_value=mem_on),
+            patch("sglang_tpu.unified_kv_pool.get_parallel", return_value=parallel_ok),
+            patch("sglang_tpu.unified_kv_pool.get_disagg", return_value=disagg_ok),
+        ):
+            self.assertTrue(unified_kv_pool_enabled(self._make_kvc()))
+
+            # Non-SWA, MLA, GDN, draft worker, SeqAlongLane, page_size=1, mxint8:
+            for attr, val in [
+                ("is_hybrid_swa", False),
+                ("use_mla_backend", True),
+                ("is_hybrid_gdn", True),
+                ("is_draft_worker", True),
+                ("dcp_enabled", True),
+                ("pp_size", 2),
+                ("token_to_kv_pool_class", TpuSeqAlongLaneKVPool),
+                ("pool_page_size", 1),
+                ("custom_mem_pool_head_num", 4),
+            ]:
+                kvc_bad = self._make_kvc()
+                setattr(kvc_bad, attr, val)
+                with self.assertRaises(ValueError):
+                    unified_kv_pool_enabled(kvc_bad)
+
+            kvc_mxint8 = self._make_kvc(dtype_str="mxint8")
+            with self.assertRaises(NotImplementedError):
+                unified_kv_pool_enabled(kvc_mxint8)
+
+    def test_configurator_gemma4_bf16_and_fp8_sizing(self):
+        from unittest.mock import patch
+
+        page_size = 64
+        parallel_mock = MagicMock(
+            attn_tp_size=8, attn_dcp_size=1, pp_size=1, attn_cp_size=1
+        )
+        disagg_mock = MagicMock(disaggregation_mode="null")
+        mem_mock = MagicMock(
+            tpu_unified_kv_pool=True,
+            enable_hierarchical_cache=False,
+            hicache_io_backend="raiden",
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            disable_radix_cache=False,
+        )
+        sched_mock = MagicMock(
+            swa_full_tokens_ratio=0.5,
+            chunked_prefill_size=4096,
+            disable_overlap_schedule=False,
+            max_running_requests=None,
+        )
+
+        exec_mock = MagicMock()
+        exec_mock.kernel.attention_backend = "pallas_tpu_rpa_v3"
+
+        with (
+            patch("sglang.srt.runtime_context.get_exec", return_value=exec_mock),
+            patch("sglang_tpu.unified_kv_pool.get_parallel", return_value=parallel_mock),
+            patch("sglang_tpu.unified_kv_pool.get_disagg", return_value=disagg_mock),
+            patch("sglang_tpu.unified_kv_pool.get_memory", return_value=mem_mock),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_parallel",
+                return_value=parallel_mock,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_disagg",
+                return_value=disagg_mock,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_memory",
+                return_value=mem_mock,
+            ),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_schedule",
+                return_value=sched_mock,
+            ),
+        ):
+            cfg_bf16 = TpuUnifiedSWAPoolConfigurator(
+                self._make_kvc(torch.bfloat16, "bfloat16")
+            )
+            cfg_fp8 = TpuUnifiedSWAPoolConfigurator(
+                self._make_kvc(torch.float8_e4m3fn, "fp8_e4m3")
+            )
+            cfg_gcd = TpuUnifiedSWAPoolConfigurator(
+                self._make_kvc(
+                    torch.bfloat16,
+                    "bfloat16",
+                    full_ids=list(range(8)),
+                    swa_ids=list(range(8, 28)),
+                )
+            )
+
+            self.assertEqual(cfg_bf16._num_shared_buffers, 10)
+            self.assertEqual(cfg_bf16._num_full_groups, 1)
+            self.assertEqual(cfg_bf16._num_swa_groups, 5)
+            self.assertEqual(cfg_gcd._num_shared_buffers, 4)
+            self.assertEqual(cfg_gcd._num_full_groups, 2)
+            self.assertEqual(cfg_gcd._num_swa_groups, 5)
+
+            # In FP8, SWA tokens are priced at the shared buffer's row byte width
+            # (_full_per_token) so merged SWA heads never overflow available_bytes!
+            self.assertEqual(cfg_fp8._split._swa_per_token, cfg_fp8._split._full_per_token)
+
+            budget_bytes = 512 * 1024 * 1024  # 512 MiB
+            res_bf16 = cfg_bf16.calculate_pool_sizes(budget_bytes, page_size)
+            res_fp8 = cfg_fp8.calculate_pool_sizes(budget_bytes, page_size)
+            res_gcd = cfg_gcd.calculate_pool_sizes(budget_bytes, page_size)
+
+            for cfg, res in (
+                (cfg_bf16, res_bf16),
+                (cfg_fp8, res_fp8),
+                (cfg_gcd, res_gcd),
+            ):
+                self.assertEqual(
+                    res.full_max_total_num_tokens, res.swa_max_total_num_tokens
+                )
+                self.assertLessEqual(
+                    res.max_total_num_tokens, res.full_max_total_num_tokens
+                )
+                total_pages = res.full_max_total_num_tokens // page_size
+                self.assertEqual(total_pages % 8, 0)
+                self.assertGreater(total_pages, 0)
+                actual_bytes = (total_pages + 1) * cfg._page_bytes
+                self.assertLessEqual(actual_bytes, budget_bytes)
+
+            # Reject a max_tokens cap too small for one sliding window + 1 page:
+            with self.assertRaises(ValueError):
+                cfg_bf16.calculate_pool_sizes_from_max_tokens(512, page_size)
+
+    def test_platform_hooks_and_rpa_layer_page_indices(self):
+        from sglang_tpu.attention_pallas_rpa_base import (
+            BaseTpuPallasRpaAttnBackend,
+            PallasForwardMetadata,
+        )
+
+        platform = TpuSRTPlatform()
+        self.assertIs(platform.get_unified_kv_pool_cls(), TpuUnifiedSWAKVPool)
+        self.assertIs(
+            platform.get_unified_kv_pool_allocator_cls(),
+            TpuUnifiedSWATokenToKVPoolAllocator,
+        )
+        self.assertIs(
+            platform.get_unified_kv_pool_configurator_cls(),
+            TpuUnifiedSWAPoolConfigurator,
+        )
+
+        # Verify BaseTpuPallasRpaAttnBackend._layer_page_indices for M_full=2, M_swa=5:
+        backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+        backend.token_to_kv_pool = MagicMock(swa_raw_head_num=2)
+        backend._swa_kv_heads_merged = True
+        backend._full_layer_groups = {0: 0, 4: 1}
+        backend._swa_layer_groups = {1: 0, 5: 1, 9: 2}
+        backend.forward_metadata = PallasForwardMetadata(
+            kv_lens=torch.tensor([4], dtype=torch.int32),
+            cu_q_lens=torch.tensor([0, 4], dtype=torch.int32),
+            cu_kv_lens=torch.tensor([0, 4], dtype=torch.int32),
+            page_indices=torch.tensor([10], dtype=torch.int32),
+            distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
+            active_num_tokens=torch.tensor(4, dtype=torch.int32),
+            swa_page_indices=torch.tensor([20], dtype=torch.int32),
+            full_group_page_indices=torch.tensor([[11]], dtype=torch.int32),
+            swa_group_page_indices=torch.tensor([[21], [22]], dtype=torch.int32),
+        )
+        self.assertEqual(
+            backend._layer_page_indices(0, is_swa_layer=False),
+            (backend.forward_metadata.page_indices, None),
+        )
+        self.assertTrue(
+            torch.equal(
+                backend._layer_page_indices(4, is_swa_layer=False)[0],
+                torch.tensor([11], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(
+            backend._layer_page_indices(1, is_swa_layer=True),
+            (backend.forward_metadata.swa_page_indices, 2),
+        )
+        self.assertTrue(
+            torch.equal(
+                backend._layer_page_indices(9, is_swa_layer=True)[0],
+                torch.tensor([22], dtype=torch.int32),
+            )
+        )
+
+    def test_import_order_isolation(self):
+        import subprocess
+        import sys
+
+        code = (
+            "import sys, sglang_tpu.attention_pallas_rpa_base; "
+            "assert 'sglang_tpu.kv_pool' not in sys.modules; "
+            "assert 'sglang_tpu.unified_kv_pool' not in sys.modules"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
 
 
 if __name__ == "__main__":
