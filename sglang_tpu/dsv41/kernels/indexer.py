@@ -23,6 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.dsv4.streamindex_topk import config
+from sglang_tpu.kernels.index_selection.pipeline import pipeline_score_topk
 
 QUERY_TILE = 32
 KEY_TILE = 128
@@ -538,39 +539,3 @@ def pipeline_score_topk_bounded(
             output = write(jnp.int32(num_tiles - 2), previous, output)
         last = jnp.int32(num_tiles - 1)
         return write(last, select(last, current, None), output)
-
-
-def pipeline_score_topk(num_tiles, prepare, score, select, write, output):
-    """Order TensorCore scoring and SparseCore selection across two query tiles.
-
-    The barrier gates score-buffer reuse on selection completion, before
-    output scatter. Physical execution overlap depends on the compiler.
-    """
-    first = score(prepare(jnp.int32(0)))
-
-    def advance(tile, state):
-        current, result = state
-        following = score(prepare(tile + 1))
-        return following, write(tile, select(tile, current), result)
-
-    def body(pair, state):
-        tile = 2 * pair
-        current, result = state
-        following = score(prepare(tile + 1))
-        selected = select(tile, current)
-        prepared, selected = lax.optimization_barrier((prepare(tile + 2), selected))
-        replacement = score(prepared)
-        following_selected = select(tile + 1, following)
-        result = write(tile, selected, result)
-        result = write(tile + 1, following_selected, result)
-        return replacement, result
-
-    pairs = (num_tiles - 1) // 2
-    with jax.named_scope("DSV41ScoreTopKPipeline"):
-        state = lax.fori_loop(0, pairs, body, (first, output))
-        if 2 * pairs < num_tiles - 1:
-            state = advance(jnp.int32(2 * pairs), state)
-        last, result = state
-        return write(
-            jnp.int32(num_tiles - 1), select(jnp.int32(num_tiles - 1), last), result
-        )

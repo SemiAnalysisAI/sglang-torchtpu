@@ -14,8 +14,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang_tpu.dsv41.kernels.index_key_layout import ROW_WORDS, SLOTS
-from sglang_tpu.dsv41.kernels.index_selection import tuned_block_sizes
+from sglang_tpu.kernels.index_selection import tuned_block_sizes
+from sglang_tpu.kernels.index_selection.key_layout import ROW_WORDS, SLOTS
 
 
 def is_supported_by_gather_packed_candidate_keys(

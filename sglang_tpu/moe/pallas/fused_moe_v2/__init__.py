@@ -18,8 +18,8 @@
 layout constants a caller must match, and the VMEM estimator and limit.
 """
 
-from sglang_tpu.dsv41.kernels.fused_ep import host, kernel
-from sglang_tpu.dsv41.kernels.fused_ep.layer import fused_ep_moe_v2
+from sglang_tpu.moe.pallas.fused_moe_v2 import host, kernel
+from sglang_tpu.moe.pallas.fused_moe_v2.layer import fused_ep_moe_v2
 
 # The layout constants a caller has to match, and the VMEM accounting,
 # named here so a caller binds against the package rather than reaching

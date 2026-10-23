@@ -237,7 +237,7 @@ def scatter_index_keys(
     """Index-only half-plane RMW, retaining the existing aliased pool writer."""
     import jax.numpy as jnp
 
-    from sglang_tpu.dsv41.kernels.index_key_layout import merge_record_rows
+    from sglang_tpu.kernels.index_selection.key_layout import merge_record_rows
 
     if isinstance(cache, tuple):
         boundary = cache[0].shape[0] * 2

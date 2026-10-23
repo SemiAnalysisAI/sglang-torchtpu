@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from sglang_tpu.dsv41.kernels.fused_ep.host import (
+from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
     QB4,
@@ -57,14 +57,14 @@ from sglang_tpu.dsv41.kernels.fused_ep.host import (
     weight_form,
     weight_format_of_dtype,
 )
-from sglang_tpu.dsv41.kernels.fused_ep.kernel import (
+from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     build_combine_kernel,
     build_fused_ep_moe_kernel,
     combine_step_tokens,
     rowquant_fp8,
 )
-from sglang_tpu.dsv41.kernels.fused_ep.router_ops import pallas_select
-from sglang_tpu.dsv41.kernels.fused_ep.token_parallel import (
+from sglang_tpu.moe.pallas.fused_moe_v2.router_ops import pallas_select
+from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
 )

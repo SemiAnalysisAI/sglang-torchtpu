@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels.index_key_layout import DIM, ROW_WORDS, SLOTS
+from sglang_tpu.kernels.index_selection.key_layout import DIM, ROW_WORDS, SLOTS
 
 MAX_BLOCK_ROWS = 4096
 

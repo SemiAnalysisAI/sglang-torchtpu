@@ -17,11 +17,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels.index_key_layout import DIM, SLOTS
-from sglang_tpu.dsv41.kernels.index_selection import (
+from sglang_tpu.kernels.index_selection import (
     prefill_scores,
     tuned_block_sizes,
 )
+from sglang_tpu.kernels.index_selection.key_layout import DIM, SLOTS
 
 
 def _reduce_heads(logits, weights, queries, stripe):

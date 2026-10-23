@@ -8,9 +8,10 @@ This adapter supplies SGLang request rows and one candidate publication contract
 import jax.numpy as jnp
 from jax import lax
 
+from sglang_tpu.kernels.index_selection.prefill_scores import prefill_index_scores
+from sglang_tpu.kernels.index_selection.streaming_topk import streaming_topk
+
 from .cache_rows import split_halves
-from .index_selection.prefill_scores import prefill_index_scores
-from .index_selection.streaming_topk import streaming_topk
 from .indexer import pipeline_score_topk_bounded
 
 

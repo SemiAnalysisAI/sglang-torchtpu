@@ -17,13 +17,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels.index_key_layout import DIM, ROW_WORDS, SLOTS
-from sglang_tpu.dsv41.kernels.index_selection import (
+from sglang_tpu.kernels.index_selection import (
     decode_scores,
     publication,
     streaming_topk,
 )
-from sglang_tpu.dsv41.kernels.index_selection.tuned_block_sizes import (
+from sglang_tpu.kernels.index_selection.key_layout import DIM, ROW_WORDS, SLOTS
+from sglang_tpu.kernels.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
     PersistentScoreConfig,
     get_decode_request_tile,

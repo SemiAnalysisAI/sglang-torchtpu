@@ -18,8 +18,8 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
-from ..index_key_layout import DIM, ROW_WORDS, SLOTS
 from . import tuned_block_sizes
+from .key_layout import DIM, ROW_WORDS, SLOTS
 
 
 def supports_chunked_prefill(

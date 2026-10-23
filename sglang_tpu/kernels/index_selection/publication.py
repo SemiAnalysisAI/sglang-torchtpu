@@ -19,8 +19,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from sglang_tpu.dsv41.kernels.index_selection import tuned_block_sizes
-from sglang_tpu.dsv41.kernels.index_selection.streaming_topk import (
+from sglang_tpu.kernels.index_selection import tuned_block_sizes
+from sglang_tpu.kernels.index_selection.streaming_topk import (
     FP32_BITS,
     ORDERED_NEG_INF,
     RADIX_BITS,

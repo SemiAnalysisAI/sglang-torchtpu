@@ -21,14 +21,14 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.dsv41.kernels import indexer
-from sglang_tpu.dsv41.kernels.index_key_layout import DIM, ROW_WORDS, SLOTS
-from sglang_tpu.dsv41.kernels.index_selection import (
+from sglang_tpu.kernels.index_selection import (
     decode,
     decode_scores,
     tuned_block_sizes,
 )
-from sglang_tpu.dsv41.kernels.index_selection.streaming_topk import (
+from sglang_tpu.kernels.index_selection.key_layout import DIM, ROW_WORDS, SLOTS
+from sglang_tpu.kernels.index_selection.pipeline import pipeline_score_topk
+from sglang_tpu.kernels.index_selection.streaming_topk import (
     streaming_topk,
 )
 
@@ -579,7 +579,7 @@ def candidate_indexer(
 
     out = jnp.full((requests * queries, k), -1, jnp.int32)
     if overlap:
-        return indexer.pipeline_score_topk(count, prepare, score, select, write, out)
+        return pipeline_score_topk(count, prepare, score, select, write, out)
 
     def serial(i, out):
         args, out = jax.lax.optimization_barrier((prepare(i), out))

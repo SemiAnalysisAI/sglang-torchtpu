@@ -26,7 +26,7 @@ def _build_ep_op(
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    from sglang_tpu.dsv41.kernels.fused_ep import WeightFormat, fused_ep_moe_v2
+    from sglang_tpu.moe.pallas.fused_moe_v2 import WeightFormat, fused_ep_moe_v2
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     parallel = get_parallel()

@@ -31,14 +31,17 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu._logging import get_logger as init_logger
 
-# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
-# implementation, called here rather than copied.
-from sglang_tpu.dsv41.kernels.activations import silu_and_mul_with_clamp, swigluoai
-
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
-from sglang_tpu.dsv41.kernels.fused_ep import host
-from sglang_tpu.dsv41.kernels.fused_ep.host import (
+from sglang_tpu.moe.pallas.fused_moe_v2 import host
+
+# The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
+# implementation, called here rather than copied.
+from sglang_tpu.moe.pallas.fused_moe_v2.activations import (
+    silu_and_mul_with_clamp,
+    swigluoai,
+)
+from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     FP4,
     FP8,
     FP8_MAX,
