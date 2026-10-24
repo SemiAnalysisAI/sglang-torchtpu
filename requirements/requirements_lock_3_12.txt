@@ -587,7 +587,7 @@ setproctitle==1.3.7
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   sglang-router
-setuptools==81.0.0
+setuptools==84.1.0
     # via
     #   modelscope
     #   pytablewriter
