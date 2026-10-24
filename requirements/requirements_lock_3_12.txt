@@ -409,7 +409,7 @@ peft==0.20.0
     # via sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
 pexpect==4.9.0
     # via ipython
-pillow==12.3.0
+pillow==13.0.0
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   torch-tpu (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/1/pyproject.toml)
