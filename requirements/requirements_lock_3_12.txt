@@ -123,7 +123,7 @@ fastapi==0.141.1
     # via
     #   sglang (bazel-out/k8-opt/bin/requirements/regenerate_lock.scratch/0/pyproject.toml)
     #   sglang-router
-filelock==3.32.5
+filelock==4.2.1
     # via
     #   blobfile
     #   datasets
